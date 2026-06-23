@@ -1,0 +1,144 @@
+name: lls-stack
+
+x-argilla-env: &argilla-env
+  ARGILLA_HOME_PATH: /var/lib/argilla
+  ARGILLA_ELASTICSEARCH: http://elasticsearch:9200
+  ARGILLA_DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/argilla
+  ARGILLA_REDIS_URL: redis://redis:6379/0
+
+services:
+  panel:
+    build:
+      context: .
+      dockerfile: docker/panel/Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://repo.huaweicloud.com/repository/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-repo.huaweicloud.com}
+    restart: unless-stopped
+    ports:
+      - "${PANEL_PORT:-8765}:8765"
+    environment:
+      LLS_PANEL_PASSWORD: ${LLS_PANEL_PASSWORD:-changeme}
+      ARGILLA_API_URL: http://argilla:6900
+      ARGILLA_API_KEY: ${ARGILLA_API_KEY:-argilla.apikey}
+      ARGILLA_WORKSPACE: ${ARGILLA_WORKSPACE:-argilla}
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+    volumes:
+      - ./runs:/app/runs
+      - ./examples:/app/examples:ro
+      - ./configs:/app/configs:ro
+    depends_on:
+      - argilla
+      - mlflow
+    networks:
+      - lls
+
+  argilla:
+    image: argilla/argilla-server:latest
+    restart: unless-stopped
+    ports:
+      - "${ARGILLA_PORT:-6900}:6900"
+    environment:
+      <<: *argilla-env
+      USERNAME: ${ARGILLA_USERNAME:-argilla}
+      PASSWORD: ${ARGILLA_PASSWORD:-12345678}
+      API_KEY: ${ARGILLA_API_KEY:-argilla.apikey}
+      WORKSPACE: ${ARGILLA_WORKSPACE:-argilla}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    volumes:
+      - argilla-data:/var/lib/argilla
+    depends_on:
+      - argilla-postgres
+      - elasticsearch
+      - redis
+    networks:
+      - lls
+
+  argilla-worker:
+    image: argilla/argilla-server:latest
+    restart: unless-stopped
+    environment:
+      <<: *argilla-env
+      BACKGROUND_NUM_WORKERS: ${ARGILLA_BACKGROUND_WORKERS:-2}
+      HF_HUB_DISABLE_TELEMETRY: "1"
+    command: sh -c 'python -m argilla_server worker --num-workers $${BACKGROUND_NUM_WORKERS}'
+    depends_on:
+      - argilla-postgres
+      - elasticsearch
+      - redis
+    networks:
+      - lls
+
+  argilla-postgres:
+    image: postgres:14
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: argilla
+    volumes:
+      - argilla-postgres-data:/var/lib/postgresql/data
+    networks:
+      - lls
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    restart: unless-stopped
+    environment:
+      ES_JAVA_OPTS: -Xms512m -Xmx512m -XX:UseSVE=0
+      CLI_JAVA_OPTS: -XX:UseSVE=0
+      node.name: elasticsearch
+      cluster.name: es-argilla-local
+      discovery.type: single-node
+      cluster.routing.allocation.disk.threshold_enabled: "false"
+      xpack.security.enabled: "false"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - lls
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    networks:
+      - lls
+
+  mlflow:
+    build:
+      context: ./docker/mlflow
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://repo.huaweicloud.com/repository/pypi/simple}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-repo.huaweicloud.com}
+    restart: unless-stopped
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - sqlite:////mlflow/mlflow.db
+      - --default-artifact-root
+      - /mlflow/artifacts
+      - --serve-artifacts
+    volumes:
+      - mlflow-data:/mlflow
+    networks:
+      - lls
+
+networks:
+  lls:
+    driver: bridge
+
+volumes:
+  argilla-data:
+  argilla-postgres-data:
+  elasticsearch-data:
+  mlflow-data:

@@ -1,0 +1,20 @@
+task_id: toy_multiclass_v1
+id_field: record_id
+runs_dir: runs
+input:
+  path: raw/sample.jsonl
+  text_fields: [title, body]
+  metadata_fields: [year, firm_id]
+labels:
+  primary:
+    name: class_label
+    type: categorical
+    values: [non_target, service_upgrade]
+  auxiliary:
+    - name: is_target
+      type: integer
+      values: [0, 1]
+constraints:
+  - if: "is_target == 0"
+    then: "class_label == 'non_target'"
+prompt: prompt.md
