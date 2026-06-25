@@ -8,8 +8,16 @@ from .config import TaskConfig
 from .io import read_jsonl, write_json, write_jsonl
 
 
-def sample_records(task: TaskConfig, rows: int, sample_id: str, strategy: str = "random", seed: int = 20260617) -> Path:
-    source = read_jsonl(task.input_path)
+def sample_records(
+    task: TaskConfig,
+    rows: int,
+    sample_id: str,
+    strategy: str = "random",
+    seed: int = 20260617,
+    source_path: str | Path | None = None,
+) -> Path:
+    input_path = Path(source_path) if source_path else task.input_path
+    source = read_jsonl(input_path)
     if strategy == "head":
         picked = source[:rows]
     elif strategy == "random":
@@ -26,7 +34,7 @@ def sample_records(task: TaskConfig, rows: int, sample_id: str, strategy: str = 
         {
             "task_id": task.task_id,
             "sample_id": sample_id,
-            "input_path": str(task.input_path),
+            "input_path": str(input_path),
             "id_field": task.id_field,
             "strategy": strategy,
             "seed": seed,

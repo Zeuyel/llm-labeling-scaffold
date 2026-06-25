@@ -1,35 +1,27 @@
 # llm-labeling-scaffold
 
-A task-agnostic scaffold for building reproducible text-labeling pipelines:
+这是一个面向文本标注实验的轻量平台。当前产品边界先按两个核心角色收口：
 
-1. define a task schema,
-2. sample records,
-3. batch records for LLM annotation,
-4. audit and merge structured outputs,
-5. apply human adjudication patches,
-6. build a versioned gold set,
-7. train a local deployable classifier,
-8. infer labels on the full corpus,
-9. write auditable reports.
+1. **轻量控制台**：给实验人员管理任务、导入数据、生成样本、发起标注任务、拉回标注结果、构建训练集版本、训练基线模型、查看模型产物和执行状态。
+2. **Argilla**：作为正式标注工作台，用来分发标注任务、收集标注结果和支持复核。
 
-The repo is intentionally not tied to any paper, data source, or label taxonomy.
-Downstream projects should keep their real data and task-specific outputs outside this repo or under `runs/`, which is git-ignored except for `.gitkeep`.
+MLflow 不再是默认依赖。它只作为可选外部模型记录服务，适合团队已经需要集中记录训练参数、指标和模型产物时再启用。默认部署只依赖本地 `runs/` 目录保存实验产物。
 
-## Quickstart
+## 快速启动
 
-The default entrypoint is the built-in Docker stack. It builds the Vite frontend into the panel backend image and runs the panel, Argilla, MLflow, PostgreSQL, Elasticsearch, and Redis together.
+源码部署时直接使用内置脚本：
 
 ```bash
 ./scripts/stack up
 ```
 
-Open:
+默认启动：
 
-- Pipeline control panel: `http://localhost:8765` (`admin` / `changeme`)
-- Argilla UI: `http://localhost:6900` (`argilla` / `12345678`)
-- MLflow UI/API: `http://localhost:5000`
+- 轻量控制台：`http://localhost:8765`，默认账号 `admin` / `changeme`
+- Argilla：`http://localhost:6900`，默认账号 `argilla` / `12345678`
+- Argilla 依赖服务：PostgreSQL、Elasticsearch、Redis
 
-Useful stack commands:
+常用命令：
 
 ```bash
 ./scripts/stack logs
@@ -38,21 +30,127 @@ Useful stack commands:
 ./scripts/stack down
 ```
 
-The panel and API are served from the same `8765` port. Vite's `5173` port is only used if you explicitly run frontend development mode.
+需要模型记录服务时再启用 profile：
 
-For `toy_multiclass_v1`, use the panel flow:
+```bash
+./scripts/stack up --mlflow
+./scripts/stack logs --mlflow
+```
 
-1. 在「采样 / Artifact」创建 sample artifact。
-2. 在「标注运行 Run」推送 sample 到 Argilla。
-3. 在 Argilla 完成人工标注或复核。
-4. 回到 panel 拉取 Argilla responses，生成 decision artifact。
-5. 在 run detail 审核 missing / duplicate / conflict / merged pools。
-6. 在「Gold 版本」构建 `gold_version`。
-7. 在「模型版本」选择 trainer 并训练，训练记录写入 MLflow。
+启用后会额外启动：
 
-## Local CLI development
+- 模型记录服务：`http://localhost:5000`
 
-The following commands are for local development and debugging, not the normal deployment path:
+脚本会在 `--mlflow` 模式下临时把 `MLFLOW_TRACKING_URI=http://mlflow:5000` 传给控制台；默认模式不会注入这个地址。
+
+## 平台流程
+
+推荐的实验闭环：
+
+1. 实验人员在轻量控制台选择任务并导入数据。
+2. 轻量控制台从数据中生成待标注样本。
+3. 轻量控制台把样本推送到 Argilla。
+4. 标注人员在 Argilla 中完成标注或复核。
+5. 实验人员从轻量控制台拉回 Argilla 标注结果，生成标注结果产物。
+6. 轻量控制台基于样本和标注结果产物构建训练集版本。
+7. 实验人员在轻量控制台选择训练器训练基线模型。
+8. 模型产物、指标和 manifest 默认写入 `runs/`。
+9. 如果启用了 MLflow，训练记录可同步到外部模型记录服务。
+
+这个边界下，控制台不再承担正式逐行标注台职责；正式人工标注和复核都交给 Argilla。
+
+## 服务器测试
+
+有两种部署方式。
+
+### 方式一：从 GitHub Container Registry 拉取控制台镜像
+
+GitHub Actions 会在 push 到 `main` 或 tag 时构建控制台镜像并推送到：
+
+```text
+ghcr.io/<owner>/<repo>/panel
+```
+
+`main` 分支会推送 `main` 和 `latest` 标签；tag push 会推送对应 tag。
+
+在服务器上可以这样测试：
+
+```bash
+git clone <repo-url>
+cd llm-labeling-scaffold
+cp .env.example .env
+export PANEL_IMAGE=ghcr.io/<owner>/<repo>/panel:main
+docker compose pull panel
+docker compose up -d --no-build
+```
+
+如果要同时测试可选模型记录服务：
+
+```bash
+export PANEL_IMAGE=ghcr.io/<owner>/<repo>/panel:main
+export MLFLOW_TRACKING_URI=http://mlflow:5000
+docker compose --profile mlflow pull panel
+docker compose --profile mlflow build mlflow
+docker compose --profile mlflow up -d --no-build
+```
+
+### 方式二：在服务器本地构建
+
+```bash
+git clone <repo-url>
+cd llm-labeling-scaffold
+./scripts/stack up
+```
+
+可选模型记录服务：
+
+```bash
+./scripts/stack up --mlflow
+```
+
+## 环境变量
+
+默认配置在 `.env.example`：
+
+```text
+PANEL_PORT=8765
+LLS_PANEL_PASSWORD=changeme
+
+ARGILLA_PORT=6900
+ARGILLA_USERNAME=argilla
+ARGILLA_PASSWORD=12345678
+ARGILLA_API_KEY=argilla.apikey
+ARGILLA_WORKSPACE=argilla
+
+MLFLOW_PORT=5000
+```
+
+`MLFLOW_TRACKING_URI` 默认不设置。只有需要把训练记录同步到可选模型记录服务时，才设置：
+
+```bash
+export MLFLOW_TRACKING_URI=http://mlflow:5000
+```
+
+## Docker 镜像说明
+
+控制台镜像会把前端构建产物打进后端镜像，并安装：
+
+- 核心流水线依赖
+- Argilla 集成依赖
+- 基线训练依赖：`scikit-learn`、`joblib`
+- MLflow 客户端依赖
+
+因此默认部署可以直接运行内置 `tfidf_sgd` 基线训练器。MLflow 客户端只提供可选记录能力；不启用 profile 时不会启动 MLflow 服务。
+
+容器挂载：
+
+- `./runs:/app/runs`：保存样本、标注结果、训练集、模型和推理产物
+- `./examples:/app/examples:ro`：示例任务
+- `./configs:/app/configs:ro`：配置示例
+
+## 本地命令开发
+
+下面命令用于开发和排查，不是服务器默认部署路径：
 
 ```bash
 python -m llm_labeling_scaffold.cli schema build --task examples/toy_text_classification/task.yaml
@@ -66,85 +164,46 @@ python -m llm_labeling_scaffold.cli train --task examples/toy_text_classificatio
 python -m llm_labeling_scaffold.cli infer --task examples/toy_text_classification/task.yaml --model runs/toy_multiclass_v1/models/baseline_v001/model.joblib --corpus examples/toy_text_classification/raw/sample.jsonl --output runs/toy_multiclass_v1/inference/baseline_v001
 ```
 
-The `tfidf_sgd` trainer is a built-in baseline plugin, not part of the core labeling flow. Install its optional dependencies before running that trainer:
+本地 Python 开发安装：
 
 ```bash
-pip install -e ".[baseline]"
+pip install -e ".[baseline,argilla]"
 ```
 
-Custom trainers can be referenced as `module:function` and receive `(task, gold_path, model_id, params)`.
-
-Optional Argilla and MLflow integrations are kept outside the core dependencies:
+如果本地也要调试可选模型记录服务：
 
 ```bash
-pip install -e ".[argilla,mlflow]"
-export ARGILLA_API_URL=http://localhost:6900
-export ARGILLA_API_KEY=argilla.apikey
-export ARGILLA_WORKSPACE=argilla
+pip install -e ".[baseline,argilla,mlflow]"
 export MLFLOW_TRACKING_URI=http://localhost:5000
 ```
 
-Argilla is the annotation workspace: push a sample artifact to an Argilla dataset, label or review in Argilla, then pull responses back as a decisions JSONL artifact. MLflow is the model tracking workspace: training jobs can log params, metrics, artifacts, and the resulting MLflow run id into the local model manifest.
-
-### Docker stack details
-
-The panel container mounts the repository's `runs/`, `examples/`, and `configs/` directories, so generated artifacts stay on the host filesystem. Inside Docker, the panel reaches Argilla at `http://argilla:6900` and MLflow at `http://mlflow:5000`.
-
-If you run the panel or CLI on the host instead of Docker, load the local integration environment:
-
-```bash
-set -a
-. configs/integrations.env.example
-set +a
-```
-
-## Pipeline control panel
-
-The panel has two parts: a stdlib JSON API (backend) and a Vite + React frontend. In Docker, the frontend is built into the panel image and served from the same `8765` port. The domain model is organized around `task`, `artifact`, `run`, `job`, `decision`, `gold_version`, and `model_version`.
-
-### Backend API (authenticated)
-
-The normal entrypoint is `docker compose up -d`; the direct Python command is only for local development.
-
-- HTTP Basic auth (user/password). If no password is given, one is generated and printed at startup; `LLS_PANEL_PASSWORD` is also honored.
-- Read: `GET /api/runs`, `GET /api/run?task=&run=`, `GET /api/rows?task=&run=&kind=merged|missing|duplicate|conflict`, `GET /api/gold?task=`.
-- Export: `GET /api/export?task=&run=&kind=` streams a `.jsonl` download.
-- Write: `POST /api/adjudicate?task=&run=` appends a human decision to `<run>/adjudication/decisions.jsonl`; `POST /api/import?task=&name=` saves uploaded JSONL to `<task>/imports/<name>/raw.jsonl`; `POST /api/action` starts pipeline jobs including Argilla push/pull, gold build, and training.
-- All run/task path segments are validated against `..` and separators. Binds to `127.0.0.1` by default; use `--host` to expose.
-
-The adjudication file is the `--decisions` input for `gold build`, so panel review feeds straight back into the gold set.
-
-### Frontend development
+前端本地开发：
 
 ```bash
 cd frontend
 npm install
-npm run dev      # dev server with /api proxied to http://127.0.0.1:8765
-npm run build    # outputs frontend/dist, auto-served by the panel backend
+npm run dev
+npm run build
 ```
 
-The UI is split by task and workflow page: task overview, sampling/artifacts, annotation runs, run detail with pools and decisions, jobs, gold versions, and model versions. It uses a restrained shadcn-style layout with a left navigation rail, compact cards, tabs, badges, and dense tables.
+`5173` 端口只用于前端开发模式。Docker 默认通过 panel 的 `8765` 端口同时提供 API 和前端页面。
 
-## Current MVP
+## 当前能力
 
-Implemented now:
+已经具备：
 
-- task YAML loading,
-- JSON Schema generation,
-- deterministic sampling and batching,
-- `local_stub` annotation provider,
-- schema/ID/constraint audit,
-- safe merge with missing/duplicate/conflict pools,
-- adjudication patch application,
-- versioned gold set build,
-- modular training registry with a TF-IDF + SGD baseline trainer,
-- JSONL full-corpus inference,
-- basic Markdown/JSON summaries.
+- 任务 YAML 加载
+- JSON Schema 生成
+- 数据采样和批处理
+- 本地 stub 标注 provider
+- schema、ID、约束检查
+- missing、duplicate、conflict pool 生成
+- 标注结果产物到训练集版本的构建
+- 版本化训练集
+- `tfidf_sgd` 基线训练
+- JSONL 全量推理
+- 本地清单、指标和摘要产物
+- Argilla push / pull 集成
+- 可选 MLflow 训练记录
 
-Planned next:
-
-- `codex_exec` provider,
-- OpenAI Responses API provider,
-- parquet streaming inference,
-- configurable aggregation,
-- richer active-learning sampling.
+后续应优先继续收口产物契约，而不是在控制台中重做正式标注界面。

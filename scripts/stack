@@ -16,7 +16,7 @@ fi
 
 if [ ! -f .env ]; then
   cp .env.example .env
-  echo "Created .env from .env.example"
+  echo "已从 .env.example 创建 .env"
 fi
 
 env_value() {
@@ -35,31 +35,93 @@ env_value() {
   fi
 }
 
-case "${1:-up}" in
+usage() {
+  cat >&2 <<'EOF'
+用法：scripts/stack [up|down|logs|ps|restart] [--mlflow]
+
+默认启动 light panel 和 Argilla 标注服务。
+如需可选模型记录服务，使用：scripts/stack up --mlflow
+EOF
+}
+
+cmd="${1:-up}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+enable_mlflow=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --mlflow|--profile=mlflow)
+      enable_mlflow=1
+      shift
+      ;;
+    --profile)
+      if [ "${2:-}" = "mlflow" ]; then
+        enable_mlflow=1
+        shift 2
+      else
+        usage
+        exit 2
+      fi
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+compose=(docker compose)
+services=(panel argilla argilla-worker argilla-postgres elasticsearch redis)
+if [ "$enable_mlflow" -eq 1 ]; then
+  compose+=(--profile mlflow)
+  services+=(mlflow)
+fi
+
+print_urls() {
+  echo
+  echo "light panel： http://localhost:$(env_value PANEL_PORT 8765)"
+  echo "Argilla：     http://localhost:$(env_value ARGILLA_PORT 6900)"
+  if [ "$enable_mlflow" -eq 1 ]; then
+    echo "模型记录服务： http://localhost:$(env_value MLFLOW_PORT 5000)"
+  fi
+  echo
+  echo "panel 登录：admin / $(env_value LLS_PANEL_PASSWORD changeme)"
+  echo "Argilla 登录：$(env_value ARGILLA_USERNAME argilla) / $(env_value ARGILLA_PASSWORD 12345678)"
+  if [ "$enable_mlflow" -eq 0 ]; then
+    echo
+    echo "默认未启动模型记录服务；需要时运行：scripts/stack up --mlflow"
+  fi
+}
+
+case "$cmd" in
   up)
-    docker compose up -d --build
-    echo
-    echo "Pipeline control panel: http://localhost:$(env_value PANEL_PORT 8765)"
-    echo "Argilla:                http://localhost:$(env_value ARGILLA_PORT 6900)"
-    echo "MLflow:                 http://localhost:$(env_value MLFLOW_PORT 5000)"
-    echo
-    echo "Panel login: admin / $(env_value LLS_PANEL_PASSWORD changeme)"
-    echo "Argilla login: $(env_value ARGILLA_USERNAME argilla) / $(env_value ARGILLA_PASSWORD 12345678)"
+    if [ "$enable_mlflow" -eq 1 ]; then
+      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --build
+    else
+      "${compose[@]}" up -d --build
+    fi
+    print_urls
     ;;
   down)
-    docker compose down
+    "${compose[@]}" down
     ;;
   logs)
-    docker compose logs -f panel argilla mlflow
+    "${compose[@]}" logs -f "${services[@]}"
     ;;
   ps)
-    docker compose ps
+    "${compose[@]}" ps
     ;;
   restart)
-    docker compose restart panel argilla mlflow
+    if [ "$enable_mlflow" -eq 1 ]; then
+      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" restart "${services[@]}"
+    else
+      "${compose[@]}" restart "${services[@]}"
+    fi
     ;;
   *)
-    echo "Usage: scripts/stack [up|down|logs|ps|restart]" >&2
+    usage
     exit 2
     ;;
 esac

@@ -4,59 +4,93 @@ import { Link } from "./../router.jsx";
 
 export default function GoldPage({ task, taskId, onError }) {
   const [versions, setVersions] = useState([]);
-  const [runs, setRuns] = useState([]);
-  const [run, setRun] = useState("");
+  const [samples, setSamples] = useState([]);
+  const [decisions, setDecisions] = useState([]);
+  const [sample, setSample] = useState("");
+  const [decision, setDecision] = useState("");
   const [version, setVersion] = useState("");
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
     if (!taskId) return;
     try {
-      const [g, r] = await Promise.all([api.getTaskGoldVersions(taskId), api.getTaskRuns(taskId)]);
+      const [g, s, d] = await Promise.all([
+        api.getTaskGoldVersions(taskId),
+        api.getTaskSamples(taskId),
+        api.getDecisionArtifacts(taskId),
+      ]);
       setVersions(g.gold_versions || []);
-      setRuns(r.runs || []);
+      setSamples(s.samples || []);
+      setDecisions(d.decision_artifacts || []);
     } catch (e) { onError(String(e)); }
   }, [taskId, onError]);
 
   useEffect(() => { reload(); }, [reload]);
 
+  const selectedDecision = decisions.find((item) => item.path === decision);
+
   async function buildGold() {
-    if (!task || !run || !version) { onError("请选择 run 并填写版本号"); return; }
+    const samplePath = sample || selectedDecision?.sample_path;
+    if (!task || !samplePath || !decision || !version) {
+      onError("请选择样本、标注结果产物并填写版本号");
+      return;
+    }
     setBusy(true);
     try {
-      const selected = runs.find((x) => x.path === run);
-      const params = { run, version };
-      if (selected && selected.decisions > 0) {
-        params.decisions = `${run}/adjudication/decisions.jsonl`;
+      const job = await api.startAction(task.path, "gold", {
+        sample: samplePath,
+        decisions: decision,
+        version,
+      });
+      const finished = job?.id ? await api.waitForJob(taskId, job.id) : null;
+      if (finished?.status === "failed") {
+        throw new Error(finished.error || "执行失败");
       }
-      await api.startAction(task.path, "gold", params);
       setVersion("");
-      setTimeout(reload, 600);
+      await reload();
     } catch (e) { onError(String(e)); } finally { setBusy(false); }
   }
 
   return (
     <div>
-      <div className="crumbs"><Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / Gold 版本</div>
+      <div className="crumbs"><Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 训练集版本</div>
       <div className="page-header">
-        <h2>Gold 版本</h2>
-        <p>合并 + 裁决生成版本化 gold 集，作为训练数据</p>
+        <h2>训练集版本</h2>
+        <p>使用样本和 Argilla 标注结果构建可追溯的训练数据版本</p>
       </div>
       <div className="card" style={{ marginBottom: 16 }}>
-        <h3>构建 Gold（gold build）</h3>
+        <h3>构建训练集</h3>
         <div className="form-grid">
-          <div className="field"><label>来源 run</label><select value={run} onChange={(e) => setRun(e.target.value)}><option value="">-- 选择 --</option>{runs.map((r) => <option key={r.run_id} value={r.path}>{r.run_id}{r.decisions ? ` (裁决 ${r.decisions})` : ""}</option>)}</select></div>
-          <div className="field"><label>版本号 version</label><input value={version} onChange={(e) => setVersion(e.target.value)} placeholder="例如 v001" /></div>
+          <div className="field">
+            <label>样本</label>
+            <select value={sample} onChange={(e) => setSample(e.target.value)}>
+              <option value="">选择样本</option>
+              {samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}
+            </select>
+            {selectedDecision?.sample_path && <span className="hint">所选标注结果已记录样本路径，可不重复选择</span>}
+          </div>
+          <div className="field">
+            <label>标注结果产物</label>
+            <select value={decision} onChange={(e) => setDecision(e.target.value)}>
+              <option value="">选择标注结果</option>
+              {decisions.map((d) => (
+                <option key={d.decision_id || d.path} value={d.path}>
+                  {(d.decision_id || d.argilla_dataset || "未命名")} · {d.rows ?? d.result?.responses ?? "-"} 行
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="field"><label>版本号</label><input value={version} onChange={(e) => setVersion(e.target.value)} placeholder="例如 v001" /></div>
         </div>
-        <button className="btn btn-primary" disabled={busy} onClick={buildGold}>构建 Gold 任务</button>
+        <button className="btn btn-primary" disabled={busy} onClick={buildGold}>构建训练集版本</button>
       </div>
       <div className="card">
-        <div className="toolbar"><h3>Gold 版本列表（{versions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
-        {!versions.length && <div className="empty">暂无 gold 版本</div>}
+        <div className="toolbar"><h3>训练集版本列表（{versions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+        {!versions.length && <div className="empty">暂无训练集版本</div>}
         {versions.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>版本</th><th>行数</th><th>主标签</th><th>标签分布</th><th>创建时间</th></tr></thead>
+              <thead><tr><th>版本</th><th>行数</th><th>主标签</th><th>标签分布</th><th>来源</th><th>创建时间</th><th>路径</th></tr></thead>
               <tbody>
                 {versions.map((g) => (
                   <tr key={g.version}>
@@ -64,7 +98,9 @@ export default function GoldPage({ task, taskId, onError }) {
                     <td>{g.rows}</td>
                     <td>{g.primary_label}</td>
                     <td className="muted">{JSON.stringify(g.label_counts || {})}</td>
+                    <td>{g.source === "decision_artifact" ? "标注结果产物" : (g.source || "-")}</td>
                     <td className="muted">{(g.created_at || "").slice(0, 19)}</td>
+                    <td className="muted path-cell">{g.path}</td>
                   </tr>
                 ))}
               </tbody>

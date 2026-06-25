@@ -5,6 +5,7 @@ import hmac
 import json
 import os
 import secrets
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -231,6 +232,18 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"samples": pipeline.list_samples(self.runs_root, task)})
+        elif path == "/api/task/imports":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            self._json({"imports": pipeline.list_imports(self.runs_root, task)})
+        elif path == "/api/task/annotation_jobs":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            self._json({"annotation_jobs": pipeline.list_annotation_jobs(self.runs_root, task)})
         elif path == "/api/task/models":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
@@ -243,6 +256,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"gold_versions": pipeline.list_gold_versions(self.runs_root, task)})
+        elif path == "/api/task/decision_artifacts":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            self._json({"decision_artifacts": pipeline.list_decision_artifacts(self.runs_root, task)})
         elif path == "/api/task/decisions":
             task = params.get("task_id", [""])[0]
             run = params.get("run", [""])[0]
@@ -342,6 +361,16 @@ class _Handler(BaseHTTPRequestHandler):
                     pass
         dest = self.runs_root / task / "imports" / name / "raw.jsonl"
         write_jsonl(rows, dest)
+        manifest = {
+            "task_id": task,
+            "import_id": name,
+            "path": str(dest),
+            "rows": len(rows),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source": "upload",
+        }
+        manifest_path = self.runs_root / task / "imports" / name / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         self._json({"ok": True, "rows": len(rows), "path": str(dest)})
 
 

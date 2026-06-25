@@ -68,6 +68,12 @@ def load_task(path: str | Path) -> TaskConfig:
     return TaskConfig(path=p, raw=raw)
 
 
+def with_runs_root(task: TaskConfig, runs_root: str | Path) -> TaskConfig:
+    raw = dict(task.raw)
+    raw["runs_dir"] = str(Path(runs_root))
+    return TaskConfig(path=task.path, raw=raw)
+
+
 def build_text(row: dict, task: TaskConfig) -> str:
     parts = []
     for field in task.text_fields:

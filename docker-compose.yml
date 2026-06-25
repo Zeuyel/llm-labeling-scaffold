@@ -8,6 +8,7 @@ x-argilla-env: &argilla-env
 
 services:
   panel:
+    image: ${PANEL_IMAGE:-llm-labeling-scaffold-panel:local}
     build:
       context: .
       dockerfile: docker/panel/Dockerfile
@@ -18,18 +19,17 @@ services:
     ports:
       - "${PANEL_PORT:-8765}:8765"
     environment:
-      LLS_PANEL_PASSWORD: ${LLS_PANEL_PASSWORD:-changeme}
-      ARGILLA_API_URL: http://argilla:6900
-      ARGILLA_API_KEY: ${ARGILLA_API_KEY:-argilla.apikey}
-      ARGILLA_WORKSPACE: ${ARGILLA_WORKSPACE:-argilla}
-      MLFLOW_TRACKING_URI: http://mlflow:5000
+      - LLS_PANEL_PASSWORD=${LLS_PANEL_PASSWORD:-changeme}
+      - ARGILLA_API_URL=http://argilla:6900
+      - ARGILLA_API_KEY=${ARGILLA_API_KEY:-argilla.apikey}
+      - ARGILLA_WORKSPACE=${ARGILLA_WORKSPACE:-argilla}
+      - MLFLOW_TRACKING_URI
     volumes:
       - ./runs:/app/runs
       - ./examples:/app/examples:ro
       - ./configs:/app/configs:ro
     depends_on:
       - argilla
-      - mlflow
     networks:
       - lls
 
@@ -108,6 +108,8 @@ services:
       - lls
 
   mlflow:
+    profiles:
+      - mlflow
     build:
       context: ./docker/mlflow
       args:

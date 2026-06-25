@@ -13,38 +13,33 @@ const q = (obj) =>
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join("&");
 
-// core objects: task
 export const getTasks = () => req("/api/tasks");
+export const getImports = (taskId) => req(`/api/task/imports?${q({ task_id: taskId })}`);
 export const getTaskRuns = (taskId) => req(`/api/task/runs?${q({ task_id: taskId })}`);
 export const getTaskSamples = (taskId) => req(`/api/task/samples?${q({ task_id: taskId })}`);
 export const getTaskModels = (taskId) => req(`/api/task/models?${q({ task_id: taskId })}`);
 export const getTaskGoldVersions = (taskId) => req(`/api/task/gold_versions?${q({ task_id: taskId })}`);
-export const getDecisions = (taskId, run) => req(`/api/task/decisions?${q({ task_id: taskId, run })}`);
+export const getAnnotationJobs = (taskId) => req(`/api/task/annotation_jobs?${q({ task_id: taskId })}`);
+export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifacts?${q({ task_id: taskId })}`);
 export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
 
-// legacy run-centric reads (still used by pools view)
-export const getRuns = () => req("/api/runs");
-export const getRun = (task, run) => req(`/api/run?${q({ task, run })}`);
-export const getRows = (task, run, kind) => req(`/api/rows?${q({ task, run, kind })}`);
-export const exportUrl = (task, run, kind) => `/api/export?${q({ task, run, kind })}`;
-
-// core object: job (start any pipeline action)
 export const startAction = (taskPath, action, params) =>
   req("/api/action", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ task: taskPath, action, params }),
-  });
+  }).then((data) => data.job || data);
 
-// core object: decision
-export const adjudicate = (task, run, payload) =>
-  req(`/api/adjudicate?${q({ task, run })}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+export async function waitForJob(taskId, jobId, attempts = 30) {
+  for (let i = 0; i < attempts; i += 1) {
+    const data = await getJobs(taskId);
+    const job = (data.jobs || []).find((item) => item.id === jobId);
+    if (job && !["pending", "running"].includes(job.status)) return job;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+  return null;
+}
 
-// artifact import
 export const importJsonl = (task, name, text) =>
   req(`/api/import?${q({ task, name })}`, {
     method: "POST",

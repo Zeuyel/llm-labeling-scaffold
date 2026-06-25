@@ -1,12 +1,13 @@
 import React, { useEffect, useState, useCallback } from "react";
 import * as api from "./../api.js";
-import { Link, useRouter } from "./../router.jsx";
+import { Link } from "./../router.jsx";
 
 export default function RunsPage({ task, taskId, onError }) {
-  const { navigate } = useRouter();
   const [runs, setRuns] = useState([]);
   const [samples, setSamples] = useState([]);
+  const [decisions, setDecisions] = useState([]);
   const [sample, setSample] = useState("");
+  const [annotationId, setAnnotationId] = useState("");
   const [runId, setRunId] = useState("");
   const [provider, setProvider] = useState("local_stub");
   const [batchSize, setBatchSize] = useState(5);
@@ -17,90 +18,117 @@ export default function RunsPage({ task, taskId, onError }) {
   const reload = useCallback(async () => {
     if (!taskId) return;
     try {
-      const [r, s] = await Promise.all([api.getTaskRuns(taskId), api.getTaskSamples(taskId)]);
+      const [r, s, d] = await Promise.all([
+        api.getTaskRuns(taskId),
+        api.getTaskSamples(taskId),
+        api.getDecisionArtifacts(taskId),
+      ]);
       setRuns(r.runs || []);
       setSamples(s.samples || []);
+      setDecisions(d.decision_artifacts || []);
     } catch (e) { onError(String(e)); }
   }, [taskId, onError]);
 
   useEffect(() => { reload(); }, [reload]);
 
+  const selectedSample = samples.find((item) => item.path === sample);
+
   async function action(name, params, label) {
-    if (!task) return;
+    if (!task) return false;
     setBusy(true);
     try {
-      await api.startAction(task.path, name, params);
-      setTimeout(reload, 600);
-    } catch (e) { onError(`${label}: ${e}`); } finally { setBusy(false); }
+      const job = await api.startAction(task.path, name, params);
+      const finished = job?.id ? await api.waitForJob(taskId, job.id) : null;
+      if (finished?.status === "failed") {
+        throw new Error(finished.error || "执行失败");
+      }
+      await reload();
+      return true;
+    } catch (e) {
+      onError(`${label}: ${e}`);
+      return false;
+    } finally { setBusy(false); }
   }
 
   async function annotate() {
-    if (!sample || !runId) { onError("请选择 sample 并填写 run_id"); return; }
-    await action("annotate", { sample, run_id: runId, provider, batch_size: Number(batchSize) }, "标注");
-    setRunId("");
+    if (!sample || !runId) { onError("请选择样本并填写调试运行编号"); return; }
+    const ok = await action("annotate", { sample, run_id: runId, provider, batch_size: Number(batchSize) }, "标注");
+    if (ok) setRunId("");
   }
 
   async function pushArgilla() {
-    if (!sample || !argillaDataset) { onError("请选择 sample 并填写 Argilla dataset"); return; }
+    if (!sample || !argillaDataset) { onError("请选择样本并填写 Argilla 数据集名"); return; }
     await action("argilla_push", {
       sample,
       dataset: argillaDataset,
+      annotation_id: annotationId || argillaDataset,
+      sample_id: selectedSample?.sample_id,
       argilla: { min_submitted: Number(argillaMinSubmitted) },
     }, "推送 Argilla");
   }
 
   async function pullArgilla() {
-    if (!argillaDataset) { onError("请填写 Argilla dataset"); return; }
-    await action("argilla_pull", { dataset: argillaDataset }, "同步 Argilla");
+    if (!sample || !argillaDataset) { onError("请选择样本并填写 Argilla 数据集名"); return; }
+    await action("argilla_pull", {
+      sample,
+      sample_id: selectedSample?.sample_id,
+      dataset: argillaDataset,
+      decision_id: annotationId || argillaDataset,
+    }, "拉回标注结果");
   }
 
   return (
     <div>
-      <div className="crumbs"><Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 标注运行</div>
+      <div className="crumbs"><Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 标注分发</div>
       <div className="page-header">
-        <h2>标注运行 Run</h2>
-        <p>对 sample 触发标注、审核、合并，生成数据池</p>
+        <h2>标注分发</h2>
+        <p>实验人员在这里把样本分发到 Argilla，并拉回人工标注结果产物</p>
       </div>
       <div className="card" style={{ marginBottom: 16 }}>
-        <h3>新建标注运行（annotate）</h3>
+        <h3>Argilla 标注任务</h3>
         <div className="form-grid">
-          <div className="field"><label>sample</label><select value={sample} onChange={(e) => setSample(e.target.value)}><option value="">-- 选择 --</option>{samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}</select></div>
-          <div className="field"><label>run_id</label><input value={runId} onChange={(e) => setRunId(e.target.value)} placeholder="例如 run_v1" /></div>
-          <div className="field"><label>provider</label><input value={provider} onChange={(e) => setProvider(e.target.value)} /></div>
-          <div className="field"><label>batch_size</label><input type="number" value={batchSize} onChange={(e) => setBatchSize(e.target.value)} /></div>
+          <div className="field">
+            <label>样本</label>
+            <select value={sample} onChange={(e) => setSample(e.target.value)}>
+              <option value="">选择样本</option>
+              {samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}
+            </select>
+          </div>
+          <div className="field">
+            <label>标注任务编号</label>
+            <input value={annotationId} onChange={(e) => setAnnotationId(e.target.value)} placeholder={`${taskId}_label_v1`} />
+            <span className="hint">用于本地记录标注结果产物；不填时使用 Argilla 数据集名</span>
+          </div>
+          <div className="field">
+            <label>Argilla 数据集名</label>
+            <input value={argillaDataset} onChange={(e) => setArgillaDataset(e.target.value)} placeholder={`${taskId}_annotation_v1`} />
+          </div>
+          <div className="field">
+            <label>单条记录所需提交数</label>
+            <input type="number" min="1" value={argillaMinSubmitted} onChange={(e) => setArgillaMinSubmitted(e.target.value)} />
+          </div>
         </div>
-        <button className="btn btn-primary" disabled={busy} onClick={annotate}>开始标注任务</button>
+        <div className="action-row">
+          <button className="btn btn-primary" disabled={busy} onClick={pushArgilla}>推送到 Argilla</button>
+          <button className="btn" disabled={busy} onClick={pullArgilla}>拉回标注结果</button>
+        </div>
       </div>
       <div className="card" style={{ marginBottom: 16 }}>
-        <h3>Argilla 标注工作台</h3>
-        <div className="form-grid">
-          <div className="field"><label>sample</label><select value={sample} onChange={(e) => setSample(e.target.value)}><option value="">-- 选择 --</option>{samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}</select></div>
-          <div className="field"><label>dataset</label><input value={argillaDataset} onChange={(e) => setArgillaDataset(e.target.value)} placeholder={`${taskId}_annotation_v1`} /></div>
-          <div className="field"><label>每条记录提交数</label><input type="number" value={argillaMinSubmitted} onChange={(e) => setArgillaMinSubmitted(e.target.value)} /></div>
-        </div>
-        <button className="btn btn-primary" disabled={busy} onClick={pushArgilla}>推送到 Argilla</button>{" "}
-        <button className="btn" disabled={busy} onClick={pullArgilla}>从 Argilla 同步标签</button>
-      </div>
-      <div className="card">
-        <div className="toolbar"><h3>运行列表</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
-        {!runs.length && <div className="empty">暂无运行</div>}
-        {runs.length > 0 && (
+        <div className="toolbar"><h3>标注结果产物（{decisions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+        {!decisions.length && <div className="empty">暂无标注结果产物</div>}
+        {decisions.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>run_id</th><th>审核</th><th>合并</th><th>merged 行</th><th>裁决数</th><th>操作</th></tr></thead>
+              <thead><tr><th>产物编号</th><th>来源</th><th>Argilla 数据集</th><th>样本</th><th>行数</th><th>存储路径</th></tr></thead>
               <tbody>
-                {runs.map((r) => (
-                  <tr key={r.run_id}>
-                    <td>{r.run_id}</td>
-                    <td>{r.has_audit ? <span className="badge badge-green">已审核</span> : <span className="badge badge-gray">未审核</span>}</td>
-                    <td>{r.has_merge ? <span className="badge badge-green">已合并</span> : <span className="badge badge-gray">未合并</span>}</td>
-                    <td>{r.merge ? r.merge.merged_rows : "-"}</td>
-                    <td>{r.decisions}</td>
-                    <td>
-                      <button className="btn btn-sm" disabled={busy} onClick={() => action("audit", { run: r.path }, "审核")}>审核</button>{" "}
-                      <button className="btn btn-sm" disabled={busy} onClick={() => action("merge", { run: r.path }, "合并")}>合并</button>{" "}
-                      <button className="btn btn-sm" onClick={() => navigate(`/task/${encodeURIComponent(taskId)}/runs/${encodeURIComponent(r.run_id)}`)}>打开</button>
-                    </td>
+                {decisions.map((d) => (
+                  <tr key={d.decision_id || d.path}>
+                    <td><span className="badge badge-blue">{d.decision_id || "-"}</span></td>
+                    <td>{d.source === "argilla" ? "Argilla" : (d.source || "-")}</td>
+                    <td>{d.argilla_dataset || "-"}</td>
+                    <td>{d.sample_id || "-"}</td>
+                    <td>{d.rows ?? d.result?.responses ?? "-"}</td>
+                    <td className="muted path-cell">{d.path}</td>
                   </tr>
                 ))}
               </tbody>
@@ -108,6 +136,40 @@ export default function RunsPage({ task, taskId, onError }) {
           </div>
         )}
       </div>
+      <details className="card secondary-panel">
+        <summary>本地模型标注调试</summary>
+        <p className="muted">这里仅用于快速检查模型输出，不作为正式人工标注入口。</p>
+        <div className="form-grid">
+          <div className="field"><label>样本</label><select value={sample} onChange={(e) => setSample(e.target.value)}><option value="">选择样本</option>{samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}</select></div>
+          <div className="field"><label>调试运行编号</label><input value={runId} onChange={(e) => setRunId(e.target.value)} placeholder="例如 debug_v1" /></div>
+          <div className="field"><label>模型来源标识</label><input value={provider} onChange={(e) => setProvider(e.target.value)} /></div>
+          <div className="field"><label>批大小</label><input type="number" value={batchSize} onChange={(e) => setBatchSize(e.target.value)} /></div>
+        </div>
+        <button className="btn" disabled={busy} onClick={annotate}>运行本地调试标注</button>
+        <div className="toolbar debug-toolbar"><h3>调试运行记录（{runs.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+        {!runs.length && <div className="empty">暂无调试运行</div>}
+        {runs.length > 0 && (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>运行编号</th><th>审核摘要</th><th>合并输出</th><th>合并行数</th><th>操作</th></tr></thead>
+              <tbody>
+                {runs.map((r) => (
+                  <tr key={r.run_id}>
+                    <td>{r.run_id}</td>
+                    <td>{r.has_audit ? <span className="badge badge-green">已生成</span> : <span className="badge badge-gray">未生成</span>}</td>
+                    <td>{r.has_merge ? <span className="badge badge-green">已生成</span> : <span className="badge badge-gray">未生成</span>}</td>
+                    <td>{r.merge ? r.merge.merged_rows : "-"}</td>
+                    <td>
+                      <button className="btn btn-sm" disabled={busy} onClick={() => action("audit", { run: r.path }, "生成审核摘要")}>审核摘要</button>{" "}
+                      <button className="btn btn-sm" disabled={busy} onClick={() => action("merge", { run: r.path }, "合并调试输出")}>合并输出</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </details>
     </div>
   );
 }

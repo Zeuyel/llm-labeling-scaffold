@@ -2,24 +2,26 @@ import React, { useEffect, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 
-const STAGES = ["采样", "分批", "标注", "审核", "合并", "裁决", "Gold", "训练", "推理"];
+const STAGES = ["数据导入", "样本抽取", "标注分发", "标注回收", "训练集构建", "模型训练", "批量推理"];
 
 export default function TaskOverviewPage({ task, taskId, onError }) {
-  const [counts, setCounts] = useState({ samples: 0, runs: 0, gold: 0, models: 0, jobs: 0 });
+  const [counts, setCounts] = useState({ imports: 0, samples: 0, decisions: 0, gold: 0, models: 0, jobs: 0 });
 
   const reload = useCallback(async () => {
     if (!taskId) return;
     try {
-      const [s, r, g, m, j] = await Promise.all([
+      const [i, s, d, g, m, j] = await Promise.all([
+        api.getImports(taskId),
         api.getTaskSamples(taskId),
-        api.getTaskRuns(taskId),
+        api.getDecisionArtifacts(taskId),
         api.getTaskGoldVersions(taskId),
         api.getTaskModels(taskId),
         api.getJobs(taskId),
       ]);
       setCounts({
+        imports: (i.imports || []).length,
         samples: (s.samples || []).length,
-        runs: (r.runs || []).length,
+        decisions: (d.decision_artifacts || []).length,
         gold: (g.gold_versions || []).length,
         models: (m.models || []).length,
         jobs: (j.jobs || []).length,
@@ -32,11 +34,12 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
   useEffect(() => { reload(); }, [reload]);
 
   const cards = [
-    { key: "samples", label: "Artifact / 采样", val: counts.samples, to: `/task/${encodeURIComponent(taskId)}/samples` },
-    { key: "runs", label: "Run / 标注运行", val: counts.runs, to: `/task/${encodeURIComponent(taskId)}/runs` },
-    { key: "gold", label: "Gold 版本", val: counts.gold, to: `/task/${encodeURIComponent(taskId)}/gold` },
-    { key: "models", label: "模型版本", val: counts.models, to: `/task/${encodeURIComponent(taskId)}/models` },
-    { key: "jobs", label: "Job 任务", val: counts.jobs, to: `/task/${encodeURIComponent(taskId)}/jobs` },
+    { key: "imports", label: "导入数据", val: counts.imports, to: `/task/${encodeURIComponent(taskId)}/imports` },
+    { key: "samples", label: "样本", val: counts.samples, to: `/task/${encodeURIComponent(taskId)}/samples` },
+    { key: "decisions", label: "标注结果", val: counts.decisions, to: `/task/${encodeURIComponent(taskId)}/annotations` },
+    { key: "gold", label: "训练集版本", val: counts.gold, to: `/task/${encodeURIComponent(taskId)}/gold` },
+    { key: "models", label: "模型", val: counts.models, to: `/task/${encodeURIComponent(taskId)}/models` },
+    { key: "jobs", label: "执行记录", val: counts.jobs, to: `/task/${encodeURIComponent(taskId)}/jobs` },
   ];
 
   return (
@@ -44,7 +47,7 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
       <div className="crumbs"><Link to="/">全部任务</Link> / {taskId}</div>
       <div className="page-header">
         <h2>{taskId}</h2>
-        <p>{task && task.primary_label ? `主标签 ${task.primary_label.name}，id 字段 ${task.id_field}` : "任务概览"}</p>
+        <p>{task && task.primary_label ? `主标签 ${task.primary_label.name}，记录编号字段 ${task.id_field}` : "任务概览"}</p>
       </div>
       <div className="card" style={{ marginBottom: 16 }}>
         <h3>数据流阶段</h3>

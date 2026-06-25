@@ -36,7 +36,7 @@ export default function ModelsPage({ task, taskId, onError }) {
 
   async function train() {
     if (!task || !gold || !modelId) {
-      onError("请选择 gold 并填写 model_id");
+      onError("请选择训练集版本并填写模型编号");
       return;
     }
     let parsedParams = {};
@@ -48,15 +48,19 @@ export default function ModelsPage({ task, taskId, onError }) {
     }
     setBusy(true);
     try {
-      await api.startAction(task.path, "train", {
+      const job = await api.startAction(task.path, "train", {
         gold,
         model_id: modelId,
         trainer,
         trainer_params: parsedParams,
         mlflow: useMlflow ? { experiment: mlflowExperiment || taskId } : null,
       });
+      const finished = job?.id ? await api.waitForJob(taskId, job.id) : null;
+      if (finished?.status === "failed") {
+        throw new Error(finished.error || "执行失败");
+      }
       setModelId("");
-      setTimeout(reload, 800);
+      await reload();
     } catch (error) {
       onError(String(error));
     } finally {
@@ -66,13 +70,17 @@ export default function ModelsPage({ task, taskId, onError }) {
 
   async function infer() {
     if (!task || !model || !corpus || !output) {
-      onError("请填写 model、corpus 和 output");
+      onError("请选择模型并填写语料路径、输出目录");
       return;
     }
     setBusy(true);
     try {
-      await api.startAction(task.path, "infer", { model, corpus, output });
-      setTimeout(reload, 800);
+      const job = await api.startAction(task.path, "infer", { model, corpus, output });
+      const finished = job?.id ? await api.waitForJob(taskId, job.id) : null;
+      if (finished?.status === "failed") {
+        throw new Error(finished.error || "执行失败");
+      }
+      await reload();
     } catch (error) {
       onError(String(error));
     } finally {
@@ -84,29 +92,29 @@ export default function ModelsPage({ task, taskId, onError }) {
     <div>
       <div className="crumbs">
         <Link to="/">全部任务</Link> /{" "}
-        <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 模型版本
+        <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 模型管理
       </div>
       <div className="page-header">
-        <h2>模型版本</h2>
-        <p>基于 gold 集训练本地分类器，并对语料进行推理</p>
+        <h2>模型管理</h2>
+        <p>默认登记到本地文件目录，按需同步到外部模型记录服务</p>
       </div>
 
       <div className="card" style={{ marginBottom: 16 }}>
-        <h3>训练</h3>
+        <h3>训练模型</h3>
         <div className="form-grid">
           <div className="field">
-            <label>Gold 版本</label>
+            <label>训练集版本</label>
             <select value={gold} onChange={(event) => setGold(event.target.value)}>
-              <option value="">选择 gold 版本</option>
+              <option value="">选择训练集版本</option>
               {golds.map((item) => (
-                <option key={item.version} value={`runs/${taskId}/gold/gold_${item.version}.jsonl`}>
-                  {item.version}
+                <option key={item.version} value={item.path || `runs/${taskId}/gold/gold_${item.version}.jsonl`}>
+                  {item.version} · {item.rows ?? "-"} 行
                 </option>
               ))}
             </select>
           </div>
           <div className="field">
-            <label>模型 ID</label>
+            <label>模型编号</label>
             <input
               value={modelId}
               onChange={(event) => setModelId(event.target.value)}
@@ -114,13 +122,13 @@ export default function ModelsPage({ task, taskId, onError }) {
             />
           </div>
           <div className="field">
-            <label>训练器</label>
+            <label>训练器标识</label>
             <input
               value={trainer}
               onChange={(event) => setTrainer(event.target.value)}
               placeholder="tfidf_sgd 或 package.module:function"
             />
-            <span className="hint">内置 tfidf_sgd 只是 baseline；BERT/SetFit 可通过自定义 trainer 接入</span>
+            <span className="hint">内置 tfidf_sgd 是轻量基线；自定义训练器可填模块函数路径</span>
           </div>
           <div className="field">
             <label>训练参数 JSON</label>
@@ -132,14 +140,14 @@ export default function ModelsPage({ task, taskId, onError }) {
             />
           </div>
           <div className="field">
-            <label>MLflow</label>
+            <label>外部模型记录服务（可选）</label>
             <select value={useMlflow ? "yes" : "no"} onChange={(event) => setUseMlflow(event.target.value === "yes")}>
-              <option value="no">不记录</option>
-              <option value="yes">记录到 MLflow</option>
+              <option value="no">仅本地文件登记</option>
+              <option value="yes">同步到外部记录服务</option>
             </select>
           </div>
           <div className="field">
-            <label>MLflow experiment</label>
+            <label>外部实验名称</label>
             <input
               value={mlflowExperiment}
               onChange={(event) => setMlflowExperiment(event.target.value)}
@@ -154,7 +162,7 @@ export default function ModelsPage({ task, taskId, onError }) {
       </div>
 
       <div className="card" style={{ marginBottom: 16 }}>
-        <h3>推理</h3>
+        <h3>模型推理</h3>
         <div className="form-grid">
           <div className="field">
             <label>模型</label>
@@ -191,7 +199,7 @@ export default function ModelsPage({ task, taskId, onError }) {
 
       <div className="card">
         <div className="toolbar">
-          <h3>模型列表（{models.length}）</h3>
+          <h3>本地模型登记（{models.length}）</h3>
           <button className="btn btn-sm" onClick={reload}>
             刷新
           </button>
@@ -202,10 +210,10 @@ export default function ModelsPage({ task, taskId, onError }) {
             <table>
               <thead>
                 <tr>
-                  <th>模型 ID</th>
-                  <th>训练器</th>
+                  <th>模型编号</th>
+                  <th>训练器标识</th>
                   <th>测试行数</th>
-                  <th>MLflow</th>
+                  <th>外部记录</th>
                   <th>标签</th>
                   <th>路径</th>
                 </tr>
@@ -218,9 +226,9 @@ export default function ModelsPage({ task, taskId, onError }) {
                     </td>
                     <td>{item.metrics ? item.metrics.trainer : item.manifest ? item.manifest.trainer : "-"}</td>
                     <td>{item.metrics ? item.metrics.test_rows : "-"}</td>
-                    <td>{item.manifest && item.manifest.mlflow ? item.manifest.mlflow.run_id : "-"}</td>
+                    <td>{item.manifest && item.manifest.mlflow ? item.manifest.mlflow.run_id : "仅本地"}</td>
                     <td className="muted">{item.metrics ? (item.metrics.labels || []).join(", ") : "-"}</td>
-                    <td className="muted">{item.path}</td>
+                    <td className="muted path-cell">{item.path}</td>
                   </tr>
                 ))}
               </tbody>

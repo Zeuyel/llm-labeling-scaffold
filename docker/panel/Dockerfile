@@ -20,7 +20,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN pip install -e ".[argilla,mlflow]"
+RUN pip install -e ".[baseline,argilla,mlflow]"
 
 EXPOSE 8765
 

@@ -4,9 +4,9 @@ import { RouterProvider, useRouter, matchRoute, Link } from "./router.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import TasksPage from "./pages/TasksPage.jsx";
 import TaskOverviewPage from "./pages/TaskOverviewPage.jsx";
+import ImportsPage from "./pages/ImportsPage.jsx";
 import SamplesPage from "./pages/SamplesPage.jsx";
 import RunsPage from "./pages/RunsPage.jsx";
-import RunDetailPage from "./pages/RunDetailPage.jsx";
 import JobsPage from "./pages/JobsPage.jsx";
 import GoldPage from "./pages/GoldPage.jsx";
 import ModelsPage from "./pages/ModelsPage.jsx";
@@ -14,9 +14,10 @@ import ModelsPage from "./pages/ModelsPage.jsx";
 const ROUTES = [
   { pattern: "/", page: "tasks" },
   { pattern: "/task/:id", page: "overview" },
+  { pattern: "/task/:id/imports", page: "imports" },
   { pattern: "/task/:id/samples", page: "samples" },
-  { pattern: "/task/:id/runs", page: "runs" },
-  { pattern: "/task/:id/runs/:run", page: "runDetail" },
+  { pattern: "/task/:id/annotations", page: "annotations" },
+  { pattern: "/task/:id/runs", page: "annotations" },
   { pattern: "/task/:id/jobs", page: "jobs" },
   { pattern: "/task/:id/gold", page: "gold" },
   { pattern: "/task/:id/models", page: "models" },
@@ -44,9 +45,9 @@ function Shell() {
   let page = null;
   if (matched.page === "tasks") page = <TasksPage tasks={tasks} onReload={loadTasks} {...common} />;
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "imports") page = <ImportsPage taskId={activeTaskId} {...common} />;
   else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "runs") page = <RunsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "runDetail") page = <RunDetailPage task={taskOf(activeTaskId)} taskId={activeTaskId} runId={matched.params.run} {...common} />;
+  else if (matched.page === "annotations") page = <RunsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "jobs") page = <JobsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "gold") page = <GoldPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "models") page = <ModelsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;

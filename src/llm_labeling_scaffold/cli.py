@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--sample-id", required=True)
     sample.add_argument("--strategy", default="random", choices=["random", "head"])
     sample.add_argument("--seed", type=int, default=20260617)
+    sample.add_argument("--source")
 
     batch = sub.add_parser("batch")
     batch.add_argument("--task", required=True)
@@ -70,9 +71,10 @@ def build_parser() -> argparse.ArgumentParser:
     gold_sub = gold.add_subparsers(dest="gold_cmd", required=True)
     gold_build = gold_sub.add_parser("build")
     gold_build.add_argument("--task", required=True)
-    gold_build.add_argument("--run", required=True)
+    gold_build.add_argument("--run")
     gold_build.add_argument("--version", required=True)
     gold_build.add_argument("--decisions")
+    gold_build.add_argument("--sample")
 
     train = sub.add_parser("train")
     train.add_argument("--task", required=True)
@@ -106,7 +108,7 @@ def main(argv: list[str] | None = None) -> None:
         print(write_output_schema(task, args.output))
     elif args.cmd == "sample":
         task = load_task(args.task)
-        print(sample_records(task, args.rows, args.sample_id, args.strategy, args.seed))
+        print(sample_records(task, args.rows, args.sample_id, args.strategy, args.seed, args.source))
     elif args.cmd == "batch":
         task = load_task(args.task)
         out = Path(args.output_dir) if args.output_dir else task.runs_dir / "samples" / Path(args.sample).parent.name
@@ -122,7 +124,14 @@ def main(argv: list[str] | None = None) -> None:
         print(merge_run(task, args.run))
     elif args.cmd == "gold":
         task = load_task(args.task)
-        print(build_gold(task, args.run, args.version, args.decisions))
+        if args.sample and args.decisions:
+            from .gold import build_gold_from_decisions
+
+            print(build_gold_from_decisions(task, args.sample, args.decisions, args.version))
+        else:
+            if not args.run:
+                raise SystemExit("gold build requires --run, or --sample with --decisions")
+            print(build_gold(task, args.run, args.version, args.decisions))
     elif args.cmd == "train":
         from .train import train_model
 
