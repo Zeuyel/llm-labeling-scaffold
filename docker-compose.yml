@@ -49,9 +49,12 @@ services:
     volumes:
       - argilla-data:/var/lib/argilla
     depends_on:
-      - argilla-postgres
-      - elasticsearch
-      - redis
+      argilla-postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - lls
 
@@ -64,9 +67,12 @@ services:
       HF_HUB_DISABLE_TELEMETRY: "1"
     command: sh -c 'python -m argilla_server worker --num-workers $${BACKGROUND_NUM_WORKERS}'
     depends_on:
-      - argilla-postgres
-      - elasticsearch
-      - redis
+      argilla-postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - lls
 
@@ -93,13 +99,19 @@ services:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
     restart: unless-stopped
     environment:
-      ES_JAVA_OPTS: -Xms512m -Xmx512m -XX:UseSVE=0
-      CLI_JAVA_OPTS: -XX:UseSVE=0
+      ES_JAVA_OPTS: ${ELASTICSEARCH_JAVA_OPTS:--Xms256m -Xmx256m -XX:UseSVE=0}
+      CLI_JAVA_OPTS: ${ELASTICSEARCH_CLI_JAVA_OPTS:--XX:UseSVE=0}
       node.name: elasticsearch
       cluster.name: es-argilla-local
       discovery.type: single-node
       cluster.routing.allocation.disk.threshold_enabled: "false"
       xpack.security.enabled: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow\\&timeout=1s >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
     ulimits:
       memlock:
         soft: -1
@@ -112,6 +124,11 @@ services:
   redis:
     image: redis:7
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     networks:
       - lls
 
