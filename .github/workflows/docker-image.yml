@@ -14,7 +14,7 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/panel
+  IMAGE_NAME: zeuyel/llm-labeling-scaffold/panel
 
 jobs:
   panel:
