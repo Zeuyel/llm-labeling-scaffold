@@ -3,6 +3,8 @@ import sys
 import tempfile
 import types
 
+from llm_labeling_scaffold.config import TaskConfig, load_task
+from llm_labeling_scaffold.integrations.argilla import _human_label_from_values, _questions_for_task
 from llm_labeling_scaffold.integrations.mlflow import log_training_result
 from llm_labeling_scaffold.io import read_json, write_json
 
@@ -60,3 +62,112 @@ def test_mlflow_result_updates_model_manifest():
             sys.modules["mlflow"] = old
         import shutil
         shutil.rmtree(tmp)
+
+
+class _Question:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+def test_argilla_questions_cover_all_task_label_fields():
+    base = load_task(Path("examples/toy_text_classification/task.yaml"))
+    task = TaskConfig(
+        path=base.path,
+        raw={
+            **base.raw,
+            "labels": {
+                "primary": {
+                    "name": "innovation_boundary_label",
+                    "type": "categorical",
+                    "values": ["new_product_or_application", "unclear_or_insufficient"],
+                },
+                "auxiliary": [
+                    {"name": "new_product_application_flag", "type": "integer", "values": [0, 1]},
+                    {"name": "process_improvement_only", "type": "integer", "values": [0, 1]},
+                    {"name": "service_solution_digital_flag", "type": "integer", "values": [0, 1]},
+                    {"name": "service_solution_digital_type", "type": "categorical", "title": "数字化服务类型", "values": ["none", "remote_monitoring"]},
+                    {"name": "technical_distance_hint", "type": "categorical", "values": ["same_domain_incremental", "cannot_judge_from_text"]},
+                    {"name": "reason", "type": "string"},
+                    {"name": "confidence", "type": "integer", "min": 0, "max": 100},
+                    {"name": "evidence_product_application", "type": "string", "required": False},
+                    {"name": "evidence_process", "type": "string", "required": False},
+                    {"name": "evidence_service_solution", "type": "string", "required": False},
+                    {"name": "evidence_distance", "type": "string", "required": False},
+                ],
+            },
+        },
+    )
+    fake_rg = types.SimpleNamespace(LabelQuestion=_Question, TextQuestion=_Question)
+
+    questions = _questions_for_task(fake_rg, task)
+    names = [question.kwargs["name"] for question in questions]
+
+    assert names == [
+        "innovation_boundary_label",
+        "new_product_application_flag",
+        "process_improvement_only",
+        "service_solution_digital_flag",
+        "service_solution_digital_type",
+        "technical_distance_hint",
+        "reason",
+        "confidence",
+        "evidence_product_application",
+        "evidence_process",
+        "evidence_service_solution",
+        "evidence_distance",
+    ]
+    optional = {q.kwargs["name"]: q.kwargs.get("required") for q in questions}
+    assert optional["evidence_product_application"] is False
+    titles = {q.kwargs["name"]: q.kwargs.get("title") for q in questions}
+    assert titles["service_solution_digital_type"] == "数字化服务类型"
+
+
+def test_argilla_pull_expands_all_response_fields():
+    base = load_task(Path("examples/toy_text_classification/task.yaml"))
+    task = TaskConfig(
+        path=base.path,
+        raw={
+            **base.raw,
+            "labels": {
+                "primary": {
+                    "name": "innovation_boundary_label",
+                    "type": "categorical",
+                    "values": ["new_product_or_application", "unclear_or_insufficient"],
+                },
+                "auxiliary": [
+                    {"name": "new_product_application_flag", "type": "integer", "values": [0, 1]},
+                    {"name": "process_improvement_only", "type": "integer", "values": [0, 1]},
+                    {"name": "service_solution_digital_flag", "type": "integer", "values": [0, 1]},
+                    {"name": "service_solution_digital_type", "type": "categorical", "values": ["none", "remote_monitoring"]},
+                    {"name": "technical_distance_hint", "type": "categorical", "values": ["same_domain_incremental", "cannot_judge_from_text"]},
+                    {"name": "reason", "type": "string"},
+                    {"name": "confidence", "type": "integer", "min": 0, "max": 100},
+                    {"name": "evidence_product_application", "type": "string", "required": False},
+                ],
+            },
+        },
+    )
+
+    values = {
+        "innovation_boundary_label": {"value": "new_product_or_application"},
+        "new_product_application_flag": {"value": "1"},
+        "process_improvement_only": {"value": "0"},
+        "service_solution_digital_flag": {"value": "1"},
+        "service_solution_digital_type": {"value": "remote_monitoring"},
+        "technical_distance_hint": {"value": "same_domain_incremental"},
+        "reason": {"value": "claims describe a new product application"},
+        "confidence": {"value": "88"},
+        "evidence_product_application": {"value": "new remote monitoring product"},
+    }
+
+    human_label = _human_label_from_values(task, values)
+
+    assert human_label["innovation_boundary_label"] == "new_product_or_application"
+    assert human_label["new_product_application_flag"] == 1
+    assert human_label["process_improvement_only"] == 0
+    assert human_label["service_solution_digital_flag"] == 1
+    assert human_label["service_solution_digital_type"] == "remote_monitoring"
+    assert human_label["technical_distance_hint"] == "same_domain_incremental"
+    assert human_label["reason"] == "claims describe a new product application"
+    assert human_label["confidence"] == 88
+    assert human_label["evidence_product_application"] == "new remote monitoring product"

@@ -24,4 +24,4 @@ RUN pip install -e ".[baseline,argilla,mlflow]"
 
 EXPOSE 8765
 
-CMD ["python", "-m", "llm_labeling_scaffold.cli", "panel", "--host", "0.0.0.0", "--port", "8765", "--static-dir", "frontend/dist", "--tasks-root", "examples", "--runs-root", "runs"]
+CMD ["python", "-m", "llm_labeling_scaffold.cli", "panel", "--host", "0.0.0.0", "--port", "8765", "--static-dir", "frontend/dist", "--tasks-root", "examples,tasks", "--runs-root", "runs"]

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from .config import load_task, with_runs_root
 from .io import read_json, write_json
@@ -11,24 +14,155 @@ from .jobs import Job, create_job, run_job
 
 # --- core object: task -------------------------------------------------------
 
-def list_tasks(tasks_root: Path) -> list[dict]:
+def _task_roots(tasks_root: str | Path) -> list[Path]:
+    parts: list[str] = []
+    for chunk in str(tasks_root).split(os.pathsep):
+        parts.extend(item.strip() for item in chunk.split(","))
+    return [Path(item) for item in parts if item]
+
+
+def list_tasks(tasks_root: str | Path) -> list[dict]:
     out: list[dict] = []
-    root = Path(tasks_root)
-    if not root.exists():
-        return out
-    for yml in sorted(root.rglob("task.yaml")):
-        try:
-            task = load_task(yml)
-            out.append({
-                "task_id": task.task_id,
-                "path": str(yml),
-                "id_field": task.id_field,
-                "primary_label": task.primary_label,
-                "auxiliary_labels": task.auxiliary_labels,
-            })
-        except Exception as exc:  # noqa: BLE001
-            out.append({"task_id": None, "path": str(yml), "error": str(exc)})
+    seen: set[str] = set()
+    for root in _task_roots(tasks_root):
+        if not root.exists():
+            continue
+        for yml in sorted(root.rglob("task.yaml")):
+            try:
+                task = load_task(yml)
+                key = task.task_id
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append({
+                    "task_id": task.task_id,
+                    "path": str(yml),
+                    "id_field": task.id_field,
+                    "primary_label": task.primary_label,
+                    "auxiliary_labels": task.auxiliary_labels,
+                })
+            except Exception as exc:  # noqa: BLE001
+                out.append({"task_id": None, "path": str(yml), "error": str(exc)})
     return out
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = []
+        for line in value.splitlines():
+            raw_items.extend(line.split(","))
+        return [item.strip() for item in raw_items if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _coerce_label_value(label_type: str, value: str):
+    if label_type == "integer":
+        return int(value)
+    if label_type == "number":
+        return float(value)
+    if label_type == "boolean":
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "y"}:
+            return True
+        if normalized in {"0", "false", "no", "n"}:
+            return False
+        raise ValueError(f"非法布尔取值: {value}")
+    return str(value)
+
+
+def _normalize_label(raw: dict[str, Any], *, primary: bool = False) -> dict[str, Any]:
+    name = str(raw.get("name") or raw.get("primary_label_name") or "").strip()
+    if not name:
+        raise ValueError("标签字段名不能为空")
+    if ".." in name or "/" in name or "\\" in name:
+        raise ValueError(f"非法标签字段名: {name}")
+    label_type = str(raw.get("type", "categorical" if primary else "string")).strip() or "string"
+    if label_type not in {"categorical", "integer", "number", "boolean", "string"}:
+        raise ValueError(f"不支持的标签类型: {label_type}")
+
+    label: dict[str, Any] = {"name": name, "type": label_type}
+    title = str(raw.get("title") or "").strip()
+    if title:
+        label["title"] = title
+    if "required" in raw:
+        label["required"] = bool(raw.get("required"))
+
+    values = _string_list(raw.get("values"))
+    if values:
+        label["values"] = [_coerce_label_value(label_type, value) for value in values]
+    if label_type == "categorical" and len(label.get("values", [])) < 2:
+        raise ValueError(f"分类标签至少需要两个取值: {name}")
+    if label_type in {"integer", "number"}:
+        if raw.get("min") not in (None, ""):
+            label["min"] = _coerce_label_value(label_type, str(raw["min"]))
+        if raw.get("max") not in (None, ""):
+            label["max"] = _coerce_label_value(label_type, str(raw["max"]))
+    return label
+
+
+def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
+    task_id = str(spec.get("task_id", "")).strip()
+    if not task_id or ".." in task_id or "/" in task_id or "\\" in task_id:
+        raise ValueError("任务编号只能使用单段目录名")
+    id_field = str(spec.get("id_field", "record_id")).strip() or "record_id"
+    text_fields = _string_list(spec.get("text_fields"))
+    metadata_fields = _string_list(spec.get("metadata_fields"))
+    primary_raw = {
+        "name": spec.get("primary_label_name", "label"),
+        "type": spec.get("primary_label_type", "categorical"),
+        "values": spec.get("primary_label_values", []),
+        "title": spec.get("primary_label_title", ""),
+    }
+    primary_label = _normalize_label(primary_raw, primary=True)
+    auxiliary_labels = [
+        _normalize_label(item)
+        for item in spec.get("auxiliary_labels", [])
+        if isinstance(item, dict) and str(item.get("name", "")).strip()
+    ]
+    if not text_fields:
+        raise ValueError("至少需要一个文本字段")
+
+    roots = _task_roots(tasks_root)
+    root = roots[-1] if roots else Path("tasks")
+    task_dir = root / task_id
+    task_path = task_dir / "task.yaml"
+    if task_path.exists():
+        raise ValueError(f"任务已存在: {task_id}")
+
+    raw = {
+        "task_id": task_id,
+        "id_field": id_field,
+        "runs_dir": "runs",
+        "input": {
+            "path": str(spec.get("input_path") or "raw/input.jsonl"),
+            "text_fields": text_fields,
+            "metadata_fields": metadata_fields,
+        },
+        "labels": {
+            "primary": primary_label,
+        },
+    }
+    if auxiliary_labels:
+        raw["labels"]["auxiliary"] = auxiliary_labels
+    task_dir.mkdir(parents=True, exist_ok=False)
+    task_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    prompt = str(spec.get("prompt", "")).strip()
+    if prompt:
+        (task_dir / "prompt.md").write_text(prompt + "\n", encoding="utf-8")
+        raw["prompt"] = "prompt.md"
+        task_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    task = load_task(task_path)
+    return {
+        "task_id": task.task_id,
+        "path": str(task_path),
+        "id_field": task.id_field,
+        "primary_label": task.primary_label,
+        "auxiliary_labels": task.auxiliary_labels,
+    }
 
 
 def _jobs_dir(runs_root: Path, task_id: str) -> Path:

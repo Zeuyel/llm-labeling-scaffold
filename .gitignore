@@ -4,5 +4,7 @@ __pycache__/
 .env
 runs/*
 !runs/.gitkeep
+tasks/*
+!tasks/.gitkeep
 *.egg-info/
 .pytest_cache/

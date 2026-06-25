@@ -3,7 +3,7 @@ name: lls-stack
 x-argilla-env: &argilla-env
   ARGILLA_HOME_PATH: /var/lib/argilla
   ARGILLA_ELASTICSEARCH: http://elasticsearch:9200
-  ARGILLA_DATABASE_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/argilla
+  ARGILLA_DATABASE_URL: postgresql+asyncpg://postgres:postgres@argilla-postgres:5432/argilla
   ARGILLA_REDIS_URL: redis://redis:6379/0
 
 services:
@@ -27,6 +27,7 @@ services:
     volumes:
       - ./runs:/app/runs
       - ./examples:/app/examples:ro
+      - ./tasks:/app/tasks
       - ./configs:/app/configs:ro
     depends_on:
       - argilla
@@ -78,8 +79,15 @@ services:
       POSTGRES_DB: argilla
     volumes:
       - argilla-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d argilla"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     networks:
-      - lls
+      lls:
+        aliases:
+          - postgres
 
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0

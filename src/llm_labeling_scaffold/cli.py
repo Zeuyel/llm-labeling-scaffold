@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     panel.add_argument("--user", default="admin")
     panel.add_argument("--password")
     panel.add_argument("--static-dir")
-    panel.add_argument("--tasks-root", default="examples")
+    panel.add_argument("--tasks-root", default="examples,tasks")
 
     return p
 

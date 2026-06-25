@@ -68,6 +68,24 @@ def test_safe_segment_blocks_traversal():
     assert panel._safe_segment("demo")
     assert not panel._safe_segment("../etc")
     assert not panel._safe_segment("a/b")
+    assert not panel._safe_segment("a\\b")
+
+
+def test_parse_import_rows_accepts_jsonl_and_json_array():
+    rows = panel.parse_import_rows('{"record_id":"r001"}\n{"record_id":"r002"}\n')
+    assert [row["record_id"] for row in rows] == ["r001", "r002"]
+
+    rows = panel.parse_import_rows('[{"record_id":"r003"}]')
+    assert rows == [{"record_id": "r003"}]
+
+
+def test_parse_import_rows_rejects_bad_lines():
+    try:
+        panel.parse_import_rows('{"record_id":"r001"}\nnot-json\n')
+    except ValueError as exc:
+        assert "第 2 行" in str(exc)
+    else:
+        raise AssertionError("bad JSONL line should fail")
 
 
 def test_list_decision_artifacts_reads_manifest(panel_workspace):

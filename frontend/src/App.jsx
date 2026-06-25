@@ -28,9 +28,9 @@ function Shell() {
   const [tasks, setTasks] = useState([]);
   const [err, setErr] = useState("");
 
-  const loadTasks = useCallback(() => {
-    api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e)));
-  }, []);
+  const loadTasks = useCallback(() =>
+    api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
+  []);
   useEffect(() => { loadTasks(); }, [loadTasks]);
 
   let matched = { page: "tasks", params: {} };

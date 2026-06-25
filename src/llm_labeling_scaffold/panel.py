@@ -23,7 +23,7 @@ POOL_FILES = {
 
 
 def _safe_segment(value: str) -> bool:
-    return bool(value) and ".." not in value and "/" not in value and "\\\\" not in value
+    return bool(value) and ".." not in value and "/" not in value and "\\" not in value
 
 
 def _count_lines(path: Path) -> int:
@@ -85,6 +85,41 @@ def append_decision(run_dir: Path, decision: dict) -> int:
     return len(existing)
 
 
+def parse_import_rows(text: str) -> list[dict]:
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("上传内容为空")
+    if stripped[0] in "[{":
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            if not all(isinstance(row, dict) for row in data):
+                raise ValueError("JSON 数组中的每一项都必须是对象")
+            if not data:
+                raise ValueError("上传内容为空")
+            return data
+
+    rows: list[dict] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"第 {line_no} 行不是合法 JSON") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"第 {line_no} 行必须是 JSON 对象")
+        rows.append(row)
+    if not rows:
+        raise ValueError("上传内容为空")
+    return rows
+
+
 def list_gold(runs_root: Path, task: str) -> list[dict]:
     gold_dir = runs_root / task / "gold"
     out = []
@@ -106,7 +141,7 @@ def _sample_rows(run_dir: Path, limit: int = 50) -> list[dict]:
 class _Handler(BaseHTTPRequestHandler):
     server_version = "LLSPanel/0.2"
     runs_root: Path = Path("runs")
-    tasks_root: Path = Path("examples")
+    tasks_root: Path = Path("examples,tasks")
     static_dir: Path | None = None
     auth_user: str = "admin"
     auth_pass: str = ""
@@ -338,6 +373,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "job": job})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/tasks":
+            body = self._read_body()
+            try:
+                task = pipeline.create_task(self.tasks_root, body)
+                self._json({"ok": True, "task": task})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/import":
             self._import(params)
         else:
@@ -351,14 +393,11 @@ class _Handler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
         raw = self.rfile.read(length) if length > 0 else b""
-        rows = []
-        for line in raw.decode("utf-8", "replace").splitlines():
-            line = line.strip()
-            if line:
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    pass
+        try:
+            rows = parse_import_rows(raw.decode("utf-8", "replace"))
+        except ValueError as exc:
+            self._json({"error": str(exc)}, status=400)
+            return
         dest = self.runs_root / task / "imports" / name / "raw.jsonl"
         write_jsonl(rows, dest)
         manifest = {
@@ -377,7 +416,7 @@ class _Handler(BaseHTTPRequestHandler):
 def serve_panel(runs_root: str | Path = "runs", host: str = "127.0.0.1",
                 port: int = 8765, user: str = "admin", password: str | None = None,
                 static_dir: str | Path | None = None,
-                tasks_root: str | Path = "examples") -> None:
+                tasks_root: str | Path = "examples,tasks") -> None:
     password = password or os.environ.get("LLS_PANEL_PASSWORD")
     if not password:
         password = secrets.token_urlsafe(12)

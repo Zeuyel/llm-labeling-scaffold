@@ -7,6 +7,7 @@ export default function ImportsPage({ taskId, onError }) {
   const [name, setName] = useState("");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [fileLabel, setFileLabel] = useState("");
 
   const reload = useCallback(async () => {
     if (!taskId) return;
@@ -24,7 +25,7 @@ export default function ImportsPage({ taskId, onError }) {
 
   async function submit() {
     if (!name.trim() || !text.trim()) {
-      onError("请填写导入编号并粘贴数据内容");
+      onError("请填写导入编号并上传或粘贴数据内容");
       return;
     }
     setBusy(true);
@@ -32,11 +33,26 @@ export default function ImportsPage({ taskId, onError }) {
       await api.importJsonl(taskId, name.trim(), text);
       setName("");
       setText("");
+      setFileLabel("");
       await reload();
     } catch (error) {
       onError(String(error));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function selectFile(event) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    try {
+      const content = await file.text();
+      const baseName = file.name.replace(/\.[^.]+$/, "").replace(/[\\/:*?"<>|]/g, "_").replace(/\.\.+/g, ".");
+      if (!name.trim()) setName(baseName || "imported");
+      setText(content);
+      setFileLabel(`${file.name} · ${content.split(/\r?\n/).filter((line) => line.trim()).length} 行`);
+    } catch (error) {
+      onError(String(error));
     }
   }
 
@@ -51,11 +67,16 @@ export default function ImportsPage({ taskId, onError }) {
       </div>
 
       <div className="card" style={{ marginBottom: 16 }}>
-        <h3>导入换行数据</h3>
+        <h3>导入数据</h3>
         <div className="form-grid">
           <div className="field">
             <label>导入编号</label>
             <input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 第一批语料" />
+          </div>
+          <div className="field">
+            <label>上传文件</label>
+            <input type="file" accept=".jsonl,.ndjson,.json,.txt,application/json,application/x-ndjson,text/plain" onChange={selectFile} />
+            {fileLabel && <span className="hint">{fileLabel}</span>}
           </div>
           <div className="field field-wide">
             <label>数据内容</label>

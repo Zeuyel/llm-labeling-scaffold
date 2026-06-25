@@ -149,7 +149,14 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 
 - `./runs:/app/runs`：保存样本、标注结果、训练集、模型和推理产物
 - `./examples:/app/examples:ro`：示例任务
+- `./tasks:/app/tasks`：控制台中新建的业务任务
 - `./configs:/app/configs:ro`：配置示例
+
+控制台默认同时读取 `examples/` 和 `tasks/`。示例任务只读；实验人员在控制台中新建的任务会写入 `tasks/<任务编号>/task.yaml`。如果任务已经有复杂配置，也仍然可以直接把任务目录放到 `tasks/` 下。
+
+数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入接口会校验每一行是否为 JSON 对象；解析失败时不会静默丢行。
+
+推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题。拉回标注结果时，这些字段会完整写入 `human_label`，再进入训练集版本构建。
 
 ## 本地命令开发
 
@@ -208,6 +215,8 @@ npm run build
 - JSONL 全量推理
 - 本地清单、指标和摘要产物
 - Argilla push / pull 集成
+- 控制台新建任务和上传数据文件
+- Argilla 完整标签字段同步
 - 可选 MLflow 训练记录
 
 后续应优先继续收口产物契约，而不是在控制台中重做正式标注界面。

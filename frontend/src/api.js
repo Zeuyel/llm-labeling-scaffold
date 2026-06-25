@@ -23,6 +23,13 @@ export const getAnnotationJobs = (taskId) => req(`/api/task/annotation_jobs?${q(
 export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifacts?${q({ task_id: taskId })}`);
 export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
 
+export const createTask = (payload) =>
+  req("/api/tasks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then((data) => data.task || data);
+
 export const startAction = (taskPath, action, params) =>
   req("/api/action", {
     method: "POST",
