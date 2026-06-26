@@ -15,6 +15,9 @@ const q = (obj) =>
 
 export const getTasks = () => req("/api/tasks");
 export const getImports = (taskId) => req(`/api/task/imports?${q({ task_id: taskId })}`);
+export const getImportDetail = (taskId, importId) => req(`/api/import/detail?${q({ task_id: taskId, import_id: importId })}`);
+export const getImportRows = (taskId, importId, opts = {}) =>
+  req(`/api/import/rows?${q({ task_id: taskId, import_id: importId, offset: opts.offset, limit: opts.limit, q: opts.query })}`);
 export const getTaskRuns = (taskId) => req(`/api/task/runs?${q({ task_id: taskId })}`);
 export const getTaskSamples = (taskId) => req(`/api/task/samples?${q({ task_id: taskId })}`);
 export const getTaskModels = (taskId) => req(`/api/task/models?${q({ task_id: taskId })}`);
@@ -22,6 +25,7 @@ export const getTaskGoldVersions = (taskId) => req(`/api/task/gold_versions?${q(
 export const getAnnotationJobs = (taskId) => req(`/api/task/annotation_jobs?${q({ task_id: taskId })}`);
 export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifacts?${q({ task_id: taskId })}`);
 export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
+export const getAuditEvents = (taskId) => req(`/api/task/audit?${q({ task_id: taskId })}`);
 export const getArgillaStatus = () => req("/api/argilla/status");
 
 export const createTask = (payload) =>
@@ -35,6 +39,8 @@ export const deleteTask = (taskId, opts = {}) =>
   req(`/api/tasks?${q({ task_id: taskId, delete_runs: opts.deleteRuns ? 1 : undefined })}`, {
     method: "DELETE",
   }).then((data) => data.task || data);
+
+export const archiveTask = (taskId) => deleteTask(taskId);
 
 export const startAction = (taskPath, action, params) =>
   req("/api/action", {
@@ -53,9 +59,22 @@ export async function waitForJob(taskId, jobId, attempts = 30) {
   return null;
 }
 
-export const importJsonl = (task, name, text) =>
-  req(`/api/import?${q({ task, name })}`, {
+export const importJsonl = (taskId, name, text) =>
+  req(`/api/import?${q({ task_id: taskId, name })}`, {
     method: "POST",
     headers: { "Content-Type": "application/x-ndjson" },
     body: text,
   });
+
+export const archiveImport = (taskId, importId, reason = "") =>
+  req(`/api/import?${q({ task_id: taskId, import_id: importId, reason })}`, {
+    method: "DELETE",
+  }).then((data) => data.import || data);
+
+export const archiveSample = (taskId, sampleId, reason = "") =>
+  req(`/api/sample?${q({ task_id: taskId, sample_id: sampleId, reason })}`, {
+    method: "DELETE",
+  }).then((data) => data.sample || data);
+
+export const importDownloadUrl = (taskId, importId) =>
+  `/api/import/download?${q({ task_id: taskId, import_id: importId })}`;

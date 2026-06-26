@@ -16,6 +16,22 @@ const KIND_LABEL = {
   train: "训练模型",
   infer: "模型推理",
 };
+const EVENT_LABEL = {
+  "import.create": "创建导入",
+  "import.reuse": "复用导入",
+  "import.save": "保存导入",
+  "import.archive": "归档导入",
+  "sample.create": "创建样本",
+  "sample.reuse": "复用样本",
+  "sample.save": "保存样本",
+  "sample.archive": "归档样本",
+  "task.archive": "归档任务",
+};
+const ASSET_LABEL = {
+  import: "导入数据",
+  sample: "样本",
+  task: "任务",
+};
 
 function shortResult(job) {
   if (job.error) return job.error.slice(0, 120);
@@ -24,13 +40,15 @@ function shortResult(job) {
 
 export default function JobsPage({ taskId, onError }) {
   const [jobs, setJobs] = useState([]);
+  const [events, setEvents] = useState([]);
   const [active, setActive] = useState(null);
 
   const reload = useCallback(async () => {
     if (!taskId) return;
     try {
-      const d = await api.getJobs(taskId);
+      const [d, a] = await Promise.all([api.getJobs(taskId), api.getAuditEvents(taskId)]);
       setJobs(d.jobs || []);
+      setEvents(a.events || []);
     } catch (e) { onError(String(e)); }
   }, [taskId, onError]);
 
@@ -89,6 +107,33 @@ export default function JobsPage({ taskId, onError }) {
           <pre className="log-box">{(active.logs || []).join("\n") || "(无日志)"}</pre>
         </div>
       )}
+      <div className="card secondary-panel">
+        <div className="toolbar">
+          <div>
+            <h3>资产审计日志（{events.length}）</h3>
+            <div className="status-line">记录导入、样本、归档等数据资产操作</div>
+          </div>
+        </div>
+        {!events.length && <div className="empty">暂无审计事件</div>}
+        {events.length > 0 && (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>时间</th><th>事件</th><th>资产</th><th>状态</th><th>详情</th></tr></thead>
+              <tbody>
+                {events.map((event, index) => (
+                  <tr key={`${event.created_at}-${index}`}>
+                    <td className="muted">{(event.created_at || "").slice(0, 19)}</td>
+                    <td>{EVENT_LABEL[event.event] || event.event}</td>
+                    <td>{ASSET_LABEL[event.asset_type] || event.asset_type}/{event.asset_id}</td>
+                    <td><span className={`badge ${event.status === "failed" ? "badge-red" : "badge-green"}`}>{event.status === "failed" ? "失败" : "成功"}</span></td>
+                    <td className="muted path-cell">{JSON.stringify(event.details || {}).slice(0, 180)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

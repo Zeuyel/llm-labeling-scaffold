@@ -5,7 +5,6 @@ import hmac
 import json
 import os
 import secrets
-from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -272,7 +271,35 @@ class _Handler(BaseHTTPRequestHandler):
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"imports": pipeline.list_imports(self.runs_root, task)})
+            try:
+                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                self._json({"imports": pipeline.list_imports(self.runs_root, task, id_field=task_cfg.id_field)})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif path == "/api/import/detail":
+            task = params.get("task_id", [""])[0]
+            import_id = params.get("import_id", [""])[0]
+            try:
+                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                self._json({"import": pipeline.import_detail(self.runs_root, task, import_id, id_field=task_cfg.id_field)})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif path == "/api/import/rows":
+            task = params.get("task_id", [""])[0]
+            import_id = params.get("import_id", [""])[0]
+            try:
+                self._json(pipeline.import_rows(
+                    self.runs_root,
+                    task,
+                    import_id,
+                    offset=int(params.get("offset", ["0"])[0] or 0),
+                    limit=int(params.get("limit", ["50"])[0] or 50),
+                    query=params.get("q", [""])[0],
+                ))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif path == "/api/import/download":
+            self._download_import(params)
         elif path == "/api/task/annotation_jobs":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
@@ -310,6 +337,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"jobs": pipeline.jobs_for_task(self.runs_root, task)})
+        elif path == "/api/task/audit":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            self._json({"events": pipeline.list_audit_events(self.runs_root, task)})
         elif path == "/api/argilla/status":
             try:
                 from .integrations.argilla import test_connection
@@ -415,35 +448,75 @@ class _Handler(BaseHTTPRequestHandler):
                 })
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/import":
+            task_id = params.get("task_id", [""])[0]
+            import_id = params.get("import_id", [""])[0]
+            reason = params.get("reason", [""])[0]
+            try:
+                self._json({
+                    "ok": True,
+                    "import": pipeline.archive_import(self.runs_root, task_id, import_id, reason=reason),
+                })
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif path == "/api/sample":
+            task_id = params.get("task_id", [""])[0]
+            sample_id = params.get("sample_id", [""])[0]
+            reason = params.get("reason", [""])[0]
+            try:
+                self._json({
+                    "ok": True,
+                    "sample": pipeline.archive_sample(self.runs_root, task_id, sample_id, reason=reason),
+                })
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         else:
             self._json({"error": "not found"}, status=404)
 
     def _import(self, params) -> None:
-        task = params.get("task", [""])[0]
+        task = params.get("task_id", params.get("task", [""]))[0]
         name = params.get("name", ["imported"])[0]
         if not _safe_segment(task) or not _safe_segment(name):
             self._json({"error": "bad task/name"}, status=400)
             return
         length = int(self.headers.get("Content-Length", "0") or "0")
+        max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
+        if length <= 0:
+            self._json({"error": "上传内容为空"}, status=400)
+            return
+        if length > max_bytes:
+            self._json({"error": f"上传内容过大，当前上限为 {max_bytes} bytes"}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
         raw = self.rfile.read(length) if length > 0 else b""
         try:
             rows = parse_import_rows(raw.decode("utf-8", "replace"))
         except ValueError as exc:
             self._json({"error": str(exc)}, status=400)
             return
-        dest = self.runs_root / task / "imports" / name / "raw.jsonl"
-        write_jsonl(rows, dest)
-        manifest = {
-            "task_id": task,
-            "import_id": name,
-            "path": str(dest),
-            "rows": len(rows),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "source": "upload",
-        }
-        manifest_path = self.runs_root / task / "imports" / name / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._json({"ok": True, "rows": len(rows), "path": str(dest)})
+        try:
+            task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+            result = pipeline.save_import(self.runs_root, task_cfg, name, rows, source="upload")
+            self._json({"ok": True, "import": result})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
+    def _download_import(self, params) -> None:
+        task = params.get("task_id", [""])[0]
+        import_id = params.get("import_id", [""])[0]
+        if not _safe_segment(task) or not _safe_segment(import_id):
+            self._json({"error": "bad task/import"}, status=400)
+            return
+        path = self.runs_root / task / "imports" / import_id / "raw.jsonl"
+        if not path.exists():
+            self._json({"error": "no data"}, status=404)
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{import_id}.jsonl"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def serve_panel(runs_root: str | Path = "runs", host: str = "127.0.0.1",

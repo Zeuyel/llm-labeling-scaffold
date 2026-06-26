@@ -31,7 +31,7 @@ export default function TasksPage({ tasks, onReload, onError }) {
   const { navigate } = useRouter();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [deleting, setDeleting] = useState("");
+  const [archiving, setArchiving] = useState("");
   const [form, setForm] = useState({
     task_id: "",
     id_field: "record_id",
@@ -106,23 +106,23 @@ export default function TasksPage({ tasks, onReload, onError }) {
     }
   }
 
-  async function removeTask(task) {
+  async function archiveTask(task) {
     if (!task?.task_id) return;
     if (!task.deletable) {
-      onError("这个任务来自只读目录，不能在面板中删除");
+      onError("这个任务来自只读目录，不能在面板中归档");
       return;
     }
-    const ok = window.confirm(`删除任务 ${task.task_id}？\n\n这只会删除任务配置目录，不会删除 runs 下已有样本、标注结果和模型产物。`);
+    const ok = window.confirm(`归档任务 ${task.task_id}？\n\n归档会把任务配置移到 _archive，不会删除数据。若该任务已有导入、样本、标注或模型产物，系统会拒绝归档。`);
     if (!ok) return;
-    setDeleting(task.task_id);
+    setArchiving(task.task_id);
     try {
-      await api.deleteTask(task.task_id);
+      await api.archiveTask(task.task_id);
       await onReload();
       navigate("/");
     } catch (error) {
       onError(String(error));
     } finally {
-      setDeleting("");
+      setArchiving("");
     }
   }
 
@@ -238,10 +238,10 @@ export default function TasksPage({ tasks, onReload, onError }) {
               {t.deletable ? (
                 <button
                   className="btn btn-sm btn-danger"
-                  disabled={deleting === t.task_id}
-                  onClick={() => removeTask(t)}
+                  disabled={archiving === t.task_id}
+                  onClick={() => archiveTask(t)}
                 >
-                  删除
+                  归档
                 </button>
               ) : (
                 <span className="badge badge-gray">只读</span>

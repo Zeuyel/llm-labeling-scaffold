@@ -1,17 +1,26 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 from typing import Any
+import uuid
 
 import yaml
 
 from .config import load_task, with_runs_root
-from .io import read_json, write_json
+from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
 from .jobs import Job, create_job, run_job
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-Unix fallback
+    fcntl = None
 
 
 # --- core object: task -------------------------------------------------------
@@ -21,6 +30,92 @@ def _task_roots(tasks_root: str | Path) -> list[Path]:
     for chunk in str(tasks_root).split(os.pathsep):
         parts.extend(item.strip() for item in chunk.split(","))
     return [Path(item) for item in parts if item]
+
+
+def _safe_segment(value: str) -> bool:
+    return bool(value) and ".." not in value and "/" not in value and "\\" not in value
+
+
+def _archive_stamp(value: str) -> str:
+    return value.replace(":", "").replace("-", "").replace("+00:00", "Z")
+
+
+def _fsync_dir(path: str | Path) -> None:
+    try:
+        fd = os.open(Path(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _staging_dir(runs_root: str | Path, task_id: str, kind: str, asset_id: str) -> Path:
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    return (
+        Path(runs_root)
+        / task_id
+        / "_staging"
+        / kind
+        / f"{_slug(asset_id)}.{os.getpid()}.{uuid.uuid4().hex}"
+    )
+
+
+def _publish_directory(staging: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        raise FileExistsError(f"目标目录已存在: {target}")
+    _fsync_dir(staging)
+    os.replace(staging, target)
+    _fsync_dir(target.parent)
+
+
+def _move_directory(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        raise FileExistsError(f"归档目录已存在: {target}")
+    old_parent = source.parent
+    os.replace(source, target)
+    _fsync_dir(old_parent)
+    _fsync_dir(target.parent)
+
+
+@contextmanager
+def _asset_lock(runs_root: str | Path, task_id: str, name: str):
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    lock_dir = Path(runs_root) / task_id / "_locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_dir / f"{_slug(name)}.lock"
+    with lock_path.open("w", encoding="utf-8") as fh:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def record_audit_event(runs_root: str | Path, task_id: str, event: str, *,
+                       asset_type: str, asset_id: str, status: str = "succeeded",
+                       actor: str = "system", details: dict[str, Any] | None = None) -> dict:
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    entry = {
+        "event": event,
+        "task_id": task_id,
+        "asset_type": asset_type,
+        "asset_id": asset_id,
+        "status": status,
+        "actor": actor,
+        "details": details or {},
+        "created_at": _now(),
+    }
+    append_jsonl(entry, Path(runs_root) / task_id / "_audit" / "events.jsonl")
+    return entry
 
 
 def _task_file_deletable(path: Path, root: Path) -> bool:
@@ -33,6 +128,99 @@ def _task_file_deletable(path: Path, root: Path) -> bool:
     return True
 
 
+def load_task_by_id(tasks_root: str | Path, task_id: str):
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    for root in _task_roots(tasks_root):
+        if not root.exists():
+            continue
+        for yml in sorted(root.rglob("task.yaml")):
+            if "_archive" in yml.parts:
+                continue
+            try:
+                task = load_task(yml)
+            except Exception:
+                continue
+            if task.task_id == task_id:
+                return task
+    raise ValueError(f"任务不存在: {task_id}")
+
+
+def _active_task_exists(roots: list[Path], task_id: str) -> bool:
+    for root in roots:
+        if not root.exists():
+            continue
+        for yml in sorted(root.rglob("task.yaml")):
+            if "_archive" in yml.parts:
+                continue
+            try:
+                if load_task(yml).task_id == task_id:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _archived_task_exists(roots: list[Path], task_id: str) -> bool:
+    for root in roots:
+        archive = root / "_archive"
+        if archive.is_dir() and any(path.name.startswith(f"{task_id}__") for path in archive.iterdir()):
+            return True
+    return False
+
+
+def _profile_jsonl(path: Path, id_field: str | None = None) -> dict[str, Any]:
+    fields: list[str] = []
+    seen_fields: set[str] = set()
+    ids: set[str] = set()
+    duplicate_ids = 0
+    missing_ids = 0
+    rows = 0
+    for row in iter_jsonl(path):
+        rows += 1
+        for key in row:
+            if key not in seen_fields:
+                seen_fields.add(key)
+                fields.append(key)
+        if id_field:
+            value = row.get(id_field)
+            if value in (None, ""):
+                missing_ids += 1
+            else:
+                text = str(value)
+                if text in ids:
+                    duplicate_ids += 1
+                ids.add(text)
+    return {
+        "rows": rows,
+        "fields": fields,
+        "id_field": id_field,
+        "unique_ids": len(ids) if id_field else None,
+        "duplicate_ids": duplicate_ids if id_field else None,
+        "missing_ids": missing_ids if id_field else None,
+    }
+
+
+def _canonical_row(row: dict) -> str:
+    return json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _content_hash(rows: list[dict]) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(_canonical_row(row).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _jsonl_content_hash(path: Path) -> str:
+    digest = hashlib.sha256()
+    for row in iter_jsonl(path):
+        digest.update(_canonical_row(row).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def list_tasks(tasks_root: str | Path) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -40,6 +228,8 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
         if not root.exists():
             continue
         for yml in sorted(root.rglob("task.yaml")):
+            if "_archive" in yml.parts:
+                continue
             try:
                 task = load_task(yml)
                 key = task.task_id
@@ -61,8 +251,16 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
     return out
 
 
-def delete_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path | None = None,
-                delete_runs: bool = False) -> dict:
+def _task_run_assets(runs_root: str | Path, task_id: str) -> list[str]:
+    run_dir = Path(runs_root) / task_id
+    if not run_dir.is_dir():
+        return []
+    ignored = {"_locks"}
+    return sorted(item.name for item in run_dir.iterdir() if item.name not in ignored)
+
+
+def archive_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path | None = None,
+                 reason: str = "") -> dict:
     task_id = str(task_id or "").strip()
     if not task_id or ".." in task_id or "/" in task_id or "\\" in task_id:
         raise ValueError("非法任务编号")
@@ -70,6 +268,8 @@ def delete_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path |
         if not root.exists():
             continue
         for yml in sorted(root.rglob("task.yaml")):
+            if "_archive" in yml.parts:
+                continue
             try:
                 task = load_task(yml)
             except Exception:
@@ -77,22 +277,49 @@ def delete_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path |
             if task.task_id != task_id:
                 continue
             if not _task_file_deletable(yml, root):
-                raise ValueError("示例任务不可删除；如需隐藏示例任务，请只配置 tasks 作为任务目录")
+                raise ValueError("示例任务不可归档；如需隐藏示例任务，请只配置 tasks 作为任务目录")
+            if runs_root is not None:
+                assets = _task_run_assets(runs_root, task_id)
+                meaningful_assets = [name for name in assets if name not in {"_audit"}]
+                if meaningful_assets:
+                    raise ValueError(f"任务已有数据资产，不能归档任务配置。请先处理 runs/{task_id} 下资产: {', '.join(meaningful_assets)}")
             task_dir = yml.parent
-            shutil.rmtree(task_dir)
-            removed_runs = False
-            if delete_runs and runs_root is not None:
-                run_dir = Path(runs_root) / task_id
-                if run_dir.exists():
-                    shutil.rmtree(run_dir)
-                    removed_runs = True
+            archived_at = _now()
+            stamp = _archive_stamp(archived_at)
+            target = root / "_archive" / f"{task_id}__{stamp}"
+            write_json(
+                {
+                    "task_id": task_id,
+                    "archived_at": archived_at,
+                    "archive_reason": reason,
+                    "archived_from": str(task_dir),
+                },
+                task_dir / "archive.json",
+            )
+            _move_directory(task_dir, target)
+            if runs_root is not None:
+                record_audit_event(
+                    runs_root,
+                    task_id,
+                    "task.archive",
+                    asset_type="task",
+                    asset_id=task_id,
+                    details={"archive_path": str(target), "reason": reason},
+                )
             return {
                 "task_id": task_id,
-                "path": str(task_dir),
-                "deleted": True,
-                "deleted_runs": removed_runs,
+                "archive_path": str(target),
+                "archived": True,
+                "archived_at": archived_at,
             }
     raise ValueError(f"任务不存在: {task_id}")
+
+
+def delete_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path | None = None,
+                delete_runs: bool = False) -> dict:
+    if delete_runs:
+        raise ValueError("不支持从面板删除 runs 数据；任务只能归档，数据资产需按各自规则归档")
+    return archive_task(tasks_root, task_id, runs_root=runs_root, reason="panel archive")
 
 
 def _string_list(value: Any) -> list[str]:
@@ -179,8 +406,10 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
     root = roots[-1] if roots else Path("tasks")
     task_dir = root / task_id
     task_path = task_dir / "task.yaml"
-    if task_path.exists():
+    if task_path.exists() or _active_task_exists(roots, task_id):
         raise ValueError(f"任务已存在: {task_id}")
+    if _archived_task_exists(roots, task_id):
+        raise ValueError(f"任务编号已归档，不能复用: {task_id}")
 
     raw = {
         "task_id": task_id,
@@ -201,12 +430,12 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
     if annotation_guidelines:
         raw["annotation"] = {"guidelines": annotation_guidelines}
     task_dir.mkdir(parents=True, exist_ok=False)
-    task_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    write_text_atomic(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), task_path)
     prompt = str(spec.get("prompt", "")).strip()
     if prompt:
-        (task_dir / "prompt.md").write_text(prompt + "\n", encoding="utf-8")
+        write_text_atomic(prompt + "\n", task_dir / "prompt.md")
         raw["prompt"] = "prompt.md"
-        task_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+        write_text_atomic(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), task_path)
     task = load_task(task_path)
     return {
         "task_id": task.task_id,
@@ -246,14 +475,18 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
         j.log(f"action={action} task={task.task_id}")
         if action == "sample":
             from .sampling import sample_records
-            path = sample_records(task, int(params["rows"]), params["sample_id"],
-                                   params.get("strategy", "random"), int(params.get("seed", 20260617)),
-                                   params.get("source"))
+            sample_id = params["sample_id"]
+            with _asset_lock(runs_root, task.task_id, f"sample-{sample_id}"):
+                path = sample_records(task, int(params["rows"]), sample_id,
+                                      params.get("strategy", "random"), int(params.get("seed", 20260617)),
+                                      params.get("source"), params.get("source_import_id"))
             return {"artifact": str(path), "kind": "sample"}
         if action == "batch":
             from .batching import batch_records
-            out = Path(runs_root) / task.task_id / "samples" / Path(params["sample"]).parent.name
-            paths = batch_records(params["sample"], out, int(params["batch_size"]))
+            sample_id = Path(params["sample"]).parent.name
+            batch_size = int(params["batch_size"])
+            out = Path(runs_root) / task.task_id / "samples" / sample_id / "batches" / f"size_{batch_size}"
+            paths = batch_records(params["sample"], out, batch_size)
             return {"artifacts": [str(p) for p in paths], "kind": "batches"}
         if action == "annotate":
             from .annotation import annotate
@@ -355,23 +588,500 @@ def _count_jsonl(path: Path) -> int:
     return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
-def list_imports(runs_root: Path, task_id: str) -> list[dict]:
+def _import_dir(runs_root: str | Path, task_id: str, import_id: str) -> Path:
+    if not _safe_segment(task_id) or not _safe_segment(import_id):
+        raise ValueError("非法任务或导入编号")
+    return Path(runs_root) / task_id / "imports" / import_id
+
+
+def _archive_dir(runs_root: str | Path, task_id: str, kind: str) -> Path:
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    return Path(runs_root) / task_id / "_archive" / kind
+
+
+def _archived_import_exists(runs_root: str | Path, task_id: str, import_id: str) -> bool:
+    archive = _archive_dir(runs_root, task_id, "imports")
+    return archive.is_dir() and any(path.name.startswith(f"{import_id}__") for path in archive.iterdir())
+
+
+def _same_path(left: str | Path | None, right: str | Path) -> bool:
+    if not left:
+        return False
+    try:
+        return Path(left).resolve() == Path(right).resolve()
+    except Exception:
+        return str(left) == str(right)
+
+
+def linked_samples_for_import(runs_root: str | Path, task_id: str, import_id: str) -> list[dict]:
+    import_path = _import_dir(runs_root, task_id, import_id) / "raw.jsonl"
+    import_manifest_path = import_path.parent / "manifest.json"
+    import_manifest = read_json(import_manifest_path) if import_manifest_path.exists() else {}
+    import_hash = import_manifest.get("content_sha256")
+    if import_path.exists() and not import_hash:
+        import_hash = _jsonl_content_hash(import_path)
+    out: list[dict] = []
+    base = Path(runs_root) / task_id / "samples"
+    if not base.is_dir():
+        return out
+    for sd in sorted(p for p in base.iterdir() if p.is_dir()):
+        manifest_path = sd / "manifest.json"
+        manifest = read_json(manifest_path) if manifest_path.exists() else {}
+        sample_path = sd / "sample.jsonl"
+        linked = manifest.get("source_import_id") == import_id or _same_path(manifest.get("input_path"), import_path)
+        link_reason = "manifest"
+        if not linked and import_hash and sample_path.exists():
+            sample_hash = manifest.get("content_sha256") or _jsonl_content_hash(sample_path)
+            if sample_hash == import_hash:
+                linked = True
+                link_reason = "内容哈希一致"
+        if linked:
+            out.append({
+                "sample_id": sd.name,
+                "path": str(sample_path),
+                "rows": manifest.get("rows"),
+                "input_path": manifest.get("input_path"),
+                "link_reason": link_reason,
+            })
+    return out
+
+
+def _sample_dir(runs_root: str | Path, task_id: str, sample_id: str) -> Path:
+    if not _safe_segment(task_id) or not _safe_segment(sample_id):
+        raise ValueError("非法任务或样本编号")
+    return Path(runs_root) / task_id / "samples" / sample_id
+
+
+def _archived_sample_exists(runs_root: str | Path, task_id: str, sample_id: str) -> bool:
+    archive = _archive_dir(runs_root, task_id, "samples")
+    return archive.is_dir() and any(path.name.startswith(f"{sample_id}__") for path in archive.iterdir())
+
+
+def dependencies_for_sample(runs_root: str | Path, task_id: str, sample_id: str) -> list[dict[str, str]]:
+    item = _sample_dir(runs_root, task_id, sample_id)
+    sample_path = item / "sample.jsonl"
+    base = Path(runs_root) / task_id
+    deps: list[dict[str, str]] = []
+    if not base.is_dir():
+        return deps
+
+    def uses_sample(manifest: dict) -> bool:
+        return manifest.get("sample_id") == sample_id or _same_path(manifest.get("sample_path"), sample_path) or _same_path(manifest.get("sample"), sample_path)
+
+    for group, key, label in [
+        ("annotation_jobs", "annotation_id", "标注分发"),
+        ("decisions", "decision_id", "标注结果"),
+    ]:
+        root = base / group
+        if not root.is_dir():
+            continue
+        for child in sorted(path for path in root.iterdir() if path.is_dir()):
+            manifest_path = child / "manifest.json"
+            if manifest_path.exists():
+                manifest = read_json(manifest_path)
+                if uses_sample(manifest):
+                    deps.append({"kind": label, "id": str(manifest.get(key) or child.name)})
+
+    gold_dir = base / "gold"
+    if gold_dir.is_dir():
+        for manifest_path in sorted(gold_dir.glob("gold_*.manifest.json")):
+            manifest = read_json(manifest_path)
+            if uses_sample(manifest):
+                deps.append({"kind": "训练集", "id": str(manifest.get("version") or manifest_path.name)})
+
+    ignored = {
+        "samples",
+        "gold",
+        "models",
+        "schemas",
+        "imports",
+        "inference",
+        "decisions",
+        "annotation_jobs",
+        "_jobs",
+        "_audit",
+        "_archive",
+        "_locks",
+        "_staging",
+    }
+    for run_dir in sorted(path for path in base.iterdir() if path.is_dir()):
+        if run_dir.name.startswith("_") or run_dir.name in ignored:
+            continue
+        manifest_path = run_dir / "input" / "manifest.json"
+        if manifest_path.exists() and uses_sample(read_json(manifest_path)):
+            deps.append({"kind": "本地标注运行", "id": run_dir.name})
+
+    return deps
+
+
+def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *,
+                source: str = "upload") -> dict:
+    import_id = str(import_id or "").strip()
+    if not _safe_segment(import_id):
+        raise ValueError("导入编号只能使用单段名称，不能包含路径分隔符")
+    if not rows:
+        raise ValueError("导入数据为空")
+    try:
+        _validate_import_rows(task, rows)
+        incoming_hash = _content_hash(rows)
+        with _asset_lock(runs_root, task.task_id, f"import-{import_id}"):
+            item = _import_dir(runs_root, task.task_id, import_id)
+            raw_path = item / "raw.jsonl"
+            manifest_path = item / "manifest.json"
+            if not item.exists() and _archived_import_exists(runs_root, task.task_id, import_id):
+                raise ValueError(f"导入编号已归档，不能复用: {import_id}。请使用新的导入编号。")
+            if item.exists():
+                if not raw_path.exists():
+                    raise ValueError(f"导入编号已存在但缺少 raw.jsonl: {import_id}")
+                manifest = read_json(manifest_path) if manifest_path.exists() else {}
+                if manifest.get("state") == "archived":
+                    raise ValueError(f"导入编号已归档，不能复用: {import_id}。请使用新的导入编号。")
+                existing_hash = manifest.get("content_sha256")
+                existing_hash = existing_hash or _jsonl_content_hash(raw_path)
+                if existing_hash == incoming_hash:
+                    summary = _import_summary(runs_root, task.task_id, item, id_field=task.id_field)
+                    summary["action"] = "reused"
+                    summary["idempotent"] = True
+                    record_audit_event(
+                        runs_root,
+                        task.task_id,
+                        "import.reuse",
+                        asset_type="import",
+                        asset_id=import_id,
+                        details={"content_sha256": incoming_hash, "rows": summary.get("rows")},
+                    )
+                    return summary
+                raise ValueError(f"导入编号已存在且内容不同: {import_id}。请使用新的导入编号，系统不会覆盖已有数据。")
+
+            profile = {
+                **_profile_jsonl_from_rows(rows, id_field=task.id_field),
+                "content_sha256": incoming_hash,
+            }
+            manifest = {
+                "task_id": task.task_id,
+                "import_id": import_id,
+                "path": str(raw_path),
+                "rows": profile["rows"],
+                "fields": profile["fields"],
+                "id_field": task.id_field,
+                "unique_ids": profile["unique_ids"],
+                "duplicate_ids": profile["duplicate_ids"],
+                "missing_ids": profile["missing_ids"],
+                "content_sha256": incoming_hash,
+                "created_at": _now(),
+                "source": source,
+                "state": "active",
+                "schema_version": 1,
+            }
+            staging = _staging_dir(runs_root, task.task_id, "imports", import_id)
+            try:
+                write_jsonl(rows, staging / "raw.jsonl")
+                write_json(manifest, staging / "manifest.json")
+                _publish_directory(staging, item)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+            result = {
+                **manifest,
+                "manifest_path": str(manifest_path),
+                "declared_path": None,
+                "linked_samples": [],
+                "action": "created",
+                "idempotent": False,
+            }
+            record_audit_event(
+                runs_root,
+                task.task_id,
+                "import.create",
+                asset_type="import",
+                asset_id=import_id,
+                details={"content_sha256": incoming_hash, "rows": profile["rows"], "source": source},
+            )
+            return result
+    except Exception as exc:
+        record_audit_event(
+            runs_root,
+            task.task_id,
+            "import.save",
+            asset_type="import",
+            asset_id=import_id or "-",
+            status="failed",
+            details={"error": str(exc), "source": source},
+        )
+        raise
+
+
+def _profile_jsonl_from_rows(rows: list[dict], id_field: str | None = None) -> dict[str, Any]:
+    fields: list[str] = []
+    seen_fields: set[str] = set()
+    ids: set[str] = set()
+    duplicate_ids = 0
+    missing_ids = 0
+    for row in rows:
+        for key in row:
+            if key not in seen_fields:
+                seen_fields.add(key)
+                fields.append(key)
+        if id_field:
+            value = row.get(id_field)
+            if value in (None, ""):
+                missing_ids += 1
+            else:
+                text = str(value)
+                if text in ids:
+                    duplicate_ids += 1
+                ids.add(text)
+    return {
+        "rows": len(rows),
+        "fields": fields,
+        "id_field": id_field,
+        "unique_ids": len(ids) if id_field else None,
+        "duplicate_ids": duplicate_ids if id_field else None,
+        "missing_ids": missing_ids if id_field else None,
+    }
+
+
+def _validate_import_rows(task, rows: list[dict]) -> None:
+    id_field = task.id_field
+    text_fields = list(task.text_fields)
+    fields = {key for row in rows for key in row.keys()}
+    missing_fields = [field for field in [id_field, *text_fields] if field not in fields]
+    if missing_fields:
+        raise ValueError(f"导入数据缺少任务必需字段: {', '.join(missing_fields)}")
+
+    seen_ids: set[str] = set()
+    duplicate_ids: list[str] = []
+    missing_id_rows: list[int] = []
+    empty_text_rows: list[int] = []
+    for index, row in enumerate(rows, start=1):
+        raw_id = row.get(id_field)
+        if raw_id in (None, ""):
+            missing_id_rows.append(index)
+        else:
+            rid = str(raw_id)
+            if rid in seen_ids and len(duplicate_ids) < 5:
+                duplicate_ids.append(rid)
+            seen_ids.add(rid)
+        if not any(str(row.get(field, "") or "").strip() for field in text_fields):
+            empty_text_rows.append(index)
+
+    if missing_id_rows:
+        preview = ", ".join(str(i) for i in missing_id_rows[:5])
+        raise ValueError(f"导入数据存在缺失 ID 的行: {preview}")
+    if duplicate_ids:
+        raise ValueError(f"导入数据存在重复 ID: {', '.join(duplicate_ids)}")
+    if empty_text_rows:
+        preview = ", ".join(str(i) for i in empty_text_rows[:5])
+        raise ValueError(f"导入数据存在文本字段全为空的行: {preview}")
+
+
+def _import_summary(runs_root: str | Path, task_id: str, item: Path, *, id_field: str | None = None) -> dict:
+    raw_path = item / "raw.jsonl"
+    manifest_path = item / "manifest.json"
+    manifest = read_json(manifest_path) if manifest_path.exists() else {}
+    declared_path = manifest.get("path")
+    fields = manifest.get("field_contract") or manifest.get("fields") or []
+    rows = manifest.get("rows")
+    if rows is None:
+        rows = _count_jsonl(raw_path)
+    summary = {
+        **manifest,
+        "task_id": task_id,
+        "import_id": manifest.get("import_id") or item.name,
+        "path": str(raw_path),
+        "manifest_path": str(manifest_path),
+        "declared_path": declared_path if declared_path and declared_path != str(raw_path) else None,
+        "rows": rows,
+        "fields": fields,
+        "id_field": manifest.get("id_field") or id_field,
+        "unique_ids": manifest.get("unique_ids"),
+        "duplicate_ids": manifest.get("duplicate_ids"),
+        "missing_ids": manifest.get("missing_ids"),
+        "content_sha256": manifest.get("content_sha256"),
+        "state": manifest.get("state", "active"),
+        "linked_samples": linked_samples_for_import(runs_root, task_id, item.name),
+    }
+    if raw_path.exists() and (not fields or summary["unique_ids"] is None):
+        profile = _profile_jsonl(raw_path, id_field=summary["id_field"])
+        summary["fields"] = fields or profile["fields"]
+        summary["rows"] = rows if rows is not None else profile["rows"]
+        for key in ("unique_ids", "duplicate_ids", "missing_ids"):
+            if summary.get(key) is None:
+                summary[key] = profile.get(key)
+    if raw_path.exists() and not summary.get("content_sha256"):
+        summary["content_sha256"] = _jsonl_content_hash(raw_path)
+    return summary
+
+
+def list_imports(runs_root: Path, task_id: str, *, id_field: str | None = None) -> list[dict]:
     out: list[dict] = []
     base = Path(runs_root) / task_id / "imports"
     if not base.is_dir():
         return out
-    for item in sorted(p for p in base.iterdir() if p.is_dir()):
-        path = item / "raw.jsonl"
-        manifest = item / "manifest.json"
-        if manifest.exists():
-            out.append(read_json(manifest))
-        else:
-            out.append({
-                "import_id": item.name,
-                "path": str(path),
-                "rows": _count_jsonl(path),
-            })
+    for item in sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith("_")):
+        out.append(_import_summary(runs_root, task_id, item, id_field=id_field))
     return out
+
+
+def import_detail(runs_root: str | Path, task_id: str, import_id: str, *, id_field: str | None = None) -> dict:
+    item = _import_dir(runs_root, task_id, import_id)
+    if not item.is_dir():
+        raise ValueError(f"导入数据不存在: {import_id}")
+    return _import_summary(runs_root, task_id, item, id_field=id_field)
+
+
+def import_rows(runs_root: str | Path, task_id: str, import_id: str, *,
+                offset: int = 0, limit: int = 50, query: str = "") -> dict:
+    item = _import_dir(runs_root, task_id, import_id)
+    raw_path = item / "raw.jsonl"
+    if not raw_path.exists():
+        raise ValueError(f"导入数据文件不存在: {import_id}")
+    offset = max(0, int(offset))
+    limit = min(max(1, int(limit)), 200)
+    query = str(query or "").strip().lower()
+    rows: list[dict] = []
+    total = 0
+    fields: list[str] = []
+    seen_fields: set[str] = set()
+    for row in iter_jsonl(raw_path):
+        if query and query not in json_dumps(row).lower():
+            continue
+        total += 1
+        if total <= offset:
+            continue
+        if len(rows) >= limit:
+            continue
+        rows.append(row)
+        for key in row:
+            if key not in seen_fields:
+                seen_fields.add(key)
+                fields.append(key)
+    return {
+        "task_id": task_id,
+        "import_id": import_id,
+        "offset": offset,
+        "limit": limit,
+        "total": total,
+        "rows": rows,
+        "fields": fields,
+    }
+
+
+def json_dumps(row: dict) -> str:
+    return json.dumps(row, ensure_ascii=False, sort_keys=True)
+
+
+def archive_import(runs_root: str | Path, task_id: str, import_id: str, *, reason: str = "") -> dict:
+    try:
+        with _asset_lock(runs_root, task_id, f"import-{import_id}"):
+            item = _import_dir(runs_root, task_id, import_id)
+            if not item.is_dir():
+                raise ValueError(f"导入数据不存在: {import_id}")
+            linked = linked_samples_for_import(runs_root, task_id, import_id)
+            if linked:
+                names = ", ".join(sample["sample_id"] for sample in linked)
+                raise ValueError(f"导入数据已被样本使用，不能归档。关联样本: {names}")
+            manifest_path = item / "manifest.json"
+            manifest = read_json(manifest_path) if manifest_path.exists() else {
+                "task_id": task_id,
+                "import_id": import_id,
+            }
+            archived_at = _now()
+            manifest.update({
+                "state": "archived",
+                "archived_at": archived_at,
+                "archive_reason": reason,
+                "archived_from": str(item),
+            })
+            write_json(manifest, manifest_path)
+            stamp = _archive_stamp(archived_at)
+            target = _archive_dir(runs_root, task_id, "imports") / f"{import_id}__{stamp}"
+            _move_directory(item, target)
+            result = {
+                "task_id": task_id,
+                "import_id": import_id,
+                "archived": True,
+                "archive_path": str(target),
+                "archived_at": archived_at,
+            }
+            record_audit_event(
+                runs_root,
+                task_id,
+                "import.archive",
+                asset_type="import",
+                asset_id=import_id,
+                details={"archive_path": str(target), "reason": reason},
+            )
+            return result
+    except Exception as exc:
+        record_audit_event(
+            runs_root,
+            task_id,
+            "import.archive",
+            asset_type="import",
+            asset_id=import_id or "-",
+            status="failed",
+            details={"error": str(exc), "reason": reason},
+        )
+        raise
+
+
+def archive_sample(runs_root: str | Path, task_id: str, sample_id: str, *, reason: str = "") -> dict:
+    try:
+        with _asset_lock(runs_root, task_id, f"sample-{sample_id}"):
+            item = _sample_dir(runs_root, task_id, sample_id)
+            sample_path = item / "sample.jsonl"
+            if not item.is_dir() or not sample_path.exists():
+                raise ValueError(f"样本不存在: {sample_id}")
+            deps = dependencies_for_sample(runs_root, task_id, sample_id)
+            if deps:
+                names = ", ".join(f"{dep['kind']}:{dep['id']}" for dep in deps)
+                raise ValueError(f"样本已被下游资产使用，不能归档。关联资产: {names}")
+            manifest_path = item / "manifest.json"
+            manifest = read_json(manifest_path) if manifest_path.exists() else {
+                "task_id": task_id,
+                "sample_id": sample_id,
+                "path": str(sample_path),
+            }
+            archived_at = _now()
+            manifest.update({
+                "state": "archived",
+                "archived_at": archived_at,
+                "archive_reason": reason,
+                "archived_from": str(item),
+            })
+            write_json(manifest, manifest_path)
+            stamp = _archive_stamp(archived_at)
+            target = _archive_dir(runs_root, task_id, "samples") / f"{sample_id}__{stamp}"
+            _move_directory(item, target)
+            result = {
+                "task_id": task_id,
+                "sample_id": sample_id,
+                "archived": True,
+                "archive_path": str(target),
+                "archived_at": archived_at,
+            }
+            record_audit_event(
+                runs_root,
+                task_id,
+                "sample.archive",
+                asset_type="sample",
+                asset_id=sample_id,
+                details={"archive_path": str(target), "reason": reason},
+            )
+            return result
+    except Exception as exc:
+        record_audit_event(
+            runs_root,
+            task_id,
+            "sample.archive",
+            asset_type="sample",
+            asset_id=sample_id or "-",
+            status="failed",
+            details={"error": str(exc), "reason": reason},
+        )
+        raise
 
 
 def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
@@ -392,13 +1102,23 @@ def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
     return out
 
 
+def list_audit_events(runs_root: str | Path, task_id: str, limit: int = 100) -> list[dict]:
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    path = Path(runs_root) / task_id / "_audit" / "events.jsonl"
+    if not path.exists():
+        return []
+    events = list(iter_jsonl(path))
+    return list(reversed(events[-max(1, int(limit)):]))
+
+
 def list_runs(runs_root: Path, task_id: str) -> list[dict]:
     out: list[dict] = []
     base = Path(runs_root) / task_id
     if not base.is_dir():
         return out
     for run_dir in sorted(p for p in base.iterdir() if p.is_dir()):
-        if run_dir.name in (
+        if run_dir.name.startswith("_") or run_dir.name in (
             "samples",
             "gold",
             "models",
@@ -435,12 +1155,15 @@ def list_samples(runs_root: Path, task_id: str) -> list[dict]:
     base = Path(runs_root) / task_id / "samples"
     if not base.is_dir():
         return out
-    for sd in sorted(p for p in base.iterdir() if p.is_dir()):
+    for sd in sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith("_")):
         manifest = sd / "manifest.json"
+        manifest_data = read_json(manifest) if manifest.exists() else None
         out.append({
             "sample_id": sd.name,
             "path": str(sd / "sample.jsonl"),
-            "manifest": read_json(manifest) if manifest.exists() else None,
+            "manifest": manifest_data,
+            "state": (manifest_data or {}).get("state", "active"),
+            "dependencies": dependencies_for_sample(runs_root, task_id, sd.name),
         })
     return out
 
