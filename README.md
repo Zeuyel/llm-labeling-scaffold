@@ -35,7 +35,7 @@ sudo sysctl -w vm.max_map_count=262144
 echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 ```
 
-默认 `.env.example` 给 Elasticsearch 配置了 `-Xms256m -Xmx256m`，用于 1GB 左右内存的临时测试机。正式环境建议至少 2GB 内存，并把 `ELASTICSEARCH_JAVA_OPTS` 调到 `-Xms512m -Xmx512m -XX:UseSVE=0` 或更高。
+默认 `.env.example` 给 Elasticsearch 配置了 `-Xms256m -Xmx256m`，用于 1GB 左右内存的临时测试机。正式环境建议至少 2GB 内存，并把 `ELASTICSEARCH_JAVA_OPTS` 调到 `-Xms512m -Xmx512m` 或更高。
 
 常用命令：
 
