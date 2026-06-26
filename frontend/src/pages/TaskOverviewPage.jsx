@@ -49,7 +49,7 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
         <h2>{taskId}</h2>
         <p>{task && task.primary_label ? `主标签 ${task.primary_label.name}，记录编号字段 ${task.id_field}` : "任务概览"}</p>
       </div>
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>数据流阶段</h3>
         <div className="stage-flow">
           {STAGES.map((s, i) => (

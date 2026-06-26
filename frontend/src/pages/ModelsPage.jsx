@@ -99,7 +99,7 @@ export default function ModelsPage({ task, taskId, onError }) {
         <p>默认登记到本地文件目录，按需同步到外部模型记录服务</p>
       </div>
 
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>训练模型</h3>
         <div className="form-grid">
           <div className="field">
@@ -161,7 +161,7 @@ export default function ModelsPage({ task, taskId, onError }) {
         </button>
       </div>
 
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>模型推理</h3>
         <div className="form-grid">
           <div className="field">
@@ -227,7 +227,7 @@ export default function ModelsPage({ task, taskId, onError }) {
                     <td>{item.metrics ? item.metrics.trainer : item.manifest ? item.manifest.trainer : "-"}</td>
                     <td>{item.metrics ? item.metrics.test_rows : "-"}</td>
                     <td>{item.manifest && item.manifest.mlflow ? item.manifest.mlflow.run_id : "仅本地"}</td>
-                    <td className="muted">{item.metrics ? (item.metrics.labels || []).join(", ") : "-"}</td>
+                    <td className="muted text-cell">{item.metrics ? (item.metrics.labels || []).join(", ") : "-"}</td>
                     <td className="muted path-cell">{item.path}</td>
                   </tr>
                 ))}

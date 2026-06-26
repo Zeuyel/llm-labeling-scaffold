@@ -59,7 +59,7 @@ export default function SamplesPage({ task, taskId, onError }) {
         <h2>样本管理</h2>
         <p>从原始语料抽样生成标注样本，并按需要切分为批次</p>
       </div>
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>创建样本</h3>
         <div className="form-grid">
           <div className="field"><label>样本编号</label><input value={sampleId} onChange={(e) => setSampleId(e.target.value)} placeholder="例如 seed_v1" /></div>
@@ -77,7 +77,7 @@ export default function SamplesPage({ task, taskId, onError }) {
         </div>
         <button className="btn btn-primary" disabled={busy} onClick={createSample}>创建样本</button>
       </div>
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>切分批次</h3>
         <div className="form-grid">
           <div className="field"><label>样本</label><select value={batchSample} onChange={(e) => setBatchSample(e.target.value)}><option value="">选择样本</option>{samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}</select></div>

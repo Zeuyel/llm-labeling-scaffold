@@ -115,7 +115,7 @@ export default function TasksPage({ tasks, onReload, onError }) {
         </div>
       </div>
       {open && (
-        <div className="card" style={{ marginBottom: 16 }}>
+        <div className="card section-card">
           <h3>新建任务</h3>
           <div className="form-grid">
             <div className="field">
@@ -201,7 +201,7 @@ export default function TasksPage({ tasks, onReload, onError }) {
       {!tasks.length && <div className="empty">未发现任务（检查 --tasks-root 目录下的 task.yaml）</div>}
       <div className="grid grid-cards">
         {tasks.map((t) => (
-          <Link key={t.path} to={`/task/${encodeURIComponent(t.task_id)}`} className="card">
+          <Link key={t.path} to={`/task/${encodeURIComponent(t.task_id)}`} className="card task-card">
             <h3>{t.task_id || "(无效)"}</h3>
             {t.error ? (
               <span className="badge badge-red">{t.error}</span>

@@ -84,7 +84,7 @@ export default function RunsPage({ task, taskId, onError }) {
         <h2>标注分发</h2>
         <p>实验人员在这里把样本分发到 Argilla，并拉回人工标注结果产物</p>
       </div>
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>Argilla 标注任务</h3>
         <div className="form-grid">
           <div className="field">
@@ -113,7 +113,7 @@ export default function RunsPage({ task, taskId, onError }) {
           <button className="btn" disabled={busy} onClick={pullArgilla}>拉回标注结果</button>
         </div>
       </div>
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <div className="toolbar"><h3>标注结果产物（{decisions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
         {!decisions.length && <div className="empty">暂无标注结果产物</div>}
         {decisions.length > 0 && (

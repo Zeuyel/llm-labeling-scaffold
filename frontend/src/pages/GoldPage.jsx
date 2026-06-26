@@ -58,7 +58,7 @@ export default function GoldPage({ task, taskId, onError }) {
         <h2>训练集版本</h2>
         <p>使用样本和 Argilla 标注结果构建可追溯的训练数据版本</p>
       </div>
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>构建训练集</h3>
         <div className="form-grid">
           <div className="field">
@@ -97,7 +97,7 @@ export default function GoldPage({ task, taskId, onError }) {
                     <td><span className="badge badge-blue">{g.version}</span></td>
                     <td>{g.rows}</td>
                     <td>{g.primary_label}</td>
-                    <td className="muted">{JSON.stringify(g.label_counts || {})}</td>
+                    <td className="muted text-cell">{JSON.stringify(g.label_counts || {})}</td>
                     <td>{g.source === "decision_artifact" ? "标注结果产物" : (g.source || "-")}</td>
                     <td className="muted">{(g.created_at || "").slice(0, 19)}</td>
                     <td className="muted path-cell">{g.path}</td>

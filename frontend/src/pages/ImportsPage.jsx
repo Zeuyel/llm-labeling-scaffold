@@ -66,7 +66,7 @@ export default function ImportsPage({ taskId, onError }) {
         <p>导入实验语料，后续可基于导入数据抽取样本</p>
       </div>
 
-      <div className="card" style={{ marginBottom: 16 }}>
+      <div className="card section-card">
         <h3>导入数据</h3>
         <div className="form-grid">
           <div className="field">
@@ -109,7 +109,7 @@ export default function ImportsPage({ taskId, onError }) {
                   <tr key={item.import_id}>
                     <td>{item.import_id}</td>
                     <td>{item.rows}</td>
-                    <td className="muted">{item.path}</td>
+                    <td className="muted path-cell">{item.path}</td>
                   </tr>
                 ))}
               </tbody>

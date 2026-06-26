@@ -83,10 +83,10 @@ export default function JobsPage({ taskId, onError }) {
         )}
       </div>
       {active && (
-        <div className="card" style={{ marginTop: 16 }}>
+        <div className="card secondary-panel">
           <div className="toolbar"><h3>执行记录 {active.id} 详情</h3><button className="btn btn-sm" onClick={() => setActive(null)}>关闭</button></div>
           <p className="muted">动作 {KIND_LABEL[active.kind] || active.kind} · 状态 {STATUS_LABEL[active.status] || active.status}</p>
-          <pre style={{ whiteSpace: "pre-wrap", fontSize: 12, background: "var(--muted-bg)", padding: 12, borderRadius: 8, overflowX: "auto" }}>{(active.logs || []).join("\n") || "(无日志)"}</pre>
+          <pre className="log-box">{(active.logs || []).join("\n") || "(无日志)"}</pre>
         </div>
       )}
     </div>
