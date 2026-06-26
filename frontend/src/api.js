@@ -22,6 +22,7 @@ export const getTaskGoldVersions = (taskId) => req(`/api/task/gold_versions?${q(
 export const getAnnotationJobs = (taskId) => req(`/api/task/annotation_jobs?${q({ task_id: taskId })}`);
 export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifacts?${q({ task_id: taskId })}`);
 export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
+export const getArgillaStatus = () => req("/api/argilla/status");
 
 export const createTask = (payload) =>
   req("/api/tasks", {

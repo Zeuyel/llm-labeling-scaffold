@@ -2,6 +2,18 @@ import React, { useEffect, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 
+function slug(value) {
+  return String(value || "item")
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[_.-]+|[_.-]+$/g, "") || "item";
+}
+
+function defaultDatasetName(taskId, sampleId) {
+  return `${slug(taskId)}_${slug(sampleId || "sample")}_v001`;
+}
+
 export default function RunsPage({ task, taskId, onError }) {
   const [runs, setRuns] = useState([]);
   const [samples, setSamples] = useState([]);
@@ -13,6 +25,9 @@ export default function RunsPage({ task, taskId, onError }) {
   const [batchSize, setBatchSize] = useState(5);
   const [argillaDataset, setArgillaDataset] = useState("");
   const [argillaMinSubmitted, setArgillaMinSubmitted] = useState(1);
+  const [argillaIfExists, setArgillaIfExists] = useState("fail");
+  const [argillaStatus, setArgillaStatus] = useState(null);
+  const [datasetAuto, setDatasetAuto] = useState(true);
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
@@ -32,6 +47,11 @@ export default function RunsPage({ task, taskId, onError }) {
   useEffect(() => { reload(); }, [reload]);
 
   const selectedSample = samples.find((item) => item.path === sample);
+  const generatedDataset = defaultDatasetName(taskId, selectedSample?.sample_id);
+
+  useEffect(() => {
+    if (datasetAuto) setArgillaDataset(generatedDataset);
+  }, [datasetAuto, generatedDataset]);
 
   async function action(name, params, label) {
     if (!task) return false;
@@ -57,24 +77,39 @@ export default function RunsPage({ task, taskId, onError }) {
   }
 
   async function pushArgilla() {
-    if (!sample || !argillaDataset) { onError("请选择样本并填写 Argilla 数据集名"); return; }
+    const dataset = argillaDataset.trim() || generatedDataset;
+    if (!sample || !dataset) { onError("请选择样本"); return; }
     await action("argilla_push", {
       sample,
-      dataset: argillaDataset,
-      annotation_id: annotationId || argillaDataset,
+      dataset,
+      annotation_id: annotationId || dataset,
       sample_id: selectedSample?.sample_id,
-      argilla: { min_submitted: Number(argillaMinSubmitted) },
+      argilla: { min_submitted: Number(argillaMinSubmitted), if_exists: argillaIfExists },
     }, "推送 Argilla");
   }
 
   async function pullArgilla() {
-    if (!sample || !argillaDataset) { onError("请选择样本并填写 Argilla 数据集名"); return; }
+    const dataset = argillaDataset.trim() || generatedDataset;
+    if (!sample || !dataset) { onError("请选择样本"); return; }
     await action("argilla_pull", {
       sample,
       sample_id: selectedSample?.sample_id,
-      dataset: argillaDataset,
-      decision_id: annotationId || argillaDataset,
+      dataset,
+      decision_id: annotationId || dataset,
     }, "拉回标注结果");
+  }
+
+  async function testArgilla() {
+    setBusy(true);
+    try {
+      const status = await api.getArgillaStatus();
+      setArgillaStatus(status);
+    } catch (error) {
+      setArgillaStatus(null);
+      onError(`测试 Argilla 连接: ${error}`);
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -101,17 +136,39 @@ export default function RunsPage({ task, taskId, onError }) {
           </div>
           <div className="field">
             <label>Argilla 数据集名</label>
-            <input value={argillaDataset} onChange={(e) => setArgillaDataset(e.target.value)} placeholder={`${taskId}_annotation_v1`} />
+            <input
+              value={argillaDataset}
+              onChange={(e) => { setDatasetAuto(false); setArgillaDataset(e.target.value); }}
+              placeholder={generatedDataset}
+            />
+            <span className="hint">默认自动生成：{generatedDataset}</span>
           </div>
           <div className="field">
             <label>单条记录所需提交数</label>
             <input type="number" min="1" value={argillaMinSubmitted} onChange={(e) => setArgillaMinSubmitted(e.target.value)} />
           </div>
+          <div className="field">
+            <label>同名数据集策略</label>
+            <select value={argillaIfExists} onChange={(e) => setArgillaIfExists(e.target.value)}>
+              <option value="fail">已存在时报错</option>
+              <option value="append">追加记录</option>
+              <option value="replace">删除后重建</option>
+            </select>
+          </div>
         </div>
         <div className="action-row">
           <button className="btn btn-primary" disabled={busy} onClick={pushArgilla}>推送到 Argilla</button>
           <button className="btn" disabled={busy} onClick={pullArgilla}>拉回标注结果</button>
+          <button className="btn" disabled={busy} onClick={testArgilla}>测试连接</button>
+          <button className="btn" disabled={busy} onClick={() => { setDatasetAuto(true); setArgillaDataset(generatedDataset); }}>恢复自动命名</button>
         </div>
+        {argillaStatus && (
+          <div className="status-line">
+            Argilla 连接正常：用户 {argillaStatus.user?.username || "-"}，workspace {argillaStatus.workspace}
+            {argillaStatus.workspace_exists ? " 已存在" : " 不存在"}；可见 workspace：
+            {(argillaStatus.workspaces || []).join(", ") || "-"}
+          </div>
+        )}
       </div>
       <div className="card section-card">
         <div className="toolbar"><h3>标注结果产物（{decisions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>

@@ -4,7 +4,8 @@ import tempfile
 import types
 
 from llm_labeling_scaffold.config import TaskConfig, load_task
-from llm_labeling_scaffold.integrations.argilla import _human_label_from_values, _questions_for_task
+from llm_labeling_scaffold.integrations import argilla
+from llm_labeling_scaffold.integrations.argilla import _guidelines_for_task, _human_label_from_values, _prepare_dataset, _questions_for_task
 from llm_labeling_scaffold.integrations.mlflow import log_training_result
 from llm_labeling_scaffold.io import read_json, write_json
 
@@ -171,3 +172,86 @@ def test_argilla_pull_expands_all_response_fields():
     assert human_label["reason"] == "claims describe a new product application"
     assert human_label["confidence"] == 88
     assert human_label["evidence_product_application"] == "new remote monitoring product"
+
+
+def test_argilla_guidelines_use_task_annotation_by_default():
+    base = load_task(Path("examples/toy_text_classification/task.yaml"))
+    task = TaskConfig(
+        path=base.path,
+        raw={
+            **base.raw,
+            "annotation": {"guidelines": "请先判断是否属于目标创新，再填写证据。"},
+        },
+    )
+
+    assert _guidelines_for_task(task, {}) == "请先判断是否属于目标创新，再填写证据。"
+    assert _guidelines_for_task(task, {"guidelines": "临时说明"}) == "临时说明"
+
+
+class _Workspace:
+    name = "argilla"
+
+
+class _Dataset:
+    def __init__(self, name="dataset_a"):
+        self.name = name
+        self.workspace = _Workspace()
+        self.created = 0
+        self.deleted = 0
+
+    def create(self):
+        self.created += 1
+        return self
+
+    def delete(self):
+        self.deleted += 1
+
+
+class _Datasets:
+    def __init__(self, items):
+        self._items = items
+
+    def list(self):
+        return self._items
+
+
+class _Client:
+    def __init__(self, datasets):
+        self.datasets = _Datasets(datasets)
+
+
+def test_argilla_dataset_existing_policy_fail_append_replace():
+    existing = _Dataset("dataset_a")
+    created = _Dataset("dataset_a")
+    client = _Client([existing])
+
+    try:
+        _prepare_dataset(client, created, "dataset_a", "argilla", "fail")
+    except ValueError as exc:
+        assert "已存在" in str(exc)
+    else:
+        raise AssertionError("existing dataset should fail by default")
+
+    dataset, action = _prepare_dataset(client, created, "dataset_a", "argilla", "append")
+    assert dataset is existing
+    assert action == "appended"
+
+    dataset, action = _prepare_dataset(client, created, "dataset_a", "argilla", "replace")
+    assert dataset is created
+    assert action == "replaced"
+    assert existing.deleted == 1
+    assert created.created == 1
+
+
+def test_argilla_connection_status_uses_client_me_and_workspaces(monkeypatch):
+    class _FakeClient:
+        me = types.SimpleNamespace(username="argilla", role=types.SimpleNamespace(value="owner"))
+        workspaces = _Datasets([_Workspace()])
+
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: _FakeClient())
+
+    status = argilla.test_connection({"workspace": "argilla"})
+
+    assert status["ok"] is True
+    assert status["user"]["username"] == "argilla"
+    assert status["workspace_exists"] is True

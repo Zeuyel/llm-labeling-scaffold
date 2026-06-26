@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 import yaml
@@ -148,6 +149,9 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
     }
     if auxiliary_labels:
         raw["labels"]["auxiliary"] = auxiliary_labels
+    annotation_guidelines = str(spec.get("annotation_guidelines", "")).strip()
+    if annotation_guidelines:
+        raw["annotation"] = {"guidelines": annotation_guidelines}
     task_dir.mkdir(parents=True, exist_ok=False)
     task_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
     prompt = str(spec.get("prompt", "")).strip()
@@ -171,6 +175,16 @@ def _jobs_dir(runs_root: Path, task_id: str) -> Path:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _slug(value: str) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value).strip())
+    text = re.sub(r"_+", "_", text).strip("_.-")
+    return text or "item"
+
+
+def _default_argilla_dataset(task_id: str, sample_id: str | None) -> str:
+    return f"{_slug(task_id)}_{_slug(sample_id or 'sample')}_v001"
 
 
 # --- core object: run + jobs -------------------------------------------------
@@ -200,15 +214,17 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             return {"run": str(run_dir), "run_id": params["run_id"], "kind": "run"}
         if action == "argilla_push":
             from .integrations.argilla import push_sample
-            result = push_sample(task, params["sample"], params["dataset"], params.get("argilla", {}))
-            annotation_id = params.get("annotation_id") or params["dataset"]
+            sample_id = params.get("sample_id") or Path(params["sample"]).parent.name
+            dataset = params.get("dataset") or _default_argilla_dataset(task.task_id, sample_id)
+            result = push_sample(task, params["sample"], dataset, params.get("argilla", {}))
+            annotation_id = params.get("annotation_id") or dataset
             annotation_dir = Path(runs_root) / task.task_id / "annotation_jobs" / annotation_id
             manifest = {
                 "task_id": task.task_id,
                 "annotation_id": annotation_id,
                 "source": "argilla",
-                "argilla_dataset": params["dataset"],
-                "sample_id": params.get("sample_id"),
+                "argilla_dataset": dataset,
+                "sample_id": sample_id,
                 "sample_path": params["sample"],
                 "rows": result.get("records", 0),
                 "status": "已分发",
@@ -219,16 +235,18 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             return {"kind": "annotation_job", "annotation_id": annotation_id, "result": result}
         if action == "argilla_pull":
             from .integrations.argilla import pull_responses
-            decision_id = params.get("decision_id") or params["dataset"]
+            sample_id = params.get("sample_id") or (Path(params["sample"]).parent.name if params.get("sample") else None)
+            dataset = params.get("dataset") or _default_argilla_dataset(task.task_id, sample_id)
+            decision_id = params.get("decision_id") or dataset
             decision_dir = Path(runs_root) / task.task_id / "decisions" / decision_id
             output = Path(params.get("output") or decision_dir / "decisions.jsonl")
-            result = pull_responses(task, params["dataset"], output, params.get("argilla", {}))
+            result = pull_responses(task, dataset, output, params.get("argilla", {}))
             manifest = {
                 "task_id": task.task_id,
                 "decision_id": decision_id,
                 "source": "argilla",
-                "argilla_dataset": params["dataset"],
-                "sample_id": params.get("sample_id"),
+                "argilla_dataset": dataset,
+                "sample_id": sample_id,
                 "sample_path": params.get("sample"),
                 "path": str(output),
                 "rows": result.get("responses", 0),

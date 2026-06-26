@@ -310,6 +310,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"jobs": pipeline.jobs_for_task(self.runs_root, task)})
+        elif path == "/api/argilla/status":
+            try:
+                from .integrations.argilla import test_connection
+
+                self._json(test_connection({
+                    "workspace": params.get("workspace", [""])[0],
+                }))
+            except Exception as exc:
+                self._json({"ok": False, "error": str(exc)}, status=400)
         elif path == "/api/export":
             self._export(params)
         elif path.startswith("/api/"):

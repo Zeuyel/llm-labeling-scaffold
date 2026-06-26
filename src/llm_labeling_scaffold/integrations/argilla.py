@@ -24,6 +24,10 @@ def _client(api_url: str | None = None, api_key: str | None = None):
     )
 
 
+def _api_url(api_url: str | None = None) -> str:
+    return api_url or os.environ.get("ARGILLA_API_URL", "http://localhost:6900")
+
+
 def _all_label_fields(task: TaskConfig) -> list[dict[str, Any]]:
     return [task.primary_label, *task.auxiliary_labels]
 
@@ -138,6 +142,40 @@ def _human_label_from_values(task: TaskConfig, values: dict) -> dict:
     return human_label
 
 
+def _guidelines_for_task(task: TaskConfig, params: dict[str, Any]) -> str:
+    return str(params.get("guidelines") or task.annotation_guidelines or f"Label records for task {task.task_id}.")
+
+
+def _workspace_name(value) -> str:
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "name"):
+        return str(value.name)
+    return str(value)
+
+
+def _existing_dataset(client, dataset_name: str, workspace: str):
+    for dataset in client.datasets.list():
+        if getattr(dataset, "name", None) == dataset_name and _workspace_name(getattr(dataset, "workspace", "")) == workspace:
+            return dataset
+    return None
+
+
+def _prepare_dataset(client, dataset, dataset_name: str, workspace: str, if_exists: str):
+    if_exists = if_exists or "fail"
+    if if_exists not in {"fail", "append", "replace"}:
+        raise ValueError("Argilla 同名数据集策略只能是 fail、append 或 replace")
+    existing = _existing_dataset(client, dataset_name, workspace)
+    if not existing:
+        return dataset.create(), "created"
+    if if_exists == "fail":
+        raise ValueError(f"Argilla 数据集已存在: {workspace}/{dataset_name}")
+    if if_exists == "append":
+        return existing, "appended"
+    existing.delete()
+    return dataset.create(), "replaced"
+
+
 def _record_source_id(record, task: TaskConfig) -> str:
     metadata = getattr(record, "metadata", None) or {}
     if isinstance(metadata, dict) and task.id_field in metadata:
@@ -152,16 +190,17 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
     workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
     text_field = params.get("text_field", "text")
     min_submitted = int(params.get("min_submitted", 1))
+    if_exists = str(params.get("if_exists") or params.get("dataset_policy") or "fail")
 
     settings = rg.Settings(
-        guidelines=params.get("guidelines", f"Label records for task {task.task_id}."),
+        guidelines=_guidelines_for_task(task, params),
         fields=[rg.TextField(name=text_field, title="Text")],
         questions=_questions_for_task(rg, task),
         distribution=rg.TaskDistribution(min_submitted=min_submitted),
         allow_extra_metadata=True,
     )
     dataset = rg.Dataset(name=dataset_name, workspace=workspace, settings=settings)
-    dataset.create()
+    dataset, dataset_action = _prepare_dataset(client, dataset, dataset_name, workspace, if_exists)
 
     records = []
     for row in read_jsonl(sample_path):
@@ -182,6 +221,8 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         "backend": "argilla",
         "workspace": workspace,
         "dataset": dataset_name,
+        "dataset_action": dataset_action,
+        "if_exists": if_exists,
         "records": len(records),
         "url": params.get("ui_url"),
     }
@@ -214,4 +255,23 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
         "dataset": dataset_name,
         "responses": len(rows),
         "artifact": str(output_path),
+    }
+
+
+def test_connection(params: dict[str, Any] | None = None) -> dict:
+    params = params or {}
+    client = _client(params.get("api_url"), params.get("api_key"))
+    workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
+    user = client.me
+    workspaces = [_workspace_name(item) for item in client.workspaces.list()]
+    return {
+        "ok": True,
+        "api_url": _api_url(params.get("api_url")),
+        "workspace": workspace,
+        "workspace_exists": workspace in workspaces,
+        "workspaces": workspaces,
+        "user": {
+            "username": str(getattr(user, "username", "")),
+            "role": str(getattr(getattr(user, "role", ""), "value", getattr(user, "role", ""))),
+        },
     }

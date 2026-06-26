@@ -49,6 +49,19 @@ class TaskConfig:
         return list(self.raw["labels"].get("auxiliary", []))
 
     @property
+    def annotation(self) -> dict[str, Any]:
+        value = self.raw.get("annotation", {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @property
+    def annotation_guidelines(self) -> str | None:
+        value = self.annotation.get("guidelines")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    @property
     def constraints(self) -> list[dict[str, str]]:
         return list(self.raw.get("constraints", []))
 

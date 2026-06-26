@@ -38,6 +38,7 @@ export default function TasksPage({ tasks, onReload, onError }) {
     primary_label_name: "label",
     primary_label_title: "",
     primary_label_values: "",
+    annotation_guidelines: "",
     prompt: "",
   });
   const [auxiliary, setAuxiliary] = useState([]);
@@ -59,6 +60,7 @@ export default function TasksPage({ tasks, onReload, onError }) {
       primary_label_name: "label",
       primary_label_title: "",
       primary_label_values: "",
+      annotation_guidelines: "",
       prompt: "",
     });
     setAuxiliary([]);
@@ -78,6 +80,7 @@ export default function TasksPage({ tasks, onReload, onError }) {
         primary_label_name: form.primary_label_name.trim() || "label",
         primary_label_title: form.primary_label_title.trim(),
         primary_label_values: parseList(form.primary_label_values),
+        annotation_guidelines: form.annotation_guidelines.trim(),
         prompt: form.prompt,
         auxiliary_labels: auxiliary
           .filter((item) => item.name.trim())
@@ -145,6 +148,10 @@ export default function TasksPage({ tasks, onReload, onError }) {
             <div className="field field-wide">
               <label>主标签取值</label>
               <textarea rows={3} value={form.primary_label_values} onChange={(event) => update("primary_label_values", event.target.value)} placeholder="每行一个取值，或用逗号分隔" />
+            </div>
+            <div className="field field-wide">
+              <label>Argilla 标注说明</label>
+              <textarea rows={5} value={form.annotation_guidelines} onChange={(event) => update("annotation_guidelines", event.target.value)} placeholder="写给人工标注员的说明，会显示在 Argilla 数据集页面" />
             </div>
             <div className="field field-wide">
               <label>提示词</label>

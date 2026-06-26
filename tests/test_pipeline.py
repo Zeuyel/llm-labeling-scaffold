@@ -14,6 +14,7 @@ def test_create_task_writes_custom_task_with_auxiliary_labels(tmp_path: Path):
             "metadata_fields": "firm_name, application_year",
             "primary_label_name": "innovation_boundary_label",
             "primary_label_values": ["new_product_or_application", "unclear_or_insufficient"],
+            "annotation_guidelines": "请阅读专利标题、摘要和权利要求节选后完成标注。",
             "auxiliary_labels": [
                 {"name": "new_product_application_flag", "type": "integer", "values": ["0", "1"]},
                 {"name": "reason", "type": "string"},
@@ -39,6 +40,7 @@ def test_create_task_writes_custom_task_with_auxiliary_labels(tmp_path: Path):
     assert created.auxiliary_labels[0]["values"] == [0, 1]
     assert created.auxiliary_labels[2]["min"] == 0
     assert created.auxiliary_labels[3]["required"] is False
+    assert created.annotation_guidelines == "请阅读专利标题、摘要和权利要求节选后完成标注。"
 
 
 def test_list_tasks_reads_multiple_roots_and_deduplicates(tmp_path: Path):
