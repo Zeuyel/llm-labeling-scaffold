@@ -68,3 +68,37 @@ def test_list_tasks_reads_multiple_roots_and_deduplicates(tmp_path: Path):
     tasks = pipeline.list_tasks(f"{root_a},{root_b}")
 
     assert [task["task_id"] for task in tasks] == ["task_a"]
+
+
+def test_delete_task_removes_writable_task_and_keeps_examples_readonly(tmp_path: Path):
+    tasks_root = tmp_path / "tasks"
+    examples_root = tmp_path / "examples"
+    pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": "delete_me",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    pipeline.create_task(
+        examples_root,
+        {
+            "task_id": "demo_task",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+
+    removed = pipeline.delete_task(tasks_root, "delete_me")
+
+    assert removed["deleted"] is True
+    assert not (tasks_root / "delete_me").exists()
+    try:
+        pipeline.delete_task(examples_root, "demo_task")
+    except ValueError as exc:
+        assert "示例任务不可删除" in str(exc)
+    else:
+        raise AssertionError("example task should not be deletable")

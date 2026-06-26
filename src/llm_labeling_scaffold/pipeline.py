@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any
 
 import yaml
@@ -22,6 +23,16 @@ def _task_roots(tasks_root: str | Path) -> list[Path]:
     return [Path(item) for item in parts if item]
 
 
+def _task_file_deletable(path: Path, root: Path) -> bool:
+    if root.name == "examples":
+        return False
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def list_tasks(tasks_root: str | Path) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -38,6 +49,9 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
                 out.append({
                     "task_id": task.task_id,
                     "path": str(yml),
+                    "root": str(root),
+                    "source": root.name,
+                    "deletable": _task_file_deletable(yml, root),
                     "id_field": task.id_field,
                     "primary_label": task.primary_label,
                     "auxiliary_labels": task.auxiliary_labels,
@@ -45,6 +59,40 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
             except Exception as exc:  # noqa: BLE001
                 out.append({"task_id": None, "path": str(yml), "error": str(exc)})
     return out
+
+
+def delete_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path | None = None,
+                delete_runs: bool = False) -> dict:
+    task_id = str(task_id or "").strip()
+    if not task_id or ".." in task_id or "/" in task_id or "\\" in task_id:
+        raise ValueError("非法任务编号")
+    for root in _task_roots(tasks_root):
+        if not root.exists():
+            continue
+        for yml in sorted(root.rglob("task.yaml")):
+            try:
+                task = load_task(yml)
+            except Exception:
+                continue
+            if task.task_id != task_id:
+                continue
+            if not _task_file_deletable(yml, root):
+                raise ValueError("示例任务不可删除；如需隐藏示例任务，请只配置 tasks 作为任务目录")
+            task_dir = yml.parent
+            shutil.rmtree(task_dir)
+            removed_runs = False
+            if delete_runs and runs_root is not None:
+                run_dir = Path(runs_root) / task_id
+                if run_dir.exists():
+                    shutil.rmtree(run_dir)
+                    removed_runs = True
+            return {
+                "task_id": task_id,
+                "path": str(task_dir),
+                "deleted": True,
+                "deleted_runs": removed_runs,
+            }
+    raise ValueError(f"任务不存在: {task_id}")
 
 
 def _string_list(value: Any) -> list[str]:

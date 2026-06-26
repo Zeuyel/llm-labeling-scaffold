@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import * as api from "./../api.js";
-import { Link } from "./../router.jsx";
+import { Link, useRouter } from "./../router.jsx";
 
 const LABEL_TYPES = [
   ["categorical", "分类"],
@@ -28,8 +28,10 @@ function parseList(value) {
 }
 
 export default function TasksPage({ tasks, onReload, onError }) {
+  const { navigate } = useRouter();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [deleting, setDeleting] = useState("");
   const [form, setForm] = useState({
     task_id: "",
     id_field: "record_id",
@@ -101,6 +103,26 @@ export default function TasksPage({ tasks, onReload, onError }) {
       onError(String(error));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function removeTask(task) {
+    if (!task?.task_id) return;
+    if (!task.deletable) {
+      onError("这个任务来自只读目录，不能在面板中删除");
+      return;
+    }
+    const ok = window.confirm(`删除任务 ${task.task_id}？\n\n这只会删除任务配置目录，不会删除 runs 下已有样本、标注结果和模型产物。`);
+    if (!ok) return;
+    setDeleting(task.task_id);
+    try {
+      await api.deleteTask(task.task_id);
+      await onReload();
+      navigate("/");
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setDeleting("");
     }
   }
 
@@ -208,17 +230,36 @@ export default function TasksPage({ tasks, onReload, onError }) {
       {!tasks.length && <div className="empty">未发现任务（检查 --tasks-root 目录下的 task.yaml）</div>}
       <div className="grid grid-cards">
         {tasks.map((t) => (
-          <Link key={t.path} to={`/task/${encodeURIComponent(t.task_id)}`} className="card task-card">
-            <h3>{t.task_id || "(无效)"}</h3>
+          <div key={t.path} className="card task-card">
+            <div className="task-card-head">
+              <Link to={`/task/${encodeURIComponent(t.task_id)}`} className="task-title-link">
+                <h3>{t.task_id || "(无效)"}</h3>
+              </Link>
+              {t.deletable ? (
+                <button
+                  className="btn btn-sm btn-danger"
+                  disabled={deleting === t.task_id}
+                  onClick={() => removeTask(t)}
+                >
+                  删除
+                </button>
+              ) : (
+                <span className="badge badge-gray">只读</span>
+              )}
+            </div>
             {t.error ? (
               <span className="badge badge-red">{t.error}</span>
             ) : (
               <div className="muted">
                 <div>id 字段：{t.id_field}</div>
                 <div>主标签：{t.primary_label ? t.primary_label.name : "-"}</div>
+                <div>来源：{t.source || "-"}</div>
               </div>
             )}
-          </Link>
+            <div className="action-row task-card-actions">
+              <button className="btn btn-sm" onClick={() => navigate(`/task/${encodeURIComponent(t.task_id)}`)}>进入</button>
+            </div>
+          </div>
         ))}
       </div>
     </div>

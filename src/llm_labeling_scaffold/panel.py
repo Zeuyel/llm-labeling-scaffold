@@ -141,7 +141,7 @@ def _sample_rows(run_dir: Path, limit: int = 50) -> list[dict]:
 class _Handler(BaseHTTPRequestHandler):
     server_version = "LLSPanel/0.2"
     runs_root: Path = Path("runs")
-    tasks_root: Path = Path("examples,tasks")
+    tasks_root: Path = Path("tasks")
     static_dir: Path | None = None
     auth_user: str = "admin"
     auth_pass: str = ""
@@ -394,6 +394,30 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, status=404)
 
+    def do_DELETE(self) -> None:
+        if not self._require_auth():
+            return
+        parsed = urlparse(self.path)
+        path = parsed.path
+        params = parse_qs(parsed.query)
+        if path == "/api/tasks":
+            task_id = params.get("task_id", [""])[0]
+            delete_runs = params.get("delete_runs", ["0"])[0] in {"1", "true", "yes"}
+            try:
+                self._json({
+                    "ok": True,
+                    "task": pipeline.delete_task(
+                        self.tasks_root,
+                        task_id,
+                        runs_root=self.runs_root,
+                        delete_runs=delete_runs,
+                    ),
+                })
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        else:
+            self._json({"error": "not found"}, status=404)
+
     def _import(self, params) -> None:
         task = params.get("task", [""])[0]
         name = params.get("name", ["imported"])[0]
@@ -425,7 +449,7 @@ class _Handler(BaseHTTPRequestHandler):
 def serve_panel(runs_root: str | Path = "runs", host: str = "127.0.0.1",
                 port: int = 8765, user: str = "admin", password: str | None = None,
                 static_dir: str | Path | None = None,
-                tasks_root: str | Path = "examples,tasks") -> None:
+                tasks_root: str | Path = "tasks") -> None:
     password = password or os.environ.get("LLS_PANEL_PASSWORD")
     if not password:
         password = secrets.token_urlsafe(12)

@@ -164,11 +164,10 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 容器挂载：
 
 - `./runs:/app/runs`：保存样本、标注结果、训练集、模型和推理产物
-- `./examples:/app/examples:ro`：示例任务
 - `./tasks:/app/tasks`：控制台中新建的业务任务
 - `./configs:/app/configs:ro`：配置示例
 
-控制台默认同时读取 `examples/` 和 `tasks/`。示例任务只读；实验人员在控制台中新建的任务会写入 `tasks/<任务编号>/task.yaml`。如果任务已经有复杂配置，也仍然可以直接把任务目录放到 `tasks/` 下。
+控制台默认只读取 `tasks/`。实验人员在控制台中新建的任务会写入 `tasks/<任务编号>/task.yaml`。如果任务已经有复杂配置，也仍然可以直接把任务目录放到 `tasks/` 下。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。
 
 数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入接口会校验每一行是否为 JSON 对象；解析失败时不会静默丢行。
 

@@ -27,6 +27,7 @@ function Shell() {
   const { path } = useRouter();
   const [tasks, setTasks] = useState([]);
   const [err, setErr] = useState("");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("lls.sidebarCollapsed") === "1");
 
   const loadTasks = useCallback(() =>
     api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
@@ -52,9 +53,23 @@ function Shell() {
   else if (matched.page === "gold") page = <GoldPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "models") page = <ModelsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
 
+  function toggleSidebar() {
+    setSidebarCollapsed((value) => {
+      const next = !value;
+      localStorage.setItem("lls.sidebarCollapsed", next ? "1" : "0");
+      return next;
+    });
+  }
+
   return (
-    <div className="app-shell">
-      <Sidebar tasks={tasks} activeTaskId={activeTaskId} activePage={matched.page} />
+    <div className={sidebarCollapsed ? "app-shell is-sidebar-collapsed" : "app-shell"}>
+      <Sidebar
+        tasks={tasks}
+        activeTaskId={activeTaskId}
+        activePage={matched.page}
+        collapsed={sidebarCollapsed}
+        onToggle={toggleSidebar}
+      />
       <div className="content">
         {err && <div className="error">{err} <button className="btn btn-sm" onClick={() => setErr("")}>关闭</button></div>}
         {page}

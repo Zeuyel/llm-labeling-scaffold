@@ -26,7 +26,6 @@ services:
       - MLFLOW_TRACKING_URI
     volumes:
       - ./runs:/app/runs
-      - ./examples:/app/examples:ro
       - ./tasks:/app/tasks
       - ./configs:/app/configs:ro
     depends_on:

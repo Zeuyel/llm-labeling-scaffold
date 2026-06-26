@@ -31,6 +31,11 @@ export const createTask = (payload) =>
     body: JSON.stringify(payload),
   }).then((data) => data.task || data);
 
+export const deleteTask = (taskId, opts = {}) =>
+  req(`/api/tasks?${q({ task_id: taskId, delete_runs: opts.deleteRuns ? 1 : undefined })}`, {
+    method: "DELETE",
+  }).then((data) => data.task || data);
+
 export const startAction = (taskPath, action, params) =>
   req("/api/action", {
     method: "POST",
