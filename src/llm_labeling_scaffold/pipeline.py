@@ -2046,16 +2046,17 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             suggestion_id = str(params.get("suggestion_id") or "suggestions_v001").strip()
             if not annotation_id:
                 raise ValueError("缺少标注任务编号 annotation_id")
-            return generate_suggestions_for_annotation_job(
-                runs_root,
-                task,
-                annotation_id,
-                suggestion_id,
-                provider=str(params.get("provider") or "local_stub"),
-                prompt_version=str(params.get("prompt_version") or "v001"),
-                publish=bool(params.get("publish")),
-                argilla=params.get("argilla") or {},
-            )
+            with _asset_lock(runs_root, task.task_id, f"suggestions-{annotation_id}-{suggestion_id}"):
+                return generate_suggestions_for_annotation_job(
+                    runs_root,
+                    task,
+                    annotation_id,
+                    suggestion_id,
+                    provider=str(params.get("provider") or "local_stub"),
+                    prompt_version=str(params.get("prompt_version") or "v001"),
+                    publish=bool(params.get("publish")),
+                    argilla=params.get("argilla") or {},
+                )
         if action == "audit":
             from .audit import audit_run
             return {"summary": audit_run(task, params["run"]), "kind": "audit"}
