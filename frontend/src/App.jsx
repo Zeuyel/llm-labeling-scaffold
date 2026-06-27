@@ -4,6 +4,7 @@ import { RouterProvider, useRouter, matchRoute } from "./router.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import TasksPage from "./pages/TasksPage.jsx";
 import TaskOverviewPage from "./pages/TaskOverviewPage.jsx";
+import TaskCanvasPage from "./pages/TaskCanvasPage.jsx";
 import ImportsPage from "./pages/ImportsPage.jsx";
 import SamplesPage from "./pages/SamplesPage.jsx";
 import RunsPage from "./pages/RunsPage.jsx";
@@ -16,6 +17,7 @@ const ROUTES = [
   { pattern: "/", page: "tasks" },
   { pattern: "/settings", page: "settings" },
   { pattern: "/task/:id", page: "overview" },
+  { pattern: "/task/:id/canvas", page: "canvas" },
   { pattern: "/task/:id/imports", page: "imports" },
   { pattern: "/task/:id/samples", page: "samples" },
   { pattern: "/task/:id/annotations", page: "annotations" },
@@ -105,6 +107,7 @@ function Shell() {
     />
   );
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "canvas") page = <TaskCanvasPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "imports") page = (
     <ImportsPage
       task={taskOf(activeTaskId)}

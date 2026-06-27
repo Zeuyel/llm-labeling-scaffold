@@ -3,6 +3,7 @@ import { Link } from "./../router.jsx";
 
 const TASK_PAGES = [
   { key: "overview", label: "概览", short: "概", suffix: "" },
+  { key: "canvas", label: "流程画布", short: "流", suffix: "/canvas" },
   { key: "imports", label: "数据导入", short: "导", suffix: "/imports" },
   { key: "samples", label: "样本管理", short: "样", suffix: "/samples" },
   { key: "annotations", label: "标注分发", short: "标", suffix: "/annotations" },

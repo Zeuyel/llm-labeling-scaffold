@@ -458,6 +458,455 @@ def task_profile_status(runs_root: str | Path, task, profile_id: str | None = No
     }
 
 
+def _graph_route(task_id: str, key: str) -> str:
+    suffix = {
+        "task": "",
+        "stage": "",
+        "import": "/imports",
+        "sample": "/samples",
+        "batch": "/samples",
+        "annotation_job": "/annotations",
+        "agreement_audit": "/annotations",
+        "run": "/annotations",
+        "decision": "/annotations",
+        "gold": "/gold",
+        "model": "/models",
+        "inference": "/models",
+    }.get(key, "")
+    return f"/task/{task_id}{suffix}"
+
+
+def _graph_stage_route(task_id: str, stage: dict[str, Any]) -> str:
+    action = str(stage.get("action") or stage.get("id") or "")
+    kind = {
+        "import": "import",
+        "lake_import": "import",
+        "sample": "sample",
+        "batch": "batch",
+        "argilla_push": "annotation_job",
+        "argilla_dispatch": "annotation_job",
+        "argilla_pull": "decision",
+        "agreement_audit": "agreement_audit",
+        "audit": "agreement_audit",
+        "gold": "gold",
+        "gold_build": "gold",
+        "train": "model",
+        "infer": "inference",
+        "batch_infer": "inference",
+    }.get(action, "stage")
+    return _graph_route(task_id, kind)
+
+
+def _graph_status(value: Any, *, exists: bool = True) -> str:
+    status = str(value or "").strip().lower()
+    if status in {"done", "completed", "complete", "succeeded", "success", "finished", "active"}:
+        return "completed"
+    if status in {"ready", "available", "runnable", "running", "in_progress", "pending"}:
+        return "ready"
+    if status in {"blocked", "failed", "error", "incomplete"}:
+        return "blocked"
+    if not exists:
+        return "not_started"
+    return "completed"
+
+
+def _graph_summary(parts: list[Any]) -> str:
+    labels = [str(part) for part in parts if part not in (None, "", [], {})]
+    return " · ".join(labels)
+
+
+def _graph_add_node(nodes: list[dict[str, Any]], seen: set[str], node: dict[str, Any]) -> None:
+    if node["id"] in seen:
+        return
+    seen.add(node["id"])
+    nodes.append(node)
+
+
+def _graph_add_edge(edges: list[dict[str, str]], seen: set[tuple[str, str, str]], source: str, target: str, reason: str) -> None:
+    if not source or not target or source == target:
+        return
+    key = (source, target, reason)
+    if key in seen:
+        return
+    seen.add(key)
+    edges.append({"source": source, "target": target, "reason": reason})
+
+
+def _graph_file_node(
+    nodes: list[dict[str, Any]],
+    seen_nodes: set[str],
+    *,
+    task_id: str,
+    node_id: str,
+    node_type: str,
+    title: str,
+    status: str = "completed",
+    summary: str = "",
+    path: str | None = None,
+    route_kind: str | None = None,
+    data: dict[str, Any] | None = None,
+) -> None:
+    node = {
+        "id": node_id,
+        "type": node_type,
+        "title": title,
+        "status": status,
+        "summary": summary,
+        "path": path,
+        "route": _graph_route(task_id, route_kind or node_type),
+    }
+    if data:
+        node["data"] = data
+    _graph_add_node(nodes, seen_nodes, node)
+
+
+def _graph_list_batches(runs_root: str | Path, task_id: str, samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    batches: list[dict[str, Any]] = []
+    for sample in samples:
+        sample_id = str(sample.get("sample_id") or "")
+        for manifest in sample.get("batch_manifests") or []:
+            if not isinstance(manifest, dict):
+                continue
+            plan_id = str(manifest.get("plan_id") or manifest.get("batch_id") or "")
+            if not plan_id:
+                continue
+            batches.append({**manifest, "sample_id": manifest.get("sample_id") or sample_id})
+    return batches
+
+
+def _graph_list_inference(runs_root: str | Path, task_id: str) -> list[dict[str, Any]]:
+    base = Path(runs_root) / task_id / "inference"
+    if not base.is_dir():
+        return []
+    out: list[dict[str, Any]] = []
+    for item in sorted(path for path in base.iterdir() if path.is_dir() and not path.name.startswith("_")):
+        manifest_path = item / "manifest.json"
+        manifest = read_json(manifest_path) if manifest_path.exists() else {}
+        prediction_path = item / "predictions.jsonl"
+        out.append({
+            **manifest,
+            "run_id": manifest.get("run_id") or manifest.get("inference_id") or item.name,
+            "path": str(manifest.get("path") or prediction_path),
+            "rows": manifest.get("rows") if manifest.get("rows") is not None else _count_jsonl(prediction_path),
+            "manifest_path": str(manifest_path) if manifest_path.exists() else None,
+            "state": manifest.get("state", "active" if prediction_path.exists() else "incomplete"),
+        })
+    return out
+
+
+def _graph_first_existing_node(node_ids: list[str], seen_nodes: set[str]) -> str | None:
+    return next((node_id for node_id in node_ids if node_id in seen_nodes), None)
+
+
+def task_asset_graph(runs_root: str | Path, task, profile_id: str | None = None) -> dict[str, Any]:
+    task_id = str(getattr(task, "task_id", task)).strip()
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+
+    id_field = getattr(task, "id_field", None)
+    profile = task_profile_status(runs_root, task, profile_id=profile_id)
+    nodes: list[dict[str, Any]] = []
+    edges: list[dict[str, str]] = []
+    seen_nodes: set[str] = set()
+    seen_edges: set[tuple[str, str, str]] = set()
+
+    _graph_add_node(nodes, seen_nodes, {
+        "id": "task",
+        "type": "task",
+        "title": task_id,
+        "status": "completed",
+        "summary": "任务配置",
+        "path": str(getattr(task, "path", "") or ""),
+        "route": _graph_route(task_id, "task"),
+    })
+
+    for stage in profile.get("stages", []):
+        stage_id = str(stage.get("id") or "")
+        if not stage_id:
+            continue
+        node_id = f"stage:{stage_id}"
+        _graph_add_node(nodes, seen_nodes, {
+            "id": node_id,
+            "type": "stage",
+            "title": stage.get("title") or stage.get("name") or stage_id,
+            "status": _graph_status(stage.get("status"), exists=False),
+            "summary": stage.get("description") or stage.get("action_hint") or "",
+            "path": None,
+            "route": _graph_stage_route(task_id, stage),
+            "data": {
+                "stage_id": stage_id,
+                "required_inputs": stage.get("required_inputs") or [],
+                "outputs": stage.get("outputs") or [],
+                "status_label": stage.get("status_label"),
+                "blocking_reason": stage.get("blocking_reason"),
+            },
+        })
+        depends_on = [str(item) for item in stage.get("depends_on") or []]
+        if depends_on:
+            for dep in depends_on:
+                _graph_add_edge(edges, seen_edges, f"stage:{dep}", node_id, "阶段依赖")
+        else:
+            _graph_add_edge(edges, seen_edges, "task", node_id, "任务入口")
+
+    imports = list_imports(Path(runs_root), task_id, id_field=id_field)
+    samples = list_samples(Path(runs_root), task_id)
+    batches = _graph_list_batches(runs_root, task_id, samples)
+    annotation_jobs = list_annotation_jobs(Path(runs_root), task_id)
+    agreement_audits = list_agreement_audits(Path(runs_root), task_id)
+    runs = list_runs(Path(runs_root), task_id)
+    decisions = list_decision_artifacts(Path(runs_root), task_id)
+    gold_versions = list_gold_versions(Path(runs_root), task_id)
+    models = list_models(Path(runs_root), task_id)
+    inference_runs = _graph_list_inference(runs_root, task_id)
+
+    for item in imports:
+        import_id = str(item.get("import_id") or "")
+        if not import_id:
+            continue
+        node_id = f"import:{import_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="import",
+            title=import_id,
+            status=_graph_status(item.get("state")),
+            summary=_graph_summary([f"{item.get('rows', 0)} 行", item.get("source")]),
+            path=item.get("path"),
+            data={"rows": item.get("rows"), "fields": item.get("fields") or [], "source": item.get("source")},
+        )
+        _graph_add_edge(edges, seen_edges, "stage:lake_import", node_id, "生成导入资产")
+
+    for item in samples:
+        sample_id = str(item.get("sample_id") or "")
+        if not sample_id:
+            continue
+        node_id = f"sample:{sample_id}"
+        manifest = item.get("manifest") or {}
+        sample_path = item.get("path")
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="sample",
+            title=sample_id,
+            status=_graph_status(item.get("state"), exists=Path(sample_path or "").exists()),
+            summary=_graph_summary([f"{manifest.get('rows', 0)} 行" if manifest else None, f"{item.get('batch_count', 0)} 个批次"]),
+            path=sample_path,
+            data={"manifest": manifest, "dependencies": item.get("dependencies") or []},
+        )
+        _graph_add_edge(edges, seen_edges, "stage:sample", node_id, "生成样本")
+        import_id = manifest.get("source_import_id") or manifest.get("import_id")
+        source = f"import:{import_id}" if import_id else _graph_first_existing_node([f"import:{x.get('import_id')}" for x in imports], seen_nodes)
+        if source:
+            _graph_add_edge(edges, seen_edges, source, node_id, "抽样来源")
+
+    for item in batches:
+        plan_id = str(item.get("plan_id") or item.get("batch_id") or "")
+        if not plan_id:
+            continue
+        sample_id = str(item.get("sample_id") or "")
+        node_id = f"batch:{sample_id}:{plan_id}" if sample_id else f"batch:{plan_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="batch",
+            title=plan_id,
+            status="completed",
+            summary=_graph_summary([f"{item.get('batch_count', 0)} 个批次", f"样本 {sample_id}" if sample_id else None]),
+            path=item.get("manifest_path") or item.get("plan_dir"),
+            route_kind="batch",
+            data={"manifest": item},
+        )
+        source_stage = _graph_first_existing_node(["stage:pilot_calibration", "stage:sample"], seen_nodes)
+        if source_stage:
+            _graph_add_edge(edges, seen_edges, source_stage, node_id, "生成批次计划")
+        if f"sample:{sample_id}" in seen_nodes:
+            _graph_add_edge(edges, seen_edges, f"sample:{sample_id}", node_id, "切分批次")
+
+    for item in annotation_jobs:
+        annotation_id = str(item.get("annotation_id") or item.get("job_id") or item.get("id") or "")
+        if not annotation_id:
+            continue
+        node_id = f"annotation_job:{annotation_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="annotation_job",
+            title=annotation_id,
+            status=_graph_status(item.get("state") or item.get("status")),
+            summary=_graph_summary([item.get("source"), item.get("argilla_dataset") or item.get("dataset")]),
+            path=item.get("manifest_path") or item.get("path"),
+            route_kind="annotation_job",
+            data={"manifest": item},
+        )
+        source_stage = _graph_first_existing_node(["stage:argilla_dispatch", "stage:main_annotation"], seen_nodes)
+        if source_stage:
+            _graph_add_edge(edges, seen_edges, source_stage, node_id, "分发标注")
+        sample_id = str(item.get("sample_id") or "")
+        if f"sample:{sample_id}" in seen_nodes:
+            _graph_add_edge(edges, seen_edges, f"sample:{sample_id}", node_id, "标注输入")
+
+    for item in agreement_audits:
+        audit_id = str(item.get("audit_id") or "")
+        if not audit_id:
+            continue
+        node_id = f"agreement_audit:{audit_id}"
+        passed = item.get("passed")
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="agreement_audit",
+            title=audit_id,
+            status="completed" if passed is not False else "blocked",
+            summary=_graph_summary(["通过" if passed is True else "需复核" if passed is False else None, f"{item.get('coverage_rate')} 覆盖率" if item.get("coverage_rate") is not None else None]),
+            path=item.get("summary_path"),
+            route_kind="agreement_audit",
+            data={"summary": item},
+        )
+        source = _graph_first_existing_node([f"batch:{x.get('sample_id')}:{x.get('plan_id')}" for x in batches] + [f"decision:{x.get('decision_id')}" for x in decisions], seen_nodes)
+        if source:
+            _graph_add_edge(edges, seen_edges, source, node_id, "一致性审计")
+        source_stage = _graph_first_existing_node(["stage:agreement_audit", "stage:consistency_check", "stage:review_adjudication"], seen_nodes)
+        if source_stage:
+            _graph_add_edge(edges, seen_edges, source_stage, node_id, "审计产物")
+
+    for item in runs:
+        run_id = str(item.get("run_id") or "")
+        if not run_id:
+            continue
+        node_id = f"run:{run_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="run",
+            title=run_id,
+            status="completed" if item.get("has_merge") or item.get("has_audit") else "ready",
+            summary=_graph_summary([f"{item.get('decisions', 0)} 条裁决", "已合并" if item.get("has_merge") else None]),
+            path=item.get("path"),
+            route_kind="run",
+            data={"run": item},
+        )
+        _graph_add_edge(edges, seen_edges, "stage:argilla_pull", node_id, "本地运行")
+
+    for item in decisions:
+        decision_id = str(item.get("decision_id") or "")
+        if not decision_id:
+            continue
+        node_id = f"decision:{decision_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="decision",
+            title=decision_id,
+            status=_graph_status(item.get("state")),
+            summary=_graph_summary([f"{item.get('rows', 0)} 条结果", item.get("source")]),
+            path=item.get("path"),
+            route_kind="decision",
+            data={"manifest": item},
+        )
+        _graph_add_edge(edges, seen_edges, "stage:argilla_pull", node_id, "回收标注")
+        sample_id = str(item.get("sample_id") or "")
+        if f"sample:{sample_id}" in seen_nodes:
+            _graph_add_edge(edges, seen_edges, f"sample:{sample_id}", node_id, "结果来源样本")
+        annotation_id = str(item.get("annotation_id") or item.get("job_id") or item.get("source_annotation_id") or "")
+        if f"annotation_job:{annotation_id}" in seen_nodes:
+            _graph_add_edge(edges, seen_edges, f"annotation_job:{annotation_id}", node_id, "回收结果")
+
+    for item in gold_versions:
+        version = str(item.get("version") or item.get("gold_id") or "")
+        if not version:
+            continue
+        node_id = f"gold:{version}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="gold",
+            title=version,
+            status=_graph_status(item.get("state")),
+            summary=_graph_summary([f"{item.get('rows', 0)} 行", item.get("source")]),
+            path=item.get("path"),
+            data={"manifest": item},
+        )
+        _graph_add_edge(edges, seen_edges, "stage:gold_build", node_id, "构建训练集")
+        source = None
+        decisions_path = item.get("decisions")
+        if decisions_path:
+            source = next((f"decision:{d.get('decision_id')}" for d in decisions if str(d.get("path")) == str(decisions_path)), None)
+        source = source or _graph_first_existing_node([f"agreement_audit:{x.get('audit_id')}" for x in agreement_audits] + [f"decision:{x.get('decision_id')}" for x in decisions], seen_nodes)
+        if source:
+            _graph_add_edge(edges, seen_edges, source, node_id, "训练集来源")
+
+    for item in models:
+        model_id = str(item.get("model_id") or "")
+        if not model_id:
+            continue
+        manifest = item.get("manifest") or {}
+        node_id = f"model:{model_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="model",
+            title=model_id,
+            status=_graph_status(manifest.get("state")),
+            summary=_graph_summary([manifest.get("trainer"), item.get("metrics") and "有评估指标"]),
+            path=item.get("path"),
+            data={"manifest": manifest, "metrics": item.get("metrics")},
+        )
+        _graph_add_edge(edges, seen_edges, "stage:train", node_id, "训练模型")
+        gold_path = str(manifest.get("gold_path") or manifest.get("gold") or "")
+        source = next((f"gold:{g.get('version')}" for g in gold_versions if gold_path and str(g.get("path")) == gold_path), None)
+        source = source or _graph_first_existing_node([f"gold:{x.get('version')}" for x in gold_versions], seen_nodes)
+        if source:
+            _graph_add_edge(edges, seen_edges, source, node_id, "训练输入")
+
+    for item in inference_runs:
+        run_id = str(item.get("run_id") or "")
+        if not run_id:
+            continue
+        node_id = f"inference:{run_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="inference",
+            title=run_id,
+            status=_graph_status(item.get("state")),
+            summary=_graph_summary([f"{item.get('rows', 0)} 条预测"]),
+            path=item.get("path"),
+            data={"manifest": item},
+        )
+        _graph_add_edge(edges, seen_edges, "stage:batch_infer", node_id, "批量推理")
+        model_id = str(item.get("model_id") or "")
+        source = f"model:{model_id}" if f"model:{model_id}" in seen_nodes else _graph_first_existing_node([f"model:{x.get('model_id')}" for x in models], seen_nodes)
+        if source:
+            _graph_add_edge(edges, seen_edges, source, node_id, "推理模型")
+
+    return {
+        "task_id": task_id,
+        "profile": profile.get("profile"),
+        "nodes": nodes,
+        "edges": edges,
+    }
+
+
 def list_tasks(tasks_root: str | Path) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()

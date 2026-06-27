@@ -401,6 +401,64 @@ def test_task_profile_status_tracks_profile_artifacts(tmp_path: Path):
     assert _stage_status(inferred, "batch_infer") == "done"
 
 
+def test_task_asset_graph_returns_stage_fallback_and_asset_lineage(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "graph_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = load_task(created["path"])
+    runs_root = tmp_path / "runs"
+
+    empty = pipeline.task_asset_graph(runs_root, task)
+    empty_ids = {node["id"] for node in empty["nodes"]}
+    assert "task" in empty_ids
+    assert "stage:lake_import" in empty_ids
+    assert "stage:sample" in empty_ids
+    assert any(edge["source"] == "task" and edge["target"] == "stage:lake_import" for edge in empty["edges"])
+
+    pipeline.save_import(
+        runs_root,
+        task,
+        "seed_1",
+        [{"record_id": "r1", "title": "A"}, {"record_id": "r2", "title": "B"}],
+    )
+    sample_dir = runs_root / task.task_id / "samples" / "sample_a"
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "sample.jsonl").write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    write_json(
+        {"sample_id": "sample_a", "rows": 1, "source_import_id": "seed_1"},
+        sample_dir / "manifest.json",
+    )
+    decisions_dir = runs_root / task.task_id / "decisions" / "round_1"
+    write_json(
+        {
+            "decision_id": "round_1",
+            "sample_id": "sample_a",
+            "path": str(decisions_dir / "decisions.jsonl"),
+            "rows": 1,
+        },
+        decisions_dir / "manifest.json",
+    )
+    (decisions_dir / "decisions.jsonl").write_text(
+        '{"record_id":"r1","human_label":{"label":"yes"}}\n',
+        encoding="utf-8",
+    )
+
+    graph = pipeline.task_asset_graph(runs_root, task)
+    nodes = {node["id"]: node for node in graph["nodes"]}
+    assert nodes["import:seed_1"]["type"] == "import"
+    assert nodes["sample:sample_a"]["status"] == "completed"
+    assert nodes["decision:round_1"]["route"].endswith("/annotations")
+    assert {"source": "import:seed_1", "target": "sample:sample_a", "reason": "抽样来源"} in graph["edges"]
+    assert {"source": "sample:sample_a", "target": "decision:round_1", "reason": "结果来源样本"} in graph["edges"]
+
+
 def test_quality_control_profile_status_tracks_batch_and_agreement_artifacts(tmp_path: Path):
     created = pipeline.create_task(
         tmp_path / "tasks",

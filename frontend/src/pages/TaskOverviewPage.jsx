@@ -270,6 +270,7 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
   }, [taskId, selectedProfileId, loadProfile]);
 
   const cards = [
+    { key: "canvas", label: "流程画布", val: "查看", to: `/task/${encodeURIComponent(taskId)}/canvas` },
     { key: "imports", label: "导入数据", val: counts.imports, to: `/task/${encodeURIComponent(taskId)}/imports` },
     { key: "samples", label: "样本", val: counts.samples, to: `/task/${encodeURIComponent(taskId)}/samples` },
     { key: "decisions", label: "标注结果", val: counts.decisions, to: `/task/${encodeURIComponent(taskId)}/annotations` },

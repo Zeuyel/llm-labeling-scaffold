@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import base64
 import hmac
+import json
+from contextlib import contextmanager
+from http.server import ThreadingHTTPServer
 from pathlib import Path
+import threading
+import urllib.error
+import urllib.request
 
 from llm_labeling_scaffold import panel
 from llm_labeling_scaffold import pipeline
@@ -14,6 +20,46 @@ def _decode_basic(header: str) -> tuple[str, str]:
     raw = base64.b64decode(header[6:]).decode("utf-8")
     user, _, pw = raw.partition(":")
     return user, pw
+
+
+@contextmanager
+def _panel_server(runs_root: Path, tasks_root: Path):
+    old = {
+        "runs_root": panel._Handler.runs_root,
+        "tasks_root": panel._Handler.tasks_root,
+        "static_dir": panel._Handler.static_dir,
+        "auth_user": panel._Handler.auth_user,
+        "auth_pass": panel._Handler.auth_pass,
+    }
+    panel._Handler.runs_root = runs_root
+    panel._Handler.tasks_root = tasks_root
+    panel._Handler.static_dir = None
+    panel._Handler.auth_user = "admin"
+    panel._Handler.auth_pass = "secret"
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), panel._Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        for key, value in old.items():
+            setattr(panel._Handler, key, value)
+
+
+def _request(base_url: str, path: str) -> tuple[int, dict]:
+    request = urllib.request.Request(
+        base_url + path,
+        headers={"Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii")},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
 def test_discover_runs_finds_demo(panel_workspace):
@@ -111,6 +157,19 @@ def test_list_decision_artifacts_reads_manifest(panel_workspace):
             "rows": 2,
         }
     ]
+
+
+def test_task_graph_api_returns_nodes_and_edges(panel_workspace):
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(base_url, "/api/task/graph?task_id=toy_multiclass_v1")
+
+    assert status == 200
+    node_ids = {node["id"] for node in body["nodes"]}
+    assert "task" in node_ids
+    assert "stage:lake_import" in node_ids
+    assert "sample:sample_a" in node_ids
+    assert "decision:argilla_round_1" in node_ids
+    assert any(edge["source"] == "sample:sample_a" and edge["target"] == "decision:argilla_round_1" for edge in body["edges"])
 
 
 def test_build_gold_from_sample_and_decisions(panel_workspace):
