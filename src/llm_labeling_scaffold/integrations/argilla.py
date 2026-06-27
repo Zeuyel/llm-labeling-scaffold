@@ -48,8 +48,30 @@ def _make_question(cls, **kwargs):
         return cls(**kwargs)
 
 
-def _label_values(label: dict[str, Any]) -> list[str]:
+def _value_label(value_labels: dict[str, Any], value: Any) -> str | None:
+    item = value_labels.get(value)
+    if item is None:
+        item = value_labels.get(str(value))
+    if item is None:
+        return None
+    if isinstance(item, dict):
+        text = item.get("label") or item.get("title") or item.get("name")
+    else:
+        text = item
+    if text in (None, ""):
+        return None
+    return str(text)
+
+
+def _label_values(label: dict[str, Any]) -> list[str] | dict[str, str]:
     values = label.get("values", [])
+    value_labels = label.get("value_labels")
+    if isinstance(value_labels, dict) and values:
+        mapped: dict[str, str] = {}
+        for value in values:
+            key = str(value)
+            mapped[key] = _value_label(value_labels, value) or key
+        return mapped
     return [str(value) for value in values]
 
 
@@ -100,6 +122,114 @@ def _response_value(raw):
     if hasattr(raw, "value"):
         return raw.value
     return raw
+
+
+def _suggestion_entries(params: dict[str, Any]) -> list[dict[str, Any]]:
+    entries = params.get("suggestions")
+    if entries is None and params.get("suggestions_path"):
+        entries = read_jsonl(params["suggestions_path"])
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise ValueError("suggestions 必须是列表或 suggestions_path 指向的 JSONL")
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("每条 suggestion 必须是 JSON object")
+        out.append(entry)
+    return out
+
+
+def _suggestion_entries_by_id(task: TaskConfig, params: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for entry in _suggestion_entries(params):
+        ids = [
+            entry.get("argilla_record_id"),
+            entry.get("__lls_argilla_record_id"),
+            entry.get("record_id"),
+            entry.get("id"),
+            entry.get(task.id_field),
+            entry.get("__lls_original_id"),
+        ]
+        for value in ids:
+            if value in (None, ""):
+                continue
+            by_id.setdefault(str(value), entry)
+    return by_id
+
+
+def _suggestion_source(entry: dict[str, Any]) -> dict[str, Any]:
+    for key in ("suggestions", "values", "prediction", "human_label"):
+        value = entry.get(key)
+        if isinstance(value, dict):
+            return value
+    return entry
+
+
+def _suggestion_values(task: TaskConfig, entry: dict[str, Any]) -> dict[str, Any]:
+    source = _suggestion_source(entry)
+    out: dict[str, Any] = {}
+    for label in _all_label_fields(task):
+        name = label["name"]
+        if name not in source:
+            continue
+        value = source.get(name)
+        if value in (None, ""):
+            continue
+        out[name] = _cast_value(label, _response_value(value))
+    return out
+
+
+def _make_suggestion(rg, *, question_name: str, value: Any, score: Any = None, agent: str | None = None):
+    suggestion_cls = getattr(rg, "Suggestion", None)
+    if suggestion_cls is None:
+        raise RuntimeError("Argilla SDK missing Suggestion; cannot sync machine suggestions")
+    kwargs = {"question_name": question_name, "value": value}
+    if score not in (None, ""):
+        kwargs["score"] = float(score)
+    if agent:
+        kwargs["agent"] = agent
+    try:
+        return suggestion_cls(**kwargs)
+    except TypeError:
+        kwargs.pop("score", None)
+        try:
+            return suggestion_cls(**kwargs)
+        except TypeError:
+            kwargs.pop("agent", None)
+            return suggestion_cls(**kwargs)
+
+
+def _record_suggestions(
+    rg,
+    task: TaskConfig,
+    row: dict,
+    record_id: str,
+    params: dict[str, Any],
+    suggestions_by_id: dict[str, dict[str, Any]],
+) -> list:
+    original_id = str(row[task.id_field])
+    entry = (
+        suggestions_by_id.get(record_id)
+        or suggestions_by_id.get(str(row.get("__lls_argilla_record_id") or ""))
+        or suggestions_by_id.get(original_id)
+        or suggestions_by_id.get(str(row.get("__lls_original_id") or ""))
+    )
+    if not entry:
+        return []
+    values = _suggestion_values(task, entry)
+    scores = entry.get("scores") if isinstance(entry.get("scores"), dict) else {}
+    agent = str(entry.get("agent") or params.get("suggestions_agent") or params.get("agent") or "machine_suggestion")
+    return [
+        _make_suggestion(
+            rg,
+            question_name=name,
+            value=value,
+            score=scores.get(name, entry.get("score")),
+            agent=agent,
+        )
+        for name, value in values.items()
+    ]
 
 
 def _cast_value(label: dict[str, Any], value):
@@ -481,15 +611,27 @@ def _prepare_records_for_push(
     policy = _record_id_policy(task, params)
     duplicate_record_ids = _duplicate_record_id_info(rows, task, str(policy["strategy"]))
     _validate_record_ids(task, policy, duplicate_record_ids)
-    records = [
-        rg.Record(
-            id=_record_id_for_row(row, task, str(policy["strategy"])),
-            fields=_record_fields(task, row, sample_path, text_field, params),
-            metadata=_record_metadata(task, row, sample_path, params),
-        )
-        for row in rows
-    ]
+    suggestions_by_id = _suggestion_entries_by_id(task, params)
+    records = []
+    for row in rows:
+        record_id = _record_id_for_row(row, task, str(policy["strategy"]))
+        kwargs = {
+            "id": record_id,
+            "fields": _record_fields(task, row, sample_path, text_field, params),
+            "metadata": _record_metadata(task, row, sample_path, params),
+        }
+        suggestions = _record_suggestions(rg, task, row, record_id, params, suggestions_by_id)
+        if suggestions:
+            kwargs["suggestions"] = suggestions
+        records.append(rg.Record(**kwargs))
     return records, policy, duplicate_record_ids
+
+
+def _record_suggestion_count(records: list) -> int:
+    total = 0
+    for record in records:
+        total += len(getattr(record, "suggestions", []) or [])
+    return total
 
 
 def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, params: dict[str, Any] | None = None) -> dict:
@@ -526,10 +668,48 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         "dataset_action": dataset_action,
         "if_exists": if_exists,
         "records": len(records),
+        "suggestions": _record_suggestion_count(records),
         "record_id_policy": record_id_policy,
         "duplicate_record_ids": duplicate_record_ids,
         "visible_fields": list(records[0].fields.keys()) if records else [text_field],
         "url": params.get("ui_url"),
+    }
+
+
+def push_suggestions(
+    task: TaskConfig,
+    sample_path: str | Path,
+    dataset_name: str,
+    suggestions_path: str | Path,
+    params: dict[str, Any] | None = None,
+) -> dict:
+    params = dict(params or {})
+    params["suggestions_path"] = str(suggestions_path)
+    rg = _load_argilla()
+    workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
+    text_field = params.get("text_field", "text")
+    records, record_id_policy, duplicate_record_ids = _prepare_records_for_push(
+        rg,
+        task,
+        sample_path,
+        text_field,
+        params,
+    )
+    suggestion_count = _record_suggestion_count(records)
+    if suggestion_count <= 0:
+        raise ValueError("没有可写入 Argilla 的 suggestions")
+
+    client = _client(params.get("api_url"), params.get("api_key"))
+    dataset = client.datasets(dataset_name, workspace=workspace)
+    dataset.records.log(records)
+    return {
+        "backend": "argilla",
+        "workspace": workspace,
+        "dataset": dataset_name,
+        "records": len(records),
+        "suggestions": suggestion_count,
+        "record_id_policy": record_id_policy,
+        "duplicate_record_ids": duplicate_record_ids,
     }
 
 

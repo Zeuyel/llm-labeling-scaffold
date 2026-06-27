@@ -1577,6 +1577,72 @@ def test_argilla_push_batch_plan_dispatch_writes_dispatch_file_and_lineage(tmp_p
     assert manifest["record_id_policy"]["strategy"] == "batch_scoped"
 
 
+def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "suggest_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    annotation_dir = tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_round_1"
+    dispatch_path = annotation_dir / "dispatch.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "title": "remote service platform",
+                "__lls_batch_id": "batch_00001.jsonl",
+                "__lls_argilla_record_id": "r1__batch_00001.jsonl",
+                "__lls_batch_plan_id": "plan_1",
+            }
+        ],
+        dispatch_path,
+    )
+    write_json(
+        {
+            "annotation_id": "argilla_round_1",
+            "argilla_dataset": "argilla_dataset_1",
+            "dispatch_path": str(dispatch_path),
+            "dispatch_mode": "batch_plan",
+            "batch_plan_id": "plan_1",
+            "batch_ids": ["batch_00001.jsonl"],
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    job = pipeline.start_action(
+        tmp_path / "runs",
+        created["path"],
+        "prelabel_suggest",
+        {
+            "annotation_id": "argilla_round_1",
+            "suggestion_id": "local_stub_v001",
+            "provider": "local_stub",
+            "prompt_version": "v001",
+        },
+    )
+    current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+
+    assert current["status"] == "succeeded"
+    out_dir = tmp_path / "runs" / task.task_id / "suggestions" / "argilla_round_1" / "local_stub_v001"
+    manifest = read_json(out_dir / "manifest.json")
+    rows = read_jsonl(out_dir / "suggestions.jsonl")
+    assert manifest["annotation_id"] == "argilla_round_1"
+    assert manifest["argilla_dataset"] == "argilla_dataset_1"
+    assert manifest["batch_plan_id"] == "plan_1"
+    assert manifest["records"] == 1
+    assert rows[0]["argilla_record_id"] == "r1__batch_00001.jsonl"
+    assert rows[0]["batch_id"] == "batch_00001.jsonl"
+    assert rows[0]["batch_plan_id"] == "plan_1"
+    assert rows[0]["agent"] == "local_stub:v001"
+    assert rows[0]["suggestions"]["label"] in {"yes", "no"}
+
+
 def test_argilla_push_sample_dispatch_still_uses_sample_file_without_batch_plan(tmp_path: Path):
     created = pipeline.create_task(
         tmp_path / "tasks",
