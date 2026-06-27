@@ -179,11 +179,77 @@ export function annotationJobLabel(job) {
 
 export function annotationJobStatusLabel(job) {
   const status = String(firstDefined(job?.status, job?.state, "")).toLowerCase();
-  if (["done", "completed", "complete", "succeeded", "success", "published", "pushed"].includes(status)) return "已推送";
+  if (["done", "completed", "complete", "succeeded", "success", "published", "pushed", "已分发", "已推送"].includes(status)) return "已推送";
   if (["running", "pending", "queued", "in_progress"].includes(status)) return "执行中";
   if (["failed", "error"].includes(status)) return "失败";
+  if (["incomplete", "partial"].includes(status)) return "记录不完整";
+  if (["cancelled", "canceled"].includes(status)) return "已取消";
   if (!status && job) return "已记录";
   return status || "-";
+}
+
+export function annotationJobDispatchLabel(job) {
+  if (!job) return "-";
+  if ((job.dispatch_mode || "sample") === "batch_plan" || job.batch_plan_id) return "按批次计划分发";
+  return "整样本直接推送";
+}
+
+export function annotationJobLineageFields(job) {
+  if (!job) return [];
+  return [
+    ["分发方式", annotationJobDispatchLabel(job)],
+    ["批次计划", job.batch_plan_id || "未使用批次计划"],
+    ["批次清单", job.batch_manifest_path],
+    ["分发文件", job.dispatch_path],
+    ["批次数", countLike(job.batch_ids) || countLike(job.batch_files)],
+    ["一致性样本", countLike(job.overlap_item_ids) || countLike(job.selected_overlap_item_ids)],
+    ["记录 ID 策略", job.record_id_policy?.strategy],
+  ];
+}
+
+export function annotationJobActionAvailability(job, decisions = [], samplePath = "") {
+  const dataset = String(firstDefined(job?.argilla_dataset, job?.dataset) || "").trim();
+  const resolvedSamplePath = String(firstDefined(samplePath, job?.sample_path) || "").trim();
+  const usableDecision = (decisions || []).find((item) => item?.path);
+  const decisionSamplePath = String(firstDefined(usableDecision?.sample_path, resolvedSamplePath) || "").trim();
+
+  const pull = !job
+    ? { enabled: false, reason: "未选择标注任务。" }
+    : !dataset
+      ? { enabled: false, reason: "缺少 Argilla 数据集名，不能拉回结果。" }
+      : !resolvedSamplePath
+        ? { enabled: false, reason: "缺少样本路径，不能拉回结果。" }
+        : { enabled: true, reason: "" };
+
+  const agreement = !job
+    ? { enabled: false, reason: "未选择标注任务。", decision: null }
+    : !usableDecision
+      ? { enabled: false, reason: "先拉回标注结果后才能运行一致性检查。", decision: null }
+      : !decisionSamplePath
+        ? { enabled: false, reason: "标注结果缺少样本路径，不能运行一致性检查。", decision: usableDecision }
+        : { enabled: true, reason: "", decision: usableDecision };
+
+  return { pull, agreement };
+}
+
+export function agreementAuditsForAnnotationJob(job, decisions = [], audits = []) {
+  if (!job) return [];
+  const annotationId = String(job.annotation_id || "");
+  const dataset = String(firstDefined(job.argilla_dataset, job.dataset, ""));
+  const samplePath = String(job.sample_path || "");
+  const decisionIds = new Set((decisions || []).map((item) => String(item.decision_id || "")).filter(Boolean));
+  const decisionPaths = new Set((decisions || []).map((item) => String(item.path || "")).filter(Boolean));
+
+  return (audits || []).filter((item) => {
+    const auditId = String(item.audit_id || "");
+    const decisionsPath = String(item.decisions_path || "");
+    const auditSamplePath = String(item.sample_path || "");
+    return (
+      (auditId && (auditId === annotationId || auditId === dataset || decisionIds.has(auditId)))
+      || (decisionsPath && decisionPaths.has(decisionsPath))
+      || (samplePath && auditSamplePath === samplePath && decisionIds.has(auditId))
+    );
+  });
 }
 
 export function batchPlanDebugFields(plan) {
@@ -206,10 +272,15 @@ export function annotationJobDebugFields(job) {
     ["dispatch_mode", job.dispatch_mode],
     ["batch_plan_id", job.batch_plan_id],
     ["batch_manifest_path", job.batch_manifest_path],
+    ["dispatch_path", job.dispatch_path],
     ["batch_ids", job.batch_ids],
     ["batch_files", job.batch_files],
     ["overlap_item_ids", job.overlap_item_ids],
     ["selected_overlap_item_ids", job.selected_overlap_item_ids],
+    ["record_id_policy", job.record_id_policy],
+    ["duplicate_record_ids", job.duplicate_record_ids],
     ["manifest_path", job.manifest_path],
+    ["created_at", job.created_at],
+    ["result", job.result],
   ];
 }

@@ -2,9 +2,13 @@ import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 import {
+  agreementAuditsForAnnotationJob,
+  annotationJobActionAvailability,
   annotationJobBatchSummary,
   annotationJobDebugFields,
+  annotationJobDispatchLabel,
   annotationJobLabel,
+  annotationJobLineageFields,
   annotationJobStatusLabel,
   batchPlanDebugFields,
   batchPlanOptionLabel,
@@ -103,6 +107,18 @@ export default function RunsPage({ task, taskId, onError }) {
   const selectedJobDecisions = useMemo(
     () => decisionsForJob(selectedAnnotationJob, decisions),
     [selectedAnnotationJob, decisions],
+  );
+  const selectedJobSamplePath = useMemo(
+    () => findSamplePathForJob(selectedAnnotationJob, samples),
+    [selectedAnnotationJob, samples],
+  );
+  const selectedJobActionAvailability = useMemo(
+    () => annotationJobActionAvailability(selectedAnnotationJob, selectedJobDecisions, selectedJobSamplePath),
+    [selectedAnnotationJob, selectedJobDecisions, selectedJobSamplePath],
+  );
+  const selectedJobAudits = useMemo(
+    () => agreementAuditsForAnnotationJob(selectedAnnotationJob, selectedJobDecisions, agreementAudits),
+    [selectedAnnotationJob, selectedJobDecisions, agreementAudits],
   );
   const generatedDataset = defaultDatasetName(taskId, selectedSample?.sample_id, selectedBatchPlan?.plan_id);
   const pushDisabledReason = !sample
@@ -536,34 +552,74 @@ export default function RunsPage({ task, taskId, onError }) {
             </div>
             <div className="drawer-detail-grid">
               <DetailField label="状态" value={annotationJobStatusLabel(selectedAnnotationJob)} />
+              <DetailField label="分发方式" value={annotationJobDispatchLabel(selectedAnnotationJob)} />
               <DetailField label="Argilla 数据集" value={selectedAnnotationJob.argilla_dataset} />
               <DetailField label="样本集" value={selectedAnnotationJob.sample_id} />
               <DetailField label="记录数" value={selectedAnnotationJob.rows ?? selectedAnnotationJob.result?.records} />
-              <DetailField label="样本路径" value={findSamplePathForJob(selectedAnnotationJob, samples)} />
+              <DetailField label="样本路径" value={selectedJobSamplePath} />
               <DetailField label="批次摘要" value={annotationJobBatchSummary(selectedAnnotationJob)} />
             </div>
             <div className="drawer-actions">
-              <button className="btn btn-primary" disabled={busy} onClick={() => pullArgillaForJob(selectedAnnotationJob)}>拉回标注结果</button>
-              {selectedJobDecisions[0] ? (
-                <button className="btn" disabled={busy} onClick={() => runAgreementAuditForDecision(selectedJobDecisions[0], selectedAnnotationJob)}>运行一致性检查</button>
-              ) : (
-                <button className="btn" disabled>暂无可检查结果</button>
-              )}
+              <button
+                className="btn btn-primary"
+                disabled={busy || !selectedJobActionAvailability.pull.enabled}
+                title={selectedJobActionAvailability.pull.reason}
+                onClick={() => pullArgillaForJob(selectedAnnotationJob)}
+              >
+                拉回标注结果
+              </button>
+              <button
+                className="btn"
+                disabled={busy || !selectedJobActionAvailability.agreement.enabled}
+                title={selectedJobActionAvailability.agreement.reason}
+                onClick={() => runAgreementAuditForDecision(selectedJobActionAvailability.agreement.decision, selectedAnnotationJob)}
+              >
+                运行一致性检查
+              </button>
             </div>
-            <div className="info-callout">
+            {(selectedJobActionAvailability.pull.reason || selectedJobActionAvailability.agreement.reason) && (
+              <div className="status-line">
+                {selectedJobActionAvailability.pull.reason || selectedJobActionAvailability.agreement.reason}
+              </div>
+            )}
+            <div className="info-callout drawer-section">
               <strong>批次血缘</strong>
-              <p>{selectedAnnotationJob.batch_manifest_path || selectedAnnotationJob.batch_plan_id || "该任务未记录批次计划路径。"}</p>
+              <p>{annotationJobBatchSummary(selectedAnnotationJob)}</p>
+              <div className="lineage-grid">
+                {annotationJobLineageFields(selectedAnnotationJob).map(([label, value]) => (
+                  <div key={label}><span>{label}</span><strong>{displayPlanValue(value)}</strong></div>
+                ))}
+              </div>
             </div>
-            <div className="secondary-panel">
+            <div className="secondary-panel drawer-section">
               <div className="toolbar"><h3>关联标注结果（{selectedJobDecisions.length}）</h3></div>
-              {!selectedJobDecisions.length && <div className="empty">暂无从该任务拉回的结果</div>}
+              {!selectedJobDecisions.length && <div className="empty">暂无从该任务拉回的结果；拉回后可在这里发起一致性检查。</div>}
               {selectedJobDecisions.map((decision) => (
                 <div className="resource-mini-row" key={decision.decision_id || decision.path}>
                   <div>
                     <strong>{decision.decision_id || decision.argilla_dataset || "未命名结果"}</strong>
-                    <span>{decision.rows ?? decision.result?.responses ?? "-"} 行 · {decision.path}</span>
+                    <span>{decision.rows ?? decision.result?.responses ?? "-"} 行 · {decision.path || "缺少产物路径"}</span>
                   </div>
                   <button className="btn btn-sm" disabled={busy} onClick={() => runAgreementAuditForDecision(decision, selectedAnnotationJob)}>运行检查</button>
+                </div>
+              ))}
+            </div>
+            <div className="secondary-panel drawer-section">
+              <div className="toolbar"><h3>一致性检查记录（{selectedJobAudits.length}）</h3></div>
+              {!selectedJobAudits.length && <div className="empty">暂无关联的一致性检查记录</div>}
+              {selectedJobAudits.map((audit) => (
+                <div className="resource-mini-row" key={audit.audit_id || audit.summary_path}>
+                  <div>
+                    <strong>{audit.audit_id || "未命名检查"}</strong>
+                    <span>
+                      {audit.passed === true ? "通过" : audit.passed === false ? "未通过" : "状态待确认"}
+                      {" · "}
+                      {audit.summary_path || "缺少摘要路径"}
+                    </span>
+                  </div>
+                  <span className={`badge ${audit.passed === true ? "badge-green" : audit.passed === false ? "badge-red" : "badge-gray"}`}>
+                    {audit.passed === true ? "通过" : audit.passed === false ? "未通过" : "未完成"}
+                  </span>
                 </div>
               ))}
             </div>

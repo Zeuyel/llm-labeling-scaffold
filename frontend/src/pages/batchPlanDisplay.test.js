@@ -1,6 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  agreementAuditsForAnnotationJob,
+  annotationJobActionAvailability,
   annotationJobBatchSummary,
   annotationJobLabel,
   annotationJobStatusLabel,
@@ -96,6 +98,42 @@ test("annotation job list uses business labels and readable statuses", () => {
 
   assert.equal(annotationJobLabel(job), "round_1");
   assert.equal(annotationJobStatusLabel(job), "已推送");
+  assert.equal(annotationJobStatusLabel({ status: "已分发" }), "已推送");
   assert.equal(annotationJobStatusLabel({ state: "running" }), "执行中");
   assert.equal(annotationJobStatusLabel({ status: "failed" }), "失败");
+  assert.equal(annotationJobStatusLabel({ state: "incomplete" }), "记录不完整");
+});
+
+test("annotation job detail action availability explains disabled states", () => {
+  const job = { annotation_id: "round_1", argilla_dataset: "dataset_round_1", sample_path: "/tmp/sample.jsonl" };
+
+  assert.deepEqual(annotationJobActionAvailability(job, [], job.sample_path), {
+    pull: { enabled: true, reason: "" },
+    agreement: { enabled: false, reason: "先拉回标注结果后才能运行一致性检查。", decision: null },
+  });
+
+  const withDecision = annotationJobActionAvailability(job, [{ decision_id: "round_1", path: "/tmp/decisions.jsonl" }], job.sample_path);
+
+  assert.equal(withDecision.pull.enabled, true);
+  assert.equal(withDecision.agreement.enabled, true);
+  assert.equal(withDecision.agreement.decision.decision_id, "round_1");
+
+  const missingDataset = annotationJobActionAvailability({ sample_path: "/tmp/sample.jsonl" }, [], "/tmp/sample.jsonl");
+  assert.equal(missingDataset.pull.enabled, false);
+  assert.equal(missingDataset.pull.reason, "缺少 Argilla 数据集名，不能拉回结果。");
+});
+
+test("annotation job detail finds related agreement audits", () => {
+  const job = { annotation_id: "round_1", argilla_dataset: "dataset_round_1", sample_path: "/tmp/sample.jsonl" };
+  const decisions = [{ decision_id: "round_1", path: "/tmp/decisions.jsonl" }];
+  const audits = [
+    { audit_id: "round_1", passed: true },
+    { audit_id: "other", decisions_path: "/tmp/decisions.jsonl", passed: false },
+    { audit_id: "unrelated", decisions_path: "/tmp/other.jsonl", passed: true },
+  ];
+
+  assert.deepEqual(
+    agreementAuditsForAnnotationJob(job, decisions, audits).map((item) => item.audit_id),
+    ["round_1", "other"],
+  );
 });

@@ -1,22 +1,15 @@
 import React, { useEffect, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
+import { displayPlanValue } from "./batchPlanDisplay.js";
+import {
+  jobBadgeClass,
+  jobDebugFields,
+  jobKindLabel,
+  jobStatusLabel,
+  shortJobResult,
+} from "./jobDisplay.js";
 
-const BADGE = { succeeded: "badge-green", failed: "badge-red", running: "badge-blue", pending: "badge-gray" };
-const STATUS_LABEL = { succeeded: "成功", failed: "失败", running: "运行中", pending: "等待中" };
-const KIND_LABEL = {
-  sample: "创建样本",
-  batch: "切分批次",
-  annotate: "本地调试标注",
-  argilla_push: "推送 Argilla",
-  argilla_pull: "拉回标注结果",
-  agreement_audit: "一致性检查",
-  audit: "审核摘要",
-  merge: "合并输出",
-  gold: "构建训练集",
-  train: "训练模型",
-  infer: "模型推理",
-};
 const EVENT_LABEL = {
   "import.create": "创建导入",
   "import.reuse": "复用导入",
@@ -34,9 +27,14 @@ const ASSET_LABEL = {
   task: "任务",
 };
 
-function shortResult(job) {
-  if (job.error) return job.error.slice(0, 120);
-  return JSON.stringify(job.result || {}).slice(0, 120);
+function DetailField({ label, value }) {
+  const text = value === undefined || value === null || value === "" ? "-" : value;
+  return (
+    <div>
+      <span>{label}</span>
+      <strong>{text}</strong>
+    </div>
+  );
 }
 
 export default function JobsPage({ taskId, onError }) {
@@ -70,7 +68,7 @@ export default function JobsPage({ taskId, onError }) {
       <div className="crumbs"><Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 执行记录</div>
       <div className="page-header">
         <h2>执行记录</h2>
-        <p>流水线动作的执行状态与日志，页面会自动刷新</p>
+        <p>流水线动作的执行状态与日志；点击行查看日志、结果和高级详情。</p>
       </div>
       <div className="card">
         <div className="toolbar">
@@ -84,16 +82,31 @@ export default function JobsPage({ taskId, onError }) {
         {jobs.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>执行编号</th><th>动作</th><th>状态</th><th>创建时间</th><th>结果/错误</th><th>操作</th></tr></thead>
+              <thead><tr><th>执行编号</th><th>动作</th><th>状态</th><th>创建时间</th><th>摘要</th><th>操作</th></tr></thead>
               <tbody>
                 {jobs.map((j) => (
-                  <tr key={j.id}>
-                    <td>{j.id}</td>
-                    <td>{KIND_LABEL[j.kind] || j.kind}</td>
-                    <td><span className={`badge ${BADGE[j.status] || "badge-gray"}`}>{STATUS_LABEL[j.status] || j.status}</span></td>
+                  <tr
+                    key={j.id}
+                    className={active?.id === j.id ? "row-selected clickable-row" : "clickable-row"}
+                    onClick={() => setActive(j)}
+                  >
+                    <td className="mono-cell">{j.id}</td>
+                    <td>{jobKindLabel(j.kind)}</td>
+                    <td><span className={`badge ${jobBadgeClass(j.status)}`}>{jobStatusLabel(j.status)}</span></td>
                     <td className="muted">{(j.created_at || "").slice(0, 19)}</td>
-                    <td className="muted path-cell">{shortResult(j)}</td>
-                    <td><button className="btn btn-sm" onClick={() => setActive(j)}>详情</button></td>
+                    <td className="muted text-cell">{shortJobResult(j)}</td>
+                    <td>
+                      <button
+                        className="btn btn-sm"
+                        type="button"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setActive(j);
+                        }}
+                      >
+                        详情
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -102,16 +115,45 @@ export default function JobsPage({ taskId, onError }) {
         )}
       </div>
       {active && (
-        <div className="card secondary-panel">
-          <div className="toolbar"><h3>执行记录 {active.id} 详情</h3><button className="btn btn-sm" onClick={() => setActive(null)}>关闭</button></div>
-          <p className="muted">动作 {KIND_LABEL[active.kind] || active.kind} · 状态 {STATUS_LABEL[active.status] || active.status}</p>
-          <pre className="log-box">{(active.logs || []).join("\n") || "(无日志)"}</pre>
+        <div className="drawer-backdrop" onClick={() => setActive(null)}>
+          <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <h3>执行记录 {active.id}</h3>
+                <p>{jobKindLabel(active.kind)} · {jobStatusLabel(active.status)}</p>
+              </div>
+              <button className="btn btn-sm" type="button" onClick={() => setActive(null)}>关闭</button>
+            </div>
+            <div className="drawer-detail-grid">
+              <DetailField label="动作" value={jobKindLabel(active.kind)} />
+              <DetailField label="状态" value={jobStatusLabel(active.status)} />
+              <DetailField label="创建时间" value={(active.created_at || "").slice(0, 19)} />
+              <DetailField label="更新时间" value={(active.updated_at || "").slice(0, 19)} />
+            </div>
+            {active.error && <div className="status-line danger-line drawer-section">错误：{active.error}</div>}
+            <div className="drawer-section">
+              <div className="toolbar"><h3>执行日志</h3></div>
+              <pre className="log-box">{(active.logs || []).join("\n") || "(无日志)"}</pre>
+            </div>
+            <div className="drawer-section">
+              <div className="toolbar"><h3>动作结果</h3></div>
+              <pre className="log-box">{active.result ? JSON.stringify(active.result, null, 2) : "(无结果)"}</pre>
+            </div>
+            <details className="advanced-panel">
+              <summary>高级详情 / 调试信息</summary>
+              <div className="debug-field-list">
+                {jobDebugFields(active).map(([key, value]) => (
+                  <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                ))}
+              </div>
+            </details>
+          </aside>
         </div>
       )}
-      <div className="card secondary-panel">
+      <details className="card secondary-panel">
+        <summary>资产审计日志（{events.length}）</summary>
         <div className="toolbar">
           <div>
-            <h3>资产审计日志（{events.length}）</h3>
             <div className="status-line">记录导入、样本、归档等数据资产操作</div>
           </div>
         </div>
@@ -134,7 +176,7 @@ export default function JobsPage({ taskId, onError }) {
             </table>
           </div>
         )}
-      </div>
+      </details>
     </div>
   );
 }
