@@ -166,8 +166,13 @@ def _wait_for_job(base_url: str, task_id: str, job_id: str) -> dict:
 def test_r2_task_source_rejects_manual_import(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _clear_import_env(monkeypatch)
     monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    monkeypatch.setenv("LLS_ALLOW_MANUAL_IMPORTS", "true")
 
     with _panel_server(tmp_path / "runs", tmp_path / "tasks") as base_url:
+        status, settings = _request(base_url, "/api/settings")
+        assert status == 200
+        assert settings["settings"]["allow_manual_imports"] is False
+
         status, payload = _request(
             base_url,
             "/api/import?task_id=manual_task&name=manual_seed",
@@ -196,6 +201,33 @@ def test_local_task_source_allows_manual_import(tmp_path: Path, monkeypatch: pyt
     assert status == 200
     assert payload["import"]["import_id"] == "manual_seed"
     assert (runs_root / "manual_task" / "imports" / "manual_seed" / "manifest.json").exists()
+
+
+def test_jobs_api_reports_failed_background_job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_import_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    created = _create_manual_task(tasks_root)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, payload = _request(
+            base_url,
+            "/api/action",
+            method="POST",
+            payload={
+                "task": created["path"],
+                "action": "batch",
+                "params": {"batch_size": 1},
+            },
+        )
+        assert status == 200
+        job_id = payload["job"]["id"]
+
+        failed = _wait_for_job(base_url, "manual_task", job_id)
+
+    assert failed["status"] == "failed"
+    assert "KeyError" in failed["error"]
+    assert "sample" in failed["error"]
 
 
 def test_data_lake_import_rejects_source_override_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

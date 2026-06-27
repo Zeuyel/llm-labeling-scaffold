@@ -41,10 +41,12 @@ def allow_data_lake_overrides() -> bool:
 
 
 def allow_manual_imports() -> bool:
+    if task_source_mode() != "local":
+        return False
     configured = _env_bool("LLS_ALLOW_MANUAL_IMPORTS")
     if configured is not None:
         return configured
-    return task_source_mode() == "local"
+    return True
 
 
 def rclone_config_path() -> str | None:

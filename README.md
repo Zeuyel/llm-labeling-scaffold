@@ -115,16 +115,16 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull p
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
 ```
 
-启动后先访问轻量控制台，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。
+启动后先访问轻量控制台，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。只要启用 R2/data lake，任何 compose 启动都必须包含 rclone override 或等价 secret 挂载。
 
 如果要同时测试可选模型记录服务：
 
 ```bash
 export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:main
 export MLFLOW_TRACKING_URI=http://mlflow:5000
-docker compose --profile mlflow pull panel
-docker compose --profile mlflow build mlflow
-docker compose --profile mlflow up -d --no-build
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow pull panel
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow build mlflow
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow up -d --no-build
 ```
 
 ### 方式二：在服务器本地构建

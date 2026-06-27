@@ -148,6 +148,20 @@ def test_settings_api_reads_env_settings(tmp_path: Path, monkeypatch: pytest.Mon
     assert payload["settings"]["data_lake_r2_prefix"] == "r2:env/lake/"
 
 
+def test_r2_task_source_forces_manual_imports_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_settings_env(monkeypatch)
+    monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    monkeypatch.setenv("LLS_ALLOW_MANUAL_IMPORTS", "true")
+
+    with _panel_server(tmp_path / "runs", tmp_path / "tasks") as base_url:
+        status, payload = _request(base_url, "/api/settings")
+
+    assert status == 200
+    assert panel_settings.allow_manual_imports() is False
+    assert payload["settings"]["task_source"] == "r2"
+    assert payload["settings"]["allow_manual_imports"] is False
+
+
 def test_settings_api_reads_stored_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _clear_settings_env(monkeypatch)
     runs_root = tmp_path / "runs"
