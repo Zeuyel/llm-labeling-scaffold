@@ -29,6 +29,22 @@ export function sourceLabel(source) {
   return source || "-";
 }
 
+function normalizedState(...values) {
+  const value = firstDefined(...values);
+  return value === undefined || value === null ? "" : String(value).trim().toLowerCase();
+}
+
+export function goldStatusLabel(gold, taskId = "") {
+  const state = normalizedState(gold?.status, gold?.state);
+  if (["archived", "已归档"].includes(state)) return "已归档";
+  if (["failed", "error"].includes(state)) return "失败";
+  if (["incomplete", "partial"].includes(state)) return "记录不完整";
+  if (!goldPathForTask(gold, taskId)) return "记录不完整";
+  const rows = Number(gold?.rows);
+  if (Number.isFinite(rows) && rows <= 0) return "空版本";
+  return "可用";
+}
+
 export function goldPathForTask(gold, taskId = "") {
   return firstDefined(
     gold?.path,
@@ -55,6 +71,7 @@ export function goldSummary(gold, taskId = "") {
   return {
     key: goldResourceKey(gold, taskId),
     version: firstDefined(gold?.version, "-"),
+    status: goldStatusLabel(gold, taskId),
     rows: firstDefined(gold?.rows, "-"),
     uniqueIds: firstDefined(gold?.unique_ids, "-"),
     primaryLabel: firstDefined(gold?.primary_label, "-"),
@@ -76,6 +93,16 @@ export function goldTrainAction(gold, taskId = "") {
 
 export function modelPath(model) {
   return firstDefined(model?.path, model?.manifest?.model_path, model?.model_path);
+}
+
+export function modelStatusLabel(model) {
+  const state = normalizedState(model?.status, model?.state, model?.manifest?.status, model?.manifest?.state);
+  if (["archived", "已归档"].includes(state)) return "已归档";
+  if (["failed", "error"].includes(state)) return "失败";
+  if (["incomplete", "partial"].includes(state)) return "记录不完整";
+  if (!model?.manifest) return "记录不完整";
+  if (!modelPath(model)) return "记录不完整";
+  return "可用";
 }
 
 export function modelResourceKey(model) {
@@ -106,6 +133,7 @@ export function modelSummary(model) {
   return {
     key: modelResourceKey(model),
     modelId: firstDefined(model?.model_id, model?.manifest?.model_id, "-"),
+    status: modelStatusLabel(model),
     trainer: modelTrainer(model),
     trainRows: firstDefined(model?.metrics?.train_rows, "-"),
     testRows: firstDefined(model?.metrics?.test_rows, "-"),
@@ -115,6 +143,7 @@ export function modelSummary(model) {
     goldPath: firstDefined(model?.metrics?.gold_path, model?.manifest?.gold_path, "-"),
     path: modelPath(model),
     metricsPath: firstDefined(model?.manifest?.metrics_path, model?.metrics_path),
+    createdAt: formatDateTime(firstDefined(model?.created_at, model?.manifest?.created_at, model?.metrics?.created_at)),
   };
 }
 

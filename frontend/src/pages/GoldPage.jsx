@@ -25,6 +25,12 @@ function sampleLabel(sample) {
   return sample?.sample_id || sample?.manifest?.sample_id || "未命名样本";
 }
 
+function statusBadgeClass(status) {
+  if (status === "可用") return "badge-green";
+  if (status === "失败" || status === "记录不完整" || status === "空版本") return "badge-red";
+  return "badge-gray";
+}
+
 export default function GoldPage({ task, taskId, onError }) {
   const [versions, setVersions] = useState([]);
   const [samples, setSamples] = useState([]);
@@ -138,13 +144,14 @@ export default function GoldPage({ task, taskId, onError }) {
         {!loading && !loadError && versions.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>版本</th><th>行数</th><th>主标签</th><th>标签分布</th><th>来源</th><th>创建时间</th><th>路径</th></tr></thead>
+              <thead><tr><th>版本</th><th>状态</th><th>行数</th><th>主标签</th><th>标签分布</th><th>来源</th><th>创建时间</th><th>路径</th></tr></thead>
               <tbody>
                 {versions.map((g) => {
                   const summary = goldSummary(g, taskId);
                   return (
                     <tr className="clickable-row" key={summary.key} onClick={() => openGoldDetail(g)}>
                       <td><span className="badge badge-blue">{summary.version}</span></td>
+                      <td><span className={`badge ${statusBadgeClass(summary.status)}`}>{summary.status}</span></td>
                       <td>{summary.rows}</td>
                       <td>{summary.primaryLabel}</td>
                       <td className="muted text-cell">{summary.labelDistribution}</td>
@@ -214,6 +221,7 @@ export default function GoldPage({ task, taskId, onError }) {
             </div>
             <div className="drawer-detail-grid">
               <DetailField label="版本" value={selectedSummary.version} />
+              <DetailField label="状态" value={selectedSummary.status} />
               <DetailField label="行数" value={selectedSummary.rows} />
               <DetailField label="唯一记录" value={selectedSummary.uniqueIds} />
               <DetailField label="主标签" value={selectedSummary.primaryLabel} />

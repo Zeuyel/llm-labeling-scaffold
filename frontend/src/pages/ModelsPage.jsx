@@ -19,6 +19,12 @@ function DetailField({ label, value }) {
   );
 }
 
+function statusBadgeClass(status) {
+  if (status === "可用") return "badge-green";
+  if (status === "失败" || status === "记录不完整") return "badge-red";
+  return "badge-gray";
+}
+
 export default function ModelsPage({ task, taskId, onError }) {
   const [models, setModels] = useState([]);
   const [golds, setGolds] = useState([]);
@@ -178,11 +184,13 @@ export default function ModelsPage({ task, taskId, onError }) {
               <thead>
                 <tr>
                   <th>模型编号</th>
+                  <th>状态</th>
                   <th>训练器标识</th>
                   <th>训练/测试行数</th>
                   <th>指标摘要</th>
                   <th>外部记录</th>
                   <th>标签</th>
+                  <th>创建时间</th>
                   <th>路径</th>
                 </tr>
               </thead>
@@ -192,11 +200,13 @@ export default function ModelsPage({ task, taskId, onError }) {
                   return (
                     <tr className="clickable-row" key={summary.key} onClick={() => openModelDetail(item)}>
                       <td><span className="badge badge-blue">{summary.modelId}</span></td>
+                      <td><span className={`badge ${statusBadgeClass(summary.status)}`}>{summary.status}</span></td>
                       <td>{summary.trainer}</td>
                       <td>{summary.trainRows} / {summary.testRows}</td>
                       <td className="muted text-cell">{summary.metricSummary}</td>
                       <td>{summary.externalRecord}</td>
                       <td className="muted text-cell">{summary.labels}</td>
+                      <td className="muted">{summary.createdAt}</td>
                       <td className="muted path-cell">{summary.path}</td>
                     </tr>
                   );
@@ -346,12 +356,14 @@ export default function ModelsPage({ task, taskId, onError }) {
             </div>
             <div className="drawer-detail-grid">
               <DetailField label="模型编号" value={selectedSummary.modelId} />
+              <DetailField label="状态" value={selectedSummary.status} />
               <DetailField label="训练器" value={selectedSummary.trainer} />
               <DetailField label="训练行数" value={selectedSummary.trainRows} />
               <DetailField label="测试行数" value={selectedSummary.testRows} />
               <DetailField label="指标摘要" value={selectedSummary.metricSummary} />
               <DetailField label="标签" value={selectedSummary.labels} />
               <DetailField label="外部记录" value={selectedSummary.externalRecord} />
+              <DetailField label="创建时间" value={selectedSummary.createdAt} />
               <DetailField label="模型路径" value={selectedSummary.path} />
               <DetailField label="metrics" value={selectedSummary.metricsPath} />
             </div>
