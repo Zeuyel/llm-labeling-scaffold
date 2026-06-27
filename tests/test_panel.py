@@ -49,11 +49,16 @@ def _panel_server(runs_root: Path, tasks_root: Path):
             setattr(panel._Handler, key, value)
 
 
-def _request(base_url: str, path: str) -> tuple[int, dict]:
+def _request(base_url: str, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, dict]:
+    data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(
         base_url + path,
-        headers={"Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii")},
-        method="GET",
+        data=data,
+        headers={
+            "Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii"),
+            "Content-Type": "application/json",
+        },
+        method=method,
     )
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
@@ -170,6 +175,20 @@ def test_task_graph_api_returns_nodes_and_edges(panel_workspace):
     assert "sample:sample_a" in node_ids
     assert "decision:argilla_round_1" in node_ids
     assert any(edge["source"] == "sample:sample_a" and edge["target"] == "decision:argilla_round_1" for edge in body["edges"])
+
+
+def test_task_archive_plan_api_returns_active_assets(panel_workspace):
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(base_url, "/api/task/archive_plan?task_id=toy_multiclass_v1")
+
+    assert status == 200
+    assert body["task_id"] == "toy_multiclass_v1"
+    assert body["can_archive"] is False
+    assert any(item["code"] == "task_config_readonly" for item in body["blocked"])
+    asset_types = {item["asset_type"] for item in body["active_assets"]}
+    assert "sample" in asset_types
+    assert "decision" in asset_types
+    assert body["cleanup"]["r2_protected"] is True
 
 
 def test_build_gold_from_sample_and_decisions(panel_workspace):

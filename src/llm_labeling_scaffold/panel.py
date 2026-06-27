@@ -662,6 +662,21 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(pipeline.task_asset_graph(self.runs_root, task_cfg, profile_id=preset))
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/task/archive_plan":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            try:
+                task_cfg = self._load_task_by_id(task)
+                self._json(pipeline.task_archive_plan(
+                    self.tasks_root,
+                    self.runs_root,
+                    task_cfg,
+                    r2_task_source=_r2_task_source_enabled(),
+                ))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/profile/presets":
             try:
                 from .profiles import DEFAULT_PROFILE, list_profile_presets
@@ -887,6 +902,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._import(params)
         elif path == "/api/import/data_lake":
             self._import_data_lake(params)
+        elif path == "/api/task/archive":
+            body = self._read_body()
+            task_id = str(body.get("task_id") or params.get("task_id", [""])[0])
+            reason = str(body.get("reason") or "")
+            if not _safe_segment(task_id):
+                self._json({"error": "bad task"}, status=400)
+                return
+            try:
+                result = pipeline.execute_task_archive(
+                    self.tasks_root,
+                    self.runs_root,
+                    task_id,
+                    reason=reason,
+                    actor="panel",
+                    r2_task_source=_r2_task_source_enabled(),
+                )
+                self._json({"ok": True, "archive": result})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif path == "/api/task/cache_cleanup":
+            body = self._read_body()
+            task_id = str(body.get("task_id") or params.get("task_id", [""])[0])
+            if not _safe_segment(task_id):
+                self._json({"error": "bad task"}, status=400)
+                return
+            try:
+                result = pipeline.execute_task_cache_cleanup(self.runs_root, task_id, actor="panel")
+                self._json({"ok": result.get("ok", False), "cleanup": result})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/settings":
             body = self._read_body()
             if not isinstance(body, dict):

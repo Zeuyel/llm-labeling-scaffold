@@ -277,6 +277,7 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
     { key: "gold", label: "训练集版本", val: counts.gold, to: `/task/${encodeURIComponent(taskId)}/gold` },
     { key: "models", label: "模型", val: counts.models, to: `/task/${encodeURIComponent(taskId)}/models` },
     { key: "jobs", label: "执行记录", val: counts.jobs, to: `/task/${encodeURIComponent(taskId)}/jobs` },
+    { key: "archive", label: "归档向导", val: "进入", to: `/task/${encodeURIComponent(taskId)}/archive` },
   ];
 
   const stages = profileStages(profile.data);
@@ -297,6 +298,13 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
       <div className="page-header">
         <h2>{taskId}</h2>
         <p>{task && task.primary_label ? `主标签 ${task.primary_label.name}，记录编号字段 ${task.id_field}` : "任务概览"}</p>
+      </div>
+      <div className="card section-card next-step-card">
+        <div>
+          <h3>归档与缓存</h3>
+          <p>业务归档用于停用任务；清理本地缓存只释放本机空间，不删除 R2 数据湖权威对象。</p>
+        </div>
+        <Link className="btn btn-sm btn-primary" to={`/task/${encodeURIComponent(taskId)}/archive`}>进入归档向导</Link>
       </div>
       <div className="card section-card">
         <div className="toolbar profile-toolbar">

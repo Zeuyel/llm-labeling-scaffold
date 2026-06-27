@@ -36,6 +36,7 @@ export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
 export const getAuditEvents = (taskId) => req(`/api/task/audit?${q({ task_id: taskId })}`);
 export const getDataLakeStatus = (taskId) => req(`/api/task/data_lake?${q({ task_id: taskId })}`);
 export const getArgillaStatus = () => req("/api/argilla/status");
+export const getTaskArchivePlan = (taskId) => req(`/api/task/archive_plan?${q({ task_id: taskId })}`);
 
 export const createTask = (payload) =>
   req("/api/tasks", {
@@ -57,6 +58,20 @@ export const deleteTask = (taskId, opts = {}) =>
   }).then((data) => data.task || data);
 
 export const archiveTask = (taskId) => deleteTask(taskId);
+
+export const executeTaskArchive = (taskId, reason = "") =>
+  req("/api/task/archive", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_id: taskId, reason }),
+  }).then((data) => data.archive || data);
+
+export const cleanupTaskCache = (taskId) =>
+  req("/api/task/cache_cleanup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_id: taskId }),
+  }).then((data) => data.cleanup || data);
 
 export const startAction = (taskPath, action, params) =>
   req("/api/action", {

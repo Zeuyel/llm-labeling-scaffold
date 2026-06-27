@@ -947,8 +947,32 @@ def _task_run_assets(runs_root: str | Path, task_id: str) -> list[str]:
     run_dir = Path(runs_root) / task_id
     if not run_dir.is_dir():
         return []
-    ignored = {"_locks"}
+    ignored = {"_archive", "_audit", "_jobs", "_locks", "_staging"}
     return sorted(item.name for item in run_dir.iterdir() if item.name not in ignored)
+
+
+def _task_config_archive_info(tasks_root: str | Path, task_id: str) -> dict[str, Any]:
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    for root in _task_roots(tasks_root):
+        if not root.exists():
+            continue
+        for yml in sorted(root.rglob("task.yaml")):
+            if "_archive" in yml.parts:
+                continue
+            try:
+                task = load_task(yml)
+            except Exception:
+                continue
+            if task.task_id == task_id:
+                return {
+                    "task_id": task_id,
+                    "path": str(yml),
+                    "task_dir": str(yml.parent),
+                    "root": str(root),
+                    "deletable": _task_file_deletable(yml, root),
+                }
+    raise ValueError(f"任务不存在: {task_id}")
 
 
 def archive_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path | None = None,
@@ -1012,6 +1036,362 @@ def delete_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path |
     if delete_runs:
         raise ValueError("不支持从面板删除 runs 数据；任务只能归档，数据资产需按各自规则归档")
     return archive_task(tasks_root, task_id, runs_root=runs_root, reason="panel archive")
+
+
+ARCHIVE_STEP_ORDER: tuple[dict[str, str], ...] = (
+    {"asset_type": "inference", "label": "推理结果", "group": "inference"},
+    {"asset_type": "model", "label": "模型", "group": "models"},
+    {"asset_type": "gold", "label": "训练集", "group": "gold"},
+    {"asset_type": "agreement_audit", "label": "一致性检查", "group": "agreement_audits"},
+    {"asset_type": "decision", "label": "标注结果", "group": "decisions"},
+    {"asset_type": "annotation_job", "label": "标注分发记录", "group": "annotation_jobs"},
+    {"asset_type": "run", "label": "本地标注运行", "group": ""},
+    {"asset_type": "sample", "label": "样本", "group": "samples"},
+    {"asset_type": "import", "label": "导入数据", "group": "imports"},
+)
+
+
+def _dir_size_bytes(path: Path) -> int:
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    total = 0
+    if path.is_dir():
+        for item in path.rglob("*"):
+            if item.is_file():
+                try:
+                    total += item.stat().st_size
+                except OSError:
+                    continue
+    return total
+
+
+def _archive_visible_children(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
+    return sorted(item for item in path.iterdir() if not item.name.startswith("_"))
+
+
+def _archive_group_operation(runs_root: str | Path, task_id: str, step: dict[str, str]) -> dict[str, Any] | None:
+    task_dir = Path(runs_root) / task_id
+    group = step["group"]
+    if group:
+        source = task_dir / group
+        if not source.exists() or not _archive_visible_children(source):
+            return None
+        return {
+            "asset_type": step["asset_type"],
+            "label": step["label"],
+            "asset_id": group,
+            "source_path": str(source),
+            "target_relative_path": group,
+            "size_bytes": _dir_size_bytes(source),
+            "item_count": len(_archive_visible_children(source)),
+        }
+
+    reserved = {
+        "samples",
+        "gold",
+        "models",
+        "schemas",
+        "imports",
+        "inference",
+        "decisions",
+        "annotation_jobs",
+        "agreement_audits",
+        "_archive",
+        "_audit",
+        "_jobs",
+        "_locks",
+        "_staging",
+    }
+    run_dirs = [
+        item
+        for item in sorted(task_dir.iterdir()) if task_dir.is_dir() and item.is_dir()
+        and not item.name.startswith("_")
+        and item.name not in reserved
+    ] if task_dir.is_dir() else []
+    if not run_dirs:
+        return None
+    return {
+        "asset_type": "run",
+        "label": step["label"],
+        "asset_id": "runs",
+        "source_paths": [str(item) for item in run_dirs],
+        "target_relative_path": "runs",
+        "size_bytes": sum(_dir_size_bytes(item) for item in run_dirs),
+        "item_count": len(run_dirs),
+    }
+
+
+def _active_asset_nodes(runs_root: str | Path, task) -> list[dict[str, Any]]:
+    graph = task_asset_graph(runs_root, task)
+    order = {step["asset_type"]: index for index, step in enumerate(ARCHIVE_STEP_ORDER)}
+    out: list[dict[str, Any]] = []
+    for node in graph.get("nodes", []):
+        node_type = node.get("type")
+        if node_type not in order:
+            continue
+        out.append({
+            "asset_type": node_type,
+            "asset_id": str(node.get("id", "")).split(":", 1)[-1],
+            "title": node.get("title"),
+            "summary": node.get("summary"),
+            "path": node.get("path"),
+            "status": node.get("status"),
+        })
+    out.sort(key=lambda item: (order.get(item["asset_type"], 99), item["asset_id"]))
+    return out
+
+
+def _archive_dependency_edges(runs_root: str | Path, task) -> list[dict[str, str]]:
+    graph = task_asset_graph(runs_root, task)
+    asset_prefixes = tuple(f"{step['asset_type']}:" for step in ARCHIVE_STEP_ORDER)
+    out: list[dict[str, str]] = []
+    for edge in graph.get("edges", []):
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if source.startswith(asset_prefixes) and target.startswith(asset_prefixes):
+            out.append({
+                "source": source,
+                "target": target,
+                "reason": str(edge.get("reason") or ""),
+            })
+    return out
+
+
+def _cleanup_file_list(runs_root: str | Path, task_id: str) -> list[dict[str, Any]]:
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    base = Path(runs_root) / task_id
+    if not base.is_dir():
+        return []
+    files: list[dict[str, Any]] = []
+    for path in sorted(item for item in base.rglob("*") if item.is_file()):
+        if "_audit" in path.relative_to(base).parts:
+            continue
+        try:
+            stat = path.stat()
+            writable = os.access(path.parent, os.W_OK | os.X_OK)
+            files.append({
+                "path": str(path),
+                "relative_path": str(path.relative_to(base)),
+                "size_bytes": stat.st_size,
+                "writable": writable,
+                "owner_uid": stat.st_uid,
+                "owner_gid": stat.st_gid,
+            })
+        except OSError as exc:
+            files.append({
+                "path": str(path),
+                "relative_path": str(path.relative_to(base)),
+                "size_bytes": 0,
+                "writable": False,
+                "error": str(exc),
+            })
+    return files
+
+
+def task_archive_plan(
+    tasks_root: str | Path,
+    runs_root: str | Path,
+    task,
+    *,
+    r2_task_source: bool = False,
+) -> dict[str, Any]:
+    task_id = str(getattr(task, "task_id", task)).strip()
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    operations = [op for step in ARCHIVE_STEP_ORDER if (op := _archive_group_operation(runs_root, task_id, step))]
+    warnings: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    task_config: dict[str, Any] | None = None
+    try:
+        task_config = _task_config_archive_info(tasks_root, task_id)
+        if not task_config.get("deletable"):
+            blocked.append({
+                "code": "task_config_readonly",
+                "message": "任务配置来自只读目录，不能由面板归档 task.yaml。",
+                "path": task_config.get("path"),
+            })
+    except Exception as exc:
+        blocked.append({"code": "task_config_missing", "message": str(exc)})
+    if r2_task_source:
+        blocked.append({
+            "code": "r2_registry_authority",
+            "message": "生产 R2 模式下，任务启停以数据湖登记表为准；面板不能伪造 registry 归档。",
+        })
+    cleanup_files = _cleanup_file_list(runs_root, task_id)
+    permission_issues = [item for item in cleanup_files if not item.get("writable")]
+    if permission_issues:
+        warnings.append({
+            "code": "cache_permission",
+            "message": "部分本地缓存当前用户不可删除，可能由容器 root 写入；请统一容器运行 UID/GID 后再清理。",
+            "paths": [item["path"] for item in permission_issues[:20]],
+        })
+    return {
+        "task_id": task_id,
+        "mode": "r2" if r2_task_source else "local",
+        "can_archive": not blocked,
+        "blocked": blocked,
+        "warnings": warnings,
+        "active_assets": _active_asset_nodes(runs_root, task),
+        "dependencies": _archive_dependency_edges(runs_root, task),
+        "archive_order": [
+            {**step, "operation": next((op for op in operations if op["asset_type"] == step["asset_type"]), None)}
+            for step in ARCHIVE_STEP_ORDER
+        ],
+        "operations": operations,
+        "task_config": task_config,
+        "cleanup": {
+            "r2_protected": True,
+            "note": "清理只删除本机 runs 缓存文件，不调用 R2 删除，也不删除数据湖权威对象。",
+            "files": cleanup_files,
+            "total_bytes": sum(int(item.get("size_bytes") or 0) for item in cleanup_files),
+        },
+    }
+
+
+def execute_task_archive(
+    tasks_root: str | Path,
+    runs_root: str | Path,
+    task_id: str,
+    *,
+    reason: str = "",
+    actor: str = "system",
+    r2_task_source: bool = False,
+) -> dict[str, Any]:
+    if r2_task_source:
+        raise ValueError("生产 R2 模式下不能在面板中归档本地 task.yaml；请先在数据湖登记表中停用任务")
+    task = load_task_by_id(tasks_root, task_id)
+    plan = task_archive_plan(tasks_root, runs_root, task)
+    if plan["blocked"]:
+        raise ValueError("; ".join(item["message"] for item in plan["blocked"]))
+    archived_at = _now()
+    stamp = _archive_stamp(archived_at)
+    archive_root = Path(runs_root) / task_id / "_archive" / stamp
+    moved: list[dict[str, Any]] = []
+    with _asset_lock(runs_root, task_id, "task-archive"):
+        for operation in plan["operations"]:
+            try:
+                if operation.get("source_paths"):
+                    for source_text in operation["source_paths"]:
+                        source = Path(source_text)
+                        target = archive_root / operation["target_relative_path"] / source.name
+                        if source.exists():
+                            _move_directory(source, target)
+                            moved.append({**operation, "source_path": str(source), "archive_path": str(target)})
+                else:
+                    source = Path(operation["source_path"])
+                    target = archive_root / operation["target_relative_path"]
+                    if source.exists():
+                        _move_directory(source, target)
+                        moved.append({**operation, "archive_path": str(target)})
+                record_audit_event(
+                    runs_root,
+                    task_id,
+                    "task_archive.step",
+                    asset_type=operation["asset_type"],
+                    asset_id=operation["asset_id"],
+                    actor=actor,
+                    details={"archive_root": str(archive_root), "operation": operation, "reason": reason},
+                )
+            except Exception as exc:
+                record_audit_event(
+                    runs_root,
+                    task_id,
+                    "task_archive.step",
+                    asset_type=operation["asset_type"],
+                    asset_id=operation["asset_id"],
+                    status="failed",
+                    actor=actor,
+                    details={"error": str(exc), "operation": operation, "reason": reason},
+                )
+                raise
+        task_result = archive_task(tasks_root, task_id, runs_root=runs_root, reason=reason)
+    record_audit_event(
+        runs_root,
+        task_id,
+        "task_archive.complete",
+        asset_type="task",
+        asset_id=task_id,
+        actor=actor,
+        details={"archive_root": str(archive_root), "task_archive": task_result, "moved_assets": moved, "reason": reason},
+    )
+    return {
+        "task_id": task_id,
+        "archived": True,
+        "archived_at": archived_at,
+        "archive_root": str(archive_root),
+        "moved_assets": moved,
+        "task": task_result,
+    }
+
+
+def execute_task_cache_cleanup(runs_root: str | Path, task_id: str, *, actor: str = "system") -> dict[str, Any]:
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    base = Path(runs_root) / task_id
+    files = _cleanup_file_list(runs_root, task_id)
+    deleted: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for item in files:
+        path = Path(item["path"])
+        try:
+            path.resolve().relative_to(base.resolve())
+        except ValueError:
+            errors.append({"path": str(path), "error": "cleanup path escaped task run directory"})
+            continue
+        if not item.get("writable"):
+            errors.append({
+                "path": str(path),
+                "error": "permission denied",
+                "owner_uid": item.get("owner_uid"),
+                "owner_gid": item.get("owner_gid"),
+                "suggestion": "请让 panel 容器使用与宿主机一致的 PANEL_UID/PANEL_GID，或先修正 runs 目录所有权。",
+            })
+            continue
+        try:
+            path.unlink()
+            deleted.append(item)
+        except PermissionError as exc:
+            errors.append({
+                "path": str(path),
+                "error": str(exc),
+                "owner_uid": item.get("owner_uid"),
+                "owner_gid": item.get("owner_gid"),
+                "suggestion": "请让 panel 容器使用与宿主机一致的 PANEL_UID/PANEL_GID，或先修正 runs 目录所有权。",
+            })
+        except OSError as exc:
+            errors.append({"path": str(path), "error": str(exc)})
+    if base.is_dir():
+        for directory in sorted((item for item in base.rglob("*") if item.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            if directory.name == "_audit":
+                continue
+            try:
+                directory.rmdir()
+            except OSError:
+                continue
+    status = "failed" if errors else "succeeded"
+    record_audit_event(
+        runs_root,
+        task_id,
+        "task.cache_cleanup",
+        asset_type="task_cache",
+        asset_id=task_id,
+        status=status,
+        actor=actor,
+        details={"deleted_files": len(deleted), "errors": errors, "r2_deleted": False},
+    )
+    return {
+        "task_id": task_id,
+        "ok": not errors,
+        "r2_deleted": False,
+        "deleted_files": deleted,
+        "errors": errors,
+    }
 
 
 def _string_list(value: Any) -> list[str]:
@@ -2416,6 +2796,7 @@ def list_runs(runs_root: Path, task_id: str) -> list[dict]:
             "inference",
             "decisions",
             "annotation_jobs",
+            "agreement_audits",
             "_jobs",
         ):
             continue

@@ -12,6 +12,7 @@ import JobsPage from "./pages/JobsPage.jsx";
 import GoldPage from "./pages/GoldPage.jsx";
 import ModelsPage from "./pages/ModelsPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
+import TaskArchivePage from "./pages/TaskArchivePage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
@@ -25,6 +26,7 @@ const ROUTES = [
   { pattern: "/task/:id/jobs", page: "jobs" },
   { pattern: "/task/:id/gold", page: "gold" },
   { pattern: "/task/:id/models", page: "models" },
+  { pattern: "/task/:id/archive", page: "archive" },
 ];
 
 const DEFAULT_SETTINGS = {
@@ -124,6 +126,7 @@ function Shell() {
   else if (matched.page === "jobs") page = <JobsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "gold") page = <GoldPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "models") page = <ModelsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "archive") page = <TaskArchivePage taskId={activeTaskId} onReloadTasks={loadTasks} {...common} />;
 
   function toggleSidebar() {
     setSidebarCollapsed((value) => {

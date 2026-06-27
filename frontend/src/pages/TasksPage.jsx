@@ -40,7 +40,6 @@ export default function TasksPage({
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
-  const [archiving, setArchiving] = useState("");
   const [form, setForm] = useState({
     task_id: "",
     id_field: "record_id",
@@ -147,24 +146,9 @@ export default function TasksPage({
     }
   }
 
-  async function archiveTask(task) {
+  function openArchiveWizard(task) {
     if (!task?.task_id) return;
-    if (!task.deletable) {
-      onError(r2TaskSource ? "这个任务来自 R2 登记表，不能在面板中归档本地缓存；请在登记表中标记为非启用状态" : "这个任务来自只读目录，不能在面板中归档");
-      return;
-    }
-    const ok = window.confirm(`归档任务 ${task.task_id}？\n\n归档会把任务配置移到 _archive，不会删除数据。若该任务已有导入、样本、标注或模型产物，系统会拒绝归档。`);
-    if (!ok) return;
-    setArchiving(task.task_id);
-    try {
-      await api.archiveTask(task.task_id);
-      await onReload();
-      navigate("/");
-    } catch (error) {
-      onError(String(error));
-    } finally {
-      setArchiving("");
-    }
+    navigate(`/task/${encodeURIComponent(task.task_id)}/archive`);
   }
 
   return (
@@ -311,17 +295,7 @@ export default function TasksPage({
               <Link to={`/task/${encodeURIComponent(t.task_id)}`} className="task-title-link">
                 <h3>{t.task_id || "(无效)"}</h3>
               </Link>
-              {t.deletable ? (
-                <button
-                  className="btn btn-sm btn-danger"
-                  disabled={archiving === t.task_id}
-                  onClick={() => archiveTask(t)}
-                >
-                  归档
-                </button>
-              ) : (
-                <span className="badge badge-gray">{r2TaskSource ? "数据湖" : "只读"}</span>
-              )}
+              <button className="btn btn-sm" onClick={() => openArchiveWizard(t)}>归档向导</button>
             </div>
             {t.error ? (
               <span className="badge badge-red">{t.error}</span>
@@ -334,6 +308,7 @@ export default function TasksPage({
             )}
             <div className="action-row task-card-actions">
               <button className="btn btn-sm" onClick={() => navigate(`/task/${encodeURIComponent(t.task_id)}`)}>进入</button>
+              {!t.deletable && <span className="badge badge-gray">{r2TaskSource ? "数据湖" : "只读"}</span>}
             </div>
           </div>
         ))}

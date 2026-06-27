@@ -24,7 +24,14 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY --from=frontend /app/frontend/dist ./frontend/dist
 RUN pip install -e ".[baseline,argilla,mlflow]"
+ARG PANEL_UID=1000
+ARG PANEL_GID=1000
+RUN groupadd --gid "${PANEL_GID}" panel \
+    && useradd --uid "${PANEL_UID}" --gid "${PANEL_GID}" --create-home --shell /usr/sbin/nologin panel \
+    && mkdir -p /app/runs /app/tasks \
+    && chown -R panel:panel /app
 
 EXPOSE 8765
 
+USER panel:panel
 CMD ["python", "-m", "llm_labeling_scaffold.cli", "panel", "--host", "0.0.0.0", "--port", "8765", "--static-dir", "frontend/dist", "--tasks-root", "tasks", "--runs-root", "runs"]

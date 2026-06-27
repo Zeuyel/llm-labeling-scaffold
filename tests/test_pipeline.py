@@ -1166,6 +1166,128 @@ def test_task_archive_blocks_existing_run_assets(tmp_path: Path):
         raise AssertionError("task with run assets should not be archived")
 
 
+def test_task_archive_plan_lists_assets_without_blocking_dependencies(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "archive_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    rows = [{"record_id": "r1", "title": "A"}, {"record_id": "r2", "title": "B"}]
+    imported = pipeline.save_import(tmp_path / "runs", task, "seed_1", rows)
+    sample_records(task, 1, "sample_a", "head", source_path=imported["path"], source_import_id="seed_1")
+    write_json(
+        {"task_id": task.task_id, "annotation_id": "job_a", "sample_id": "sample_a"},
+        tmp_path / "runs" / task.task_id / "annotation_jobs" / "job_a" / "manifest.json",
+    )
+    write_json(
+        {"task_id": task.task_id, "decision_id": "round_1", "sample_id": "sample_a", "rows": 1},
+        tmp_path / "runs" / task.task_id / "decisions" / "round_1" / "manifest.json",
+    )
+
+    plan = pipeline.task_archive_plan(tmp_path / "tasks", tmp_path / "runs", task)
+
+    assert plan["can_archive"] is True
+    assert not plan["blocked"]
+    asset_types = [item["asset_type"] for item in plan["active_assets"]]
+    assert "import" in asset_types
+    assert "sample" in asset_types
+    assert "annotation_job" in asset_types
+    assert "decision" in asset_types
+    assert [step["asset_type"] for step in plan["archive_order"][:3]] == ["inference", "model", "gold"]
+    assert plan["cleanup"]["r2_protected"] is True
+    assert plan["cleanup"]["files"]
+
+
+def test_execute_task_archive_moves_run_assets_then_task_config(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "archive_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    imported = pipeline.save_import(
+        tmp_path / "runs",
+        task,
+        "seed_1",
+        [{"record_id": "r1", "title": "A"}, {"record_id": "r2", "title": "B"}],
+    )
+    sample_path = sample_records(task, 1, "sample_a", "head", source_path=imported["path"], source_import_id="seed_1")
+    write_json(
+        {"task_id": task.task_id, "annotation_id": "job_a", "sample_id": "sample_a", "sample_path": str(sample_path)},
+        tmp_path / "runs" / task.task_id / "annotation_jobs" / "job_a" / "manifest.json",
+    )
+    write_json(
+        {"task_id": task.task_id, "decision_id": "round_1", "sample_id": "sample_a", "path": "decisions.jsonl"},
+        tmp_path / "runs" / task.task_id / "decisions" / "round_1" / "manifest.json",
+    )
+    write_json(
+        {"task_id": task.task_id, "audit_id": "audit_1", "passed": True},
+        tmp_path / "runs" / task.task_id / "agreement_audits" / "audit_1" / "summary.json",
+    )
+    write_jsonl(
+        [{"record_id": "r1", "title": "A", "label": "yes"}],
+        tmp_path / "runs" / task.task_id / "gold" / "gold_v001.jsonl",
+    )
+    write_json(
+        {"task_id": task.task_id, "version": "v001", "path": str(tmp_path / "runs" / task.task_id / "gold" / "gold_v001.jsonl")},
+        tmp_path / "runs" / task.task_id / "gold" / "gold_v001.manifest.json",
+    )
+    write_json(
+        {"task_id": task.task_id, "model_id": "model_a", "model_path": str(tmp_path / "runs" / task.task_id / "models" / "model_a" / "model.joblib")},
+        tmp_path / "runs" / task.task_id / "models" / "model_a" / "manifest.json",
+    )
+    (tmp_path / "runs" / task.task_id / "models" / "model_a" / "model.joblib").write_text("model", encoding="utf-8")
+    write_jsonl(
+        [{"record_id": "r1", "prediction": "yes"}],
+        tmp_path / "runs" / task.task_id / "inference" / "batch_a" / "predictions.jsonl",
+    )
+
+    result = pipeline.execute_task_archive(tmp_path / "tasks", tmp_path / "runs", task.task_id, reason="done")
+
+    archive_root = Path(result["archive_root"])
+    assert (archive_root / "imports" / "seed_1" / "raw.jsonl").exists()
+    assert (archive_root / "samples" / "sample_a" / "sample.jsonl").exists()
+    assert (archive_root / "annotation_jobs" / "job_a" / "manifest.json").exists()
+    assert (archive_root / "decisions" / "round_1" / "manifest.json").exists()
+    assert (archive_root / "agreement_audits" / "audit_1" / "summary.json").exists()
+    assert (archive_root / "gold" / "gold_v001.jsonl").exists()
+    assert (archive_root / "models" / "model_a" / "model.joblib").exists()
+    assert (archive_root / "inference" / "batch_a" / "predictions.jsonl").exists()
+    assert not (tmp_path / "tasks" / task.task_id).exists()
+    assert list((tmp_path / "tasks" / "_archive").glob("archive_task__*/task.yaml"))
+    events = read_jsonl(tmp_path / "runs" / task.task_id / "_audit" / "events.jsonl")
+    assert any(event["event"] == "task_archive.complete" for event in events)
+
+
+def test_task_cache_cleanup_deletes_only_local_run_files(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    task_dir = runs_root / "cleanup_task"
+    write_json({"uri": "r2:bucket/path/object.jsonl"}, task_dir / "imports" / "seed_1" / "manifest.json")
+    (task_dir / "imports" / "seed_1" / "raw.jsonl").write_text('{"record_id":"r1"}\n', encoding="utf-8")
+    write_json({"event": "keep"}, task_dir / "_audit" / "keep.json")
+
+    result = pipeline.execute_task_cache_cleanup(runs_root, "cleanup_task")
+
+    assert result["ok"] is True
+    assert result["r2_deleted"] is False
+    assert not (task_dir / "imports" / "seed_1" / "raw.jsonl").exists()
+    assert (task_dir / "_audit" / "keep.json").exists()
+    events = read_jsonl(task_dir / "_audit" / "events.jsonl")
+    assert events[-1]["event"] == "task.cache_cleanup"
+    assert events[-1]["details"]["r2_deleted"] is False
+
+
 def test_sample_archive_blocks_dependencies_and_prevents_id_reuse(tmp_path: Path):
     created = pipeline.create_task(
         tmp_path / "tasks",

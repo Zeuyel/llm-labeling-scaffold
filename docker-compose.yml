@@ -15,6 +15,9 @@ services:
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://repo.huaweicloud.com/repository/pypi/simple}
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-repo.huaweicloud.com}
+        PANEL_UID: ${PANEL_UID:-1000}
+        PANEL_GID: ${PANEL_GID:-1000}
+    user: "${PANEL_UID:-1000}:${PANEL_GID:-1000}"
     restart: unless-stopped
     ports:
       - "${PANEL_PORT:-8765}:8765"
