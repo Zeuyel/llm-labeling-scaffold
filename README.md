@@ -144,6 +144,8 @@ ARGILLA_API_KEY=argilla.apikey
 ARGILLA_WORKSPACE=argilla
 
 MLFLOW_PORT=5000
+LLS_TASK_SOURCE=r2
+LLS_TASK_REGISTRY_URI=r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
 
@@ -168,10 +170,10 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 容器挂载：
 
 - `./runs:/app/runs`：保存样本、标注结果、训练集、模型和推理产物
-- `./tasks:/app/tasks`：控制台中新建的业务任务
+- `./tasks:/app/tasks`：R2 任务配置的本地执行缓存
 - `./configs:/app/configs:ro`：配置示例
 
-控制台默认只读取 `tasks/`。实验人员在控制台中新建的任务会写入 `tasks/<任务编号>/task.yaml`。如果任务已经有复杂配置，也仍然可以直接把任务目录放到 `tasks/` 下。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
+生产面板默认使用 `LLS_TASK_SOURCE=r2`：启动和刷新任务时会从 `LLS_TASK_REGISTRY_URI` 指向的数据湖登记表读取 `tasks.<任务编号>.task_uri`，把远端 `task.yaml` 同步到 `tasks/<任务编号>/task.yaml` 作为本地缓存。面板不允许新建或归档本地任务配置；任务下线应在 R2 数据湖登记表中把对应任务标记为非启用状态。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
 
 数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
 

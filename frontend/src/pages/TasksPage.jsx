@@ -27,8 +27,16 @@ function parseList(value) {
     .filter(Boolean);
 }
 
-export default function TasksPage({ tasks, onReload, onError, allowDataLakeOverrides = false }) {
+export default function TasksPage({
+  tasks,
+  onReload,
+  onError,
+  allowDataLakeOverrides = false,
+  taskSource = "local",
+  taskRegistryUri = "",
+}) {
   const { navigate } = useRouter();
+  const r2TaskSource = taskSource === "r2";
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [archiving, setArchiving] = useState("");
@@ -132,7 +140,7 @@ export default function TasksPage({ tasks, onReload, onError, allowDataLakeOverr
   async function archiveTask(task) {
     if (!task?.task_id) return;
     if (!task.deletable) {
-      onError("这个任务来自只读目录，不能在面板中归档");
+      onError(r2TaskSource ? "这个任务来自 R2 数据湖登记表，不能在面板中归档本地缓存；请在登记表中标记为非启用状态" : "这个任务来自只读目录，不能在面板中归档");
       return;
     }
     const ok = window.confirm(`归档任务 ${task.task_id}？\n\n归档会把任务配置移到 _archive，不会删除数据。若该任务已有导入、样本、标注或模型产物，系统会拒绝归档。`);
@@ -153,16 +161,18 @@ export default function TasksPage({ tasks, onReload, onError, allowDataLakeOverr
     <div>
       <div className="page-header">
         <h2>全部任务</h2>
-        <p>选择一个标注任务进入其数据流水线</p>
+        <p>{r2TaskSource ? "任务配置来自 R2 数据湖登记表，本地只缓存执行配置" : "选择一个标注任务进入其数据流水线"}</p>
       </div>
       <div className="toolbar">
-        <span className="muted">{tasks.length} 个任务</span>
+        <span className="muted">{tasks.length} 个任务{r2TaskSource && taskRegistryUri ? ` · ${taskRegistryUri}` : ""}</span>
         <div className="action-row">
-          <button className="btn btn-sm" onClick={() => setOpen((value) => !value)}>{open ? "收起" : "新建任务"}</button>
+          {!r2TaskSource && (
+            <button className="btn btn-sm" onClick={() => setOpen((value) => !value)}>{open ? "收起" : "新建任务"}</button>
+          )}
           <button className="btn btn-sm" onClick={onReload}>刷新</button>
         </div>
       </div>
-      {open && (
+      {open && !r2TaskSource && (
         <div className="card section-card">
           <h3>新建任务</h3>
           <div className="form-grid">
@@ -278,7 +288,7 @@ export default function TasksPage({ tasks, onReload, onError, allowDataLakeOverr
           </div>
         </div>
       )}
-      {!tasks.length && <div className="empty">未发现任务（检查 --tasks-root 目录下的 task.yaml）</div>}
+      {!tasks.length && <div className="empty">{r2TaskSource ? "数据湖登记表暂无启用任务" : "未发现任务（检查 --tasks-root 目录下的 task.yaml）"}</div>}
       <div className="grid grid-cards">
         {tasks.map((t) => (
           <div key={t.path} className="card task-card">
@@ -295,7 +305,7 @@ export default function TasksPage({ tasks, onReload, onError, allowDataLakeOverr
                   归档
                 </button>
               ) : (
-                <span className="badge badge-gray">只读</span>
+                <span className="badge badge-gray">{r2TaskSource ? "数据湖" : "只读"}</span>
               )}
             </div>
             {t.error ? (

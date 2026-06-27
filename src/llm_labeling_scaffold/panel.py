@@ -10,8 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+from .config import load_task
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
+from .task_registry import task_registry_uri
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -31,6 +33,17 @@ def _truthy_env(name: str) -> bool:
 
 def _allow_data_lake_overrides() -> bool:
     return _truthy_env("LLS_ALLOW_DATA_LAKE_OVERRIDES")
+
+
+def _task_source_mode() -> str:
+    value = str(os.environ.get("LLS_TASK_SOURCE") or "local").strip().lower()
+    if value in {"r2", "data_lake", "registry"}:
+        return "r2"
+    return "local"
+
+
+def _r2_task_source_enabled() -> bool:
+    return _task_source_mode() == "r2"
 
 
 def _count_lines(path: Path) -> int:
@@ -203,6 +216,48 @@ class _Handler(BaseHTTPRequestHandler):
         run_dir = self.runs_root / task / run
         return run_dir if run_dir.is_dir() else None
 
+    def _sync_tasks_if_needed(self):
+        if not _r2_task_source_enabled():
+            return None
+        from .task_registry import sync_tasks_from_registry
+
+        return sync_tasks_from_registry(self.tasks_root, registry_uri=task_registry_uri())
+
+    def _list_tasks(self) -> list[dict]:
+        synced = self._sync_tasks_if_needed()
+        tasks = pipeline.list_tasks(self.tasks_root)
+        if synced is None:
+            return tasks
+        active = synced.tasks
+        out: list[dict] = []
+        for task in tasks:
+            task_id = task.get("task_id")
+            if task_id not in active:
+                continue
+            item = dict(task)
+            item["source"] = "R2 数据湖"
+            item["deletable"] = False
+            item["task_uri"] = active[task_id]["task_uri"]
+            item["registry_uri"] = synced.registry_uri
+            out.append(item)
+        return out
+
+    def _load_task_by_id(self, task_id: str):
+        synced = self._sync_tasks_if_needed()
+        if synced is not None and task_id not in synced.tasks:
+            raise ValueError(f"任务未在 R2 数据湖登记表中登记为启用状态: {task_id}")
+        return pipeline.load_task_by_id(self.tasks_root, task_id)
+
+    def _resolve_action_task_path(self, task_path: str) -> str:
+        synced = self._sync_tasks_if_needed()
+        if synced is None:
+            return task_path
+        task = load_task(task_path)
+        meta = synced.tasks.get(task.task_id)
+        if not meta:
+            raise ValueError(f"任务未在 R2 数据湖登记表中登记为启用状态: {task.task_id}")
+        return str(meta["path"])
+
     def _serve_static(self, path: str) -> bool:
         if not self.static_dir:
             return False
@@ -261,20 +316,25 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json({"gold": list_gold(self.runs_root, task)})
         elif path == "/api/tasks":
-            self._json({"tasks": pipeline.list_tasks(self.tasks_root)})
+            try:
+                self._json({"tasks": self._list_tasks()})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/task/profile":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                task_cfg = self._load_task_by_id(task)
                 self._json(pipeline.task_profile_status(self.runs_root, task_cfg))
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/config":
             self._json({
                 "allow_data_lake_overrides": _allow_data_lake_overrides(),
+                "task_source": _task_source_mode(),
+                "task_registry_uri": task_registry_uri() if _r2_task_source_enabled() else None,
             })
         elif path == "/api/task/runs":
             task = params.get("task_id", [""])[0]
@@ -294,7 +354,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                task_cfg = self._load_task_by_id(task)
                 self._json({"imports": pipeline.list_imports(self.runs_root, task, id_field=task_cfg.id_field)})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
@@ -302,7 +362,7 @@ class _Handler(BaseHTTPRequestHandler):
             task = params.get("task_id", [""])[0]
             import_id = params.get("import_id", [""])[0]
             try:
-                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                task_cfg = self._load_task_by_id(task)
                 self._json({"import": pipeline.import_detail(self.runs_root, task, import_id, id_field=task_cfg.id_field)})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
@@ -379,7 +439,7 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 from .data_lake import preview_source
 
-                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                task_cfg = self._load_task_by_id(task)
                 self._json({
                     "enabled": bool(task_cfg.data_lake),
                     "data_lake": task_cfg.data_lake,
@@ -455,13 +515,16 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "task and action required"}, status=400)
                 return
             try:
-                job = pipeline.start_action(self.runs_root, task_path, action, body.get("params", {}))
+                job = pipeline.start_action(self.runs_root, self._resolve_action_task_path(task_path), action, body.get("params", {}))
                 self._json({"ok": True, "job": job})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/tasks":
             body = self._read_body()
             try:
+                if _r2_task_source_enabled():
+                    self._json({"error": "生产模式任务必须从 R2 数据湖登记表拉取，不能在面板中新建本地任务"}, status=400)
+                    return
                 if not _allow_data_lake_overrides() and "data_lake" in body:
                     body = dict(body)
                     body.pop("data_lake", None)
@@ -486,6 +549,9 @@ class _Handler(BaseHTTPRequestHandler):
             task_id = params.get("task_id", [""])[0]
             delete_runs = params.get("delete_runs", ["0"])[0] in {"1", "true", "yes"}
             try:
+                if _r2_task_source_enabled():
+                    self._json({"error": "生产模式任务来自 R2 数据湖登记表，不能在面板中归档本地缓存；请在登记表中标记为非启用状态"}, status=400)
+                    return
                 self._json({
                     "ok": True,
                     "task": pipeline.delete_task(
@@ -543,7 +609,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, status=400)
             return
         try:
-            task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+            task_cfg = self._load_task_by_id(task)
             result = pipeline.save_import(self.runs_root, task_cfg, name, rows, source="upload")
             self._json({"ok": True, "import": result})
         except Exception as exc:
@@ -569,7 +635,7 @@ class _Handler(BaseHTTPRequestHandler):
         overrides = provided_overrides if _allow_data_lake_overrides() else {}
         max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
         try:
-            task_cfg = pipeline.load_task_by_id(self.tasks_root, task_id)
+            task_cfg = self._load_task_by_id(task_id)
             result = pipeline.import_from_data_lake(
                 self.runs_root,
                 task_cfg,

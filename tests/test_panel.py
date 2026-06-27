@@ -39,6 +39,15 @@ def test_basic_auth_roundtrip():
     assert not hmac.compare_digest(pw, "wrong")
 
 
+def test_task_source_mode_defaults_to_local(monkeypatch):
+    monkeypatch.delenv("LLS_TASK_SOURCE", raising=False)
+    assert panel._task_source_mode() == "local"
+    monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    assert panel._task_source_mode() == "r2"
+    monkeypatch.setenv("LLS_TASK_SOURCE", "data_lake")
+    assert panel._task_source_mode() == "r2"
+
+
 def test_run_detail_and_pools(panel_workspace):
     runs = panel.discover_runs(panel_workspace["runs_root"])
     demo = next(r for r in runs if r["run_id"] == "demo")

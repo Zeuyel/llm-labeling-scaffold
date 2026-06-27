@@ -72,7 +72,15 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-compose=(docker compose)
+task_source="$(env_value LLS_TASK_SOURCE r2)"
+compose=(docker compose -f docker-compose.yml)
+case "${task_source,,}" in
+  local)
+    ;;
+  *)
+    compose+=(-f docker-compose.rclone.example.yml)
+    ;;
+esac
 services=(panel argilla argilla-worker argilla-postgres elasticsearch redis)
 if [ "$enable_mlflow" -eq 1 ]; then
   compose+=(--profile mlflow)

@@ -26,6 +26,8 @@ services:
       - MLFLOW_TRACKING_URI
       - RCLONE_CONFIG=${RCLONE_CONFIG:-/run/secrets/rclone/rclone.conf}
       - LLS_RCLONE_TIMEOUT_SECONDS=${LLS_RCLONE_TIMEOUT_SECONDS:-120}
+      - LLS_TASK_SOURCE=${LLS_TASK_SOURCE:-r2}
+      - LLS_TASK_REGISTRY_URI=${LLS_TASK_REGISTRY_URI:-r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml}
     volumes:
       - ./runs:/app/runs
       - ./tasks:/app/tasks
