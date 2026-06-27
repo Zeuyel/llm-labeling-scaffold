@@ -176,7 +176,7 @@ export default function TasksPage({
       <div className="toolbar">
         <div className="toolbar-stack">
           <span className="muted">{tasks.length} 个任务{r2TaskSource && taskRegistryUri ? ` · ${taskRegistryUri}` : ""}</span>
-          {r2TaskSource && <span className="status-line">从系统设置中的 R2 登记表同步</span>}
+          {r2TaskSource && <span className="status-line">从 registry/data_lake.yaml 同步 task_id 到 task_uri，再读取任务配置。</span>}
         </div>
         <div className="action-row">
           {!r2TaskSource && (

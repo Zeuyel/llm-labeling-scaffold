@@ -1128,6 +1128,49 @@ def import_from_data_lake(runs_root: str | Path, task, import_id: str | None = N
             source.local_path.unlink()
 
 
+def start_data_lake_import(runs_root: str | Path, task, import_id: str | None = None,
+                           overrides: dict[str, Any] | None = None,
+                           max_bytes: int | None = None) -> dict:
+    overrides = dict(overrides or {})
+    params = {
+        "task_id": task.task_id,
+        "import_id": import_id,
+        "overrides": overrides,
+        "max_bytes": max_bytes,
+    }
+    job = create_job("data_lake_import", params, _jobs_dir(Path(runs_root), task.task_id))
+
+    def target(j: Job) -> dict:
+        j.log(f"data_lake_import task={task.task_id}")
+        if import_id:
+            j.log(f"requested_import_id={import_id}")
+        if overrides:
+            j.log("使用 data_lake override 配置执行导入")
+        lock_name = f"data-lake-import-{import_id or 'default'}"
+        with _asset_lock(runs_root, task.task_id, lock_name):
+            result = import_from_data_lake(
+                runs_root,
+                task,
+                import_id=import_id,
+                overrides=overrides,
+                max_bytes=max_bytes,
+            )
+        j.log(
+            "导入完成 "
+            f"import_id={result.get('import_id')} rows={result.get('rows')} action={result.get('action')}"
+        )
+        return {
+            "kind": "import",
+            "import_id": result.get("import_id"),
+            "action": result.get("action"),
+            "rows": result.get("rows"),
+            "import": result,
+        }
+
+    run_job(job, target)
+    return job.to_dict()
+
+
 def _profile_jsonl_from_rows(rows: list[dict], id_field: str | None = None) -> dict[str, Any]:
     fields: list[str] = []
     seen_fields: set[str] = set()

@@ -24,6 +24,63 @@ def _stage_status(profile: dict, stage_id: str) -> str:
     return next(stage["status"] for stage in profile["stages"] if stage["id"] == stage_id)
 
 
+def _create_local_data_lake_task(tmp_path: Path, *, task_id: str = "data_task"):
+    source = tmp_path / f"{task_id}_lake_source.jsonl"
+    source.write_text(
+        '{"record_id":"r1","title":"A"}\n{"record_id":"r2","title":"B"}\n',
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / f"{task_id}_manifest.json"
+    write_json(
+        {
+            "dataset_id": f"{task_id}_lake_seed",
+            "layer": "labels",
+            "domain": "patent",
+            "objects": [
+                {
+                    "path": "inputs/manual_seed/v1/raw.jsonl",
+                    "storage_uri": str(source),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 2,
+                    "id_field": "record_id",
+                    "unique_ids": 2,
+                    "bytes": source.stat().st_size,
+                    "sha256": _file_sha256(source),
+                    "created_by": "tests",
+                    "upstream_uri": ["r2:test/upstream/source.jsonl"],
+                    "sampling_strategy": "unit_test_seed",
+                }
+            ],
+        },
+        manifest_path,
+    )
+    registry_path = tmp_path / f"{task_id}_data_lake.yaml"
+    registry_path.write_text(
+        yaml.safe_dump(
+            {"datasets": {f"{task_id}_lake_seed": {"manifest": str(manifest_path)}}},
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": task_id,
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+            "data_lake": {
+                "lake_registry_uri": str(registry_path),
+                "source_dataset_id": f"{task_id}_lake_seed",
+                "source_object_path": "inputs/manual_seed/v1/raw.jsonl",
+                "default_import_id": "lake_import",
+            },
+        },
+    )
+    return load_task(created["path"]), source
+
+
 def test_create_task_writes_custom_task_with_auxiliary_labels(tmp_path: Path):
     task = pipeline.create_task(
         tmp_path,
@@ -384,6 +441,31 @@ def test_import_from_data_lake_manifest_records_lineage(tmp_path: Path):
         assert "血缘不同" in str(exc)
     else:
         raise AssertionError("same import id with different lake lineage should fail")
+
+
+def test_start_data_lake_import_job_writes_import_manifest(tmp_path: Path):
+    task, source = _create_local_data_lake_task(tmp_path)
+
+    with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
+        job = pipeline.start_data_lake_import(tmp_path / "runs", task)
+        current = None
+        for _ in range(100):
+            current = next(
+                (item for item in pipeline.jobs_for_task(tmp_path / "runs", task.task_id) if item["id"] == job["id"]),
+                None,
+            )
+            if current and current["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.05)
+
+    assert current and current["status"] == "succeeded"
+    assert current["kind"] == "data_lake_import"
+    assert current["result"]["import_id"] == "lake_import"
+    manifest_path = tmp_path / "runs" / task.task_id / "imports" / "lake_import" / "manifest.json"
+    assert manifest_path.exists()
+    manifest = read_json(manifest_path)
+    assert manifest["source"] == "data_lake"
+    assert manifest["source_object_sha256"] == _file_sha256(source)
 
 
 def test_data_lake_import_accepts_source_path_relative_to_canonical_uri(tmp_path: Path):

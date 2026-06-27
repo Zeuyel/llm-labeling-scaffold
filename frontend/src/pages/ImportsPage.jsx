@@ -18,6 +18,28 @@ function stateLabel(value) {
   return value || "-";
 }
 
+const JOB_STATUS_LABEL = {
+  pending: "等待中",
+  queued: "排队中",
+  running: "运行中",
+  in_progress: "运行中",
+  started: "运行中",
+  succeeded: "成功",
+  success: "成功",
+  completed: "已完成",
+  complete: "已完成",
+  done: "已完成",
+  finished: "已完成",
+  failed: "失败",
+  error: "失败",
+  cancelled: "已取消",
+  canceled: "已取消",
+};
+
+const JOB_ACTIVE_STATUSES = new Set(["pending", "queued", "running", "in_progress", "started"]);
+const JOB_SUCCESS_STATUSES = new Set(["succeeded", "success", "completed", "complete", "done", "finished"]);
+const JOB_FAILED_STATUSES = new Set(["failed", "error", "cancelled", "canceled"]);
+
 const DATA_LAKE_SOURCE_FIELDS = [
   "source_dataset_id",
   "source_object_path",
@@ -31,7 +53,103 @@ function hasEffectiveDataLakeConfig(dataLake) {
   return DATA_LAKE_SOURCE_FIELDS.some((field) => typeof dataLake[field] === "string" && dataLake[field].trim() !== "");
 }
 
-export default function ImportsPage({ task, taskId, onError }) {
+function normalizeStatus(value) {
+  return String(value || "pending").toLowerCase();
+}
+
+function jobStatusLabel(value) {
+  const status = normalizeStatus(value);
+  return JOB_STATUS_LABEL[status] || value || "-";
+}
+
+function jobBadgeClass(value) {
+  const status = normalizeStatus(value);
+  if (JOB_SUCCESS_STATUSES.has(status)) return "badge-green";
+  if (JOB_FAILED_STATUSES.has(status)) return "badge-red";
+  if (JOB_ACTIVE_STATUSES.has(status)) return "badge-blue";
+  return "badge-gray";
+}
+
+function isActiveJob(job) {
+  return Boolean(job?.id && JOB_ACTIVE_STATUSES.has(normalizeStatus(job.status)));
+}
+
+function normalizeJob(job) {
+  if (!job || typeof job !== "object") return null;
+  const id = job.id || job.job_id;
+  return id ? { ...job, id } : null;
+}
+
+function findJob(jobs, jobId) {
+  return (jobs || []).find((job) => job.id === jobId || job.job_id === jobId) || null;
+}
+
+function jobErrorText(job) {
+  if (!job) return "后端未返回错误详情";
+  if (job.error) return String(job.error);
+  if (job.result?.error) return String(job.result.error);
+  return "后端未返回错误详情";
+}
+
+function extractImport(value) {
+  if (!value || typeof value !== "object") return null;
+  const direct = value.import || value.result?.import || value.result || value;
+  if (!direct || typeof direct !== "object") return null;
+  if (direct.import_id || direct.action || direct.path || direct.rows !== undefined) return direct;
+  return null;
+}
+
+function importedId(value, fallback = "") {
+  const imported = extractImport(value);
+  return imported?.import_id || value?.import_id || value?.result?.import_id || fallback || "";
+}
+
+function completionNotice(imported, savedText) {
+  if (imported?.action === "reused") return "导入内容与已有数据一致，已幂等复用。下一步：样本抽取。";
+  return `${savedText}下一步：样本抽取。`;
+}
+
+function truthyFlag(value) {
+  if (value === true) return true;
+  if (typeof value === "number") return value === 1;
+  if (typeof value === "string") return ["1", "true", "yes", "on", "enabled"].includes(value.trim().toLowerCase());
+  return false;
+}
+
+function usesR2TaskSource(taskSource, task) {
+  const sources = [taskSource, task?.task_source, task?.source_type, task?.source];
+  return sources.some((value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    return normalized === "r2" || normalized.startsWith("r2:");
+  });
+}
+
+function usesLocalTaskSource(taskSource) {
+  const normalized = String(taskSource || "").trim().toLowerCase();
+  return normalized === "local" || normalized.startsWith("local:");
+}
+
+function backendAllowsManualImports(task, allowManualImports) {
+  return [
+    allowManualImports,
+    task?.allow_manual_imports,
+    task?.allow_manual_import,
+    task?.manual_imports_enabled,
+    task?.features?.allow_manual_imports,
+    task?.capabilities?.allow_manual_imports,
+    task?.permissions?.allow_manual_imports,
+  ].some(truthyFlag);
+}
+
+export default function ImportsPage({
+  task,
+  taskId,
+  taskSource = "",
+  allowManualImports = false,
+  settingsReady = false,
+  settingsError = "",
+  onError,
+}) {
   const [items, setItems] = useState([]);
   const [name, setName] = useState("");
   const [text, setText] = useState("");
@@ -45,6 +163,8 @@ export default function ImportsPage({ task, taskId, onError }) {
   const [rowsData, setRowsData] = useState({ rows: [], fields: [], total: 0, offset: 0, limit: 25 });
   const [query, setQuery] = useState("");
   const [notice, setNotice] = useState("");
+  const [lakeJob, setLakeJob] = useState(null);
+  const [completedImport, setCompletedImport] = useState(null);
 
   const selected = useMemo(
     () => items.find((item) => item.import_id === selectedId) || null,
@@ -52,6 +172,12 @@ export default function ImportsPage({ task, taskId, onError }) {
   );
   const dataLake = task?.data_lake || null;
   const hasDataLakeConfig = hasEffectiveDataLakeConfig(dataLake);
+  const r2TaskSource = usesR2TaskSource(taskSource, task);
+  const localTaskSource = usesLocalTaskSource(taskSource);
+  const settingsAvailable = settingsReady && !settingsError;
+  const manualAllowed = backendAllowsManualImports(task, allowManualImports);
+  const showManualImports = settingsAvailable && localTaskSource && !r2TaskSource && manualAllowed;
+  const lakeWorking = lakeBusy || isActiveJob(lakeJob);
 
   const reload = useCallback(async () => {
     if (!taskId) return;
@@ -87,6 +213,8 @@ export default function ImportsPage({ task, taskId, onError }) {
     const configured = task?.data_lake || {};
     setLakeImportId(configured.default_import_id || "");
     setLakeStatus(null);
+    setLakeJob(null);
+    setCompletedImport(null);
   }, [task?.task_id, task?.data_lake]);
 
   useEffect(() => {
@@ -111,12 +239,14 @@ export default function ImportsPage({ task, taskId, onError }) {
     try {
       const result = await api.importJsonl(taskId, name.trim(), text);
       const imported = result.import || result;
-      setNotice(imported.action === "reused" ? "导入内容与已有数据一致，已幂等复用原导入。" : "导入数据已保存。");
+      const nextImportId = imported.import_id || name.trim();
+      setNotice(completionNotice(imported, "导入数据已保存。"));
+      setCompletedImport({ import_id: nextImportId, source: "manual" });
       setName("");
       setText("");
       setFileLabel("");
       await reload();
-      setSelectedId(imported.import_id || name.trim());
+      setSelectedId(nextImportId);
     } catch (error) {
       onError(String(error));
     } finally {
@@ -162,7 +292,7 @@ export default function ImportsPage({ task, taskId, onError }) {
   async function checkDataLake() {
     if (!taskId) return;
     if (!hasDataLakeConfig) {
-      onError("当前任务未配置数据湖来源，请在 R2 任务配置中登记 data_lake 后同步任务。");
+      onError("当前任务没有 data_lake 来源。需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。");
       return;
     }
     setLakeBusy(true);
@@ -182,23 +312,82 @@ export default function ImportsPage({ task, taskId, onError }) {
   async function importLake() {
     if (!taskId) return;
     if (!hasDataLakeConfig) {
-      onError("当前任务未配置数据湖来源，请在 R2 任务配置中登记 data_lake 后同步任务。");
+      onError("当前任务没有 data_lake 来源。需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。");
       return;
     }
     setLakeBusy(true);
     setNotice("");
+    setLakeJob(null);
+    setCompletedImport(null);
     try {
       const result = await api.importFromDataLake(taskId, { import_id: lakeImportId.trim() });
-      const imported = result.import || result;
-      setNotice(imported.action === "reused" ? "数据湖内容与已有导入一致，已幂等复用。" : "已从数据湖生成本地导入。");
+      const job = normalizeJob(result.job || result.import_job || result.data?.job || (result.ok ? result : null));
+      if (job) {
+        setLakeJob(job);
+        setNotice("已提交数据湖导入任务，正在轮询执行状态。");
+        if (!isActiveJob(job)) await finishLakeJob(job);
+        return;
+      }
+
+      const imported = extractImport(result);
+      const nextImportId = importedId(result, lakeImportId.trim());
+      setNotice(completionNotice(imported, "已从数据湖生成本地导入。"));
+      setCompletedImport({ import_id: nextImportId, source: "data_lake" });
       await reload();
-      setSelectedId(imported.import_id || lakeImportId.trim());
+      if (nextImportId) setSelectedId(nextImportId);
     } catch (error) {
       onError(String(error));
     } finally {
       setLakeBusy(false);
     }
   }
+
+  const finishLakeJob = useCallback(async (job) => {
+    const status = normalizeStatus(job?.status);
+    if (JOB_SUCCESS_STATUSES.has(status)) {
+      const imported = extractImport(job);
+      const nextImportId = importedId(job, lakeImportId.trim());
+      setNotice(completionNotice(imported, "数据湖导入已完成。"));
+      setCompletedImport({ import_id: nextImportId, source: "data_lake" });
+      await reload();
+      if (nextImportId) setSelectedId(nextImportId);
+    } else if (JOB_FAILED_STATUSES.has(status)) {
+      setNotice("数据湖导入未完成，请查看任务状态和错误信息。");
+      onError(`数据湖导入失败：${jobErrorText(job)}`);
+    }
+    setLakeBusy(false);
+  }, [lakeImportId, onError, reload]);
+
+  useEffect(() => {
+    if (!taskId || !isActiveJob(lakeJob)) return undefined;
+    const jobId = lakeJob.id;
+    let stopped = false;
+    let inflight = false;
+
+    async function pollJob() {
+      if (inflight) return;
+      inflight = true;
+      try {
+        const data = await api.getJobs(taskId);
+        const latest = normalizeJob(findJob(data.jobs || [], jobId));
+        if (!stopped && latest) {
+          setLakeJob(latest);
+          if (!isActiveJob(latest)) await finishLakeJob(latest);
+        }
+      } catch (error) {
+        if (!stopped) onError(String(error));
+      } finally {
+        inflight = false;
+      }
+    }
+
+    pollJob();
+    const timer = window.setInterval(pollJob, 2000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [taskId, lakeJob?.id, lakeJob?.status, finishLakeJob, onError]);
 
   function searchRows() {
     loadRows(selectedId, { offset: 0, query });
@@ -218,10 +407,25 @@ export default function ImportsPage({ task, taskId, onError }) {
       </div>
       <div className="page-header">
         <h2>数据导入</h2>
-        <p>导入数据按不可覆盖资产管理；同名同内容幂等复用，同名不同内容拒绝写入</p>
+        <p>生产路径优先从 R2 数据湖读取；导入数据按不可覆盖资产管理，同名同内容幂等复用。</p>
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
+      {completedImport && (
+        <div className="card section-card next-step-card">
+          <div>
+            <h3>下一步：样本抽取</h3>
+            <p>
+              {completedImport.import_id ? `导入 ${completedImport.import_id} 已可用。` : "导入已可用。"}
+              可以回到任务概览查看 profile 阶段，也可以进入样本管理创建样本。
+            </p>
+          </div>
+          <div className="action-row">
+            <Link className="btn" to={`/task/${encodeURIComponent(taskId)}`}>回到任务概览</Link>
+            <Link className="btn btn-primary" to={`/task/${encodeURIComponent(taskId)}/samples`}>进入样本管理</Link>
+          </div>
+        </div>
+      )}
 
       <div className={hasDataLakeConfig ? "card section-card primary-import-card" : "card section-card primary-import-card muted-import-card"}>
         <div className="toolbar">
@@ -230,10 +434,10 @@ export default function ImportsPage({ task, taskId, onError }) {
             <div className="status-line">
               {hasDataLakeConfig
                 ? "按任务配置读取 R2 数据湖清单文件，并生成当前任务的本地导入缓存"
-                : "当前任务未配置数据湖来源，请在 R2 任务配置中登记 data_lake 后同步任务。"}
+                : "当前任务没有 data_lake 来源。需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。"}
             </div>
           </div>
-          {!hasDataLakeConfig && <Link to="/" className="btn btn-sm">去同步任务配置</Link>}
+          {!hasDataLakeConfig && <Link to="/" className="btn btn-sm">去任务列表同步</Link>}
         </div>
         {hasDataLakeConfig ? (
           <>
@@ -260,23 +464,47 @@ export default function ImportsPage({ task, taskId, onError }) {
               <div><span>选中对象大小</span><strong>{lakeStatus.selected_object?.bytes ?? "-"}</strong></div>
             </div>
           )}
+          {lakeJob && (
+            <div className="job-panel">
+              <div className="toolbar">
+                <div>
+                  <h3>导入任务状态</h3>
+                  <div className="status-line">执行编号：<span className="mono-cell">{lakeJob.id}</span></div>
+                </div>
+                <span className={`badge ${jobBadgeClass(lakeJob.status)}`}>{jobStatusLabel(lakeJob.status)}</span>
+              </div>
+              <div className="job-grid">
+                <div><span>轮询状态</span><strong>{isActiveJob(lakeJob) ? "每 2 秒刷新" : "已停止"}</strong></div>
+                <div><span>创建时间</span><strong>{(lakeJob.created_at || "").slice(0, 19) || "-"}</strong></div>
+                <div><span>最近更新</span><strong>{(lakeJob.updated_at || lakeJob.finished_at || "").slice(0, 19) || "-"}</strong></div>
+              </div>
+              {JOB_FAILED_STATUSES.has(normalizeStatus(lakeJob.status)) && (
+                <div className="status-line danger-line">错误：{jobErrorText(lakeJob)}</div>
+              )}
+            </div>
+          )}
           <div className="action-row">
-            <button className="btn btn-primary" disabled={lakeBusy} onClick={importLake}>
-              {lakeBusy ? "导入中..." : "从数据湖生成导入"}
+            <button className="btn btn-primary" disabled={lakeWorking} onClick={importLake}>
+              {lakeWorking ? "导入任务执行中..." : "从数据湖导入"}
             </button>
-            <button className="btn" disabled={lakeBusy} onClick={checkDataLake}>检查配置</button>
+            <button className="btn" disabled={lakeWorking} onClick={checkDataLake}>检查配置</button>
           </div>
           </>
         ) : (
           <div className="info-callout">
-            <strong>当前任务未配置数据湖来源</strong>
-            <p>请在 R2 任务配置中登记 data_lake 后同步任务。</p>
+            <strong>当前任务没有 data_lake 来源</strong>
+            <p>需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。</p>
           </div>
         )}
       </div>
 
-      <div className="card section-card">
-        <h3>手动新增导入</h3>
+      {showManualImports && (
+      <div className="card section-card manual-import-card">
+        <div className="toolbar">
+          <div>
+            <h3>手动新增导入</h3>
+          </div>
+        </div>
         <div className="form-grid">
           <div className="field">
             <label>导入编号</label>
@@ -300,6 +528,7 @@ export default function ImportsPage({ task, taskId, onError }) {
         </div>
         <button className="btn" disabled={busy} onClick={submit}>保存手动导入</button>
       </div>
+      )}
 
       <div className="card section-card">
         <div className="toolbar">

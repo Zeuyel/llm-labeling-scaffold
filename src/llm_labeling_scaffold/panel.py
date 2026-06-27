@@ -35,6 +35,10 @@ def _allow_data_lake_overrides() -> bool:
     return panel_settings.allow_data_lake_overrides()
 
 
+def _allow_manual_imports() -> bool:
+    return panel_settings.allow_manual_imports()
+
+
 def _task_source_mode() -> str:
     return panel_settings.task_source_mode()
 
@@ -630,6 +634,9 @@ class _Handler(BaseHTTPRequestHandler):
         if not _safe_segment(task) or not _safe_segment(name):
             self._json({"error": "bad task/name"}, status=400)
             return
+        if not _allow_manual_imports():
+            self._json({"error": "生产模式不允许手动上传或粘贴导入；请使用 task.yaml 中的 data_lake 配置从数据湖导入"}, status=400)
+            return
         length = int(self.headers.get("Content-Length", "0") or "0")
         max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
         if length <= 0:
@@ -673,14 +680,14 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             _apply_runtime_settings(self.runs_root)
             task_cfg = self._load_task_by_id(task_id)
-            result = pipeline.import_from_data_lake(
+            job = pipeline.start_data_lake_import(
                 self.runs_root,
                 task_cfg,
                 import_id=import_id or None,
                 overrides=overrides,
                 max_bytes=max_bytes,
             )
-            self._json({"ok": True, "import": result})
+            self._json({"ok": True, "job": job})
         except Exception as exc:
             self._json({"error": str(exc)}, status=400)
 

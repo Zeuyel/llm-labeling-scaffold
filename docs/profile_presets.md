@@ -8,7 +8,8 @@
 - `profile`：任务绑定的执行模板。面板按它生成阶段计划、默认编号、默认参数和质量控制点。
 - `profile preset`：可复用的 profile 名称，例如 `manual_labeling_cv_v1`。任务通常只引用 preset，必要时再写少量覆盖参数。
 - `profile registry`：平台可加载的 profile 预设集合。它和数据湖 registry 不是同一个概念；前者描述执行流程，后者登记数据集和 manifest。
-- `data lake registry`：数据湖治理登记表，记录数据集编号、层级、领域和 manifest URI。
+- `data lake registry`：数据湖治理登记表，记录任务、数据集编号、层级、领域和 manifest URI。
+- `task_registry_uri`：当前部署使用的数据湖治理登记表地址，一般是 `data_lake.yaml`。它不是 `task.yaml`；登记表中的 `tasks.<task_id>.task_uri` 才指向具体任务文件。
 - `manifest`：资产清单。导入、样本、标注分发、标注结果、训练集、模型和推理结果都要写 manifest，用于记录来源、路径、行数、哈希、时间和状态。
 - `import`：任务级导入数据，落到 `runs/<task_id>/imports/<import_id>/raw.jsonl`。来自 R2 数据湖时，它只是执行缓存，权威来源仍是数据湖 manifest。
 - `sample`：从 import 或任务输入抽取出的待标注样本，落到 `runs/<task_id>/samples/<sample_id>/sample.jsonl`。
@@ -25,7 +26,7 @@
 
 默认执行顺序：
 
-1. `import`：上传、粘贴或从数据湖 materialize 任务级 JSONL。
+1. `import`：生产模式从 R2 数据湖 materialize 任务级 JSONL；上传或粘贴只作为本地开发能力。
 2. `sample`：从导入数据创建样本，写入样本 manifest。
 3. `distribute`：把样本推送到 Argilla，写入 `annotation_job` manifest。
 4. `collect`：从 Argilla 拉回标注结果，写入 `decision_artifact` manifest。
@@ -35,6 +36,8 @@
 8. `inference`：用模型对指定 corpus 执行批量推理。
 
 生产环境中，profile 不能覆盖数据湖权威字段。`lake_registry_uri`、`source_dataset_id`、`source_manifest_uri`、`source_object_path` 仍由 `task.yaml` 的 `data_lake` 配置决定；只有开发排查时才允许用 `LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 临时覆盖。
+
+R2 导入阶段应作为异步 job 执行：job 下载源对象、校验 manifest 中的大小、哈希、行数和 ID 约束，再原子提交本地 import。页面只通过 job 状态反馈进度。导入完成后的 profile 下一步固定是 `sample`，即从该 import 抽取待标注样本。
 
 ## `task.yaml` 引用方式
 
@@ -160,7 +163,7 @@ manual_labeling_cv_v1:
 
 说明：
 
-- `import.source=data_lake` 表示优先按 `task.yaml` 中的 `data_lake` 配置生成导入；没有 `data_lake` 的任务可由面板上传或粘贴生成 import。
+- `import.source=data_lake` 表示按 `task.yaml` 中的 `data_lake` 配置从 R2 数据湖生成导入。生产模式下不能用面板上传或粘贴替代数据湖来源；没有 `data_lake` 的任务只应在本地开发或测试模式下用上传、粘贴生成 import。
 - `sample.strategy=head` 适合数据湖上游已经完成抽样的人工种子集；若要由 scaffold 抽样，可覆盖为 `random` 并设置 `seed`。
 - `distribute.include_labels` 要求 Argilla 同步主标签和辅助标签，避免训练集只保留主标签。
 - `quality.on_failure=block_gold` 表示质量门槛未过时不能构建 `gold`。

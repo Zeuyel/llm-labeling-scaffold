@@ -23,6 +23,7 @@ def _clear_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "LLS_DATA_LAKE_R2_PREFIX",
         "LLS_PANEL_SETTINGS_PATH",
         "LLS_ALLOW_DATA_LAKE_OVERRIDES",
+        "LLS_ALLOW_MANUAL_IMPORTS",
         "RCLONE_CONFIG",
         "LLS_RCLONE_CONFIG",
     ):
@@ -87,6 +88,7 @@ def test_settings_api_saves_and_reads_runtime_settings(tmp_path: Path, monkeypat
             "task_registry_uri": "",
             "data_lake_r2_prefix": "",
             "allow_data_lake_overrides": False,
+            "allow_manual_imports": True,
             "rclone_config_path": None,
         }
         assert "ai-innovation" not in json.dumps(payload, ensure_ascii=False)

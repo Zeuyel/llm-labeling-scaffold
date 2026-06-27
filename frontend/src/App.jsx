@@ -27,16 +27,19 @@ const ROUTES = [
 
 const DEFAULT_SETTINGS = {
   allow_data_lake_overrides: false,
+  allow_manual_imports: false,
   data_lake_r2_prefix: "",
   rclone_config_path: "",
   task_registry_uri: "",
-  task_source: "local",
+  task_source: "r2",
 };
 
 function Shell() {
   const { path } = useRouter();
   const [tasks, setTasks] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [settingsReady, setSettingsReady] = useState(false);
+  const [settingsError, setSettingsError] = useState("");
   const [err, setErr] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("lls.sidebarCollapsed") === "1");
 
@@ -44,11 +47,23 @@ function Shell() {
     api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
   []);
   useEffect(() => { loadTasks(); }, [loadTasks]);
-  const loadSettings = useCallback(() =>
-    api.getSettings()
-      .then((d) => setSettings({ ...DEFAULT_SETTINGS, ...(d || {}) }))
-      .catch(() => setSettings(DEFAULT_SETTINGS)),
-  []);
+  const handleSettingsLoadError = useCallback((error) => {
+    const message = `设置读取失败：${String(error)}`;
+    setSettings(DEFAULT_SETTINGS);
+    setSettingsError(message);
+    setSettingsReady(true);
+    setErr(message);
+  }, []);
+  const loadSettings = useCallback(() => {
+    setSettingsReady(false);
+    return api.getSettings()
+      .then((d) => {
+        setSettings({ ...DEFAULT_SETTINGS, ...(d || {}) });
+        setSettingsError("");
+      })
+      .catch(handleSettingsLoadError)
+      .finally(() => setSettingsReady(true));
+  }, [handleSettingsLoadError]);
   useEffect(() => {
     loadSettings();
   }, [loadSettings]);
@@ -63,10 +78,13 @@ function Shell() {
 
   async function handleSettingsSaved(next) {
     setSettings({ ...DEFAULT_SETTINGS, ...(next || {}) });
+    setSettingsError("");
+    setSettingsReady(true);
     await loadTasks();
   }
 
   const common = { onError: setErr };
+  const settingsAvailable = settingsReady && !settingsError;
   let page = null;
   if (matched.page === "tasks") page = (
     <TasksPage
@@ -78,9 +96,26 @@ function Shell() {
       {...common}
     />
   );
-  else if (matched.page === "settings") page = <SettingsPage settings={settings} onSettingsSaved={handleSettingsSaved} {...common} />;
+  else if (matched.page === "settings") page = (
+    <SettingsPage
+      settings={settings}
+      onSettingsSaved={handleSettingsSaved}
+      onSettingsLoadError={handleSettingsLoadError}
+      {...common}
+    />
+  );
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "imports") page = <ImportsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "imports") page = (
+    <ImportsPage
+      task={taskOf(activeTaskId)}
+      taskId={activeTaskId}
+      taskSource={settingsAvailable ? (settings.task_source || "") : ""}
+      allowManualImports={settingsAvailable && Boolean(settings.allow_manual_imports || settings.manual_imports_enabled)}
+      settingsReady={settingsReady}
+      settingsError={settingsError}
+      {...common}
+    />
+  );
   else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "annotations") page = <RunsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "jobs") page = <JobsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;

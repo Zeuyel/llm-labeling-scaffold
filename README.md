@@ -84,11 +84,11 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 平台部署时按三层管理配置和数据：
 
-1. **R2 数据湖 / registry 是权威层**：任务列表、任务快照、源数据 manifest、任务级输入对象以及需要回写的数据湖产物，都以 R2 registry 中登记的 URI 为准。
+1. **R2 数据湖 / registry 是权威层**：任务列表、任务快照、源数据 manifest、任务级输入对象以及需要回写的数据湖产物，都以 R2 registry 中登记的 URI 为准。`task_registry_uri` 指向数据湖治理登记表，通常是 `governance/data_lake/v1/current/data_lake.yaml`；登记表中的 `tasks.<task_id>.task_uri` 才指向具体 `task.yaml`，`task_registry_uri` 不是 `task.yaml` 本身。
 2. **panel settings 是运行配置层**：当前部署在“系统设置”中保存 `task_registry_uri` 和 `data_lake_r2_prefix`，决定本控制台连接哪一个 R2 registry 和允许访问哪个 R2 前缀。
 3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 只缓存从 registry 同步下来的任务配置；`runs/` 保存导入、样本、标注结果、训练集、模型、推理结果和审计日志。
 
-服务器部署后，第一步是在轻量控制台的“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，保存后同步任务配置。不要把示例 bucket 当成生产配置；同一套镜像应能连接任意符合约定的 R2 数据湖。
+服务器部署后，第一步是在轻量控制台的“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，保存后同步任务配置。`task_registry_uri` 应填写数据湖治理登记表地址，不要填写某个任务的 `task.yaml`。不要把示例 bucket 当成生产配置；同一套镜像应能连接任意符合约定的 R2 数据湖。
 
 ## 服务器测试
 
@@ -162,7 +162,7 @@ LLS_DATA_LAKE_R2_PREFIX=r2:YOUR_BUCKET/
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
 
-`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。
+`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。`LLS_TASK_REGISTRY_URI` 对应 `task_registry_uri`，应指向数据湖治理登记表，通常是 `data_lake.yaml`；具体任务文件由登记表的 `tasks.<task_id>.task_uri` 指向。
 
 `MLFLOW_TRACKING_URI` 默认不设置。只有需要把训练记录同步到可选模型记录服务时，才设置：
 
@@ -188,11 +188,11 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - `./tasks:/app/tasks`：R2 任务配置的本地执行缓存
 - `./configs:/app/configs:ro`：配置示例
 
-生产面板默认使用 `LLS_TASK_SOURCE=r2`。当前部署应在“系统设置”保存 `task_registry_uri` 和 `data_lake_r2_prefix`；启动兜底值可由 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 提供。刷新或同步任务时，面板会从 registry 读取 `tasks.<任务编号>.task_uri`，把远端 `task.yaml` 同步到 `tasks/<任务编号>/task.yaml` 作为本地缓存。面板不允许新建或归档本地任务配置；任务下线应在 R2 registry 中把对应任务标记为非启用状态。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
+生产面板默认使用 `LLS_TASK_SOURCE=r2`。当前部署应在“系统设置”保存 `task_registry_uri` 和 `data_lake_r2_prefix`；启动兜底值可由 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 提供。`task_registry_uri` 是数据湖治理登记表地址，通常是 `data_lake.yaml`；刷新或同步任务时，面板会从登记表读取 `tasks.<任务编号>.task_uri`，把远端 `task.yaml` 同步到 `tasks/<任务编号>/task.yaml` 作为本地缓存。面板不允许新建或归档本地任务配置；任务下线应在 R2 registry 中把对应任务标记为非启用状态。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
 
-数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
+生产模式下，R2 数据湖是任务输入的权威来源，面板只把登记表和 manifest 指定的任务级 JSONL materialize 到本地 `runs/<task_id>/imports/`。手动上传文件和粘贴导入默认关闭，只能在本地开发或测试模式下开启。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
 
-配置了 `data_lake` 的任务可以直接从 R2 数据湖 manifest 生成本地导入。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。生产面板默认不能覆盖数据湖来源，只按 `task.yaml` 中的治理登记表配置导入；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。Docker 部署时需要叠加 `docker-compose.rclone.example.yml`，把 rclone 配置以只读方式映射到面板容器。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
+配置了 `data_lake` 的任务可以从 R2 数据湖 manifest 生成本地导入。R2 导入是下载、校验和原子提交过程，应作为异步 job 执行；页面通过 job 状态反馈排队、运行、成功或失败。导入成功后，profile 的下一步是从该导入中抽取样本。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。生产面板默认不能覆盖数据湖来源，只按 `task.yaml` 中的治理登记表配置导入；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。Docker 部署时需要叠加 `docker-compose.rclone.example.yml`，把 rclone 配置以只读方式映射到面板容器。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
 
 推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题。拉回标注结果时，这些字段会完整写入 `human_label`，再进入训练集版本构建。
 
@@ -253,7 +253,7 @@ npm run build
 - JSONL 全量推理
 - 本地清单、指标和摘要产物
 - Argilla push / pull 集成
-- 控制台新建任务和上传数据文件
+- 控制台本地开发模式的新建任务和上传数据文件
 - Argilla 完整标签字段同步
 - 可选 MLflow 训练记录
 

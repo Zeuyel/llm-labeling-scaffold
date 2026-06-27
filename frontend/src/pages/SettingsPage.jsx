@@ -5,9 +5,10 @@ import { Link } from "./../router.jsx";
 const DEFAULT_SETTINGS = {
   task_registry_uri: "",
   data_lake_r2_prefix: "",
-  task_source: "local",
+  task_source: "r2",
   rclone_config_path: "",
   allow_data_lake_overrides: false,
+  allow_manual_imports: false,
 };
 
 function mergeSettings(value) {
@@ -24,7 +25,7 @@ function boolLabel(value) {
   return value ? "是" : "否";
 }
 
-export default function SettingsPage({ settings, onSettingsSaved, onError }) {
+export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoadError, onError }) {
   const normalized = useMemo(() => mergeSettings(settings), [settings]);
   const [form, setForm] = useState({
     task_registry_uri: normalized.task_registry_uri,
@@ -71,7 +72,11 @@ export default function SettingsPage({ settings, onSettingsSaved, onError }) {
       await onSettingsSaved?.(fresh);
       setNotice("系统设置已刷新。");
     } catch (error) {
-      onError(String(error));
+      if (onSettingsLoadError) {
+        onSettingsLoadError(error);
+      } else {
+        onError(`设置读取失败：${String(error)}`);
+      }
     } finally {
       setBusy(false);
     }
@@ -84,7 +89,7 @@ export default function SettingsPage({ settings, onSettingsSaved, onError }) {
       </div>
       <div className="page-header">
         <h2>系统设置</h2>
-        <p>配置任务登记表和数据湖导入使用的共享位置，保存后任务列表会按新配置刷新。</p>
+        <p>配置 R2 任务登记表和数据湖导入使用的共享位置，保存后任务列表会按新配置刷新。</p>
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
@@ -100,9 +105,9 @@ export default function SettingsPage({ settings, onSettingsSaved, onError }) {
             <input
               value={form.task_registry_uri}
               onChange={(event) => update("task_registry_uri", event.target.value)}
-              placeholder="r2:bucket/path/task_registry.json"
+              placeholder="r2:bucket/registry/data_lake.yaml"
             />
-            <span className="hint">R2 模式下，任务列表会从这个登记表同步任务配置。</span>
+            <span className="hint">填写数据湖 registry/data_lake.yaml 的地址。这个文件登记 task_id 到 task_uri 的映射；task_uri 才指向具体任务配置，不能直接填写某个 task.yaml。</span>
           </div>
           <div className="field field-wide">
             <label>数据湖根路径 <span className="field-key">data_lake_r2_prefix</span></label>
@@ -129,6 +134,10 @@ export default function SettingsPage({ settings, onSettingsSaved, onError }) {
           <div className="field">
             <label>允许任务覆盖数据湖来源 <span className="field-key">allow_data_lake_overrides</span></label>
             <input value={boolLabel(Boolean(normalized.allow_data_lake_overrides))} readOnly />
+          </div>
+          <div className="field">
+            <label>允许手动导入 <span className="field-key">allow_manual_imports</span></label>
+            <input value={boolLabel(Boolean(normalized.allow_manual_imports || normalized.manual_imports_enabled))} readOnly />
           </div>
           <div className="field field-wide">
             <label>Rclone 配置文件路径 <span className="field-key">rclone_config_path</span></label>

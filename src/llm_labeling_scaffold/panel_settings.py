@@ -17,6 +17,18 @@ def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_bool(name: str) -> bool | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
 def task_source_mode() -> str:
     value = str(os.environ.get("LLS_TASK_SOURCE") or "local").strip().lower()
     if value in {"r2", "data_lake", "registry"}:
@@ -26,6 +38,13 @@ def task_source_mode() -> str:
 
 def allow_data_lake_overrides() -> bool:
     return _truthy_env("LLS_ALLOW_DATA_LAKE_OVERRIDES")
+
+
+def allow_manual_imports() -> bool:
+    configured = _env_bool("LLS_ALLOW_MANUAL_IMPORTS")
+    if configured is not None:
+        return configured
+    return task_source_mode() == "local"
 
 
 def rclone_config_path() -> str | None:
@@ -102,6 +121,7 @@ def effective_settings(runs_root: str | Path) -> dict[str, Any]:
         "task_registry_uri": normalize_task_registry_uri(task_registry) if task_registry else "",
         "data_lake_r2_prefix": normalize_data_lake_r2_prefix(data_lake_prefix) if data_lake_prefix else "",
         "allow_data_lake_overrides": allow_data_lake_overrides(),
+        "allow_manual_imports": allow_manual_imports(),
         "rclone_config_path": rclone_config_path(),
     }
 

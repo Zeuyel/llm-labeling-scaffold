@@ -15,7 +15,7 @@
 
 平台按三层划分配置和数据权威：
 
-- R2 数据湖 / registry 是任务与数据权威。任务启用状态、远端 `task.yaml`、源数据 manifest、源对象 URI 和需要回写的数据湖产物，都以 registry 登记内容为准。
+- R2 数据湖 / registry 是任务与数据权威。任务启用状态、远端 `task.yaml`、源数据 manifest、源对象 URI 和需要回写的数据湖产物，都以 registry 登记内容为准。`task_registry_uri` 指向数据湖治理登记表，通常是 `data_lake.yaml`；登记表中的 `tasks.<task_id>.task_uri` 才指向具体 `task.yaml`。
 - panel settings 是当前部署的运行配置。服务器部署后应先在“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，再同步任务配置。
 - 本地 `tasks/` 和 `runs/` 是执行缓存与产物目录。`tasks/` 可以从 registry 重建；`runs/` 记录本部署产生的导入、样本、标注、训练集、模型、推理结果和审计日志。
 
@@ -39,8 +39,16 @@ runs/<task_id>/imports/<import_id>/manifest.json
 - 已归档导入编号不能复用。
 - 导入数据必须包含任务的 `id_field` 和 `text_fields`。
 - `id_field` 缺失、重复，或文本字段全为空时，导入必须失败。
-- 默认上传上限为 100MB，可通过 `LLS_MAX_IMPORT_BYTES` 调整。
+- 本地开发模式的手动上传上限为 100MB，可通过 `LLS_MAX_IMPORT_BYTES` 调整。
 - 来自 R2 数据湖的导入只是任务级执行缓存。源数据集、源 manifest、源对象和内容哈希必须写入导入 manifest，R2 数据湖仍是上游数据权威。
+
+生产导入规则：
+
+- R2 数据湖是权威来源，面板只 materialize registry 和 manifest 指定的任务级输入，不复制上游大数据路径体系。
+- 生产模式下手动上传文件和粘贴导入默认关闭，只能在本地开发或测试模式下开启。
+- R2 导入必须按“下载到临时位置 -> 校验 bytes、sha256、rows、id_field、unique_ids -> 原子提交到 import 目录”的过程执行。
+- R2 导入应作为异步 job 执行，页面通过 job 状态展示排队、运行、成功或失败，不把长时间下载和校验绑定在同步页面请求上。
+- R2 导入完成后，profile 的下一步是样本抽取；样本 manifest 必须引用本次导入。
 
 导入 manifest 至少应包含：
 
@@ -93,10 +101,11 @@ runs/<task_id>/samples/<sample_id>/manifest.json
 
 ## 任务配置
 
-生产环境中，任务配置的权威来源是当前 `task_registry_uri` 指向的 R2 registry，不是本地 `tasks/` 目录。规则：
+生产环境中，任务配置的权威来源是当前 `task_registry_uri` 指向的 R2 registry，不是本地 `tasks/` 目录。`task_registry_uri` 是数据湖治理登记表地址，一般是 `data_lake.yaml`，不是 `task.yaml` 本身。规则：
 
 - 新任务必须先写入 R2 任务快照，再在 registry 的 `tasks` 段登记。
-- 面板只把 R2 的 `task.yaml` 同步为本地执行缓存。
+- registry 的 `tasks.<task_id>.task_uri` 指向具体 `task.yaml`。
+- 面板只把 `task_uri` 指向的 R2 `task.yaml` 同步为本地执行缓存。
 - 本地任务缓存可以重建，不作为长期权威资产。
 - 任务下线应在 R2 registry 中把状态改为非启用状态，不能只删除本地缓存。
 
