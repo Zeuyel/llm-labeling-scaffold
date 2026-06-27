@@ -8,7 +8,7 @@ import yaml
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.io import read_json, read_jsonl, write_json
 from llm_labeling_scaffold import pipeline
-from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE, profile_definition
+from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE, list_profile_presets, profile_definition
 from llm_labeling_scaffold.sampling import sample_records
 
 
@@ -196,6 +196,44 @@ def test_quality_control_profile_preset_is_available(tmp_path: Path):
     loaded = load_task(task["path"])
     assert loaded.profile == QUALITY_CONTROL_PROFILE
     assert task["profile"] == QUALITY_CONTROL_PROFILE
+
+
+def test_profile_preset_catalog_discovers_multiple_cached_presets():
+    presets = list_profile_presets()
+
+    assert [preset["id"] for preset in presets][:2] == [DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE]
+    assert all("stages" not in preset for preset in presets)
+    assert all(preset.get("name") for preset in presets)
+
+    presets[0]["name"] = "mutated"
+    assert list_profile_presets()[0]["name"] != "mutated"
+
+
+def test_task_profile_status_can_switch_profile_without_rewriting_task(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "switch_profile_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = load_task(created["path"])
+    runs_root = tmp_path / "runs"
+
+    default_status = pipeline.task_profile_status(runs_root, task)
+    switched_status = pipeline.task_profile_status(runs_root, task, profile_id=QUALITY_CONTROL_PROFILE)
+
+    assert default_status["task_profile_id"] == DEFAULT_PROFILE
+    assert default_status["selected_profile_id"] == DEFAULT_PROFILE
+    assert switched_status["task_profile_id"] == DEFAULT_PROFILE
+    assert switched_status["selected_profile_id"] == QUALITY_CONTROL_PROFILE
+    assert [preset["id"] for preset in switched_status["presets"]] == [DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE]
+    assert "argilla_dispatch" in [stage["id"] for stage in default_status["stages"]]
+    assert "pilot_calibration" in [stage["id"] for stage in switched_status["stages"]]
+    assert load_task(created["path"]).profile == DEFAULT_PROFILE
 
 
 def test_delete_task_archives_writable_task_and_keeps_examples_readonly(tmp_path: Path):

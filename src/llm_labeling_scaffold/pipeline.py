@@ -16,7 +16,7 @@ import yaml
 from .config import load_task, resolve_profile_id, with_runs_root
 from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
 from .jobs import Job, create_job, run_job
-from .profiles import DEFAULT_PROFILE, profile_definition, status_label
+from .profiles import DEFAULT_PROFILE, list_profile_presets, profile_definition, status_label
 
 try:
     import fcntl
@@ -406,11 +406,13 @@ def _profile_stage_artifact_state(task_dir: Path, stage_id: str) -> dict[str, An
     return {"done": False, "partial": False, "evidence": []}
 
 
-def task_profile_status(runs_root: str | Path, task) -> dict[str, Any]:
+def task_profile_status(runs_root: str | Path, task, profile_id: str | None = None) -> dict[str, Any]:
     task_id = str(getattr(task, "task_id", task)).strip()
     if not _safe_segment(task_id):
         raise ValueError("非法任务编号")
-    profile = profile_definition(getattr(task, "profile", DEFAULT_PROFILE))
+    task_profile_id = resolve_profile_id(getattr(task, "profile", DEFAULT_PROFILE))
+    selected_profile_id = resolve_profile_id(profile_id) if profile_id else task_profile_id
+    profile = profile_definition(selected_profile_id)
     task_dir = Path(runs_root) / task_id
     statuses: dict[str, str] = {}
     stages: list[dict[str, Any]] = []
@@ -448,7 +450,10 @@ def task_profile_status(runs_root: str | Path, task) -> dict[str, Any]:
         stages.append(item)
     return {
         "task_id": task_id,
+        "task_profile_id": task_profile_id,
+        "selected_profile_id": selected_profile_id,
         "profile": _profile_meta(profile),
+        "presets": list_profile_presets(),
         "stages": stages,
     }
 

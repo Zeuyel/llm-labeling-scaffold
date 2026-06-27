@@ -138,6 +138,11 @@ tr:last-child td { border-bottom: 0; }
 .muted { color: var(--muted); }
 .empty { padding: 32px; text-align: center; color: var(--muted); border: 1px dashed var(--border); border-radius: var(--radius); }
 .profile-toolbar { margin-bottom: 12px; }
+.profile-preset-list { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px; background: var(--muted-bg); border-radius: var(--radius); max-width: 100%; }
+.profile-preset { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; max-width: 280px; padding: 5px 10px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; font: inherit; font-size: 13px; text-align: left; }
+.profile-preset span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.profile-preset em { flex: 0 0 auto; font-style: normal; font-size: 11px; color: var(--muted); }
+.profile-preset.active { background: var(--bg); border-color: var(--border); color: var(--fg); font-weight: 600; box-shadow: 0 1px 2px hsl(0 0% 0% / .08); }
 .profile-empty { padding: 18px; text-align: left; }
 .profile-stage-list { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
 .profile-stage { display: grid; grid-template-columns: 32px minmax(0, 1fr); gap: 12px; padding: 14px; border-bottom: 1px solid var(--border); }

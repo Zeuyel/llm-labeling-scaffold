@@ -12,8 +12,9 @@ import urllib.request
 
 import pytest
 
-from llm_labeling_scaffold import data_lake, panel, panel_settings, task_registry
+from llm_labeling_scaffold import data_lake, panel, panel_settings, pipeline, task_registry
 from llm_labeling_scaffold.io import read_json
+from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE
 
 
 def _clear_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -227,6 +228,39 @@ def test_r2_task_sync_prefers_settings_registry_uri(tmp_path: Path, monkeypatch:
         "tasks_root": tasks_root,
         "registry_uri": "r2:settings/governance/data_lake.yaml",
     }
+
+
+def test_profile_preset_api_lists_and_switches_task_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": "profile_api_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, catalog = _request(base_url, "/api/profile/presets")
+        assert status == 200
+        assert catalog["default_profile_id"] == DEFAULT_PROFILE
+        assert [preset["id"] for preset in catalog["presets"]][:2] == [DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE]
+        assert all("stages" not in preset for preset in catalog["presets"])
+
+        status, switched = _request(
+            base_url,
+            f"/api/task/profile?task_id=profile_api_task&preset={QUALITY_CONTROL_PROFILE}",
+        )
+
+    assert status == 200
+    assert switched["task_profile_id"] == DEFAULT_PROFILE
+    assert switched["selected_profile_id"] == QUALITY_CONTROL_PROFILE
+    assert "pilot_calibration" in [stage["id"] for stage in switched["stages"]]
 
 
 def test_runtime_settings_override_data_lake_prefix_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

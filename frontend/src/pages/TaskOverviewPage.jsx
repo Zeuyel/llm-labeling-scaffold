@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 
@@ -15,6 +15,54 @@ const STATUS_BADGE = {
   completed: "badge-green",
   blocked: "badge-red",
 };
+
+const PROFILE_CACHE_TTL_MS = 15000;
+const profileStatusCache = new Map();
+let profilePresetCatalogCache = null;
+
+function selectedPresetStorageKey(taskId) {
+  return `lls.profilePreset.${taskId}`;
+}
+
+function readSelectedPreset(taskId) {
+  try {
+    return localStorage.getItem(selectedPresetStorageKey(taskId)) || "";
+  } catch {
+    return "";
+  }
+}
+
+function writeSelectedPreset(taskId, presetId) {
+  try {
+    if (presetId) localStorage.setItem(selectedPresetStorageKey(taskId), presetId);
+  } catch {
+    // localStorage is an optional speed-up only.
+  }
+}
+
+function taskProfileIdFromTask(task) {
+  const profile = task?.profile;
+  if (typeof profile === "string") return profile;
+  if (profile && typeof profile === "object") {
+    return profile.preset || profile.id || profile.profile || "";
+  }
+  return "";
+}
+
+function cachedProfileKey(taskId, presetId) {
+  return `${taskId}::${presetId || ""}`;
+}
+
+function getCachedProfile(taskId, presetId) {
+  const cached = profileStatusCache.get(cachedProfileKey(taskId, presetId));
+  if (!cached) return null;
+  if (Date.now() - cached.loadedAt > PROFILE_CACHE_TTL_MS) return null;
+  return cached.data;
+}
+
+function setCachedProfile(taskId, presetId, data) {
+  profileStatusCache.set(cachedProfileKey(taskId, presetId), { data, loadedAt: Date.now() });
+}
 
 function normalizeStageStatus(value) {
   const status = String(value || "not_started").toLowerCase();
@@ -69,6 +117,11 @@ function profileStages(data) {
   return [];
 }
 
+function profilePresets(data, fallback = []) {
+  if (Array.isArray(data?.presets)) return data.presets;
+  return fallback;
+}
+
 function stageBlockReason(stage, status) {
   const reason = stage.blocked_reason || stage.blocking_reason || stage.block_reason || stage.status_reason || stage.reason;
   if (reason) return detailText(reason, "后端未提供阻塞原因");
@@ -120,6 +173,9 @@ function stageRouteLabel(stage, status) {
 export default function TaskOverviewPage({ task, taskId, onError }) {
   const [counts, setCounts] = useState({ imports: 0, samples: 0, decisions: 0, gold: 0, models: 0, jobs: 0 });
   const [profile, setProfile] = useState({ loading: false, data: null, error: "" });
+  const [presetCatalog, setPresetCatalog] = useState(() => profilePresetCatalogCache || []);
+  const [selectedProfileId, setSelectedProfileId] = useState("");
+  const profileRequestSeq = useRef(0);
 
   const reload = useCallback(async () => {
     if (!taskId) return;
@@ -145,19 +201,73 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
     }
   }, [taskId, onError]);
 
-  const loadProfile = useCallback(async () => {
+  const loadProfile = useCallback(async (presetId) => {
     if (!taskId) return;
-    setProfile({ loading: true, data: null, error: "" });
+    const requestSeq = profileRequestSeq.current + 1;
+    profileRequestSeq.current = requestSeq;
+    const cached = getCachedProfile(taskId, presetId);
+    if (cached) {
+      setProfile({ loading: false, data: cached, error: "" });
+      return;
+    }
+    setProfile((current) => ({ loading: true, data: current.data, error: "" }));
     try {
-      const data = await api.getTaskProfile(taskId);
+      const data = await api.getTaskProfile(taskId, presetId);
+      if (profileRequestSeq.current !== requestSeq) return;
+      setCachedProfile(taskId, presetId, data || {});
+      if (Array.isArray(data?.presets)) {
+        profilePresetCatalogCache = data.presets;
+        setPresetCatalog(data.presets);
+      }
       setProfile({ loading: false, data: data || {}, error: "" });
     } catch {
+      if (profileRequestSeq.current !== requestSeq) return;
       setProfile({ loading: false, data: null, error: "流程预设暂不可用，仍可使用下方入口推进任务。" });
     }
   }, [taskId]);
 
   useEffect(() => { reload(); }, [reload]);
-  useEffect(() => { loadProfile(); }, [loadProfile]);
+  useEffect(() => {
+    if (!taskId) return;
+    const taskProfileId = taskProfileIdFromTask(task);
+    setSelectedProfileId(readSelectedPreset(taskId) || taskProfileId);
+    setProfile({ loading: false, data: null, error: "" });
+  }, [taskId, task?.profile]);
+  useEffect(() => {
+    if (profilePresetCatalogCache) {
+      setPresetCatalog(profilePresetCatalogCache);
+      return;
+    }
+    let ignore = false;
+    api.getProfilePresets()
+      .then((data) => {
+        if (ignore) return;
+        const presets = Array.isArray(data?.presets) ? data.presets : [];
+        profilePresetCatalogCache = presets;
+        setPresetCatalog(presets);
+      })
+      .catch(() => {});
+    return () => { ignore = true; };
+  }, []);
+  useEffect(() => {
+    if (!taskId) return undefined;
+    let cancelled = false;
+    const run = () => {
+      if (!cancelled) loadProfile(selectedProfileId);
+    };
+    if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+      const idleId = window.requestIdleCallback(run, { timeout: 500 });
+      return () => {
+        cancelled = true;
+        window.cancelIdleCallback(idleId);
+      };
+    }
+    const timer = window.setTimeout(run, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [taskId, selectedProfileId, loadProfile]);
 
   const cards = [
     { key: "imports", label: "导入数据", val: counts.imports, to: `/task/${encodeURIComponent(taskId)}/imports` },
@@ -169,8 +279,16 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
   ];
 
   const stages = profileStages(profile.data);
+  const presets = profilePresets(profile.data, presetCatalog);
+  const taskProfileId = profile.data?.task_profile_id || taskProfileIdFromTask(task);
+  const activeProfileId = selectedProfileId || profile.data?.selected_profile_id || taskProfileId;
   const profileTitle = profile.data ? profileName(profile.data) : "等待流程预设";
   const nextStage = stages.find((stage) => normalizeStageStatus(stage.status) === "ready");
+
+  function choosePreset(presetId) {
+    setSelectedProfileId(presetId);
+    writeSelectedPreset(taskId, presetId);
+  }
 
   return (
     <div>
@@ -188,6 +306,29 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
               {nextStage ? ` · 下一步：${nextStage.title || nextStage.name || nextStage.id}` : ""}
             </div>
           </div>
+          {presets.length > 0 && (
+            <div className="profile-preset-list" role="tablist" aria-label="流程预设">
+              {presets.map((preset) => {
+                const presetId = preset.id || preset.name;
+                const selected = presetId === activeProfileId;
+                const bound = presetId === taskProfileId;
+                return (
+                  <button
+                    key={presetId}
+                    type="button"
+                    role="tab"
+                    aria-selected={selected}
+                    className={selected ? "profile-preset active" : "profile-preset"}
+                    onClick={() => choosePreset(presetId)}
+                    title={preset.description || preset.name || presetId}
+                  >
+                    <span>{preset.name || presetId}</span>
+                    {bound && <em>任务默认</em>}
+                  </button>
+                );
+              })}
+            </div>
+          )}
         </div>
         {profile.loading && <div className="empty profile-empty">正在读取流程预设...</div>}
         {!profile.loading && profile.error && <div className="empty profile-empty">{profile.error}</div>}

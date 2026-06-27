@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from functools import lru_cache
 from typing import Any
 
 
 DEFAULT_PROFILE = "manual_labeling_cv_v1"
 QUALITY_CONTROL_PROFILE = "manual_labeling_quality_control_v1"
+PROFILE_ORDER = (DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE)
 
 STATUS_LABELS = {
     "not_started": "未开始",
@@ -261,11 +263,31 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 
+def _profile_meta(profile: dict[str, Any]) -> dict[str, Any]:
+    return {key: deepcopy(value) for key, value in profile.items() if key != "stages"}
+
+
+@lru_cache(maxsize=None)
+def _cached_profile_definition(profile_id: str) -> dict[str, Any]:
+    if profile_id not in BUILTIN_PROFILES:
+        raise ValueError(f"未知流程预设: {profile_id}")
+    return deepcopy(BUILTIN_PROFILES[profile_id])
+
+
+@lru_cache(maxsize=1)
+def _cached_profile_preset_catalog() -> tuple[dict[str, Any], ...]:
+    ordered_ids = [profile_id for profile_id in PROFILE_ORDER if profile_id in BUILTIN_PROFILES]
+    ordered_ids.extend(profile_id for profile_id in BUILTIN_PROFILES if profile_id not in ordered_ids)
+    return tuple(_profile_meta(_cached_profile_definition(profile_id)) for profile_id in ordered_ids)
+
+
+def list_profile_presets() -> list[dict[str, Any]]:
+    return [deepcopy(item) for item in _cached_profile_preset_catalog()]
+
+
 def profile_definition(profile_id: str | None = None) -> dict[str, Any]:
     resolved = str(profile_id or DEFAULT_PROFILE).strip() or DEFAULT_PROFILE
-    if resolved not in BUILTIN_PROFILES:
-        raise ValueError(f"未知流程预设: {resolved}")
-    return deepcopy(BUILTIN_PROFILES[resolved])
+    return deepcopy(_cached_profile_definition(resolved))
 
 
 def status_label(status: str) -> str:

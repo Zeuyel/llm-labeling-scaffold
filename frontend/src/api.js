@@ -26,7 +26,8 @@ export const getTaskRuns = (taskId) => req(`/api/task/runs?${q({ task_id: taskId
 export const getTaskSamples = (taskId) => req(`/api/task/samples?${q({ task_id: taskId })}`);
 export const getTaskModels = (taskId) => req(`/api/task/models?${q({ task_id: taskId })}`);
 export const getTaskGoldVersions = (taskId) => req(`/api/task/gold_versions?${q({ task_id: taskId })}`);
-export const getTaskProfile = (taskId) => req(`/api/task/profile?${q({ task_id: taskId })}`);
+export const getProfilePresets = () => req("/api/profile/presets");
+export const getTaskProfile = (taskId, preset) => req(`/api/task/profile?${q({ task_id: taskId, preset })}`);
 export const getAnnotationJobs = (taskId) => req(`/api/task/annotation_jobs?${q({ task_id: taskId })}`);
 export const getAgreementAudits = (taskId) => req(`/api/task/agreement_audits?${q({ task_id: taskId })}`);
 export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifacts?${q({ task_id: taskId })}`);

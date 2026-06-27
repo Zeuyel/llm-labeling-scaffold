@@ -344,12 +344,20 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/task/profile":
             task = params.get("task_id", [""])[0]
+            preset = params.get("preset", [""])[0].strip() or None
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
                 task_cfg = self._load_task_by_id(task)
-                self._json(pipeline.task_profile_status(self.runs_root, task_cfg))
+                self._json(pipeline.task_profile_status(self.runs_root, task_cfg, profile_id=preset))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif path == "/api/profile/presets":
+            try:
+                from .profiles import DEFAULT_PROFILE, list_profile_presets
+
+                self._json({"default_profile_id": DEFAULT_PROFILE, "presets": list_profile_presets()})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/settings":
