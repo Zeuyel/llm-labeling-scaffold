@@ -354,11 +354,43 @@ def _agreement_audit_artifact_state(task_dir: Path) -> dict[str, Any]:
     return {"done": False, "partial": False, "evidence": []}
 
 
+def _sample_batch_artifact_state(task_dir: Path) -> dict[str, Any]:
+    evidence: list[str] = []
+    batches_dirs: list[Path] = []
+    samples_dir = task_dir / "samples"
+    for sample_dir in _visible_children(samples_dir):
+        if not sample_dir.is_dir():
+            continue
+        batches_dir = sample_dir / "batches"
+        if not batches_dir.is_dir():
+            continue
+        batches_dirs.append(batches_dir)
+        for batch_dir in _visible_children(batches_dir):
+            if not batch_dir.is_dir():
+                continue
+            manifest = batch_dir / "manifest.json"
+            if manifest.exists():
+                evidence.append(str(manifest))
+    return {
+        "done": bool(evidence),
+        "partial": bool(batches_dirs) and not evidence,
+        "evidence": evidence,
+    }
+
+
 def _profile_stage_artifact_state(task_dir: Path, stage_id: str) -> dict[str, Any]:
     if stage_id == "lake_import":
         return _child_dir_artifact_state(task_dir / "imports", ("raw.jsonl",))
     if stage_id == "sample":
         return _child_dir_artifact_state(task_dir / "samples", ("sample.jsonl",))
+    if stage_id == "pilot_calibration":
+        return _sample_batch_artifact_state(task_dir)
+    if stage_id == "consistency_check":
+        return _agreement_audit_artifact_state(task_dir)
+    if stage_id == "main_annotation":
+        return _child_dir_artifact_state(task_dir / "annotation_jobs", ("manifest.json",))
+    if stage_id == "review_adjudication":
+        return _agreement_audit_artifact_state(task_dir)
     if stage_id == "argilla_dispatch":
         return _child_dir_artifact_state(task_dir / "annotation_jobs", ("manifest.json",))
     if stage_id == "argilla_pull":
@@ -671,6 +703,57 @@ def _slug(value: str) -> str:
     return text or "item"
 
 
+def _batch_plan_dir_name(batch_size: int, params: dict[str, Any]) -> str:
+    plan_id = str(params.get("plan_id") or "").strip()
+    if plan_id:
+        if not _safe_segment(plan_id):
+            raise ValueError("批次计划编号只能使用单段名称，不能包含路径分隔符")
+        return plan_id
+    overlap_rate = float(params.get("overlap_rate") or 0)
+    gold_rate = float(params.get("gold_rate") or 0)
+    strategy_id = str(params.get("strategy_id") or "").strip()
+    has_quality_plan = overlap_rate > 0 or gold_rate > 0 or bool(strategy_id)
+    if not has_quality_plan:
+        return f"size_{batch_size}"
+    min_annotators = int(params.get("min_annotators_per_overlap_item", 2))
+    return _slug(f"qc_size_{batch_size}_{strategy_id or 'quality_control_overlap_v1'}_overlap_{overlap_rate:g}_min_{min_annotators}")
+
+
+def _run_batch_action(runs_root: str | Path, task, params: dict[str, Any]) -> dict[str, Any]:
+    from .batching import batch_records
+
+    sample = params["sample"]
+    sample_id = str(params.get("sample_id") or Path(sample).parent.name)
+    batch_size = int(params["batch_size"])
+    plan_dir_name = _batch_plan_dir_name(batch_size, params)
+    out = Path(runs_root) / task.task_id / "samples" / sample_id / "batches" / plan_dir_name
+    plan_id = str(params.get("plan_id") or plan_dir_name)
+    paths = batch_records(
+        sample,
+        out,
+        batch_size,
+        overlap_rate=params.get("overlap_rate", 0.0),
+        min_annotators_per_overlap_item=params.get("min_annotators_per_overlap_item", 2),
+        gold_rate=params.get("gold_rate", 0.0),
+        strategy_id=params.get("strategy_id"),
+        plan_id=plan_id,
+        id_field=getattr(task, "id_field", None),
+    )
+    manifest_path = out / "manifest.json"
+    manifest = read_json(manifest_path)
+    return {
+        "artifacts": [str(p) for p in paths],
+        "manifest": str(manifest_path),
+        "manifest_path": str(manifest_path),
+        "kind": "batches",
+        "sample_id": sample_id,
+        "plan_id": manifest.get("plan_id"),
+        "strategy_id": manifest.get("strategy_id"),
+        "overlap_rate": manifest.get("overlap_rate"),
+        "min_annotators_per_overlap_item": manifest.get("min_annotators_per_overlap_item"),
+    }
+
+
 def _default_argilla_dataset(task_id: str, sample_id: str | None) -> str:
     return f"{_slug(task_id)}_{_slug(sample_id or 'sample')}_v001"
 
@@ -709,12 +792,7 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                                       params.get("source"), params.get("source_import_id"))
             return {"artifact": str(path), "kind": "sample"}
         if action == "batch":
-            from .batching import batch_records
-            sample_id = Path(params["sample"]).parent.name
-            batch_size = int(params["batch_size"])
-            out = Path(runs_root) / task.task_id / "samples" / sample_id / "batches" / f"size_{batch_size}"
-            paths = batch_records(params["sample"], out, batch_size)
-            return {"artifacts": [str(p) for p in paths], "kind": "batches"}
+            return _run_batch_action(runs_root, task, params)
         if action == "annotate":
             from .annotation import annotate
             run_dir = annotate(task, params["sample"], params["run_id"], params.get("provider", "local_stub"),
@@ -827,6 +905,13 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
 
     run_job(job, target)
     return job.to_dict()
+
+
+def run_action(runs_root: str | Path, task_path: str, action: str, params: dict) -> dict:
+    task = with_runs_root(load_task(task_path), runs_root)
+    if action == "batch":
+        return _run_batch_action(runs_root, task, params)
+    raise ValueError(f"run_action does not support action: {action}")
 
 
 # --- core objects: artifact / gold_version / model_version / decision --------
@@ -1533,6 +1618,40 @@ def _count_decisions(run_dir: Path) -> int:
     return sum(1 for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
 
 
+def _list_batch_manifests(sample_dir: Path) -> list[dict[str, Any]]:
+    batches_dir = sample_dir / "batches"
+    if not batches_dir.is_dir():
+        return []
+    manifests: list[tuple[int, str, dict[str, Any]]] = []
+    for plan_dir in sorted(p for p in batches_dir.iterdir() if p.is_dir() and not p.name.startswith("_")):
+        manifest_path = plan_dir / "manifest.json"
+        if not manifest_path.is_file():
+            continue
+        manifest_data = read_json(manifest_path)
+        manifest_data.setdefault("plan_id", plan_dir.name)
+        manifest_data["manifest_path"] = str(manifest_path)
+        manifest_data["plan_dir"] = str(plan_dir)
+        try:
+            mtime_ns = manifest_path.stat().st_mtime_ns
+        except OSError:
+            mtime_ns = 0
+        manifests.append((mtime_ns, plan_dir.name, manifest_data))
+    manifests.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in manifests]
+
+
+def _batch_count_from_manifest(manifest: dict[str, Any] | None) -> int:
+    if not manifest:
+        return 0
+    batch_count = manifest.get("batch_count")
+    if batch_count is not None:
+        return int(batch_count)
+    batches = manifest.get("batches")
+    if isinstance(batches, list):
+        return len(batches)
+    return 0
+
+
 def list_samples(runs_root: Path, task_id: str) -> list[dict]:
     out: list[dict] = []
     base = Path(runs_root) / task_id / "samples"
@@ -1541,12 +1660,19 @@ def list_samples(runs_root: Path, task_id: str) -> list[dict]:
     for sd in sorted(p for p in base.iterdir() if p.is_dir() and not p.name.startswith("_")):
         manifest = sd / "manifest.json"
         manifest_data = read_json(manifest) if manifest.exists() else None
+        batch_manifests = _list_batch_manifests(sd)
+        latest_batch_manifest = batch_manifests[-1] if batch_manifests else None
         out.append({
             "sample_id": sd.name,
             "path": str(sd / "sample.jsonl"),
             "manifest": manifest_data,
             "state": (manifest_data or {}).get("state", "active"),
             "dependencies": dependencies_for_sample(runs_root, task_id, sd.name),
+            "batch_manifests": batch_manifests,
+            "latest_batch_manifest": latest_batch_manifest,
+            "batch_manifest": latest_batch_manifest,
+            "batches": batch_manifests,
+            "batch_count": _batch_count_from_manifest(latest_batch_manifest),
         })
     return out
 

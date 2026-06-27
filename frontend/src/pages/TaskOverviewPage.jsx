@@ -89,6 +89,7 @@ function stageRoute(taskId, stage) {
     import: "imports",
     lake_import: "imports",
     sample: "samples",
+    batch: "samples",
     argilla_push: "annotations",
     argilla_dispatch: "annotations",
     argilla_pull: "annotations",
@@ -109,6 +110,7 @@ function stageRouteLabel(stage, status) {
   const verb = status === "completed" ? "查看" : "进入";
   if (["import", "lake_import"].includes(action)) return `${verb}导入`;
   if (action === "sample") return `${verb}样本`;
+  if (action === "batch") return `${verb}批次`;
   if (["argilla_push", "argilla_dispatch", "argilla_pull", "audit", "agreement_audit"].includes(action)) return `${verb}标注`;
   if (["gold", "gold_build"].includes(action)) return `${verb}训练集`;
   if (["train", "infer", "batch_infer"].includes(action)) return `${verb}模型`;

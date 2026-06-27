@@ -6,9 +6,9 @@ from unittest.mock import patch
 import yaml
 
 from llm_labeling_scaffold.config import load_task
-from llm_labeling_scaffold.io import read_json, write_json
+from llm_labeling_scaffold.io import read_json, read_jsonl, write_json
 from llm_labeling_scaffold import pipeline
-from llm_labeling_scaffold.profiles import DEFAULT_PROFILE
+from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE, profile_definition
 from llm_labeling_scaffold.sampling import sample_records
 
 
@@ -167,6 +167,35 @@ def test_task_profile_accepts_preset_mapping(tmp_path: Path):
 
     assert loaded.profile == DEFAULT_PROFILE
     assert task["profile"] == DEFAULT_PROFILE
+
+
+def test_quality_control_profile_preset_is_available(tmp_path: Path):
+    profile = profile_definition(QUALITY_CONTROL_PROFILE)
+
+    assert profile["id"] == QUALITY_CONTROL_PROFILE
+    assert profile["quality_controls"]["overlap_rate"] == 0.2
+    assert profile["quality_controls"]["min_annotators_per_overlap_item"] == 2
+    titles = [stage["title"] for stage in profile["stages"]]
+    assert "试标/校准" in titles
+    assert "一致性检查" in titles
+    assert "主标注" in titles
+    assert "复核裁决" in titles
+    assert "模型训练" in titles
+    assert "批量推理" in titles
+
+    task = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "quality_profile_task",
+            "profile": {"preset": QUALITY_CONTROL_PROFILE},
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    loaded = load_task(task["path"])
+    assert loaded.profile == QUALITY_CONTROL_PROFILE
+    assert task["profile"] == QUALITY_CONTROL_PROFILE
 
 
 def test_delete_task_archives_writable_task_and_keeps_examples_readonly(tmp_path: Path):
@@ -332,6 +361,83 @@ def test_task_profile_status_tracks_profile_artifacts(tmp_path: Path):
     (infer_dir / "predictions.jsonl").write_text('{"record_id":"r1","pred_label":"yes"}\n', encoding="utf-8")
     inferred = pipeline.task_profile_status(runs_root, task)
     assert _stage_status(inferred, "batch_infer") == "done"
+
+
+def test_quality_control_profile_status_tracks_batch_and_agreement_artifacts(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "quality_status_task",
+            "profile": {"preset": QUALITY_CONTROL_PROFILE},
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = load_task(created["path"])
+    runs_root = tmp_path / "runs"
+    pipeline.save_import(
+        runs_root,
+        task,
+        "seed_1",
+        [{"record_id": "r1", "title": "A"}, {"record_id": "r2", "title": "B"}],
+    )
+
+    sample_dir = runs_root / task.task_id / "samples" / "sample_a"
+    sample_dir.mkdir(parents=True)
+    (sample_dir / "sample.jsonl").write_text(
+        '{"record_id":"r1","title":"A"}\n{"record_id":"r2","title":"B"}\n',
+        encoding="utf-8",
+    )
+    write_json({"sample_id": "sample_a", "rows": 2}, sample_dir / "manifest.json")
+
+    sampled = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(sampled, "sample") == "done"
+    assert _stage_status(sampled, "pilot_calibration") == "ready"
+    assert _stage_status(sampled, "consistency_check") == "not_started"
+    assert _stage_status(sampled, "main_annotation") == "not_started"
+
+    batch_dir = sample_dir / "batches" / "pilot_round_1"
+    batch_dir.mkdir(parents=True)
+    broken_batch = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(broken_batch, "pilot_calibration") == "blocked"
+    assert _stage_status(broken_batch, "consistency_check") == "blocked"
+
+    write_json(
+        {"plan_id": "pilot_round_1", "sample_id": "sample_a", "batch_count": 1},
+        batch_dir / "manifest.json",
+    )
+    batched = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(batched, "pilot_calibration") == "done"
+    assert _stage_status(batched, "consistency_check") == "ready"
+    assert _stage_status(batched, "main_annotation") == "not_started"
+
+    write_json(
+        {"audit_id": "audit_a", "passed": True},
+        runs_root / task.task_id / "agreement_audits" / "audit_a" / "summary.json",
+    )
+    audited = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(audited, "consistency_check") == "done"
+    assert _stage_status(audited, "main_annotation") == "ready"
+
+    write_json(
+        {"annotation_id": "job_a", "source": "argilla"},
+        runs_root / task.task_id / "annotation_jobs" / "job_a" / "manifest.json",
+    )
+    annotated = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(annotated, "main_annotation") == "done"
+    assert _stage_status(annotated, "argilla_pull") == "ready"
+
+    decisions_dir = runs_root / task.task_id / "decisions" / "job_a"
+    write_json({"decision_id": "job_a", "rows": 1}, decisions_dir / "manifest.json")
+    (decisions_dir / "decisions.jsonl").write_text(
+        '{"record_id":"r1","human_label":{"label":"yes"}}\n',
+        encoding="utf-8",
+    )
+    pulled = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(pulled, "argilla_pull") == "done"
+    assert _stage_status(pulled, "review_adjudication") == "done"
 
 
 def test_import_from_data_lake_manifest_records_lineage(tmp_path: Path):
@@ -1015,3 +1121,105 @@ def test_batch_action_does_not_overwrite_sample_manifest(tmp_path: Path):
     after = read_json(manifest_path)
     assert after == before
     assert (tmp_path / "runs" / task.task_id / "samples" / "sample_a" / "batches" / "size_1" / "manifest.json").exists()
+
+
+def test_pipeline_batch_run_action_accepts_overlap_plan_params(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "qc_batch_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        "".join(f'{{"record_id":"r{idx}","title":"Title {idx}"}}\n' for idx in range(1, 7)),
+        encoding="utf-8",
+    )
+    sample_path = sample_records(task, 6, "sample_a", "head", source_path=source)
+
+    result = pipeline.run_action(
+        tmp_path / "runs",
+        created["path"],
+        "batch",
+        {
+            "sample": str(sample_path),
+            "batch_size": 2,
+            "overlap_rate": 0.34,
+            "min_annotators_per_overlap_item": 2,
+            "gold_rate": 0.05,
+            "strategy_id": "pipeline_qc_overlap",
+            "plan_id": "qc_round_1",
+        },
+    )
+
+    manifest_path = tmp_path / "runs" / task.task_id / "samples" / "sample_a" / "batches" / "qc_round_1" / "manifest.json"
+    assert result["manifest_path"] == str(manifest_path)
+    assert result["plan_id"] == "qc_round_1"
+    assert result["strategy_id"] == "pipeline_qc_overlap"
+
+    manifest = read_json(manifest_path)
+    assert manifest["id_field"] == "record_id"
+    assert manifest["overlap_item_count"] == 3
+    assert manifest["overlap_assignment_count"] == 3
+    assert manifest["gold_rate"] == 0.05
+    assert len(result["artifacts"]) == manifest["batch_count"]
+
+    batch_memberships: dict[str, set[str]] = {}
+    for artifact in result["artifacts"]:
+        for row in read_jsonl(artifact):
+            batch_memberships.setdefault(row["record_id"], set()).add(Path(artifact).name)
+    assert all(len(batch_memberships[item_id]) == 2 for item_id in manifest["overlap_item_ids"])
+
+
+def test_list_samples_returns_latest_batch_manifest_after_overlap_batch(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "qc_list_samples_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        "".join(f'{{"record_id":"r{idx}","title":"Title {idx}"}}\n' for idx in range(1, 7)),
+        encoding="utf-8",
+    )
+    sample_path = sample_records(task, 6, "sample_a", "head", source_path=source)
+
+    pipeline.run_action(
+        tmp_path / "runs",
+        created["path"],
+        "batch",
+        {
+            "sample": str(sample_path),
+            "batch_size": 2,
+            "overlap_rate": 0.34,
+            "min_annotators_per_overlap_item": 2,
+            "strategy_id": "pipeline_qc_overlap",
+            "plan_id": "qc_round_1",
+        },
+    )
+
+    samples = pipeline.list_samples(tmp_path / "runs", task.task_id)
+    sample = next(item for item in samples if item["sample_id"] == "sample_a")
+    latest = sample["latest_batch_manifest"]
+    manifest_path = tmp_path / "runs" / task.task_id / "samples" / "sample_a" / "batches" / "qc_round_1" / "manifest.json"
+
+    assert sample["batch_manifests"] == [latest]
+    assert sample["batch_manifest"] == latest
+    assert sample["batches"] == sample["batch_manifests"]
+    assert sample["batch_count"] == latest["batch_count"]
+    assert latest["manifest_path"] == str(manifest_path)
+    assert latest["plan_dir"] == str(manifest_path.parent)
+    assert latest["plan_id"] == "qc_round_1"
+    assert latest["overlap_item_count"] == 3
+    assert latest["batch_count"] == 3
