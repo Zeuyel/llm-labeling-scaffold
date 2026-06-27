@@ -675,6 +675,22 @@ def _default_argilla_dataset(task_id: str, sample_id: str | None) -> str:
     return f"{_slug(task_id)}_{_slug(sample_id or 'sample')}_v001"
 
 
+def _has_passing_agreement_audit(task, sample_path: str | Path, decisions_path: str | Path) -> bool:
+    base = task.runs_dir / "agreement_audits"
+    if not base.is_dir():
+        return False
+    for summary_path in sorted(base.glob("*/summary.json")):
+        try:
+            summary = read_json(summary_path)
+        except Exception:
+            continue
+        if summary.get("passed") is not True:
+            continue
+        if _same_path(summary.get("sample_path"), sample_path) and _same_path(summary.get("decisions_path"), decisions_path):
+            return True
+    return False
+
+
 # --- core object: run + jobs -------------------------------------------------
 
 def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> dict:
@@ -775,6 +791,8 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             return {"summary": merge_run(task, params["run"]), "kind": "merge"}
         if action == "gold":
             if params.get("sample") and params.get("decisions"):
+                if not _has_passing_agreement_audit(task, params["sample"], params["decisions"]):
+                    raise ValueError("构建训练集前必须先完成并通过同一样本和标注结果的一致性检查")
                 from .gold import build_gold_from_decisions
                 path = build_gold_from_decisions(task, params["sample"], params["decisions"], params["version"])
             else:

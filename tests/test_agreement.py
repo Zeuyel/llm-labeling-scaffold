@@ -52,6 +52,20 @@ def test_agreement_audit_action_writes_summary_and_reuses_same_inputs(tmp_path: 
         decisions_path,
     )
 
+    blocked_gold_job = pipeline.start_action(
+        runs_root,
+        created["path"],
+        "gold",
+        {
+            "sample": str(sample_path),
+            "decisions": str(decisions_path),
+            "version": "blocked",
+        },
+    )
+    blocked_gold = _wait_job(runs_root, task.task_id, blocked_gold_job["id"])
+    assert blocked_gold["status"] == "failed"
+    assert "一致性检查" in blocked_gold["error"]
+
     job = pipeline.start_action(
         runs_root,
         created["path"],
@@ -79,6 +93,19 @@ def test_agreement_audit_action_writes_summary_and_reuses_same_inputs(tmp_path: 
     stage = next(item for item in status["stages"] if item["id"] == "agreement_audit")
     assert stage["status"] == "done"
     assert stage["evidence"] == [str(summary_path)]
+
+    gold_job = pipeline.start_action(
+        runs_root,
+        created["path"],
+        "gold",
+        {
+            "sample": str(sample_path),
+            "decisions": str(decisions_path),
+            "version": "v001",
+        },
+    )
+    gold = _wait_job(runs_root, task.task_id, gold_job["id"])
+    assert gold["status"] == "succeeded"
 
     reused_job = pipeline.start_action(
         runs_root,
