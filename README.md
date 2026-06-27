@@ -142,6 +142,7 @@ ARGILLA_API_KEY=argilla.apikey
 ARGILLA_WORKSPACE=argilla
 
 MLFLOW_PORT=5000
+LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
 
 `MLFLOW_TRACKING_URI` 默认不设置。只有需要把训练记录同步到可选模型记录服务时，才设置：
@@ -158,6 +159,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - Argilla 集成依赖
 - 基线训练依赖：`scikit-learn`、`joblib`
 - MLflow 客户端依赖
+- rclone，用于按任务配置读取 R2 数据湖
 
 因此默认部署可以直接运行内置 `tfidf_sgd` 基线训练器。MLflow 客户端只提供可选记录能力；不启用 profile 时不会启动 MLflow 服务。
 
@@ -170,6 +172,8 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 控制台默认只读取 `tasks/`。实验人员在控制台中新建的任务会写入 `tasks/<任务编号>/task.yaml`。如果任务已经有复杂配置，也仍然可以直接把任务目录放到 `tasks/` 下。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。
 
 数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
+
+配置了 `data_lake` 的任务可以直接从 R2 数据湖 manifest 生成本地导入。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。Docker 部署时需要把 rclone 配置以只读方式映射到面板容器，例如 `~/.config/rclone/rclone.conf:/run/secrets/rclone/rclone.conf:ro`，并设置 `RCLONE_CONFIG=/run/secrets/rclone/rclone.conf`。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
 
 推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题。拉回标注结果时，这些字段会完整写入 `human_label`，再进入训练集版本构建。
 

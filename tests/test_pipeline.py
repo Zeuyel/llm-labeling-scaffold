@@ -1,10 +1,21 @@
 from pathlib import Path
+import hashlib
 import time
+
+import yaml
 
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.io import read_json, write_json
 from llm_labeling_scaffold import pipeline
 from llm_labeling_scaffold.sampling import sample_records
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def test_create_task_writes_custom_task_with_auxiliary_labels(tmp_path: Path):
@@ -140,6 +151,254 @@ def test_import_asset_is_idempotent_and_blocks_conflicting_overwrite(tmp_path: P
         raise AssertionError("conflicting import should fail")
     audit = tmp_path / "runs" / task.task_id / "_audit" / "events.jsonl"
     assert audit.exists()
+
+
+def test_import_from_data_lake_manifest_records_lineage(tmp_path: Path):
+    source = tmp_path / "lake_source.jsonl"
+    source.write_text(
+        '{"record_id":"r1","title":"A"}\n{"title":"B","record_id":"r2"}\n',
+        encoding="utf-8",
+    )
+    manifest_path = tmp_path / "manifest.json"
+    write_json(
+        {
+            "dataset_id": "lake_seed",
+            "layer": "labels",
+            "domain": "patent",
+            "objects": [
+                {
+                    "path": "imports/seed/raw.jsonl",
+                    "storage_uri": str(source),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 2,
+                    "id_field": "record_id",
+                    "unique_ids": 2,
+                    "bytes": source.stat().st_size,
+                    "sha256": _file_sha256(source),
+                    "created_by": "tests",
+                    "upstream_uri": ["r2:test/upstream/source.jsonl"],
+                    "sampling_strategy": "unit_test_seed",
+                },
+                {
+                    "path": "imports/seed_alias/raw.jsonl",
+                    "storage_uri": str(source),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 2,
+                    "id_field": "record_id",
+                    "unique_ids": 2,
+                    "bytes": source.stat().st_size,
+                    "sha256": _file_sha256(source),
+                    "created_by": "tests",
+                    "upstream_uri": ["r2:test/upstream/source_alias.jsonl"],
+                    "sampling_strategy": "unit_test_seed_alias",
+                }
+            ],
+        },
+        manifest_path,
+    )
+    registry_path = tmp_path / "data_lake.yaml"
+    registry_path.write_text(
+        yaml.safe_dump(
+            {
+                "datasets": {
+                    "lake_seed": {
+                        "layer": "labels",
+                        "domain": "patent",
+                        "manifest": str(manifest_path),
+                    }
+                }
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "data_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+            "data_lake": {
+                "lake_registry_uri": str(registry_path),
+                "source_dataset_id": "lake_seed",
+                "source_object_path": "imports/seed/raw.jsonl",
+                "default_import_id": "lake_import",
+            },
+        },
+    )
+    task = load_task(created["path"])
+
+    imported = pipeline.import_from_data_lake(tmp_path / "runs", task)
+    reused = pipeline.import_from_data_lake(tmp_path / "runs", task)
+    manifest = read_json(tmp_path / "runs" / task.task_id / "imports" / "lake_import" / "manifest.json")
+    raw_cache = tmp_path / "runs" / task.task_id / "imports" / "lake_import" / "raw.jsonl"
+
+    assert imported["import_id"] == "lake_import"
+    assert reused["action"] == "reused"
+    assert _file_sha256(raw_cache) == _file_sha256(source)
+    assert manifest["source"] == "data_lake"
+    assert manifest["source_dataset_id"] == "lake_seed"
+    assert manifest["source_manifest_uri"] == str(manifest_path)
+    assert manifest["source_object_uri"] == str(source)
+    assert manifest["source_object_path"] == "imports/seed/raw.jsonl"
+    assert manifest["source_object_sha256"] == _file_sha256(source)
+    assert manifest["source_content_sha256"] == manifest["content_sha256"]
+    assert manifest["source_rows"] == 2
+    assert manifest["source_asset_type"] == "label_import_jsonl"
+    assert manifest["source_created_by"] == "tests"
+    assert manifest["source_upstream_uri"] == ["r2:test/upstream/source.jsonl"]
+    assert manifest["source_sampling_strategy"] == "unit_test_seed"
+
+    task.raw["data_lake"]["source_object_path"] = "imports/seed_alias/raw.jsonl"
+    try:
+        pipeline.import_from_data_lake(tmp_path / "runs", task, import_id="lake_import")
+    except ValueError as exc:
+        assert "血缘不同" in str(exc)
+    else:
+        raise AssertionError("same import id with different lake lineage should fail")
+
+
+def test_data_lake_import_requires_manifest_relative_object_and_matching_manifest(tmp_path: Path):
+    source_a = tmp_path / "a.jsonl"
+    source_b = tmp_path / "b.jsonl"
+    source_a.write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    source_b.write_text('{"record_id":"r2","title":"B"}\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_json(
+        {
+            "dataset_id": "lake_seed",
+            "objects": [
+                {
+                    "path": "inputs/a/raw.jsonl",
+                    "storage_uri": str(source_a),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 1,
+                    "id_field": "record_id",
+                    "unique_ids": 1,
+                    "bytes": source_a.stat().st_size,
+                    "sha256": _file_sha256(source_a),
+                    "created_by": "tests",
+                    "upstream_uri": ["r2:test/upstream/a.jsonl"],
+                    "sampling_strategy": "unit_test_seed",
+                },
+                {
+                    "path": "inputs/b/raw.jsonl",
+                    "storage_uri": str(source_b),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 1,
+                    "id_field": "record_id",
+                    "unique_ids": 1,
+                    "bytes": source_b.stat().st_size,
+                    "sha256": _file_sha256(source_b),
+                    "created_by": "tests",
+                    "upstream_uri": ["r2:test/upstream/b.jsonl"],
+                    "sampling_strategy": "unit_test_seed",
+                },
+            ],
+        },
+        manifest_path,
+    )
+    other_manifest = tmp_path / "other_manifest.json"
+    write_json({"objects": []}, other_manifest)
+    registry_path = tmp_path / "data_lake.yaml"
+    registry_path.write_text(
+        yaml.safe_dump({"datasets": {"lake_seed": {"manifest": str(manifest_path)}}}),
+        encoding="utf-8",
+    )
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "data_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+            "data_lake": {
+                "lake_registry_uri": str(registry_path),
+                "source_dataset_id": "lake_seed",
+                "source_manifest_uri": str(other_manifest),
+            },
+        },
+    )
+    task = load_task(created["path"])
+
+    try:
+        pipeline.import_from_data_lake(tmp_path / "runs", task)
+    except Exception as exc:
+        assert "source_manifest_uri 与 registry 不一致" in str(exc)
+    else:
+        raise AssertionError("mismatched manifest uri should fail")
+
+    task = load_task(created["path"])
+    task.raw["data_lake"].pop("source_manifest_uri")
+    try:
+        pipeline.import_from_data_lake(tmp_path / "runs", task)
+    except Exception as exc:
+        assert "匹配到多个 JSONL 对象" in str(exc)
+    else:
+        raise AssertionError("multiple jsonl candidates should require source_object_path")
+
+    task.raw["data_lake"]["source_object_path"] = "../raw.jsonl"
+    try:
+        pipeline.import_from_data_lake(tmp_path / "runs", task)
+    except Exception as exc:
+        assert "安全相对路径" in str(exc)
+    else:
+        raise AssertionError("unsafe source_object_path should fail")
+
+
+def test_data_lake_import_requires_task_level_manifest_fields(tmp_path: Path):
+    source = tmp_path / "raw.jsonl"
+    source.write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_json(
+        {
+            "dataset_id": "lake_seed",
+            "objects": [
+                {
+                    "path": "inputs/manual_seed/v1/raw.jsonl",
+                    "storage_uri": str(source),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 1,
+                    "id_field": "record_id",
+                    "unique_ids": 1,
+                    "bytes": source.stat().st_size,
+                    "sha256": _file_sha256(source),
+                }
+            ],
+        },
+        manifest_path,
+    )
+    registry_path = tmp_path / "data_lake.yaml"
+    registry_path.write_text(
+        yaml.safe_dump({"datasets": {"lake_seed": {"manifest": str(manifest_path)}}}),
+        encoding="utf-8",
+    )
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "data_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+            "data_lake": {
+                "lake_registry_uri": str(registry_path),
+                "source_dataset_id": "lake_seed",
+                "source_object_path": "inputs/manual_seed/v1/raw.jsonl",
+            },
+        },
+    )
+    task = load_task(created["path"])
+
+    try:
+        pipeline.import_from_data_lake(tmp_path / "runs", task)
+    except Exception as exc:
+        assert "created_by" in str(exc)
+    else:
+        raise AssertionError("task-level manifest governance fields should be required")
 
 
 def test_import_rows_and_archive_respect_sample_dependencies(tmp_path: Path):

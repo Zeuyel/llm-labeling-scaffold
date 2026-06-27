@@ -343,6 +343,22 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"events": pipeline.list_audit_events(self.runs_root, task)})
+        elif path == "/api/task/data_lake":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            try:
+                from .data_lake import preview_source
+
+                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                self._json({
+                    "enabled": bool(task_cfg.data_lake),
+                    "data_lake": task_cfg.data_lake,
+                    "preview": preview_source(task_cfg) if task_cfg.data_lake else None,
+                })
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/argilla/status":
             try:
                 from .integrations.argilla import test_connection
@@ -424,6 +440,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/import":
             self._import(params)
+        elif path == "/api/import/data_lake":
+            self._import_data_lake(params)
         else:
             self._json({"error": "not found"}, status=404)
 
@@ -496,6 +514,37 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
             result = pipeline.save_import(self.runs_root, task_cfg, name, rows, source="upload")
+            self._json({"ok": True, "import": result})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
+    def _import_data_lake(self, params) -> None:
+        body = self._read_body()
+        task_id = str(body.get("task_id") or params.get("task_id", [""])[0])
+        if not _safe_segment(task_id):
+            self._json({"error": "bad task"}, status=400)
+            return
+        import_id = str(body.get("import_id") or params.get("import_id", [""])[0] or "").strip()
+        overrides = {
+            key: body.get(key)
+            for key in (
+                "lake_registry_uri",
+                "source_dataset_id",
+                "source_manifest_uri",
+                "source_object_path",
+            )
+            if body.get(key) not in (None, "")
+        }
+        max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
+        try:
+            task_cfg = pipeline.load_task_by_id(self.tasks_root, task_id)
+            result = pipeline.import_from_data_lake(
+                self.runs_root,
+                task_cfg,
+                import_id=import_id or None,
+                overrides=overrides,
+                max_bytes=max_bytes,
+            )
             self._json({"ok": True, "import": result})
         except Exception as exc:
             self._json({"error": str(exc)}, status=400)

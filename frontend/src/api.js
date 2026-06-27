@@ -26,6 +26,7 @@ export const getAnnotationJobs = (taskId) => req(`/api/task/annotation_jobs?${q(
 export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifacts?${q({ task_id: taskId })}`);
 export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
 export const getAuditEvents = (taskId) => req(`/api/task/audit?${q({ task_id: taskId })}`);
+export const getDataLakeStatus = (taskId) => req(`/api/task/data_lake?${q({ task_id: taskId })}`);
 export const getArgillaStatus = () => req("/api/argilla/status");
 
 export const createTask = (payload) =>
@@ -64,6 +65,13 @@ export const importJsonl = (taskId, name, text) =>
     method: "POST",
     headers: { "Content-Type": "application/x-ndjson" },
     body: text,
+  });
+
+export const importFromDataLake = (taskId, payload = {}) =>
+  req("/api/import/data_lake", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_id: taskId, ...payload }),
   });
 
 export const archiveImport = (taskId, importId, reason = "") =>

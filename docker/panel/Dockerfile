@@ -17,6 +17,9 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 
 WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends rclone \
+    && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY --from=frontend /app/frontend/dist ./frontend/dist

@@ -24,6 +24,8 @@ services:
       - ARGILLA_API_KEY=${ARGILLA_API_KEY:-argilla.apikey}
       - ARGILLA_WORKSPACE=${ARGILLA_WORKSPACE:-argilla}
       - MLFLOW_TRACKING_URI
+      - RCLONE_CONFIG=${RCLONE_CONFIG:-/run/secrets/rclone/rclone.conf}
+      - LLS_RCLONE_TIMEOUT_SECONDS=${LLS_RCLONE_TIMEOUT_SECONDS:-120}
     volumes:
       - ./runs:/app/runs
       - ./tasks:/app/tasks

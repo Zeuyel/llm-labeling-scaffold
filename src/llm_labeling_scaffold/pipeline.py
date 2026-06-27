@@ -72,6 +72,16 @@ def _publish_directory(staging: Path, target: Path) -> None:
     _fsync_dir(target.parent)
 
 
+def _copy_file_fsync(source: str | Path, target: str | Path) -> None:
+    source_path = Path(source)
+    target_path = Path(target)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with source_path.open("rb") as src, target_path.open("wb") as dst:
+        shutil.copyfileobj(src, dst)
+        dst.flush()
+        os.fsync(dst.fileno())
+
+
 def _move_directory(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
@@ -221,6 +231,34 @@ def _jsonl_content_hash(path: Path) -> str:
     return digest.hexdigest()
 
 
+DATA_LAKE_LINEAGE_KEYS = (
+    "lake_registry_uri",
+    "source_dataset_id",
+    "source_manifest_uri",
+    "source_object_uri",
+    "source_object_path",
+    "source_object_bytes",
+    "source_object_sha256",
+    "source_rows",
+    "source_asset_type",
+    "source_id_field",
+    "source_unique_ids",
+    "source_created_by",
+    "source_upstream_uri",
+    "source_sampling_strategy",
+)
+
+
+def _metadata_mismatches(existing: dict[str, Any], incoming: dict[str, Any]) -> list[str]:
+    mismatches: list[str] = []
+    for key in DATA_LAKE_LINEAGE_KEYS:
+        if key not in incoming:
+            continue
+        if existing.get(key) != incoming[key]:
+            mismatches.append(key)
+    return mismatches
+
+
 def list_tasks(tasks_root: str | Path) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -245,6 +283,7 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
                     "id_field": task.id_field,
                     "primary_label": task.primary_label,
                     "auxiliary_labels": task.auxiliary_labels,
+                    "data_lake": task.data_lake,
                 })
             except Exception as exc:  # noqa: BLE001
                 out.append({"task_id": None, "path": str(yml), "error": str(exc)})
@@ -429,6 +468,11 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
     annotation_guidelines = str(spec.get("annotation_guidelines", "")).strip()
     if annotation_guidelines:
         raw["annotation"] = {"guidelines": annotation_guidelines}
+    data_lake = spec.get("data_lake")
+    if isinstance(data_lake, dict):
+        cleaned = {str(key): value for key, value in data_lake.items() if value not in (None, "")}
+        if cleaned:
+            raw["data_lake"] = cleaned
     task_dir.mkdir(parents=True, exist_ok=False)
     write_text_atomic(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), task_path)
     prompt = str(spec.get("prompt", "")).strip()
@@ -716,8 +760,13 @@ def dependencies_for_sample(runs_root: str | Path, task_id: str, sample_id: str)
 
 
 def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *,
-                source: str = "upload") -> dict:
+                source: str = "upload", metadata: dict[str, Any] | None = None,
+                raw_source_path: str | Path | None = None) -> dict:
     import_id = str(import_id or "").strip()
+    metadata = metadata or {}
+    source_file = Path(raw_source_path) if raw_source_path is not None else None
+    if source_file is not None and not source_file.is_file():
+        raise ValueError(f"导入源文件不存在: {source_file}")
     if not _safe_segment(import_id):
         raise ValueError("导入编号只能使用单段名称，不能包含路径分隔符")
     if not rows:
@@ -740,6 +789,12 @@ def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *
                 existing_hash = manifest.get("content_sha256")
                 existing_hash = existing_hash or _jsonl_content_hash(raw_path)
                 if existing_hash == incoming_hash:
+                    mismatches = _metadata_mismatches(manifest, metadata)
+                    if mismatches:
+                        raise ValueError(
+                            f"导入编号已存在且内容相同，但数据湖血缘不同: {', '.join(mismatches)}。"
+                            "请使用新的导入编号。"
+                        )
                     summary = _import_summary(runs_root, task.task_id, item, id_field=task.id_field)
                     summary["action"] = "reused"
                     summary["idempotent"] = True
@@ -774,9 +829,33 @@ def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *
                 "state": "active",
                 "schema_version": 1,
             }
+            for key in (
+                "lake_registry_uri",
+                "source_dataset_id",
+                "source_manifest_uri",
+                "source_object_uri",
+                "source_object_path",
+                "source_object_bytes",
+                "source_object_sha256",
+                "source_content_sha256",
+                "source_rows",
+                "source_asset_type",
+                "source_id_field",
+                "source_unique_ids",
+                "source_created_by",
+                "source_upstream_uri",
+                "source_sampling_strategy",
+            ):
+                if metadata.get(key) not in (None, ""):
+                    manifest[key] = metadata[key]
+            if metadata:
+                manifest["source_metadata"] = metadata
             staging = _staging_dir(runs_root, task.task_id, "imports", import_id)
             try:
-                write_jsonl(rows, staging / "raw.jsonl")
+                if source_file is not None:
+                    _copy_file_fsync(source_file, staging / "raw.jsonl")
+                else:
+                    write_jsonl(rows, staging / "raw.jsonl")
                 write_json(manifest, staging / "manifest.json")
                 _publish_directory(staging, item)
             finally:
@@ -796,7 +875,7 @@ def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *
                 "import.create",
                 asset_type="import",
                 asset_id=import_id,
-                details={"content_sha256": incoming_hash, "rows": profile["rows"], "source": source},
+                details={"content_sha256": incoming_hash, "rows": profile["rows"], "source": source, **metadata},
             )
             return result
     except Exception as exc:
@@ -807,9 +886,41 @@ def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *
             asset_type="import",
             asset_id=import_id or "-",
             status="failed",
-            details={"error": str(exc), "source": source},
+            details={"error": str(exc), "source": source, **metadata},
         )
         raise
+
+
+def import_from_data_lake(runs_root: str | Path, task, import_id: str | None = None,
+                          overrides: dict[str, Any] | None = None,
+                          max_bytes: int | None = None) -> dict:
+    from .data_lake import default_import_id, materialize_source, read_source_rows
+
+    source = materialize_source(task, overrides=overrides, max_bytes=max_bytes)
+    try:
+        rows = read_source_rows(source)
+        profile = _profile_jsonl_from_rows(rows, id_field=task.id_field)
+        if profile["rows"] != source.source_object_rows:
+            raise ValueError(f"数据湖对象行数校验失败: manifest={source.source_object_rows}, actual={profile['rows']}")
+        if profile["unique_ids"] != source.source_unique_ids:
+            raise ValueError(f"数据湖对象唯一 ID 数校验失败: manifest={source.source_unique_ids}, actual={profile['unique_ids']}")
+        incoming_hash = _content_hash(rows)
+        lineage = source.lineage(content_sha256=incoming_hash)
+        target_import_id = str(import_id or default_import_id(task, source)).strip()
+        result = save_import(
+            runs_root,
+            task,
+            target_import_id,
+            rows,
+            source="data_lake",
+            metadata=lineage,
+            raw_source_path=source.local_path,
+        )
+        result["data_lake"] = lineage
+        return result
+    finally:
+        if source.local_path.exists():
+            source.local_path.unlink()
 
 
 def _profile_jsonl_from_rows(rows: list[dict], id_field: str | None = None) -> dict[str, Any]:

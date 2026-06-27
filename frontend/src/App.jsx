@@ -46,7 +46,7 @@ function Shell() {
   let page = null;
   if (matched.page === "tasks") page = <TasksPage tasks={tasks} onReload={loadTasks} {...common} />;
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "imports") page = <ImportsPage taskId={activeTaskId} {...common} />;
+  else if (matched.page === "imports") page = <ImportsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "annotations") page = <RunsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "jobs") page = <JobsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;

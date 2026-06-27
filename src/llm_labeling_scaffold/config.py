@@ -62,6 +62,11 @@ class TaskConfig:
         return text or None
 
     @property
+    def data_lake(self) -> dict[str, Any]:
+        value = self.raw.get("data_lake", {})
+        return dict(value) if isinstance(value, dict) else {}
+
+    @property
     def constraints(self) -> list[dict[str, str]]:
         return list(self.raw.get("constraints", []))
 

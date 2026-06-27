@@ -89,6 +89,22 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--corpus", required=True)
     infer.add_argument("--output", required=True)
 
+    lake = sub.add_parser("data-lake")
+    lake_sub = lake.add_subparsers(dest="lake_cmd", required=True)
+    lake_check = lake_sub.add_parser("check")
+    lake_check.add_argument("--task", required=True)
+    lake_import = lake_sub.add_parser("import")
+    lake_import.add_argument("--task", required=True)
+    lake_import.add_argument("--runs-root", default="runs")
+    lake_import.add_argument("--import-id")
+    lake_import.add_argument("--source-object-path")
+    lake_import.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024)
+    lake_export = lake_sub.add_parser("export")
+    lake_export.add_argument("--task", required=True)
+    lake_export.add_argument("--local", required=True)
+    lake_export.add_argument("--target-uri")
+    lake_export.add_argument("--target-path")
+
     panel = sub.add_parser("panel")
     panel.add_argument("--runs-root", default="runs")
     panel.add_argument("--host", default="127.0.0.1")
@@ -111,7 +127,8 @@ def main(argv: list[str] | None = None) -> None:
         print(sample_records(task, args.rows, args.sample_id, args.strategy, args.seed, args.source))
     elif args.cmd == "batch":
         task = load_task(args.task)
-        out = Path(args.output_dir) if args.output_dir else task.runs_dir / "samples" / Path(args.sample).parent.name
+        sample_id = Path(args.sample).parent.name
+        out = Path(args.output_dir) if args.output_dir else task.runs_dir / "samples" / sample_id / "batches" / f"size_{args.batch_size}"
         print("\n".join(str(p) for p in batch_records(args.sample, out, args.batch_size)))
     elif args.cmd == "annotate":
         task = load_task(args.task)
@@ -142,6 +159,31 @@ def main(argv: list[str] | None = None) -> None:
 
         task = load_task(args.task)
         print(infer_jsonl(task, args.model, args.corpus, args.output))
+    elif args.cmd == "data-lake":
+        task = load_task(args.task)
+        if args.lake_cmd == "check":
+            from .data_lake import preview_source
+
+            print(json.dumps(preview_source(task), ensure_ascii=False, indent=2))
+        elif args.lake_cmd == "import":
+            from .pipeline import import_from_data_lake
+
+            overrides = {
+                "source_object_path": args.source_object_path,
+            }
+            print(json.dumps(
+                import_from_data_lake(args.runs_root, task, import_id=args.import_id, overrides=overrides, max_bytes=args.max_bytes),
+                ensure_ascii=False,
+                indent=2,
+            ))
+        elif args.lake_cmd == "export":
+            from .data_lake import export_artifact
+
+            print(json.dumps(
+                export_artifact(task, args.local, target_uri=args.target_uri, target_path=args.target_path),
+                ensure_ascii=False,
+                indent=2,
+            ))
 
     elif args.cmd == "panel":
         from .panel import serve_panel

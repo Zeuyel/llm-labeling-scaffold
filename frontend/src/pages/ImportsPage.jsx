@@ -18,11 +18,14 @@ function stateLabel(value) {
   return value || "-";
 }
 
-export default function ImportsPage({ taskId, onError }) {
+export default function ImportsPage({ task, taskId, onError }) {
   const [items, setItems] = useState([]);
   const [name, setName] = useState("");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
+  const [lakeBusy, setLakeBusy] = useState(false);
+  const [lakeImportId, setLakeImportId] = useState("");
+  const [lakeStatus, setLakeStatus] = useState(null);
   const [fileLabel, setFileLabel] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const [detail, setDetail] = useState(null);
@@ -64,6 +67,12 @@ export default function ImportsPage({ taskId, onError }) {
   useEffect(() => {
     reload();
   }, [reload]);
+
+  useEffect(() => {
+    const configured = task?.data_lake || {};
+    setLakeImportId(configured.default_import_id || "");
+    setLakeStatus(null);
+  }, [task?.task_id, task?.data_lake]);
 
   useEffect(() => {
     if (!taskId || !selectedId) {
@@ -135,6 +144,39 @@ export default function ImportsPage({ taskId, onError }) {
     }
   }
 
+  async function checkDataLake() {
+    if (!taskId) return;
+    setLakeBusy(true);
+    setNotice("");
+    try {
+      const data = await api.getDataLakeStatus(taskId);
+      setLakeStatus(data.preview || null);
+      if (!lakeImportId && task?.data_lake?.default_import_id) setLakeImportId(task.data_lake.default_import_id);
+      setNotice("数据湖配置可读取。");
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setLakeBusy(false);
+    }
+  }
+
+  async function importLake() {
+    if (!taskId) return;
+    setLakeBusy(true);
+    setNotice("");
+    try {
+      const result = await api.importFromDataLake(taskId, { import_id: lakeImportId.trim() });
+      const imported = result.import || result;
+      setNotice(imported.action === "reused" ? "数据湖内容与已有导入一致，已幂等复用。" : "已从数据湖生成本地导入。");
+      await reload();
+      setSelectedId(imported.import_id || lakeImportId.trim());
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setLakeBusy(false);
+    }
+  }
+
   function searchRows() {
     loadRows(selectedId, { offset: 0, query });
   }
@@ -157,6 +199,42 @@ export default function ImportsPage({ taskId, onError }) {
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
+
+      {task?.data_lake && (
+        <div className="card section-card">
+          <div className="toolbar">
+            <div>
+              <h3>从数据湖导入</h3>
+              <div className="status-line">按任务配置读取 R2 数据湖 manifest，并生成当前任务的本地导入缓存</div>
+            </div>
+            <button className="btn btn-sm" disabled={lakeBusy} onClick={checkDataLake}>检查配置</button>
+          </div>
+          <div className="form-grid">
+            <div className="field">
+              <label>目标导入编号</label>
+              <input value={lakeImportId} onChange={(event) => setLakeImportId(event.target.value)} placeholder={task.data_lake.default_import_id || "留空则自动生成"} />
+              <span className="hint">同名同内容会幂等复用，同名不同内容会拒绝写入。</span>
+            </div>
+            <div className="field">
+              <label>源数据集</label>
+              <input value={task.data_lake.source_dataset_id || "-"} readOnly />
+            </div>
+            <div className="field field-wide">
+              <label>源对象</label>
+              <input value={lakeStatus?.selected_object?.path || task.data_lake.source_object_path || "-"} readOnly />
+            </div>
+          </div>
+          {lakeStatus && (
+            <div className="data-profile">
+              <div><span>数据层</span><strong>{lakeStatus.dataset?.layer || "-"}</strong></div>
+              <div><span>领域</span><strong>{lakeStatus.dataset?.domain || "-"}</strong></div>
+              <div><span>manifest 对象数</span><strong>{lakeStatus.manifest?.object_count ?? "-"}</strong></div>
+              <div><span>选中对象大小</span><strong>{lakeStatus.selected_object?.bytes ?? "-"}</strong></div>
+            </div>
+          )}
+          <button className="btn btn-primary" disabled={lakeBusy} onClick={importLake}>从数据湖生成导入</button>
+        </div>
+      )}
 
       <div className="card section-card">
         <h3>新增导入</h3>

@@ -1,0 +1,560 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+from typing import Any
+from urllib.parse import urlparse
+
+import yaml
+
+from .config import TaskConfig
+from .io import read_jsonl
+
+
+DEFAULT_REGISTRY_URI = "r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml"
+JSONL_SUFFIXES = (".jsonl", ".ndjson")
+
+
+class DataLakeError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class MaterializedSource:
+    registry_uri: str
+    source_dataset_id: str
+    source_manifest_uri: str
+    source_object_uri: str
+    source_object_path: str | None
+    source_object_bytes: int | None
+    source_object_sha256: str
+    source_object_rows: int
+    source_asset_type: str
+    source_id_field: str
+    source_unique_ids: int
+    source_created_by: str
+    source_upstream_uri: list[str]
+    source_sampling_strategy: str
+    local_path: Path
+    manifest: dict[str, Any]
+    dataset: dict[str, Any]
+
+    def lineage(self, content_sha256: str | None = None) -> dict[str, Any]:
+        data = {
+            "lake_registry_uri": self.registry_uri,
+            "source_dataset_id": self.source_dataset_id,
+            "source_manifest_uri": self.source_manifest_uri,
+            "source_object_uri": self.source_object_uri,
+            "source_object_path": self.source_object_path,
+            "source_object_bytes": self.source_object_bytes,
+            "source_object_sha256": self.source_object_sha256,
+            "source_content_sha256": content_sha256,
+            "source_rows": self.source_object_rows,
+            "source_asset_type": self.source_asset_type,
+            "source_id_field": self.source_id_field,
+            "source_unique_ids": self.source_unique_ids,
+            "source_created_by": self.source_created_by,
+            "source_upstream_uri": self.source_upstream_uri,
+            "source_sampling_strategy": self.source_sampling_strategy,
+        }
+        return {key: value for key, value in data.items() if value not in (None, "")}
+
+
+def _rclone_bin() -> str:
+    return os.environ.get("LLS_RCLONE_BIN") or "rclone"
+
+
+def _rclone_timeout() -> int:
+    return int(os.environ.get("LLS_RCLONE_TIMEOUT_SECONDS", "120"))
+
+
+def _normalize_registry_uri(uri: str) -> str:
+    text = str(uri or "").strip() or DEFAULT_REGISTRY_URI
+    if text.endswith("/"):
+        return text + "data_lake.yaml"
+    if Path(text).name == "":
+        return text.rstrip("/") + "/data_lake.yaml"
+    return text
+
+
+def _is_file_uri(uri: str) -> bool:
+    return uri.startswith("file://")
+
+
+def _is_local_path(uri: str) -> bool:
+    return _is_file_uri(uri) or uri.startswith("/") or uri.startswith("./") or uri.startswith("../")
+
+
+def _local_path(uri: str) -> Path:
+    if _is_file_uri(uri):
+        parsed = urlparse(uri)
+        return Path(parsed.path)
+    return Path(uri)
+
+
+def _is_rclone_uri(uri: str) -> bool:
+    if _is_local_path(uri):
+        return False
+    head, sep, tail = uri.partition(":")
+    return bool(head and sep and tail)
+
+
+def _validate_rclone_uri(uri: str) -> None:
+    remote, sep, path = uri.partition(":")
+    if not sep or not remote or not path:
+        raise DataLakeError(f"非法数据湖 URI: {uri}")
+    if any(ch in remote for ch in "/\\"):
+        raise DataLakeError(f"非法 rclone remote: {remote}")
+    if path.startswith("/") or any(part == ".." for part in path.split("/")):
+        raise DataLakeError(f"数据湖对象路径不允许路径穿越: {uri}")
+
+
+def _validate_manifest_path(path: str) -> str:
+    value = str(path or "").strip()
+    if not value:
+        raise DataLakeError("任务 data_lake 缺少 source_object_path")
+    if value.startswith("/") or "\\" in value or any(part in {"", ".", ".."} for part in value.split("/")):
+        raise DataLakeError(f"source_object_path 必须是 manifest 内的安全相对路径: {path}")
+    return value
+
+
+def _validate_output_path(path: str) -> str:
+    value = str(path or "").strip()
+    if not value:
+        raise DataLakeError("回写相对路径不能为空")
+    if value.startswith("/") or "\\" in value or any(part in {"", ".", ".."} for part in value.split("/")):
+        raise DataLakeError(f"回写路径必须是安全相对路径: {path}")
+    return value
+
+
+def _validate_storage_uri(uri: str) -> str:
+    value = str(uri or "").strip()
+    if not value:
+        raise DataLakeError("manifest 对象缺少 storage_uri")
+    if _is_rclone_uri(value):
+        _validate_rclone_uri(value)
+    elif not _is_local_path(value):
+        raise DataLakeError(f"不支持的数据湖对象 URI: {uri}")
+    return value
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def copy_uri_to_path(uri: str, target: str | Path) -> Path:
+    target_path = Path(target)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if _is_local_path(uri):
+        source = _local_path(uri)
+        if not source.is_file():
+            raise DataLakeError(f"本地数据湖文件不存在: {source}")
+        shutil.copyfile(source, target_path)
+        return target_path
+    if not _is_rclone_uri(uri):
+        raise DataLakeError(f"不支持的数据湖 URI: {uri}")
+    _validate_rclone_uri(uri)
+    try:
+        subprocess.run(
+            [_rclone_bin(), "copyto", uri, str(target_path)],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=_rclone_timeout(),
+        )
+    except FileNotFoundError as exc:
+        raise DataLakeError("未找到 rclone。请在宿主机或面板容器中安装 rclone，并配置 R2 remote。") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DataLakeError(f"rclone 读取超时: {uri}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise DataLakeError(f"rclone 读取失败: {uri} {detail}") from exc
+    return target_path
+
+
+def copy_path_to_uri(source: str | Path, uri: str) -> str:
+    source_path = Path(source)
+    if not source_path.is_file():
+        raise DataLakeError(f"本地文件不存在: {source_path}")
+    if _is_local_path(uri):
+        target = _local_path(uri)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_path, target)
+        return str(target)
+    if not _is_rclone_uri(uri):
+        raise DataLakeError(f"不支持的数据湖 URI: {uri}")
+    _validate_rclone_uri(uri)
+    try:
+        subprocess.run(
+            [_rclone_bin(), "copyto", str(source_path), uri],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=_rclone_timeout(),
+        )
+    except FileNotFoundError as exc:
+        raise DataLakeError("未找到 rclone。请在宿主机或面板容器中安装 rclone，并配置 R2 remote。") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DataLakeError(f"rclone 写入超时: {uri}") from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        raise DataLakeError(f"rclone 写入失败: {uri} {detail}") from exc
+    return uri
+
+
+def _read_uri(uri: str, suffix: str) -> Any:
+    with tempfile.TemporaryDirectory(prefix="lls-lake-") as td:
+        path = Path(td) / f"object{suffix}"
+        copy_uri_to_path(uri, path)
+        if suffix in {".yaml", ".yml"}:
+            return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_yaml_uri(uri: str) -> dict[str, Any]:
+    data = _read_uri(uri, ".yaml")
+    if not isinstance(data, dict):
+        raise DataLakeError(f"数据湖 YAML 必须是对象: {uri}")
+    return data
+
+
+def read_json_uri(uri: str) -> dict[str, Any]:
+    data = _read_uri(uri, ".json")
+    if not isinstance(data, dict):
+        raise DataLakeError(f"数据湖 manifest 必须是对象: {uri}")
+    return data
+
+
+def _data_lake_config(task: TaskConfig, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = dict(task.data_lake)
+    for key, value in (overrides or {}).items():
+        if value not in (None, ""):
+            cfg[key] = value
+    return cfg
+
+
+def _registry_uri(cfg: dict[str, Any]) -> str:
+    return _normalize_registry_uri(str(cfg.get("lake_registry_uri") or DEFAULT_REGISTRY_URI))
+
+
+def _resolve_dataset(registry: dict[str, Any], dataset_id: str) -> dict[str, Any]:
+    datasets = registry.get("datasets")
+    if not isinstance(datasets, dict):
+        raise DataLakeError("数据湖登记表缺少 datasets")
+    dataset = datasets.get(dataset_id)
+    if not isinstance(dataset, dict):
+        raise DataLakeError(f"数据湖登记表中没有数据集: {dataset_id}")
+    return dict(dataset)
+
+
+def _manifest_objects(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    objects = manifest.get("objects")
+    if not isinstance(objects, list):
+        raise DataLakeError("数据集 manifest 缺少 objects 清单")
+    return [dict(item) for item in objects if isinstance(item, dict)]
+
+
+def candidate_objects(manifest: dict[str, Any], suffixes: tuple[str, ...] = JSONL_SUFFIXES) -> list[dict[str, Any]]:
+    out = []
+    for item in _manifest_objects(manifest):
+        path = str(item.get("path") or "")
+        uri = str(item.get("storage_uri") or "")
+        if path.endswith(suffixes) or uri.endswith(suffixes):
+            out.append(item)
+    return out
+
+
+def _manifest_sha256(item: dict[str, Any]) -> str:
+    value = item.get("sha256") or item.get("content_sha256")
+    text = str(value or "").strip()
+    if not text:
+        raise DataLakeError("任务级输入对象缺少 sha256")
+    return text
+
+
+def _manifest_int(item: dict[str, Any], key: str) -> int:
+    value = item.get(key)
+    if not isinstance(value, int):
+        raise DataLakeError(f"任务级输入对象缺少整数 {key}")
+    return value
+
+
+def _manifest_text(item: dict[str, Any], key: str) -> str:
+    text = str(item.get(key) or "").strip()
+    if not text:
+        raise DataLakeError(f"任务级输入对象缺少 {key}")
+    return text
+
+
+def _manifest_uri_list(item: dict[str, Any], key: str) -> list[str]:
+    value = item.get(key)
+    if not isinstance(value, list):
+        raise DataLakeError(f"任务级输入对象缺少列表 {key}")
+    out = [str(part).strip() for part in value if str(part).strip()]
+    if not out:
+        raise DataLakeError(f"任务级输入对象 {key} 不能为空")
+    return out
+
+
+def _validate_label_import_object(item: dict[str, Any], task: TaskConfig) -> dict[str, Any]:
+    path = _validate_manifest_path(str(item.get("path") or ""))
+    uri = _validate_storage_uri(str(item.get("storage_uri") or "").strip())
+    if not (path.endswith(JSONL_SUFFIXES) or uri.endswith(JSONL_SUFFIXES)):
+        raise DataLakeError(f"任务级输入对象必须是 JSONL/NDJSON: {path}")
+    asset_type = str(item.get("asset_type") or "").strip()
+    if asset_type != "label_import_jsonl":
+        raise DataLakeError(f"任务级输入对象 asset_type 必须是 label_import_jsonl: {path}")
+    rows = _manifest_int(item, "rows")
+    unique_ids = _manifest_int(item, "unique_ids")
+    bytes_value = _manifest_int(item, "bytes")
+    sha256 = _manifest_sha256(item)
+    created_by = _manifest_text(item, "created_by")
+    upstream_uri = _manifest_uri_list(item, "upstream_uri")
+    sampling_strategy = _manifest_text(item, "sampling_strategy")
+    id_field = str(item.get("id_field") or "").strip()
+    if id_field != task.id_field:
+        raise DataLakeError(f"任务 ID 字段与 manifest 不一致: task={task.id_field}, manifest={id_field or '-'}")
+    return {
+        **item,
+        "path": path,
+        "storage_uri": uri,
+        "asset_type": asset_type,
+        "rows": rows,
+        "unique_ids": unique_ids,
+        "bytes": bytes_value,
+        "sha256": sha256,
+        "id_field": id_field,
+        "created_by": created_by,
+        "upstream_uri": upstream_uri,
+        "sampling_strategy": sampling_strategy,
+    }
+
+
+def _select_object(manifest: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+    objects = _manifest_objects(manifest)
+    source_object_path = str(cfg.get("source_object_path") or "").strip()
+
+    if source_object_path:
+        safe_path = _validate_manifest_path(source_object_path)
+        matches = [item for item in objects if item.get("path") == safe_path]
+    else:
+        matches = candidate_objects(manifest)
+
+    if not matches:
+        raise DataLakeError("数据集 manifest 中没有匹配的可导入对象")
+    if len(matches) > 1:
+        preview = ", ".join(str(item.get("path") or item.get("storage_uri")) for item in matches[:8])
+        raise DataLakeError(f"匹配到多个 JSONL 对象，必须在 task.yaml 指定 source_object_path: {preview}")
+    return matches[0]
+
+
+def resolve_source(task: TaskConfig, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    cfg = _data_lake_config(task, overrides)
+    if not cfg:
+        raise DataLakeError("任务未配置 data_lake")
+    registry_uri = _registry_uri(cfg)
+    registry = read_yaml_uri(registry_uri)
+    dataset_id = str(cfg.get("source_dataset_id") or "").strip()
+    if not dataset_id:
+        raise DataLakeError("任务 data_lake 缺少 source_dataset_id")
+    dataset = _resolve_dataset(registry, dataset_id)
+    registry_manifest_uri = str(dataset.get("manifest") or "").strip()
+    if not registry_manifest_uri:
+        raise DataLakeError(f"数据集缺少 manifest URI: {dataset_id}")
+    explicit_manifest_uri = str(cfg.get("source_manifest_uri") or "").strip()
+    if explicit_manifest_uri and explicit_manifest_uri != registry_manifest_uri:
+        raise DataLakeError(
+            f"source_manifest_uri 与 registry 不一致: task={explicit_manifest_uri}, registry={registry_manifest_uri}"
+        )
+    manifest_uri = registry_manifest_uri
+    manifest = read_json_uri(manifest_uri)
+    selected = _validate_label_import_object(_select_object(manifest, cfg), task)
+    object_uri = str(selected.get("storage_uri") or "").strip()
+    if not object_uri:
+        raise DataLakeError("匹配对象缺少 storage_uri")
+    return {
+        "registry_uri": registry_uri,
+        "registry": registry,
+        "source_dataset_id": dataset_id,
+        "dataset": dataset,
+        "source_manifest_uri": manifest_uri,
+        "manifest": manifest,
+        "selected_object": selected,
+        "candidate_objects": candidate_objects(manifest),
+    }
+
+
+def preview_source(task: TaskConfig, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
+    resolved = resolve_source(task, overrides)
+    selected = resolved["selected_object"]
+    candidates = resolved["candidate_objects"]
+    return {
+        "lake_registry_uri": resolved["registry_uri"],
+        "source_dataset_id": resolved["source_dataset_id"],
+        "source_manifest_uri": resolved["source_manifest_uri"],
+        "dataset": {
+            "layer": resolved["dataset"].get("layer"),
+            "domain": resolved["dataset"].get("domain"),
+            "canonical_uri": resolved["dataset"].get("canonical_uri"),
+        },
+        "manifest": {
+            "dataset_id": resolved["manifest"].get("dataset_id"),
+            "layer": resolved["manifest"].get("layer"),
+            "domain": resolved["manifest"].get("domain"),
+            "object_count": resolved["manifest"].get("object_count"),
+            "total_bytes": resolved["manifest"].get("total_bytes"),
+        },
+        "selected_object": {
+            "path": selected.get("path"),
+            "storage_uri": selected.get("storage_uri"),
+            "bytes": selected.get("bytes"),
+            "sha256": selected.get("sha256"),
+            "rows": selected.get("rows"),
+            "asset_type": selected.get("asset_type"),
+            "id_field": selected.get("id_field"),
+            "unique_ids": selected.get("unique_ids"),
+            "created_by": selected.get("created_by"),
+            "upstream_uri": selected.get("upstream_uri"),
+            "sampling_strategy": selected.get("sampling_strategy"),
+            "mod_time": selected.get("mod_time"),
+        },
+        "candidate_objects": [
+            {
+                "path": item.get("path"),
+                "storage_uri": item.get("storage_uri"),
+                "bytes": item.get("bytes"),
+            }
+            for item in candidates[:50]
+        ],
+    }
+
+
+def materialize_source(task: TaskConfig, overrides: dict[str, Any] | None = None,
+                       max_bytes: int | None = None) -> MaterializedSource:
+    resolved = resolve_source(task, overrides)
+    selected = resolved["selected_object"]
+    object_uri = str(selected.get("storage_uri") or "").strip()
+    size = selected.get("bytes")
+    if max_bytes is not None and isinstance(size, int) and size > max_bytes:
+        raise DataLakeError(f"数据湖对象过大，当前上限为 {max_bytes} bytes")
+    tmp = tempfile.NamedTemporaryFile(prefix="lls-lake-source-", suffix=Path(object_uri).suffix or ".jsonl", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        copy_uri_to_path(object_uri, tmp_path)
+        actual_size = tmp_path.stat().st_size
+        if isinstance(size, int) and actual_size != size:
+            raise DataLakeError(f"数据湖对象字节数校验失败: manifest={size}, actual={actual_size}")
+        actual_sha256 = _file_sha256(tmp_path)
+        if actual_sha256 != selected["sha256"]:
+            raise DataLakeError("数据湖对象 sha256 校验失败")
+        if max_bytes is not None and tmp_path.stat().st_size > max_bytes:
+            raise DataLakeError(f"数据湖对象过大，当前上限为 {max_bytes} bytes")
+        return MaterializedSource(
+            registry_uri=resolved["registry_uri"],
+            source_dataset_id=resolved["source_dataset_id"],
+            source_manifest_uri=resolved["source_manifest_uri"],
+            source_object_uri=object_uri,
+            source_object_path=selected.get("path"),
+            source_object_bytes=size if isinstance(size, int) else None,
+            source_object_sha256=selected["sha256"],
+            source_object_rows=selected["rows"],
+            source_asset_type=selected["asset_type"],
+            source_id_field=selected["id_field"],
+            source_unique_ids=selected["unique_ids"],
+            source_created_by=selected["created_by"],
+            source_upstream_uri=selected["upstream_uri"],
+            source_sampling_strategy=selected["sampling_strategy"],
+            local_path=tmp_path,
+            manifest=resolved["manifest"],
+            dataset=resolved["dataset"],
+        )
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def read_source_rows(source: MaterializedSource) -> list[dict]:
+    suffix = source.local_path.suffix.lower()
+    if suffix in JSONL_SUFFIXES or suffix == "":
+        return read_jsonl(source.local_path)
+    raise DataLakeError(f"不支持直接导入的数据湖对象格式: {source.source_object_uri}")
+
+
+def default_import_id(task: TaskConfig, source: MaterializedSource) -> str:
+    cfg = task.data_lake
+    if cfg.get("default_import_id"):
+        return str(cfg["default_import_id"]).strip()
+    stem = Path(str(source.source_object_path or source.source_object_uri)).stem
+    return f"{task.task_id}_{stem}_lake"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _jsonl_rows_if_supported(path: Path) -> int | None:
+    if path.suffix.lower() not in JSONL_SUFFIXES:
+        return None
+    return len(read_jsonl(path))
+
+
+def _artifact_manifest_uri(target_uri: str) -> str:
+    for suffix in JSONL_SUFFIXES + (".json", ".csv"):
+        if target_uri.endswith(suffix):
+            return target_uri[: -len(suffix)] + ".manifest.json"
+    return target_uri.rstrip("/") + ".manifest.json"
+
+
+def export_artifact(task: TaskConfig, local_path: str | Path,
+                    target_uri: str | None = None, target_path: str | None = None) -> dict[str, Any]:
+    cfg = task.data_lake
+    local = Path(local_path)
+    if not local.is_file():
+        raise DataLakeError(f"本地文件不存在: {local}")
+    if not target_uri:
+        base = str(cfg.get("output_base_uri") or "").strip()
+        if not base:
+            raise DataLakeError("任务 data_lake 缺少 output_base_uri，无法推导回写位置")
+        rel = _validate_output_path(target_path or local.name)
+        target_uri = base.rstrip("/") + "/" + rel
+    else:
+        rel = _validate_output_path(target_path or local.name)
+    manifest_uri = _artifact_manifest_uri(target_uri)
+    rows = _jsonl_rows_if_supported(local)
+    manifest = {
+        "manifest_version": "1.0",
+        "task_id": task.task_id,
+        "asset_type": "scaffold_output",
+        "path": rel,
+        "storage_uri": target_uri,
+        "bytes": local.stat().st_size,
+        "sha256": _file_sha256(local),
+        "rows": rows,
+        "created_at": _now(),
+        "created_by": "llm_labeling_scaffold",
+    }
+    with tempfile.TemporaryDirectory(prefix="lls-lake-export-") as td:
+        manifest_path = Path(td) / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        written = copy_path_to_uri(local, target_uri)
+        written_manifest = copy_path_to_uri(manifest_path, manifest_uri)
+    return {
+        "task_id": task.task_id,
+        "local_path": str(local),
+        "target_uri": written,
+        "manifest_uri": written_manifest,
+        "manifest": manifest,
+    }

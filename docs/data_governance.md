@@ -30,6 +30,7 @@ runs/<task_id>/imports/<import_id>/manifest.json
 - 导入数据必须包含任务的 `id_field` 和 `text_fields`。
 - `id_field` 缺失、重复，或文本字段全为空时，导入必须失败。
 - 默认上传上限为 100MB，可通过 `LLS_MAX_IMPORT_BYTES` 调整。
+- 来自 R2 数据湖的导入只是任务级执行缓存。源数据集、源 manifest、源对象和内容哈希必须写入导入 manifest，R2 数据湖仍是上游数据权威。
 
 导入 manifest 至少应包含：
 
