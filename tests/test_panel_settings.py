@@ -21,6 +21,7 @@ def _clear_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "LLS_TASK_SOURCE",
         "LLS_TASK_REGISTRY_URI",
+        "LLS_TASK_REGISTRY_SYNC_TTL_SECONDS",
         "LLS_DATA_LAKE_R2_PREFIX",
         "LLS_PANEL_SETTINGS_PATH",
         "LLS_ALLOW_DATA_LAKE_OVERRIDES",
@@ -31,6 +32,7 @@ def _clear_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(data_lake, "_DEFAULT_REGISTRY_URI_OVERRIDE", None)
     monkeypatch.setattr(data_lake, "_ALLOWED_R2_PREFIX_OVERRIDE", None)
+    panel._invalidate_task_registry_sync_cache()
 
 
 @contextmanager
@@ -228,6 +230,82 @@ def test_r2_task_sync_prefers_settings_registry_uri(tmp_path: Path, monkeypatch:
         "tasks_root": tasks_root,
         "registry_uri": "r2:settings/governance/data_lake.yaml",
     }
+
+
+def test_r2_task_sync_reuses_ttl_cache_and_expires(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    monkeypatch.setenv("LLS_TASK_REGISTRY_URI", "r2:env/governance/data_lake.yaml")
+    monkeypatch.setenv("LLS_TASK_REGISTRY_SYNC_TTL_SECONDS", "5")
+    clock = [100.0]
+    calls: list[tuple[Path, str | None]] = []
+
+    def fake_sync(root, registry_uri=None):
+        calls.append((root, registry_uri))
+        return SimpleNamespace(registry_uri=registry_uri, registry={}, tasks={}, sequence=len(calls))
+
+    monkeypatch.setattr(panel.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(task_registry, "sync_tasks_from_registry", fake_sync)
+
+    handler = SimpleNamespace(runs_root=runs_root, tasks_root=tasks_root)
+    first = panel._Handler._sync_tasks_if_needed(handler)
+    clock[0] = 104.9
+    second = panel._Handler._sync_tasks_if_needed(handler)
+    clock[0] = 105.1
+    third = panel._Handler._sync_tasks_if_needed(handler)
+
+    assert first is second
+    assert third is not first
+    assert [item[1] for item in calls] == [
+        "r2:env/governance/data_lake.yaml",
+        "r2:env/governance/data_lake.yaml",
+    ]
+    assert third.sequence == 2
+
+
+def test_settings_update_invalidates_r2_task_sync_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    monkeypatch.setenv("LLS_TASK_REGISTRY_SYNC_TTL_SECONDS", "60")
+    panel_settings.update_settings(runs_root, {"task_registry_uri": "r2:settings/governance/data_lake.yaml"})
+    calls: list[str | None] = []
+
+    def fake_sync(root, registry_uri=None):
+        calls.append(registry_uri)
+        return SimpleNamespace(registry_uri=registry_uri, registry={}, tasks={})
+
+    monkeypatch.setattr(task_registry, "sync_tasks_from_registry", fake_sync)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, payload = _request(base_url, "/api/tasks")
+        assert status == 200
+        assert payload == {"tasks": []}
+
+        status, payload = _request(base_url, "/api/tasks")
+        assert status == 200
+        assert payload == {"tasks": []}
+
+        status, payload = _request(
+            base_url,
+            "/api/settings",
+            method="POST",
+            payload={"task_registry_uri": "r2:settings/governance/data_lake.yaml"},
+        )
+        assert status == 200
+        assert payload["ok"] is True
+
+        status, payload = _request(base_url, "/api/tasks")
+
+    assert status == 200
+    assert payload == {"tasks": []}
+    assert calls == [
+        "r2:settings/governance/data_lake.yaml",
+        "r2:settings/governance/data_lake.yaml",
+    ]
 
 
 def test_profile_preset_api_lists_and_switches_task_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -5,6 +5,8 @@ import hmac
 import json
 import os
 import secrets
+import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,6 +23,10 @@ POOL_FILES = {
     "duplicate": ("merged", "duplicate_pool.jsonl"),
     "conflict": ("merged", "conflict_pool.jsonl"),
 }
+
+_TASK_REGISTRY_SYNC_CACHE: dict[tuple[str, str, str, str], tuple[float, object]] = {}
+_TASK_REGISTRY_SYNC_CACHE_LOCK = threading.Lock()
+_DEFAULT_TASK_REGISTRY_SYNC_TTL_SECONDS = 5.0
 
 
 def _safe_segment(value: str) -> bool:
@@ -45,6 +51,30 @@ def _task_source_mode() -> str:
 
 def _r2_task_source_enabled() -> bool:
     return _task_source_mode() == "r2"
+
+
+def _task_registry_sync_ttl_seconds() -> float:
+    raw = os.environ.get("LLS_TASK_REGISTRY_SYNC_TTL_SECONDS")
+    if raw is None:
+        return _DEFAULT_TASK_REGISTRY_SYNC_TTL_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _DEFAULT_TASK_REGISTRY_SYNC_TTL_SECONDS
+
+
+def _task_registry_sync_cache_key(tasks_root: str | Path, settings: dict) -> tuple[str, str, str, str]:
+    return (
+        str(Path(tasks_root).expanduser().resolve()),
+        str(settings.get("task_registry_uri") or ""),
+        str(settings.get("data_lake_r2_prefix") or ""),
+        str(settings.get("rclone_config_path") or ""),
+    )
+
+
+def _invalidate_task_registry_sync_cache() -> None:
+    with _TASK_REGISTRY_SYNC_CACHE_LOCK:
+        _TASK_REGISTRY_SYNC_CACHE.clear()
 
 
 def _apply_runtime_settings(runs_root: str | Path, settings: dict | None = None) -> dict:
@@ -243,7 +273,19 @@ class _Handler(BaseHTTPRequestHandler):
         from .task_registry import sync_tasks_from_registry
 
         settings = _apply_runtime_settings(self.runs_root)
-        return sync_tasks_from_registry(self.tasks_root, registry_uri=settings["task_registry_uri"])
+        ttl_seconds = _task_registry_sync_ttl_seconds()
+        cache_key = _task_registry_sync_cache_key(self.tasks_root, settings)
+        now = time.monotonic()
+
+        with _TASK_REGISTRY_SYNC_CACHE_LOCK:
+            cached = _TASK_REGISTRY_SYNC_CACHE.get(cache_key)
+            if cached is not None and ttl_seconds > 0 and now - cached[0] < ttl_seconds:
+                return cached[1]
+
+            synced = sync_tasks_from_registry(self.tasks_root, registry_uri=settings["task_registry_uri"])
+            if ttl_seconds > 0:
+                _TASK_REGISTRY_SYNC_CACHE[cache_key] = (time.monotonic(), synced)
+            return synced
 
     def _list_tasks(self) -> list[dict]:
         synced = self._sync_tasks_if_needed()
@@ -580,6 +622,7 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 settings = panel_settings.update_settings(self.runs_root, body)
+                _invalidate_task_registry_sync_cache()
                 _apply_runtime_settings(self.runs_root, settings)
                 self._json({"ok": True, **_settings_response(settings)})
             except Exception as exc:
