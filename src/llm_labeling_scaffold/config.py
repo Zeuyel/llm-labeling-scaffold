@@ -6,6 +6,17 @@ from typing import Any
 
 import yaml
 
+from .profiles import DEFAULT_PROFILE
+
+
+def resolve_profile_id(value: Any) -> str:
+    if isinstance(value, dict):
+        raw = value.get("preset") or value.get("id") or value.get("profile")
+    else:
+        raw = value
+    text = str(raw or DEFAULT_PROFILE).strip()
+    return text or DEFAULT_PROFILE
+
 
 @dataclass(frozen=True)
 class TaskConfig:
@@ -15,6 +26,10 @@ class TaskConfig:
     @property
     def task_id(self) -> str:
         return str(self.raw["task_id"])
+
+    @property
+    def profile(self) -> str:
+        return resolve_profile_id(self.raw.get("profile"))
 
     @property
     def id_field(self) -> str:

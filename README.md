@@ -46,7 +46,7 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 ./scripts/stack down
 ```
 
-需要模型记录服务时再启用 profile：
+需要模型记录服务时再启用 Docker Compose 的 mlflow profile：
 
 ```bash
 ./scripts/stack up --mlflow
@@ -73,6 +73,8 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 8. 高性能训练服务器读取训练任务并产出模型版本。
 9. 模型产物、指标和 manifest 默认写入 `runs/`。
 10. 如果启用了 MLflow，训练记录可同步到外部模型记录服务。
+
+在 panel 工作流中，`profile` 是执行模板，不是备注。任务的 `task.yaml` 可以通过 `profile: {preset: manual_labeling_cv_v1}` 绑定预设流程，面板据此展开导入、抽样、Argilla 分发、结果回收、质量门槛、训练集构建、训练和推理的默认动作与参数；每个阶段都必须写 manifest，下一阶段只消费上游 manifest 中登记的产物。术语和 `manual_labeling_cv_v1` 示例见 [Profile 预设](docs/profile_presets.md)。
 
 这个边界下，控制台不再承担正式逐行标注台职责；正式人工标注和复核都交给 Argilla。
 
@@ -161,7 +163,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - MLflow 客户端依赖
 - rclone，用于按任务配置读取 R2 数据湖
 
-因此默认部署可以直接运行内置 `tfidf_sgd` 基线训练器。MLflow 客户端只提供可选记录能力；不启用 profile 时不会启动 MLflow 服务。
+因此默认部署可以直接运行内置 `tfidf_sgd` 基线训练器。MLflow 客户端只提供可选记录能力；不启用 Docker Compose 的 mlflow profile 时不会启动 MLflow 服务。
 
 容器挂载：
 
@@ -169,7 +171,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - `./tasks:/app/tasks`：控制台中新建的业务任务
 - `./configs:/app/configs:ro`：配置示例
 
-控制台默认只读取 `tasks/`。实验人员在控制台中新建的任务会写入 `tasks/<任务编号>/task.yaml`。如果任务已经有复杂配置，也仍然可以直接把任务目录放到 `tasks/` 下。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。
+控制台默认只读取 `tasks/`。实验人员在控制台中新建的任务会写入 `tasks/<任务编号>/task.yaml`。如果任务已经有复杂配置，也仍然可以直接把任务目录放到 `tasks/` 下。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
 
 数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
 

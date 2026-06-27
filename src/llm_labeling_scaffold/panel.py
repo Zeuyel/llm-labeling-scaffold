@@ -262,6 +262,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"gold": list_gold(self.runs_root, task)})
         elif path == "/api/tasks":
             self._json({"tasks": pipeline.list_tasks(self.tasks_root)})
+        elif path == "/api/task/profile":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            try:
+                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                self._json(pipeline.task_profile_status(self.runs_root, task_cfg))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/config":
             self._json({
                 "allow_data_lake_overrides": _allow_data_lake_overrides(),

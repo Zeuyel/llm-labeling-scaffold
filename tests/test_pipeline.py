@@ -8,6 +8,7 @@ import yaml
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.io import read_json, write_json
 from llm_labeling_scaffold import pipeline
+from llm_labeling_scaffold.profiles import DEFAULT_PROFILE
 from llm_labeling_scaffold.sampling import sample_records
 
 
@@ -17,6 +18,10 @@ def _file_sha256(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _stage_status(profile: dict, stage_id: str) -> str:
+    return next(stage["status"] for stage in profile["stages"] if stage["id"] == stage_id)
 
 
 def test_create_task_writes_custom_task_with_auxiliary_labels(tmp_path: Path):
@@ -42,6 +47,9 @@ def test_create_task_writes_custom_task_with_auxiliary_labels(tmp_path: Path):
     created = load_task(task["path"])
 
     assert created.task_id == "patent_boundary_demo"
+    assert task["profile"] == DEFAULT_PROFILE
+    assert created.profile == DEFAULT_PROFILE
+    assert created.raw["profile"] == DEFAULT_PROFILE
     assert created.id_field == "patent_id"
     assert created.text_fields == ["patent_title", "patent_abstract"]
     assert created.metadata_fields == ["firm_name", "application_year"]
@@ -83,6 +91,25 @@ def test_list_tasks_reads_multiple_roots_and_deduplicates(tmp_path: Path):
     tasks = pipeline.list_tasks(f"{root_a},{root_b}")
 
     assert [task["task_id"] for task in tasks] == ["task_a"]
+    assert tasks[0]["profile"] == DEFAULT_PROFILE
+
+
+def test_task_profile_accepts_preset_mapping(tmp_path: Path):
+    task = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "profile_mapping_task",
+            "profile": {"preset": DEFAULT_PROFILE},
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+
+    loaded = load_task(task["path"])
+
+    assert loaded.profile == DEFAULT_PROFILE
+    assert task["profile"] == DEFAULT_PROFILE
 
 
 def test_delete_task_archives_writable_task_and_keeps_examples_readonly(tmp_path: Path):
@@ -152,6 +179,102 @@ def test_import_asset_is_idempotent_and_blocks_conflicting_overwrite(tmp_path: P
         raise AssertionError("conflicting import should fail")
     audit = tmp_path / "runs" / task.task_id / "_audit" / "events.jsonl"
     assert audit.exists()
+
+
+def test_task_profile_status_tracks_profile_artifacts(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "profile_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = load_task(created["path"])
+    runs_root = tmp_path / "runs"
+
+    empty = pipeline.task_profile_status(runs_root, task)
+    assert empty["profile"]["id"] == DEFAULT_PROFILE
+    assert [stage["id"] for stage in empty["stages"]] == [
+        "lake_import",
+        "sample",
+        "argilla_dispatch",
+        "argilla_pull",
+        "agreement_audit",
+        "gold_build",
+        "train",
+        "batch_infer",
+    ]
+    assert _stage_status(empty, "lake_import") == "ready"
+    assert _stage_status(empty, "sample") == "not_started"
+    assert next(stage for stage in empty["stages"] if stage["id"] == "lake_import")["action_hint"]
+    assert next(stage for stage in empty["stages"] if stage["id"] == "sample")["required_inputs"]
+
+    pipeline.save_import(
+        runs_root,
+        task,
+        "seed_1",
+        [{"record_id": "r1", "title": "A"}, {"record_id": "r2", "title": "B"}],
+    )
+    imported = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(imported, "lake_import") == "done"
+    assert _stage_status(imported, "sample") == "ready"
+    assert _stage_status(imported, "argilla_dispatch") == "not_started"
+
+    sample_dir = runs_root / task.task_id / "samples" / "sample_a"
+    sample_dir.mkdir(parents=True)
+    broken_sample = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(broken_sample, "sample") == "blocked"
+    assert _stage_status(broken_sample, "argilla_dispatch") == "blocked"
+
+    (sample_dir / "sample.jsonl").write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    write_json({"sample_id": "sample_a", "rows": 1}, sample_dir / "manifest.json")
+    sampled = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(sampled, "sample") == "done"
+    assert _stage_status(sampled, "argilla_dispatch") == "ready"
+
+    write_json(
+        {"annotation_id": "job_a", "source": "argilla"},
+        runs_root / task.task_id / "annotation_jobs" / "job_a" / "manifest.json",
+    )
+    dispatched = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(dispatched, "argilla_dispatch") == "done"
+    assert _stage_status(dispatched, "argilla_pull") == "ready"
+
+    decisions_dir = runs_root / task.task_id / "decisions" / "job_a"
+    write_json({"decision_id": "job_a", "rows": 1}, decisions_dir / "manifest.json")
+    (decisions_dir / "decisions.jsonl").write_text(
+        '{"record_id":"r1","human_label":{"label":"yes"}}\n',
+        encoding="utf-8",
+    )
+    pulled = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(pulled, "argilla_pull") == "done"
+    assert _stage_status(pulled, "agreement_audit") == "ready"
+    assert _stage_status(pulled, "gold_build") == "not_started"
+
+    gold_dir = runs_root / task.task_id / "gold"
+    gold_dir.mkdir(parents=True)
+    (gold_dir / "gold_v1.jsonl").write_text('{"record_id":"r1","label":"yes"}\n', encoding="utf-8")
+    write_json({"version": "v1", "rows": 1}, gold_dir / "gold_v1.manifest.json")
+    gold = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(gold, "agreement_audit") == "done"
+    assert _stage_status(gold, "gold_build") == "done"
+    assert _stage_status(gold, "train") == "ready"
+
+    model_dir = runs_root / task.task_id / "models" / "model_a"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.joblib").write_text("placeholder", encoding="utf-8")
+    trained = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(trained, "train") == "done"
+    assert _stage_status(trained, "batch_infer") == "ready"
+
+    infer_dir = runs_root / task.task_id / "inference" / "batch_a"
+    infer_dir.mkdir(parents=True)
+    (infer_dir / "predictions.jsonl").write_text('{"record_id":"r1","pred_label":"yes"}\n', encoding="utf-8")
+    inferred = pipeline.task_profile_status(runs_root, task)
+    assert _stage_status(inferred, "batch_infer") == "done"
 
 
 def test_import_from_data_lake_manifest_records_lineage(tmp_path: Path):

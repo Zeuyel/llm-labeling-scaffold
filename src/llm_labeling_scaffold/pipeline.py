@@ -13,9 +13,10 @@ import uuid
 
 import yaml
 
-from .config import load_task, with_runs_root
+from .config import load_task, resolve_profile_id, with_runs_root
 from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
 from .jobs import Job, create_job, run_job
+from .profiles import DEFAULT_PROFILE, profile_definition, status_label
 
 try:
     import fcntl
@@ -259,6 +260,148 @@ def _metadata_mismatches(existing: dict[str, Any], incoming: dict[str, Any]) -> 
     return mismatches
 
 
+def _profile_meta(profile: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in profile.items() if key != "stages"}
+
+
+def _visible_children(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
+    return sorted(item for item in path.iterdir() if not item.name.startswith("_"))
+
+
+def _child_dir_artifact_state(base: Path, filenames: tuple[str, ...]) -> dict[str, Any]:
+    evidence: list[str] = []
+    children = _visible_children(base)
+    for child in children:
+        if not child.is_dir():
+            continue
+        if any((child / filename).exists() for filename in filenames):
+            evidence.append(str(child))
+    return {
+        "done": bool(evidence),
+        "partial": bool(children) and not evidence,
+        "evidence": evidence,
+    }
+
+
+def _gold_artifact_state(base: Path) -> dict[str, Any]:
+    evidence = [str(path) for path in sorted(base.glob("gold_*.jsonl"))] if base.is_dir() else []
+    return {
+        "done": bool(evidence),
+        "partial": bool(_visible_children(base)) and not evidence,
+        "evidence": evidence,
+    }
+
+
+def _inference_artifact_state(base: Path) -> dict[str, Any]:
+    evidence: list[str] = []
+    if base.is_dir():
+        evidence = [
+            str(path)
+            for name in ("predictions.jsonl", "inference_summary.json")
+            for path in sorted(base.rglob(name))
+        ]
+    return {
+        "done": bool(evidence),
+        "partial": bool(_visible_children(base)) and not evidence,
+        "evidence": evidence,
+    }
+
+
+def _agreement_audit_artifact_state(task_dir: Path) -> dict[str, Any]:
+    reserved = {
+        "samples",
+        "gold",
+        "models",
+        "schemas",
+        "imports",
+        "inference",
+        "decisions",
+        "annotation_jobs",
+        "_jobs",
+    }
+    evidence = [
+        str(path)
+        for path in sorted(task_dir.glob("*/audit/run_summary.json"))
+        if path.parent.parent.name not in reserved and not path.parent.parent.name.startswith("_")
+    ]
+    if evidence:
+        return {"done": True, "partial": False, "evidence": evidence}
+
+    gold_state = _gold_artifact_state(task_dir / "gold")
+    if gold_state["done"]:
+        return {"done": True, "partial": False, "evidence": gold_state["evidence"]}
+    return {"done": False, "partial": False, "evidence": []}
+
+
+def _profile_stage_artifact_state(task_dir: Path, stage_id: str) -> dict[str, Any]:
+    if stage_id == "lake_import":
+        return _child_dir_artifact_state(task_dir / "imports", ("raw.jsonl",))
+    if stage_id == "sample":
+        return _child_dir_artifact_state(task_dir / "samples", ("sample.jsonl",))
+    if stage_id == "argilla_dispatch":
+        return _child_dir_artifact_state(task_dir / "annotation_jobs", ("manifest.json",))
+    if stage_id == "argilla_pull":
+        return _child_dir_artifact_state(task_dir / "decisions", ("decisions.jsonl", "manifest.json"))
+    if stage_id == "agreement_audit":
+        return _agreement_audit_artifact_state(task_dir)
+    if stage_id == "gold_build":
+        return _gold_artifact_state(task_dir / "gold")
+    if stage_id == "train":
+        return _child_dir_artifact_state(task_dir / "models", ("model.joblib", "manifest.json"))
+    if stage_id == "batch_infer":
+        return _inference_artifact_state(task_dir / "inference")
+    return {"done": False, "partial": False, "evidence": []}
+
+
+def task_profile_status(runs_root: str | Path, task) -> dict[str, Any]:
+    task_id = str(getattr(task, "task_id", task)).strip()
+    if not _safe_segment(task_id):
+        raise ValueError("非法任务编号")
+    profile = profile_definition(getattr(task, "profile", DEFAULT_PROFILE))
+    task_dir = Path(runs_root) / task_id
+    statuses: dict[str, str] = {}
+    stages: list[dict[str, Any]] = []
+    for stage in profile.get("stages", []):
+        stage_id = str(stage["id"])
+        artifact = _profile_stage_artifact_state(task_dir, stage_id)
+        depends_on = [str(item) for item in stage.get("depends_on", [])]
+        waiting_for = [dep for dep in depends_on if statuses.get(dep) != "done"]
+        blocked_by = [dep for dep in waiting_for if statuses.get(dep) == "blocked"]
+
+        if artifact["done"]:
+            status = "done"
+        elif artifact["partial"] or blocked_by:
+            status = "blocked"
+        elif waiting_for:
+            status = "not_started"
+        else:
+            status = "ready"
+        statuses[stage_id] = status
+
+        item = dict(stage)
+        item["status"] = status
+        item["status_label"] = status_label(status)
+        if artifact["evidence"]:
+            item["evidence"] = artifact["evidence"]
+            item["outputs"] = artifact["evidence"]
+        if waiting_for and status != "done":
+            item["waiting_for"] = waiting_for
+            item["blocking_reason"] = f"等待前置阶段完成: {', '.join(waiting_for)}"
+        if blocked_by:
+            item["blocked_by"] = blocked_by
+            item["blocking_reason"] = f"前置阶段受阻: {', '.join(blocked_by)}"
+        if artifact["partial"] and status == "blocked":
+            item["blocking_reason"] = "检测到阶段目录存在，但缺少可识别的 manifest 或产物文件。"
+        stages.append(item)
+    return {
+        "task_id": task_id,
+        "profile": _profile_meta(profile),
+        "stages": stages,
+    }
+
+
 def list_tasks(tasks_root: str | Path) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -280,6 +423,7 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
                     "root": str(root),
                     "source": root.name,
                     "deletable": _task_file_deletable(yml, root),
+                    "profile": task.profile,
                     "id_field": task.id_field,
                     "primary_label": task.primary_label,
                     "auxiliary_labels": task.auxiliary_labels,
@@ -423,6 +567,8 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
     task_id = str(spec.get("task_id", "")).strip()
     if not task_id or ".." in task_id or "/" in task_id or "\\" in task_id:
         raise ValueError("任务编号只能使用单段目录名")
+    profile = resolve_profile_id(spec.get("profile"))
+    profile_definition(profile)
     id_field = str(spec.get("id_field", "record_id")).strip() or "record_id"
     text_fields = _string_list(spec.get("text_fields"))
     metadata_fields = _string_list(spec.get("metadata_fields"))
@@ -452,6 +598,7 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
 
     raw = {
         "task_id": task_id,
+        "profile": profile,
         "id_field": id_field,
         "runs_dir": "runs",
         "input": {
@@ -484,6 +631,7 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
     return {
         "task_id": task.task_id,
         "path": str(task_path),
+        "profile": task.profile,
         "id_field": task.id_field,
         "primary_label": task.primary_label,
         "auxiliary_labels": task.auxiliary_labels,
