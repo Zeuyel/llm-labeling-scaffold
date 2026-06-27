@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test": "node --test src/pages/*.test.js",
+    "test:batch-plans": "node --test src/pages/batchPlanDisplay.test.js",
     "test:workflow": "node --test src/pages/samplesWorkflowState.test.js",
     "preview": "vite preview"
   },

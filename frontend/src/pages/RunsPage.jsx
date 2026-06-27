@@ -1,118 +1,17 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
-
-function slug(value) {
-  return String(value || "item")
-    .trim()
-    .replace(/[^A-Za-z0-9_.-]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^[_.-]+|[_.-]+$/g, "") || "item";
-}
-
-function defaultDatasetName(taskId, sampleId, planId) {
-  return `${slug(taskId)}_${slug(sampleId || "sample")}_${slug(planId || "batch_plan")}_v001`;
-}
-
-function firstDefined(...values) {
-  return values.find((value) => value !== undefined && value !== null && value !== "");
-}
-
-function planIdFromPath(value) {
-  const parts = String(value || "").split(/[\\/]+/).filter(Boolean);
-  if (!parts.length) return "";
-  const last = parts[parts.length - 1];
-  if (last === "manifest.json" && parts.length > 1) return parts[parts.length - 2];
-  return last;
-}
-
-function countLike(value) {
-  return Array.isArray(value) ? value.length : value;
-}
-
-function batchPlanFromManifest(manifest, index) {
-  const consistency = manifest.consistency || manifest.quality_controls || manifest.policy || {};
-  const manifestPath = firstDefined(manifest.manifest_path, manifest.batch_manifest_path, manifest.path);
-  const planDir = firstDefined(manifest.plan_dir, manifest.batch_plan_dir);
-  const planId = firstDefined(
-    manifest.plan_id,
-    manifest.batch_plan_id,
-    manifest.id,
-    manifest.name,
-    planIdFromPath(planDir),
-    planIdFromPath(manifestPath),
-    `plan_${index + 1}`,
-  );
-  const batchCount = firstDefined(
-    manifest.batch_count,
-    manifest.batches_count,
-    Array.isArray(manifest.batches) ? manifest.batches.length : undefined,
-  );
-  const overlapItemCount = firstDefined(
-    manifest.overlap_item_count,
-    countLike(manifest.overlap_item_ids),
-    countLike(manifest.overlap_items),
-    manifest.overlap_count,
-    consistency.overlap_item_count,
-    countLike(consistency.overlap_item_ids),
-    countLike(consistency.overlap_items),
-    consistency.overlap_count,
-  );
-
-  return {
-    key: String(firstDefined(manifest.plan_id, manifest.batch_plan_id, manifestPath, planDir, planId)),
-    manifest,
-    manifest_path: manifestPath,
-    plan_id: planId,
-    strategy_id: firstDefined(manifest.strategy_id, consistency.strategy_id, manifest.strategy),
-    batch_count: batchCount,
-    batch_size: firstDefined(manifest.batch_size, manifest.rows_per_batch),
-    overlap_rate: firstDefined(manifest.overlap_rate, consistency.overlap_rate),
-    overlap_item_count: overlapItemCount,
-    min_annotators_per_overlap_item: firstDefined(
-      manifest.min_annotators_per_overlap_item,
-      manifest.min_annotators,
-      consistency.min_annotators_per_overlap_item,
-      consistency.min_annotators,
-    ),
-  };
-}
-
-function getBatchPlans(sample) {
-  const plans = [];
-  const seen = new Set();
-  const pushManifest = (value) => {
-    if (!value) return;
-    if (Array.isArray(value)) {
-      value.forEach(pushManifest);
-      return;
-    }
-    if (typeof value !== "object") return;
-    const plan = batchPlanFromManifest(value, plans.length);
-    if (seen.has(plan.key)) return;
-    seen.add(plan.key);
-    plans.push(plan);
-  };
-
-  pushManifest(sample?.latest_batch_manifest);
-  pushManifest(Array.isArray(sample?.batch_manifests) ? [...sample.batch_manifests].reverse() : sample?.batch_manifests);
-  pushManifest(sample?.batch_manifest);
-  pushManifest(sample?.batch);
-  pushManifest(Array.isArray(sample?.batches) ? [...sample.batches].reverse() : sample?.batches);
-  pushManifest(sample?.manifest?.batch_manifest);
-  pushManifest(sample?.manifest?.batch);
-  if (sample?.manifest?.batch_count || sample?.manifest?.batch_size || sample?.manifest?.batches) {
-    pushManifest(sample.manifest);
-  }
-  return plans;
-}
-
-function displayPlanValue(value) {
-  if (value === undefined || value === null || value === "") return "-";
-  if (Array.isArray(value)) return String(value.length);
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
-}
+import {
+  annotationJobBatchSummary,
+  annotationJobDebugFields,
+  batchPlanDebugFields,
+  batchPlanOptionLabel,
+  defaultDatasetName,
+  displayPlanValue,
+  firstDefined,
+  formatBatchPlanSummary,
+  getBatchPlans,
+} from "./batchPlanDisplay.js";
 
 export default function RunsPage({ task, taskId, onError }) {
   const [runs, setRuns] = useState([]);
@@ -330,7 +229,7 @@ export default function RunsPage({ task, taskId, onError }) {
               <option value="">{selectedSample ? "选择批次计划" : "请先选择样本集"}</option>
               {batchPlans.map((plan, index) => (
                 <option key={plan.key} value={plan.key}>
-                  {index === 0 ? "最新 · " : ""}{plan.plan_id} · {displayPlanValue(plan.batch_count)} 批
+                  {batchPlanOptionLabel(plan, index)}
                 </option>
               ))}
             </select>
@@ -364,15 +263,20 @@ export default function RunsPage({ task, taskId, onError }) {
           </div>
         </div>
         {selectedBatchPlan && (
-          <div className="plan-summary-grid">
-            <div><span>plan_id</span><strong>{displayPlanValue(selectedBatchPlan.plan_id)}</strong></div>
-            <div><span>strategy_id</span><strong>{displayPlanValue(selectedBatchPlan.strategy_id)}</strong></div>
-            <div><span>batch_count</span><strong>{displayPlanValue(selectedBatchPlan.batch_count)}</strong></div>
-            <div><span>batch_size</span><strong>{displayPlanValue(selectedBatchPlan.batch_size)}</strong></div>
-            <div><span>overlap_rate</span><strong>{displayPlanValue(selectedBatchPlan.overlap_rate)}</strong></div>
-            <div><span>overlap_item_count</span><strong>{displayPlanValue(selectedBatchPlan.overlap_item_count)}</strong></div>
-            <div><span>min_annotators_per_overlap_item</span><strong>{displayPlanValue(selectedBatchPlan.min_annotators_per_overlap_item)}</strong></div>
-          </div>
+          <>
+            <div className="batch-summary-callout">
+              <span>执行摘要</span>
+              <strong>当前批次方案：{formatBatchPlanSummary(selectedBatchPlan)}</strong>
+            </div>
+            <details className="advanced-panel compact-details">
+              <summary>高级详情 / 调试信息</summary>
+              <div className="plan-summary-grid">
+                {batchPlanDebugFields(selectedBatchPlan).map(([key, value]) => (
+                  <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                ))}
+              </div>
+            </details>
+          </>
         )}
         {selectedSample && !selectedBatchPlan && (
           <div className="stage-tip">
@@ -413,8 +317,15 @@ export default function RunsPage({ task, taskId, onError }) {
                     <td>{job.argilla_dataset || "-"}</td>
                     <td>{job.sample_id || "-"}</td>
                     <td className="text-cell dispatch-cell">
-                      <span>dispatch_mode: {job.dispatch_mode || "-"}</span>
-                      <span className="muted mono-cell">batch_plan_id: {job.batch_plan_id || "-"}</span>
+                      <span>{annotationJobBatchSummary(job)}</span>
+                      <details className="inline-details">
+                        <summary>详情</summary>
+                        <div className="debug-field-list">
+                          {annotationJobDebugFields(job).map(([key, value]) => (
+                            <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                          ))}
+                        </div>
+                      </details>
                     </td>
                     <td>{job.rows ?? job.result?.records ?? "-"}</td>
                     <td>{job.status || "-"}</td>

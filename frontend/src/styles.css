@@ -188,6 +188,9 @@ tr:last-child td { border-bottom: 0; }
 .policy-preview div { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--muted-bg); min-width: 0; }
 .policy-preview span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
 .policy-preview strong { display: block; font-weight: 500; overflow-wrap: anywhere; }
+.batch-summary-callout { margin: -2px 0 12px; padding: 12px 14px; border: 1px solid hsl(221 83% 53% / .24); border-radius: var(--radius); background: hsl(221 83% 53% / .05); min-width: 0; }
+.batch-summary-callout span { display: block; color: var(--muted); font-size: 12px; margin-bottom: 2px; }
+.batch-summary-callout strong { display: block; font-weight: 600; overflow-wrap: anywhere; }
 .plan-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: -2px 0 16px; }
 .plan-summary-grid div { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--muted-bg); min-width: 0; }
 .plan-summary-grid span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
@@ -197,7 +200,16 @@ tr:last-child td { border-bottom: 0; }
 .advanced-panel { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
 .advanced-panel summary { cursor: pointer; font-weight: 600; }
 .advanced-panel p { margin: 8px 0 10px; }
+.compact-details { margin: 0 0 16px; }
+.compact-details[open] summary { margin-bottom: 10px; }
+.compact-details .plan-summary-grid { margin: 0; }
 .dispatch-cell span { display: block; }
+.inline-details { margin-top: 6px; }
+.inline-details summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.debug-field-list { display: grid; gap: 6px; margin-top: 6px; }
+.debug-field-list div { min-width: 0; }
+.debug-field-list span { display: block; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
+.debug-field-list strong { display: block; font-weight: 500; overflow-wrap: anywhere; white-space: normal; }
 .log-box { white-space: pre-wrap; font-size: 12px; background: var(--muted-bg); padding: 12px; border-radius: var(--radius); overflow-x: auto; }
 .canvas-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .canvas-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
