@@ -2,12 +2,20 @@ import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 import {
+  computeSampleDetailActions,
   computeSampleWorkflow,
+  computeSamplesListView,
   getBatchManifests,
   hasBatchPlan,
   newestSample,
   sampleCompletionNotice,
 } from "./samplesWorkflowState.js";
+import {
+  batchPlanDebugFields,
+  displayPlanValue,
+  formatBatchPlanSummary,
+  getBatchPlans,
+} from "./batchPlanDisplay.js";
 
 function shortHash(value) {
   return value ? `${String(value).slice(0, 12)}...` : "-";
@@ -80,6 +88,29 @@ function batchSummary(sample) {
   };
 }
 
+function DetailField({ label, value, className = "" }) {
+  return (
+    <div>
+      <span>{label}</span>
+      <strong className={className}>{value === undefined || value === null || value === "" ? "-" : value}</strong>
+    </div>
+  );
+}
+
+function formatStrategy(value) {
+  if (value === "random") return "随机抽样";
+  if (value === "head") return "前 N 行";
+  return value || "-";
+}
+
+function sampleDependencies(sample) {
+  return (sample?.dependencies || []).map((dep) => `${dep.kind}:${dep.id}`).join(", ") || "-";
+}
+
+function manifestJson(value) {
+  return JSON.stringify(value || {}, null, 2);
+}
+
 export default function SamplesPage({ task, taskId, onError }) {
   const [samples, setSamples] = useState([]);
   const [imports, setImports] = useState([]);
@@ -99,6 +130,8 @@ export default function SamplesPage({ task, taskId, onError }) {
   const [lastAction, setLastAction] = useState("");
   const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
+  const [drawer, setDrawer] = useState("");
+  const [detailSamplePath, setDetailSamplePath] = useState("");
 
   const reload = useCallback(async () => {
     if (!taskId) {
@@ -129,10 +162,29 @@ export default function SamplesPage({ task, taskId, onError }) {
     [samples, batchSample],
   );
 
+  const selectedDetailSample = useMemo(
+    () => samples.find((item) => item.path === detailSamplePath) || null,
+    [samples, detailSamplePath],
+  );
+
   const selectedBatchSummary = useMemo(
     () => batchSummary(selectedBatchSample),
     [selectedBatchSample],
   );
+  const selectedDetailSummary = useMemo(
+    () => batchSummary(selectedDetailSample),
+    [selectedDetailSample],
+  );
+  const detailBatchPlans = useMemo(
+    () => getBatchPlans(selectedDetailSample),
+    [selectedDetailSample],
+  );
+  const latestDetailBatchPlan = detailBatchPlans[0] || null;
+  const detailSourceImport = useMemo(() => {
+    const sourceImportId = selectedDetailSample?.manifest?.source_import_id;
+    const sourcePath = selectedDetailSample?.manifest?.source || selectedDetailSample?.manifest?.source_path;
+    return imports.find((item) => item.import_id === sourceImportId || item.path === sourcePath) || null;
+  }, [imports, selectedDetailSample]);
   const workflow = useMemo(
     () => computeSampleWorkflow({
       assetsLoading,
@@ -143,6 +195,14 @@ export default function SamplesPage({ task, taskId, onError }) {
       actionError,
     }),
     [assetsLoading, imports, samples, selectedBatchSample, activeAction, lastAction, actionError],
+  );
+  const listView = useMemo(
+    () => computeSamplesListView({ assetsLoading, imports, samples }),
+    [assetsLoading, imports, samples],
+  );
+  const detailActions = useMemo(
+    () => computeSampleDetailActions({ assetsLoading, busy, sample: selectedDetailSample }),
+    [assetsLoading, busy, selectedDetailSample],
   );
 
   const selectedSampleRows = Number(selectedBatchSample?.manifest?.rows || 0);
@@ -185,6 +245,26 @@ export default function SamplesPage({ task, taskId, onError }) {
     }
   }, [samples, batchSample]);
 
+  useEffect(() => {
+    if (drawer === "detail" && detailSamplePath && !selectedDetailSample) {
+      setDrawer("");
+      setDetailSamplePath("");
+    }
+  }, [drawer, detailSamplePath, selectedDetailSample]);
+
+  function openCreateDrawer() {
+    setDrawer("create");
+    setNotice("");
+  }
+
+  function openSampleDetail(sample) {
+    if (!sample?.path) return;
+    setDetailSamplePath(sample.path);
+    setBatchSample(sample.path);
+    setDrawer("detail");
+    setNotice("");
+  }
+
   async function runAction(action, params, label) {
     if (!task) return false;
     setBusy(true);
@@ -226,7 +306,13 @@ export default function SamplesPage({ task, taskId, onError }) {
     if (result) {
       setSampleId("");
       setNotice(sampleCompletionNotice({ existedBefore, result }));
-      if (result.artifact) setBatchSample(result.artifact);
+      if (result.artifact) {
+        setBatchSample(result.artifact);
+        setDetailSamplePath(result.artifact);
+        setDrawer("detail");
+      } else {
+        setDrawer("");
+      }
     }
   }
 
@@ -272,6 +358,8 @@ export default function SamplesPage({ task, taskId, onError }) {
       await api.archiveSample(taskId, sample.sample_id, "panel archive");
       setNotice(`已归档样本：${sample.sample_id}`);
       await reload();
+      setDrawer("");
+      setDetailSamplePath("");
     } catch (error) {
       onError(String(error));
     } finally {
@@ -282,13 +370,93 @@ export default function SamplesPage({ task, taskId, onError }) {
   return (
     <div>
       <div className="crumbs"><Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 样本管理</div>
-      <div className="page-header">
-        <h2>样本管理</h2>
-        <p>从导入数据生成样本集，配置批次和一致性策略后进入标注分发</p>
+      <div className="page-header canvas-page-header">
+        <div>
+          <h2>样本管理</h2>
+          <p>管理样本集资源，进入详情后配置批次和后续标注分发。</p>
+        </div>
+        <div className="action-row">
+          <button className="btn btn-primary" disabled={assetsLoading || !imports.length} onClick={openCreateDrawer}>
+            创建样本集
+          </button>
+          <button className="btn" disabled={assetsLoading} onClick={reload}>刷新</button>
+        </div>
       </div>
       {notice && <div className="status-banner">{notice}</div>}
       <div className="card section-card">
-        <h3>样本到批次流程</h3>
+        <div className="toolbar">
+          <div>
+            <h3>样本集（{samples.length}）</h3>
+            <div className="status-line">
+              {assetsLoading ? dataLoadingText : samples.length ? "点击样本行查看 manifest、批次计划和可执行动作。" : listView.emptyReason}
+            </div>
+          </div>
+          <span className={`badge badge-${listView.status === "loading" ? "blue" : samples.length ? "green" : "red"}`}>
+            {assetsLoading ? "读取中" : samples.length ? "列表就绪" : "暂无样本"}
+          </span>
+        </div>
+        {assetsLoading && <div className="status-line">{dataLoadingText}</div>}
+        {listView.showEmpty && (
+          <div className="empty action-empty">
+            <span>{listView.emptyReason}</span>
+            {listView.canCreate ? (
+              <button className="btn btn-primary" onClick={openCreateDrawer}>创建样本集</button>
+            ) : (
+              <Link className="btn btn-primary" to={`/task/${encodeURIComponent(taskId)}/imports`}>进入数据导入</Link>
+            )}
+          </div>
+        )}
+        {listView.showList && (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>样本集</th>
+                  <th>行数</th>
+                  <th>抽样策略</th>
+                  <th>来源导入</th>
+                  <th>批次计划</th>
+                  <th>一致性策略</th>
+                  <th>关联资产</th>
+                  <th>存储路径</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {samples.map((s) => {
+                  const summary = batchSummary(s);
+                  return (
+                    <tr className="clickable-row" key={s.sample_id} onClick={() => openSampleDetail(s)}>
+                      <td>
+                        <strong>{s.sample_id}</strong>
+                        <div className="status-line mono-cell">{shortHash(s.manifest?.content_sha256)}</div>
+                      </td>
+                      <td>{s.manifest ? s.manifest.rows : "-"}</td>
+                      <td>{formatStrategy(s.manifest?.strategy)}</td>
+                      <td>{s.manifest?.source_import_id || "-"}</td>
+                      <td>{summary.batchText}</td>
+                      <td className="text-cell">{summary.policyText}</td>
+                      <td>{sampleDependencies(s)}</td>
+                      <td className="muted path-cell">{s.path}</td>
+                      <td>
+                        <div className="action-row">
+                          <button className="btn btn-sm" onClick={(event) => { event.stopPropagation(); openSampleDetail(s); }}>详情</button>
+                          <button className="btn btn-sm" disabled={actionDisabled} onClick={(event) => { event.stopPropagation(); openSampleDetail(s); }}>
+                            生成批次
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      <div className="card section-card">
+        <h3>状态摘要</h3>
         <div className="workflow-stage-list">
           <section className={`workflow-stage workflow-stage-${workflow.imports.status}`}>
             <div className="workflow-stage-index">1</div>
@@ -316,38 +484,9 @@ export default function SamplesPage({ task, taskId, onError }) {
                 </div>
                 <div className="workflow-stage-actions">
                   <span className={`badge badge-${workflow.sample.badgeTone}`}>{workflow.sample.badge}</span>
+                  <button className="btn btn-sm" disabled={createSampleDisabled} onClick={openCreateDrawer}>创建样本集</button>
                 </div>
               </div>
-              <div className="form-grid workflow-form-grid">
-                <div className="field"><label>样本编号</label><input value={sampleId} disabled={actionDisabled} onChange={(e) => setSampleId(e.target.value)} placeholder="例如 seed_v1" /></div>
-                <div className="field">
-                  <label>数据来源</label>
-                  <select value={source} disabled={actionDisabled} onChange={(e) => { setSource(e.target.value); setSampleAuto(true); }}>
-                    <option value="">任务配置中的原始数据</option>
-                    {imports.map((item) => (
-                      <option key={item.import_id} value={item.path}>{item.import_id} · {item.rows} 行</option>
-                    ))}
-                  </select>
-                </div>
-                <div className="field">
-                  <label>编号方式</label>
-                  <select value={sampleAuto ? "auto" : "manual"} disabled={actionDisabled} onChange={(e) => setSampleAuto(e.target.value === "auto")}>
-                    <option value="auto">按导入编号自动生成</option>
-                    <option value="manual">手动填写样本编号</option>
-                  </select>
-                </div>
-                <div className="field"><label>抽样行数</label><input type="number" min="1" value={rows} disabled={actionDisabled} onChange={(e) => setRows(e.target.value)} /></div>
-                <div className="field"><label>抽样策略</label><select value={strategy} disabled={actionDisabled} onChange={(e) => setStrategy(e.target.value)}><option value="head">前 N 行</option><option value="random">随机抽样</option></select></div>
-                <div className="field">
-                  <label>后续使用样本</label>
-                  <select value={batchSample} disabled={assetsLoading || !samples.length} onChange={(e) => setBatchSample(e.target.value)}>
-                    <option value="">{assetsLoading ? "正在读取样本" : samples.length ? "选择样本" : "请先创建样本"}</option>
-                    {samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}
-                  </select>
-                  <span className="hint">{assetsLoading ? dataLoadingText : samples.length ? "所选样本将用于批次生成和后续标注分发。" : "没有样本时不能生成批次。"}</span>
-                </div>
-              </div>
-              <button className="btn btn-primary" disabled={createSampleDisabled} onClick={createSample}>{activeAction === "sample" ? "正在创建样本集..." : "创建样本"}</button>
               {!assetsLoading && !imports.length && (
                 <div className="stage-tip">
                   当前任务没有导入资产，请先<Link to={`/task/${encodeURIComponent(taskId)}/imports`}>进入数据导入</Link>完成导入。
@@ -366,27 +505,7 @@ export default function SamplesPage({ task, taskId, onError }) {
                 </div>
                 <div className="workflow-stage-actions">
                   <span className={`badge badge-${workflow.batchConfig.badgeTone}`}>{workflow.batchConfig.badge}</span>
-                </div>
-              </div>
-              <div className="form-grid workflow-form-grid">
-                <div className="field">
-                  <label>每批行数</label>
-                  <input type="number" min="1" value={batchSize} disabled={sampleActionDisabled} onChange={(e) => setBatchSize(e.target.value)} />
-                </div>
-                <div className="field">
-                  <label>overlap_rate</label>
-                  <input type="number" min="0" max="1" step="0.01" value={overlapRate} disabled={sampleActionDisabled} onChange={(e) => setOverlapRate(e.target.value)} />
-                  <span className="hint">默认 0.1，用于抽取重叠样本做一致性检查。</span>
-                </div>
-                <div className="field">
-                  <label>min_annotators_per_overlap_item</label>
-                  <input type="number" min="1" step="1" value={minAnnotatorsPerOverlapItem} disabled={sampleActionDisabled} onChange={(e) => setMinAnnotatorsPerOverlapItem(e.target.value)} />
-                  <span className="hint">默认 2，表示每条重叠样本至少分配给多少标注者。</span>
-                </div>
-                <div className="field">
-                  <label>gold_rate</label>
-                  <input type="number" min="0" max="1" step="0.01" value={goldRate} disabled />
-                  <span className="hint">默认 0；暂不启用，预留为可选控制样本比例。</span>
+                  <button className="btn btn-sm" disabled={actionDisabled || !samples.length} onClick={() => selectedBatchSample && openSampleDetail(selectedBatchSample)}>打开详情</button>
                 </div>
               </div>
               <div className="policy-preview">
@@ -407,7 +526,9 @@ export default function SamplesPage({ task, taskId, onError }) {
                 </div>
                 <div className="workflow-stage-actions">
                   <span className={`badge badge-${workflow.batch.badgeTone}`}>{workflow.batch.badge}</span>
-                  <button className="btn btn-primary" disabled={actionDisabled || !samples.length || !batchSample} onClick={runBatch}>{activeAction === "batch" ? "正在生成批次计划..." : "生成批次"}</button>
+                  <button className="btn btn-sm btn-primary" disabled={actionDisabled || !samples.length || !batchSample} onClick={() => selectedBatchSample && openSampleDetail(selectedBatchSample)}>
+                    {activeAction === "batch" ? "正在生成批次计划..." : "生成批次"}
+                  </button>
                 </div>
               </div>
               {!assetsLoading && !samples.length && <div className="stage-tip">没有可用样本，批次生成已禁用。</div>}
@@ -436,38 +557,171 @@ export default function SamplesPage({ task, taskId, onError }) {
           </section>
         </div>
       </div>
-      <div className="card">
-        <div className="toolbar"><h3>已有样本（{samples.length}）</h3><button className="btn btn-sm" disabled={assetsLoading} onClick={reload}>刷新</button></div>
-        {assetsLoading && <div className="status-line">{dataLoadingText}</div>}
-        {!assetsLoading && !samples.length && <div className="empty">暂无样本</div>}
-        {samples.length > 0 && (
-          <div className="table-wrap">
-            <table>
-              <thead><tr><th>样本编号</th><th>行数</th><th>抽样策略</th><th>来源导入</th><th>内容哈希</th><th>批次信息</th><th>重叠样本</th><th>一致性策略</th><th>关联资产</th><th>存储路径</th><th>操作</th></tr></thead>
-              <tbody>
-                {samples.map((s) => {
-                  const summary = batchSummary(s);
-                  return (
-                    <tr key={s.sample_id}>
-                      <td>{s.sample_id}</td>
-                      <td>{s.manifest ? s.manifest.rows : "-"}</td>
-                      <td>{s.manifest?.strategy === "random" ? "随机抽样" : s.manifest?.strategy === "head" ? "前 N 行" : "-"}</td>
-                      <td>{s.manifest?.source_import_id || "-"}</td>
-                      <td className="mono-cell">{shortHash(s.manifest?.content_sha256)}</td>
-                      <td>{summary.batchText}</td>
-                      <td>{summary.overlapText}</td>
-                      <td className="text-cell">{summary.policyText}</td>
-                      <td>{(s.dependencies || []).map((dep) => `${dep.kind}:${dep.id}`).join(", ") || "-"}</td>
-                      <td className="muted path-cell">{s.path}</td>
-                      <td><button className="btn btn-sm btn-danger" disabled={actionDisabled || (s.dependencies || []).length > 0} onClick={() => archiveSample(s)}>归档</button></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+
+      {drawer === "create" && (
+        <div className="drawer-backdrop" onClick={() => setDrawer("")}>
+          <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <h3>创建样本集</h3>
+                <p>从已有导入资产生成一个样本集，完成后回到样本列表管理。</p>
+              </div>
+              <button className="btn btn-sm" type="button" onClick={() => setDrawer("")}>关闭</button>
+            </div>
+            <div className="form-grid drawer-form-grid">
+              <div className="field field-half"><label>样本编号</label><input value={sampleId} disabled={actionDisabled} onChange={(e) => setSampleId(e.target.value)} placeholder="例如 seed_v1" /></div>
+              <div className="field field-half">
+                <label>数据来源</label>
+                <select value={source} disabled={actionDisabled} onChange={(e) => { setSource(e.target.value); setSampleAuto(true); }}>
+                  <option value="">任务配置中的原始数据</option>
+                  {imports.map((item) => (
+                    <option key={item.import_id} value={item.path}>{item.import_id} · {item.rows} 行</option>
+                  ))}
+                </select>
+              </div>
+              <div className="field field-half">
+                <label>编号方式</label>
+                <select value={sampleAuto ? "auto" : "manual"} disabled={actionDisabled} onChange={(e) => setSampleAuto(e.target.value === "auto")}>
+                  <option value="auto">按导入编号自动生成</option>
+                  <option value="manual">手动填写样本编号</option>
+                </select>
+              </div>
+              <div className="field field-half"><label>抽样行数</label><input type="number" min="1" value={rows} disabled={actionDisabled} onChange={(e) => setRows(e.target.value)} /></div>
+              <div className="field field-half"><label>抽样策略</label><select value={strategy} disabled={actionDisabled} onChange={(e) => setStrategy(e.target.value)}><option value="head">前 N 行</option><option value="random">随机抽样</option></select></div>
+            </div>
+            {!assetsLoading && !imports.length && (
+              <div className="stage-tip">
+                当前任务没有导入资产，请先<Link to={`/task/${encodeURIComponent(taskId)}/imports`}>进入数据导入</Link>完成导入。
+              </div>
+            )}
+            <div className="drawer-actions">
+              <button className="btn btn-primary" disabled={createSampleDisabled} onClick={createSample}>
+                {activeAction === "sample" ? "正在创建样本集..." : "创建样本集"}
+              </button>
+              <span className={`badge badge-${workflow.sample.badgeTone}`}>{workflow.sample.badge}</span>
+            </div>
+          </aside>
+        </div>
+      )}
+
+      {drawer === "detail" && selectedDetailSample && (
+        <div className="drawer-backdrop" onClick={() => setDrawer("")}>
+          <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <h3>{selectedDetailSample.sample_id}</h3>
+                <p>样本 manifest、来源导入、批次计划、依赖与后续动作。</p>
+              </div>
+              <button className="btn btn-sm" type="button" onClick={() => setDrawer("")}>关闭</button>
+            </div>
+
+            <div className="drawer-detail-grid">
+              <DetailField label="行数" value={selectedDetailSample.manifest?.rows} />
+              <DetailField label="抽样策略" value={formatStrategy(selectedDetailSample.manifest?.strategy)} />
+              <DetailField label="来源导入" value={selectedDetailSample.manifest?.source_import_id || detailSourceImport?.import_id} />
+              <DetailField label="内容哈希" value={shortHash(selectedDetailSample.manifest?.content_sha256)} className="mono-cell" />
+              <DetailField label="批次计划" value={selectedDetailSummary.batchText} />
+              <DetailField label="重叠样本" value={selectedDetailSummary.overlapText} />
+              <DetailField label="一致性策略" value={selectedDetailSummary.policyText} />
+              <DetailField label="依赖" value={sampleDependencies(selectedDetailSample)} />
+              <DetailField label="样本路径" value={selectedDetailSample.path} className="mono-cell" />
+              <DetailField label="manifest 路径" value={selectedDetailSample.manifest_path || selectedDetailSample.manifest?.manifest_path} className="mono-cell" />
+            </div>
+
+            <details className="secondary-panel">
+              <summary>样本 manifest</summary>
+              <pre className="log-box">{manifestJson(selectedDetailSample.manifest)}</pre>
+            </details>
+
+            <details className="secondary-panel" open>
+              <summary>来源导入</summary>
+              {detailSourceImport ? (
+                <div className="drawer-detail-grid">
+                  <DetailField label="导入编号" value={detailSourceImport.import_id} />
+                  <DetailField label="行数" value={detailSourceImport.rows} />
+                  <DetailField label="导入路径" value={detailSourceImport.path} className="mono-cell" />
+                  <DetailField label="状态" value={detailSourceImport.state || "active"} />
+                </div>
+              ) : (
+                <div className="status-line">API 未返回匹配的来源导入详情。</div>
+              )}
+            </details>
+
+            <details className="secondary-panel" open>
+              <summary>批次计划</summary>
+              {latestDetailBatchPlan ? (
+                <>
+                  <div className="batch-summary-callout">
+                    <span>最新计划</span>
+                    <strong>{formatBatchPlanSummary(latestDetailBatchPlan)}</strong>
+                  </div>
+                  <div className="plan-summary-grid">
+                    {batchPlanDebugFields(latestDetailBatchPlan).map(([key, value]) => (
+                      <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                    ))}
+                  </div>
+                </>
+              ) : (
+                <div className="stage-tip">该样本集还没有批次计划，请先生成批次。</div>
+              )}
+            </details>
+
+            <details className="secondary-panel" open>
+              <summary>生成批次</summary>
+              <div className="form-grid drawer-form-grid">
+                <div className="field field-half">
+                  <label>每批行数</label>
+                  <input type="number" min="1" value={batchSize} disabled={sampleActionDisabled} onChange={(e) => setBatchSize(e.target.value)} />
+                </div>
+                <div className="field field-half">
+                  <label>overlap_rate</label>
+                  <input type="number" min="0" max="1" step="0.01" value={overlapRate} disabled={sampleActionDisabled} onChange={(e) => setOverlapRate(e.target.value)} />
+                  <span className="hint">默认 0.1，用于抽取重叠样本做一致性检查。</span>
+                </div>
+                <div className="field field-half">
+                  <label>min_annotators_per_overlap_item</label>
+                  <input type="number" min="1" step="1" value={minAnnotatorsPerOverlapItem} disabled={sampleActionDisabled} onChange={(e) => setMinAnnotatorsPerOverlapItem(e.target.value)} />
+                  <span className="hint">默认 2，表示每条重叠样本至少分配给多少标注者。</span>
+                </div>
+                <div className="field field-half">
+                  <label>gold_rate</label>
+                  <input type="number" min="0" max="1" step="0.01" value={goldRate} disabled />
+                  <span className="hint">默认 0；暂不启用，预留为可选控制样本比例。</span>
+                </div>
+              </div>
+              <div className="policy-preview">
+                <div><span>预计重叠样本</span><strong>{projectedOverlapItems === null ? "选择样本后计算" : `${projectedOverlapItems} 条`}</strong></div>
+                <div><span>当前策略</span><strong>重叠 {formatPercent(overlapRate)}；每条至少 {minAnnotatorsPerOverlapItem || "-"} 人；控制样本 {formatPercent(goldRate)}</strong></div>
+                <div><span>已有批次记录</span><strong>{selectedDetailSummary.hasBatchInfo ? `${selectedDetailSummary.batchText}；重叠 ${selectedDetailSummary.overlapText}` : "未记录"}</strong></div>
+              </div>
+              <div className="drawer-actions">
+                <button className="btn btn-primary" disabled={!detailActions.generateBatch.enabled} onClick={runBatch}>
+                  {activeAction === "batch" ? "正在生成批次计划..." : "生成批次"}
+                </button>
+                <span className={`badge badge-${workflow.batch.badgeTone}`}>{workflow.batch.badge}</span>
+              </div>
+              {!detailActions.generateBatch.enabled && detailActions.generateBatch.disabledReason && (
+                <div className="status-line danger-line">{detailActions.generateBatch.disabledReason}</div>
+              )}
+            </details>
+
+            <div className="drawer-actions">
+              {detailActions.pushArgilla.enabled ? (
+                <Link className="btn btn-accent" to={`/task/${encodeURIComponent(taskId)}/annotations`}>下一步推送 Argilla</Link>
+              ) : (
+                <button className="btn" disabled title={detailActions.pushArgilla.disabledReason}>下一步推送 Argilla</button>
+              )}
+              <button className="btn btn-danger" disabled={!detailActions.archive.enabled} onClick={() => archiveSample(selectedDetailSample)}>归档样本集</button>
+            </div>
+            {!detailActions.pushArgilla.enabled && detailActions.pushArgilla.disabledReason && (
+              <div className="stage-tip">{detailActions.pushArgilla.disabledReason}</div>
+            )}
+            {!detailActions.archive.enabled && detailActions.archive.disabledReason && selectedDetailSample && (
+              <div className="status-line danger-line">{detailActions.archive.disabledReason}</div>
+            )}
+          </aside>
+        </div>
+      )}
     </div>
   );
 }

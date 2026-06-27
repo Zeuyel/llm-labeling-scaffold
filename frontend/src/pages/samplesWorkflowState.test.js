@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  computeSampleDetailActions,
   computeSampleWorkflow,
+  computeSamplesListView,
   hasBatchPlan,
   newestSample,
   sampleCompletionNotice,
@@ -34,6 +36,24 @@ test("existing sample completes step two and prepares batch configuration", () =
   assert.equal(workflow.batchConfig.status, STAGE_STATUS.READY);
 });
 
+test("samples page defaults to list-first state", () => {
+  const samples = [{ sample_id: "sample_a", path: "/tmp/sample_a.jsonl", manifest: { rows: 10 } }];
+  const ready = computeSamplesListView({ imports: [{ import_id: "raw" }], samples });
+  const empty = computeSamplesListView({ imports: [{ import_id: "raw" }], samples: [] });
+  const loading = computeSamplesListView({ assetsLoading: true, imports: [{ import_id: "raw" }], samples: [] });
+
+  assert.equal(ready.defaultSurface, "list");
+  assert.equal(ready.showList, true);
+  assert.equal(ready.showEmpty, false);
+  assert.equal(empty.defaultSurface, "list");
+  assert.equal(empty.showList, false);
+  assert.equal(empty.showEmpty, true);
+  assert.equal(empty.canCreate, true);
+  assert.equal(loading.defaultSurface, "list");
+  assert.equal(loading.status, STAGE_STATUS.LOADING);
+  assert.equal(loading.showEmpty, false);
+});
+
 test("argilla step requires a generated batch plan", () => {
   const sampleWithoutPlan = { sample_id: "sample_a", path: "/tmp/sample_a.jsonl", manifest: {} };
   const sampleWithPlan = {
@@ -59,6 +79,27 @@ test("argilla step requires a generated batch plan", () => {
   assert.equal(hasBatchPlan(sampleWithPlan), true);
   assert.equal(ready.batch.status, STAGE_STATUS.COMPLETED);
   assert.equal(ready.argilla.status, STAGE_STATUS.READY);
+});
+
+test("sample detail actions enable argilla only after batch plan exists", () => {
+  const sampleWithoutPlan = { sample_id: "sample_a", path: "/tmp/sample_a.jsonl", manifest: {}, dependencies: [] };
+  const sampleWithPlan = {
+    sample_id: "sample_b",
+    path: "/tmp/sample_b.jsonl",
+    latest_batch_manifest: { plan_id: "qc_round_1", batch_count: 2 },
+    dependencies: [],
+  };
+  const blocked = computeSampleDetailActions({ sample: sampleWithoutPlan });
+  const ready = computeSampleDetailActions({ sample: sampleWithPlan });
+  const busy = computeSampleDetailActions({ sample: sampleWithPlan, busy: true });
+
+  assert.equal(blocked.generateBatch.enabled, true);
+  assert.equal(blocked.pushArgilla.enabled, false);
+  assert.equal(blocked.pushArgilla.disabledReason, "请先生成批次计划。");
+  assert.equal(ready.generateBatch.enabled, true);
+  assert.equal(ready.pushArgilla.enabled, true);
+  assert.equal(busy.generateBatch.enabled, false);
+  assert.equal(busy.pushArgilla.enabled, false);
 });
 
 test("running and failed states are explicit", () => {
