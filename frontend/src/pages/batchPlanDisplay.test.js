@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   annotationJobBatchSummary,
+  annotationJobLabel,
+  annotationJobStatusLabel,
   batchPlanDebugFields,
   batchPlanFromManifest,
   batchPlanOptionLabel,
@@ -83,4 +85,17 @@ test("annotation job table summary prefers readable batch information", () => {
   assert.equal(summary, "3 个批次，每批条数待确认，2 条一致性样本，一致性样本标注人数待确认。");
   assert.equal(summary.includes("batch_plan_id"), false);
   assert.equal(summary.includes("dispatch_mode"), false);
+});
+
+test("annotation job list uses business labels and readable statuses", () => {
+  const job = {
+    annotation_id: "round_1",
+    argilla_dataset: "dataset_round_1",
+    status: "succeeded",
+  };
+
+  assert.equal(annotationJobLabel(job), "round_1");
+  assert.equal(annotationJobStatusLabel(job), "已推送");
+  assert.equal(annotationJobStatusLabel({ state: "running" }), "执行中");
+  assert.equal(annotationJobStatusLabel({ status: "failed" }), "失败");
 });

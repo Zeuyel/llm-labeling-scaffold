@@ -172,6 +172,20 @@ export function annotationJobBatchSummary(job) {
   return formatBatchPlanSummary(planLike);
 }
 
+export function annotationJobLabel(job) {
+  if (!job) return "未选择标注任务";
+  return String(firstDefined(job.annotation_id, job.argilla_dataset, job.job_id, job.id, "未命名标注任务"));
+}
+
+export function annotationJobStatusLabel(job) {
+  const status = String(firstDefined(job?.status, job?.state, "")).toLowerCase();
+  if (["done", "completed", "complete", "succeeded", "success", "published", "pushed"].includes(status)) return "已推送";
+  if (["running", "pending", "queued", "in_progress"].includes(status)) return "执行中";
+  if (["failed", "error"].includes(status)) return "失败";
+  if (!status && job) return "已记录";
+  return status || "-";
+}
+
 export function batchPlanDebugFields(plan) {
   if (!plan) return [];
   return [
