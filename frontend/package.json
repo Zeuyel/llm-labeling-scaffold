@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "test:workflow": "node --test src/pages/samplesWorkflowState.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

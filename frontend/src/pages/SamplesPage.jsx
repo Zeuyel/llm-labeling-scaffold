@@ -1,6 +1,13 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
+import {
+  computeSampleWorkflow,
+  getBatchManifests,
+  hasBatchPlan,
+  newestSample,
+  sampleCompletionNotice,
+} from "./samplesWorkflowState.js";
 
 function shortHash(value) {
   return value ? `${String(value).slice(0, 12)}...` : "-";
@@ -18,28 +25,6 @@ function formatPercent(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "-";
   return `${Math.round(numeric * 1000) / 10}%`;
-}
-
-function getBatchManifests(sample) {
-  const manifests = [];
-  const pushManifest = (value) => {
-    if (!value) return;
-    if (Array.isArray(value)) {
-      value.forEach(pushManifest);
-      return;
-    }
-    if (typeof value === "object") manifests.push(value);
-  };
-  pushManifest(sample?.latest_batch_manifest);
-  pushManifest(sample?.batch_manifest);
-  pushManifest(sample?.batch);
-  pushManifest(sample?.batches);
-  pushManifest(sample?.manifest?.batch_manifest);
-  pushManifest(sample?.manifest?.batch);
-  if (sample?.manifest?.batch_count || sample?.manifest?.batch_size || sample?.manifest?.batches) {
-    pushManifest(sample.manifest);
-  }
-  return manifests;
 }
 
 function firstDefined(...values) {
@@ -110,6 +95,9 @@ export default function SamplesPage({ task, taskId, onError }) {
   const [sampleAuto, setSampleAuto] = useState(true);
   const [assetsLoading, setAssetsLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [activeAction, setActiveAction] = useState("");
+  const [lastAction, setLastAction] = useState("");
+  const [actionError, setActionError] = useState("");
   const [notice, setNotice] = useState("");
 
   const reload = useCallback(async () => {
@@ -145,6 +133,17 @@ export default function SamplesPage({ task, taskId, onError }) {
     () => batchSummary(selectedBatchSample),
     [selectedBatchSample],
   );
+  const workflow = useMemo(
+    () => computeSampleWorkflow({
+      assetsLoading,
+      imports,
+      samples,
+      selectedSample: selectedBatchSample,
+      action: activeAction || (actionError ? lastAction : ""),
+      actionError,
+    }),
+    [assetsLoading, imports, samples, selectedBatchSample, activeAction, lastAction, actionError],
+  );
 
   const selectedSampleRows = Number(selectedBatchSample?.manifest?.rows || 0);
   const overlapRateNumber = Number(overlapRate);
@@ -155,6 +154,8 @@ export default function SamplesPage({ task, taskId, onError }) {
   const dataLoadingText = "正在读取导入资产/样本集";
   const actionDisabled = busy || assetsLoading;
   const sampleActionDisabled = actionDisabled || !samples.length;
+  const createSampleDisabled = actionDisabled || !imports.length;
+  const selectedSampleHasBatchPlan = hasBatchPlan(selectedBatchSample);
 
   useEffect(() => {
     if (!source && imports.length) {
@@ -180,13 +181,16 @@ export default function SamplesPage({ task, taskId, onError }) {
       return;
     }
     if (!samples.some((item) => item.path === batchSample)) {
-      setBatchSample(samples[0].path);
+      setBatchSample(newestSample(samples)?.path || samples[0].path);
     }
   }, [samples, batchSample]);
 
   async function runAction(action, params, label) {
     if (!task) return false;
     setBusy(true);
+    setActiveAction(action);
+    setLastAction(action);
+    setActionError("");
     try {
       const job = await api.startAction(task.path, action, params);
       const finished = job?.id ? await api.waitForJob(taskId, job.id) : null;
@@ -194,27 +198,35 @@ export default function SamplesPage({ task, taskId, onError }) {
         throw new Error(finished.error || "执行失败");
       }
       await reload();
-      return true;
+      return finished?.result || job?.result || job || {};
     } catch (e) {
+      setActionError(String(e));
       onError(`${label}: ${e}`);
-      return false;
-    } finally { setBusy(false); }
+      return null;
+    } finally {
+      setBusy(false);
+      setActiveAction("");
+    }
   }
 
   async function createSample() {
     if (assetsLoading) { onError("正在读取导入资产/样本集，请稍候"); return; }
+    if (!imports.length) { onError("当前任务没有导入资产，请先进入数据导入页完成导入"); return; }
     if (!task || !sampleId) { onError("请填写样本编号"); return; }
-    setNotice("");
-    const ok = await runAction("sample", {
+    const pendingSampleId = sampleId;
+    const existedBefore = samples.some((item) => item.sample_id === pendingSampleId);
+    setNotice("正在创建样本集...");
+    const result = await runAction("sample", {
       sample_id: sampleId,
       rows: Number(rows),
       strategy,
       source,
       source_import_id: selectedImport?.import_id,
     }, "创建样本");
-    if (ok) {
+    if (result) {
       setSampleId("");
-      setNotice("样本已创建或幂等复用。");
+      setNotice(sampleCompletionNotice({ existedBefore, result }));
+      if (result.artifact) setBatchSample(result.artifact);
     }
   }
 
@@ -231,14 +243,15 @@ export default function SamplesPage({ task, taskId, onError }) {
     if (!Number.isFinite(numericOverlapRate) || numericOverlapRate < 0 || numericOverlapRate > 1) { onError("重叠比例需在 0 到 1 之间"); return; }
     if (!Number.isFinite(numericMinAnnotators) || numericMinAnnotators < 1) { onError("重叠样本最少标注人数必须大于 0"); return; }
     if (!Number.isFinite(numericGoldRate) || numericGoldRate < 0 || numericGoldRate > 1) { onError("控制样本比例需在 0 到 1 之间"); return; }
-    const ok = await runAction("batch", {
+    setNotice("正在生成批次计划...");
+    const result = await runAction("batch", {
       sample: batchSample,
       batch_size: numericBatchSize,
       overlap_rate: numericOverlapRate,
       min_annotators_per_overlap_item: numericMinAnnotators,
       gold_rate: numericGoldRate,
     }, "生成批次");
-    if (ok) {
+    if (result) {
       setNotice("批次生成任务已完成。");
     }
   }
@@ -277,7 +290,7 @@ export default function SamplesPage({ task, taskId, onError }) {
       <div className="card section-card">
         <h3>样本到批次流程</h3>
         <div className="workflow-stage-list">
-          <section className={`workflow-stage ${imports.length ? "workflow-stage-completed" : "workflow-stage-ready"}`}>
+          <section className={`workflow-stage workflow-stage-${workflow.imports.status}`}>
             <div className="workflow-stage-index">1</div>
             <div className="workflow-stage-main">
               <div className="workflow-stage-head">
@@ -286,30 +299,30 @@ export default function SamplesPage({ task, taskId, onError }) {
                   <p>{assetsLoading ? dataLoadingText : imports.length ? `当前任务有 ${imports.length} 个导入资产可作为来源。` : "当前任务尚未检测到导入资产，可先进入数据导入页。"}</p>
                 </div>
                 <div className="workflow-stage-actions">
-                  <span className={`badge ${imports.length ? "badge-green" : "badge-blue"}`}>{assetsLoading ? "读取中" : imports.length ? "已就绪" : "待导入"}</span>
+                  <span className={`badge badge-${workflow.imports.badgeTone}`}>{workflow.imports.badge}</span>
                   <Link className="btn btn-sm" to={`/task/${encodeURIComponent(taskId)}/imports`}>查看导入</Link>
                 </div>
               </div>
             </div>
           </section>
 
-          <section className="workflow-stage workflow-stage-ready">
+          <section className={`workflow-stage workflow-stage-${workflow.sample.status}`}>
             <div className="workflow-stage-index">2</div>
             <div className="workflow-stage-main">
               <div className="workflow-stage-head">
                 <div>
                   <h4>创建/选择样本集</h4>
-                  <p>{assetsLoading ? dataLoadingText : samples.length ? `已有 ${samples.length} 个样本集，可选择其中一个进入批次配置。` : "先从来源数据创建一个样本集。"}</p>
+                  <p>{assetsLoading ? dataLoadingText : activeAction === "sample" ? "正在创建样本集..." : samples.length ? `已有 ${samples.length} 个样本集，可选择其中一个进入批次配置。` : imports.length ? "先从来源数据创建一个样本集。" : "需要先完成数据导入。"}</p>
                 </div>
                 <div className="workflow-stage-actions">
-                  <span className={`badge ${samples.length ? "badge-green" : "badge-blue"}`}>{assetsLoading ? "读取中" : samples.length ? "已有样本" : "可创建"}</span>
+                  <span className={`badge badge-${workflow.sample.badgeTone}`}>{workflow.sample.badge}</span>
                 </div>
               </div>
               <div className="form-grid workflow-form-grid">
-                <div className="field"><label>样本编号</label><input value={sampleId} onChange={(e) => setSampleId(e.target.value)} placeholder="例如 seed_v1" /></div>
+                <div className="field"><label>样本编号</label><input value={sampleId} disabled={actionDisabled} onChange={(e) => setSampleId(e.target.value)} placeholder="例如 seed_v1" /></div>
                 <div className="field">
                   <label>数据来源</label>
-                  <select value={source} disabled={assetsLoading} onChange={(e) => { setSource(e.target.value); setSampleAuto(true); }}>
+                  <select value={source} disabled={actionDisabled} onChange={(e) => { setSource(e.target.value); setSampleAuto(true); }}>
                     <option value="">任务配置中的原始数据</option>
                     {imports.map((item) => (
                       <option key={item.import_id} value={item.path}>{item.import_id} · {item.rows} 行</option>
@@ -318,13 +331,13 @@ export default function SamplesPage({ task, taskId, onError }) {
                 </div>
                 <div className="field">
                   <label>编号方式</label>
-                  <select value={sampleAuto ? "auto" : "manual"} disabled={assetsLoading} onChange={(e) => setSampleAuto(e.target.value === "auto")}>
+                  <select value={sampleAuto ? "auto" : "manual"} disabled={actionDisabled} onChange={(e) => setSampleAuto(e.target.value === "auto")}>
                     <option value="auto">按导入编号自动生成</option>
                     <option value="manual">手动填写样本编号</option>
                   </select>
                 </div>
-                <div className="field"><label>抽样行数</label><input type="number" min="1" value={rows} onChange={(e) => setRows(e.target.value)} /></div>
-                <div className="field"><label>抽样策略</label><select value={strategy} onChange={(e) => setStrategy(e.target.value)}><option value="head">前 N 行</option><option value="random">随机抽样</option></select></div>
+                <div className="field"><label>抽样行数</label><input type="number" min="1" value={rows} disabled={actionDisabled} onChange={(e) => setRows(e.target.value)} /></div>
+                <div className="field"><label>抽样策略</label><select value={strategy} disabled={actionDisabled} onChange={(e) => setStrategy(e.target.value)}><option value="head">前 N 行</option><option value="random">随机抽样</option></select></div>
                 <div className="field">
                   <label>后续使用样本</label>
                   <select value={batchSample} disabled={assetsLoading || !samples.length} onChange={(e) => setBatchSample(e.target.value)}>
@@ -334,11 +347,16 @@ export default function SamplesPage({ task, taskId, onError }) {
                   <span className="hint">{assetsLoading ? dataLoadingText : samples.length ? "所选样本将用于批次生成和后续标注分发。" : "没有样本时不能生成批次。"}</span>
                 </div>
               </div>
-              <button className="btn btn-primary" disabled={actionDisabled} onClick={createSample}>创建样本</button>
+              <button className="btn btn-primary" disabled={createSampleDisabled} onClick={createSample}>{activeAction === "sample" ? "正在创建样本集..." : "创建样本"}</button>
+              {!assetsLoading && !imports.length && (
+                <div className="stage-tip">
+                  当前任务没有导入资产，请先<Link to={`/task/${encodeURIComponent(taskId)}/imports`}>进入数据导入</Link>完成导入。
+                </div>
+              )}
             </div>
           </section>
 
-          <section className={`workflow-stage ${samples.length || assetsLoading ? "workflow-stage-ready" : "workflow-stage-blocked"}`}>
+          <section className={`workflow-stage workflow-stage-${workflow.batchConfig.status}`}>
             <div className="workflow-stage-index">3</div>
             <div className="workflow-stage-main">
               <div className="workflow-stage-head">
@@ -347,7 +365,7 @@ export default function SamplesPage({ task, taskId, onError }) {
                   <p>{assetsLoading ? dataLoadingText : selectedBatchSample ? `当前样本：${selectedBatchSample.sample_id}` : "需要先创建并选择样本。"}</p>
                 </div>
                 <div className="workflow-stage-actions">
-                  <span className={`badge ${samples.length || assetsLoading ? "badge-blue" : "badge-red"}`}>{assetsLoading ? "读取中" : samples.length ? "可配置" : "待样本"}</span>
+                  <span className={`badge badge-${workflow.batchConfig.badgeTone}`}>{workflow.batchConfig.badge}</span>
                 </div>
               </div>
               <div className="form-grid workflow-form-grid">
@@ -379,45 +397,48 @@ export default function SamplesPage({ task, taskId, onError }) {
             </div>
           </section>
 
-          <section className={`workflow-stage ${samples.length || assetsLoading ? "workflow-stage-ready" : "workflow-stage-blocked"}`}>
+          <section className={`workflow-stage workflow-stage-${workflow.batch.status}`}>
             <div className="workflow-stage-index">4</div>
             <div className="workflow-stage-main">
               <div className="workflow-stage-head">
                 <div>
                   <h4>生成批次</h4>
-                  <p>{assetsLoading ? dataLoadingText : samples.length ? "按当前批次配置生成批次资产。" : "请先创建样本，再生成批次。"}</p>
+                  <p>{assetsLoading ? dataLoadingText : activeAction === "batch" ? "正在生成批次计划..." : selectedSampleHasBatchPlan ? "当前样本已有批次计划，可继续推送 Argilla。" : samples.length ? "按当前批次配置生成批次资产。" : "请先创建样本，再生成批次。"}</p>
                 </div>
                 <div className="workflow-stage-actions">
-                  <button className="btn btn-primary" disabled={actionDisabled || !samples.length || !batchSample} onClick={runBatch}>生成批次</button>
+                  <span className={`badge badge-${workflow.batch.badgeTone}`}>{workflow.batch.badge}</span>
+                  <button className="btn btn-primary" disabled={actionDisabled || !samples.length || !batchSample} onClick={runBatch}>{activeAction === "batch" ? "正在生成批次计划..." : "生成批次"}</button>
                 </div>
               </div>
               {!assetsLoading && !samples.length && <div className="stage-tip">没有可用样本，批次生成已禁用。</div>}
             </div>
           </section>
 
-          <section className={`workflow-stage ${samples.length || assetsLoading ? "workflow-stage-ready" : "workflow-stage-blocked"}`}>
+          <section className={`workflow-stage workflow-stage-${workflow.argilla.status}`}>
             <div className="workflow-stage-index">5</div>
             <div className="workflow-stage-main">
               <div className="workflow-stage-head">
                 <div>
                   <h4>下一步推送 Argilla</h4>
-                  <p>{assetsLoading ? dataLoadingText : samples.length ? "批次生成后，进入标注分发页推送样本。" : "需要先完成样本创建和批次生成。"}</p>
+                  <p>{assetsLoading ? dataLoadingText : selectedSampleHasBatchPlan ? "批次计划已生成，可进入标注分发页推送样本。" : samples.length ? "请先生成批次计划，再进入标注分发页推送样本。" : "需要先完成样本创建和批次生成。"}</p>
                 </div>
                 <div className="workflow-stage-actions">
-                  {samples.length ? (
+                  <span className={`badge badge-${workflow.argilla.badgeTone}`}>{workflow.argilla.badge}</span>
+                  {selectedSampleHasBatchPlan ? (
                     <Link className="btn btn-accent" to={`/task/${encodeURIComponent(taskId)}/annotations`}>进入标注分发</Link>
                   ) : (
-                    <button className="btn" disabled>进入标注分发</button>
+                    <button className="btn" disabled title={workflow.argilla.disabledReason || "请先生成批次计划"}>进入标注分发</button>
                   )}
                 </div>
               </div>
+              {!assetsLoading && workflow.argilla.disabledReason && <div className="stage-tip">{workflow.argilla.disabledReason}</div>}
             </div>
           </section>
         </div>
       </div>
       <div className="card">
         <div className="toolbar"><h3>已有样本（{samples.length}）</h3><button className="btn btn-sm" disabled={assetsLoading} onClick={reload}>刷新</button></div>
-        {assetsLoading && <div className="empty">{dataLoadingText}</div>}
+        {assetsLoading && <div className="status-line">{dataLoadingText}</div>}
         {!assetsLoading && !samples.length && <div className="empty">暂无样本</div>}
         {samples.length > 0 && (
           <div className="table-wrap">
