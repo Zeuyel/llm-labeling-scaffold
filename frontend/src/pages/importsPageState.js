@@ -42,9 +42,12 @@ export function usesR2TaskSource(taskSource, task) {
   });
 }
 
-export function usesLocalTaskSource(taskSource) {
-  const normalized = String(taskSource || "").trim().toLowerCase();
-  return normalized === "local" || normalized.startsWith("local:");
+export function usesLocalTaskSource(taskSource, task) {
+  const sources = [taskSource, task?.task_source, task?.source_type, task?.source];
+  return sources.some((value) => {
+    const normalized = String(value || "").trim().toLowerCase();
+    return normalized === "local" || normalized.startsWith("local:");
+  });
 }
 
 export function backendAllowsManualImports(task, allowManualImports) {
@@ -61,7 +64,11 @@ export function backendAllowsManualImports(task, allowManualImports) {
 
 export function sourceLabel(item) {
   const source = String(item?.source || "").trim().toLowerCase();
-  if (source === "data_lake" || item?.source_dataset_id || item?.source_object_path || item?.source_manifest_uri) {
+  const hasDataLakeSource = DATA_LAKE_SOURCE_FIELDS.some((field) => {
+    const value = item?.[field];
+    return typeof value === "string" ? value.trim() !== "" : Boolean(value);
+  });
+  if (source === "data_lake" || hasDataLakeSource) {
     return "数据湖";
   }
   if (source === "upload") return "手动上传";

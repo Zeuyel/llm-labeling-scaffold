@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -180,23 +181,34 @@ def _suggestion_values(task: TaskConfig, entry: dict[str, Any]) -> dict[str, Any
     return out
 
 
+def _suggestion_score(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return score if math.isfinite(score) else None
+
+
 def _make_suggestion(rg, *, question_name: str, value: Any, score: Any = None, agent: str | None = None):
     suggestion_cls = getattr(rg, "Suggestion", None)
     if suggestion_cls is None:
         raise RuntimeError("Argilla SDK missing Suggestion; cannot sync machine suggestions")
     kwargs = {"question_name": question_name, "value": value}
-    if score not in (None, ""):
-        kwargs["score"] = float(score)
+    resolved_score = _suggestion_score(score)
+    if resolved_score is not None:
+        kwargs["score"] = resolved_score
     if agent:
         kwargs["agent"] = agent
     try:
         return suggestion_cls(**kwargs)
     except TypeError:
-        kwargs.pop("score", None)
+        kwargs.pop("agent", None)
         try:
             return suggestion_cls(**kwargs)
         except TypeError:
-            kwargs.pop("agent", None)
+            kwargs.pop("score", None)
             return suggestion_cls(**kwargs)
 
 

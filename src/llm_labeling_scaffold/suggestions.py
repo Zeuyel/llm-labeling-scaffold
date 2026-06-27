@@ -50,14 +50,16 @@ def _suggestion_values(task: TaskConfig, result: dict) -> dict[str, Any]:
 
 def _provider_results(task: TaskConfig, rows: list[dict], provider_name: str) -> list[dict]:
     if provider_name == "codex_exec":
-        raise ValueError("codex_exec provider 尚未实现；当前先支持本地 suggestions 产物和 Argilla Suggestions 写入边界")
+        raise ValueError("codex_exec provider 尚未实现; 当前先支持本地 suggestions 产物和 Argilla Suggestions 写入边界")
     provider = get_provider(provider_name)
     payload = provider.annotate_batch(rows, task)
+    if not isinstance(payload, dict):
+        raise ValueError(f"provider {provider_name} 必须返回 dict payload")
     results = payload.get("results")
     if not isinstance(results, list):
         raise ValueError(f"provider {provider_name} 没有返回 results 列表")
     if len(results) != len(rows):
-        raise ValueError(f"provider {provider_name} 返回 {len(results)} 条结果，但输入有 {len(rows)} 条")
+        raise ValueError(f"provider {provider_name} 返回 {len(results)} 条结果, 但输入有 {len(rows)} 条")
     return [dict(item) for item in results]
 
 
@@ -116,6 +118,7 @@ def generate_suggestions_for_annotation_job(
                 publish_params = _argilla_publish_params(annotation_manifest, argilla)
                 push_result = push_suggestions(task, dispatch_path, dataset, suggestions_path, publish_params)
                 result["publish"] = push_result
+                write_json({**existing, "status": "published", "publish": push_result}, manifest_path)
             return result
         raise ValueError(f"suggestion_id 已存在且输入或参数不同: {suggestion_id}")
 
@@ -123,7 +126,7 @@ def generate_suggestions_for_annotation_job(
     results = _provider_results(task, rows, provider)
     suggestion_rows: list[dict[str, Any]] = []
     agent = f"{provider}:{prompt_version}"
-    for row, result in zip(rows, results):
+    for row, result in zip(rows, results, strict=True):
         suggestions = _suggestion_values(task, result)
         if not suggestions:
             continue

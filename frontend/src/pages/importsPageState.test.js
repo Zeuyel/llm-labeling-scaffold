@@ -5,7 +5,9 @@ import {
   filterImportAuditEvents,
   hasEffectiveDataLakeConfig,
   importActionState,
+  sourceLabel,
   summarizeImportAsset,
+  usesLocalTaskSource,
 } from "./importsPageState.js";
 
 test("summarizes import assets for list-first rows", () => {
@@ -54,6 +56,17 @@ test("data lake config detection requires an effective source field", () => {
   assert.equal(hasEffectiveDataLakeConfig({ source_dataset_id: "dataset_a" }), true);
   assert.equal(hasEffectiveDataLakeConfig({ output_base_uri: "r2:bucket/out" }), false);
   assert.equal(hasEffectiveDataLakeConfig(null), false);
+});
+
+test("manual import source detection mirrors task field fallbacks", () => {
+  assert.equal(usesLocalTaskSource("", { task_source: "local" }), true);
+  assert.equal(usesLocalTaskSource("", { source_type: "local:disk" }), true);
+  assert.equal(usesLocalTaskSource("", { source: "r2" }), false);
+});
+
+test("data lake source labels cover all effective source fields", () => {
+  assert.equal(sourceLabel({ source_object_uri: "r2://bucket/raw.jsonl" }), "数据湖");
+  assert.equal(sourceLabel({ lake_registry_uri: "r2://bucket/registry.json" }), "数据湖");
 });
 
 test("import detail audit log filters by import asset", () => {

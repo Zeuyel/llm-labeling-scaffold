@@ -14,6 +14,11 @@ export function firstDefined(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== "");
 }
 
+export function firstDefinedString(...values) {
+  const value = firstDefined(...values);
+  return value === undefined || value === null ? "" : String(value);
+}
+
 function planIdFromPath(value) {
   const parts = String(value || "").split(/[\\/]+/).filter(Boolean);
   if (!parts.length) return "";
@@ -78,7 +83,7 @@ export function batchPlanFromManifest(manifest, index = 0) {
   );
 
   return {
-    key: String(firstDefined(manifest.plan_id, manifest.batch_plan_id, manifestPath, planDir, planId)),
+    key: firstDefinedString(manifest.plan_id, manifest.batch_plan_id, manifestPath, planDir, planId),
     manifest,
     manifest_path: manifestPath,
     plan_id: planId,
@@ -172,9 +177,13 @@ export function annotationJobBatchSummary(job) {
   return formatBatchPlanSummary(planLike);
 }
 
+export function annotationJobKey(job) {
+  return firstDefinedString(job?.annotation_id, job?.argilla_dataset, job?.job_id, job?.id, job?.manifest_path);
+}
+
 export function annotationJobLabel(job) {
   if (!job) return "未选择标注任务";
-  return String(firstDefined(job.annotation_id, job.argilla_dataset, job.job_id, job.id, "未命名标注任务"));
+  return firstDefinedString(job.annotation_id, job.argilla_dataset, job.job_id, job.id, "未命名标注任务");
 }
 
 export function annotationJobStatusLabel(job) {
@@ -202,17 +211,17 @@ export function annotationJobLineageFields(job) {
     ["批次计划", job.batch_plan_id || "未使用批次计划"],
     ["批次清单", job.batch_manifest_path],
     ["分发文件", job.dispatch_path],
-    ["批次数", countLike(job.batch_ids) || countLike(job.batch_files)],
-    ["一致性样本", countLike(job.overlap_item_ids) || countLike(job.selected_overlap_item_ids)],
+    ["批次数", firstDefined(countLike(job.batch_ids), countLike(job.batch_files))],
+    ["一致性样本", firstDefined(countLike(job.overlap_item_ids), countLike(job.selected_overlap_item_ids))],
     ["记录 ID 策略", job.record_id_policy?.strategy],
   ];
 }
 
 export function annotationJobActionAvailability(job, decisions = [], samplePath = "") {
-  const dataset = String(firstDefined(job?.argilla_dataset, job?.dataset) || "").trim();
-  const resolvedSamplePath = String(firstDefined(samplePath, job?.sample_path) || "").trim();
+  const dataset = firstDefinedString(job?.argilla_dataset, job?.dataset).trim();
+  const resolvedSamplePath = firstDefinedString(samplePath, job?.sample_path).trim();
   const usableDecision = (decisions || []).find((item) => item?.path);
-  const decisionSamplePath = String(firstDefined(usableDecision?.sample_path, resolvedSamplePath) || "").trim();
+  const decisionSamplePath = firstDefinedString(usableDecision?.sample_path, resolvedSamplePath).trim();
 
   const pull = !job
     ? { enabled: false, reason: "未选择标注任务。" }
@@ -236,7 +245,7 @@ export function annotationJobActionAvailability(job, decisions = [], samplePath 
 export function agreementAuditsForAnnotationJob(job, decisions = [], audits = []) {
   if (!job) return [];
   const annotationId = String(job.annotation_id || "");
-  const dataset = String(firstDefined(job.argilla_dataset, job.dataset, ""));
+  const dataset = firstDefinedString(job.argilla_dataset, job.dataset);
   const samplePath = String(job.sample_path || "");
   const decisionIds = new Set((decisions || []).map((item) => String(item.decision_id || "")).filter(Boolean));
   const decisionPaths = new Set((decisions || []).map((item) => String(item.path || "")).filter(Boolean));
@@ -254,12 +263,12 @@ export function agreementAuditsForAnnotationJob(job, decisions = [], audits = []
 }
 
 export function decisionArtifactKey(decision) {
-  return String(firstDefined(decision?.decision_id, decision?.path, decision?.argilla_dataset, decision?.created_at, ""));
+  return firstDefinedString(decision?.decision_id, decision?.path, decision?.argilla_dataset, decision?.created_at);
 }
 
 export function decisionArtifactLabel(decision) {
   if (!decision) return "未选择标注结果";
-  return String(firstDefined(decision.decision_id, decision.argilla_dataset, decision.path, "未命名标注结果"));
+  return firstDefinedString(decision.decision_id, decision.argilla_dataset, decision.path, "未命名标注结果");
 }
 
 export function decisionArtifactSourceLabel(decision) {
@@ -292,8 +301,8 @@ export function decisionArtifactLineageFields(decision) {
     ["分发方式", annotationJobDispatchLabel(decision)],
     ["批次计划", decision.batch_plan_id],
     ["批次清单", decision.batch_manifest_path],
-    ["批次数", countLike(decision.batch_ids) || countLike(decision.batch_files)],
-    ["一致性样本", countLike(decision.overlap_item_ids) || countLike(decision.selected_overlap_item_ids)],
+    ["批次数", firstDefined(countLike(decision.batch_ids), countLike(decision.batch_files))],
+    ["一致性样本", firstDefined(countLike(decision.overlap_item_ids), countLike(decision.selected_overlap_item_ids))],
     ["产物路径", decision.path],
   ];
 }
@@ -322,12 +331,12 @@ export function decisionArtifactDebugFields(decision) {
 }
 
 export function agreementAuditKey(audit) {
-  return String(firstDefined(audit?.audit_id, audit?.summary_path, audit?.created_at, ""));
+  return firstDefinedString(audit?.audit_id, audit?.summary_path, audit?.created_at);
 }
 
 export function agreementAuditLabel(audit) {
   if (!audit) return "未选择一致性检查";
-  return String(firstDefined(audit.audit_id, audit.summary_path, "未命名检查"));
+  return firstDefinedString(audit.audit_id, audit.summary_path, "未命名检查");
 }
 
 export function agreementAuditStatusLabel(audit) {
@@ -345,8 +354,8 @@ export function agreementAuditStatusLabel(audit) {
 export function agreementAuditCoverageLabel(audit) {
   if (!audit) return "-";
   const coverage = audit.sample_coverage || {};
-  const covered = firstDefined(coverage.covered_ids, audit.covered_ids);
-  const total = firstDefined(coverage.sample_ids, audit.sample_unique_ids, audit.sample_rows);
+  const covered = countLike(firstDefined(coverage.covered_ids, audit.covered_ids));
+  const total = countLike(firstDefined(coverage.sample_ids, audit.sample_unique_ids, audit.sample_rows));
   const rate = coverage.coverage_rate;
   if (covered === undefined || total === undefined) return "-";
   const rateText = Number.isFinite(Number(rate)) ? `（${Math.round(Number(rate) * 1000) / 10}%）` : "";
@@ -378,8 +387,8 @@ export function agreementAuditIssueSummary(audit) {
 export function agreementAuditsForDecision(decision, audits = []) {
   if (!decision) return [];
   const decisionId = String(decision.decision_id || "");
-  const dataset = String(firstDefined(decision.argilla_dataset, decision.dataset, ""));
-  const annotationId = String(firstDefined(decision.annotation_id, decision.source_annotation_id, ""));
+  const dataset = firstDefinedString(decision.argilla_dataset, decision.dataset);
+  const annotationId = firstDefinedString(decision.annotation_id, decision.source_annotation_id);
   const decisionPath = String(decision.path || "");
   const samplePath = String(decision.sample_path || "");
 

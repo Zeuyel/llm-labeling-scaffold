@@ -75,12 +75,18 @@ export default function GoldPage({ task, taskId, onError }) {
   );
   const selectedSummary = selectedGold ? goldSummary(selectedGold, taskId) : null;
   const selectedTrainAction = selectedGold ? goldTrainAction(selectedGold, taskId) : null;
-  const selectedSourceSample = selectedGold
-    ? samples.find((item) => item.path && item.path === selectedGold.sample_path)
-    : null;
-  const selectedSourceDecision = selectedGold
-    ? decisions.find((item) => item.path && item.path === selectedGold.decisions)
-    : null;
+  const selectedSourceSample = useMemo(
+    () => (selectedGold
+      ? samples.find((item) => item.path && item.path === selectedGold.sample_path) || null
+      : null),
+    [selectedGold, samples],
+  );
+  const selectedSourceDecision = useMemo(
+    () => (selectedGold
+      ? decisions.find((item) => item.path && item.path === selectedGold.decisions) || null
+      : null),
+    [selectedGold, decisions],
+  );
 
   function openBuildDrawer() {
     setDrawer("build");
@@ -144,12 +150,12 @@ export default function GoldPage({ task, taskId, onError }) {
         {!loading && !loadError && versions.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>版本</th><th>状态</th><th>行数</th><th>主标签</th><th>标签分布</th><th>来源</th><th>创建时间</th><th>路径</th></tr></thead>
+              <thead><tr><th>版本</th><th>状态</th><th>行数</th><th>主标签</th><th>标签分布</th><th>来源</th><th>创建时间</th><th>路径</th><th>操作</th></tr></thead>
               <tbody>
                 {versions.map((g) => {
                   const summary = goldSummary(g, taskId);
                   return (
-                    <tr className="clickable-row" key={summary.key} onClick={() => openGoldDetail(g)}>
+                    <tr key={summary.key}>
                       <td><span className="badge badge-blue">{summary.version}</span></td>
                       <td><span className={`badge ${statusBadgeClass(summary.status)}`}>{summary.status}</span></td>
                       <td>{summary.rows}</td>
@@ -158,6 +164,9 @@ export default function GoldPage({ task, taskId, onError }) {
                       <td>{summary.source}</td>
                       <td className="muted">{summary.createdAt}</td>
                       <td className="muted path-cell">{summary.path}</td>
+                      <td>
+                        <button className="btn btn-sm" type="button" onClick={() => openGoldDetail(g)}>查看</button>
+                      </td>
                     </tr>
                   );
                 })}

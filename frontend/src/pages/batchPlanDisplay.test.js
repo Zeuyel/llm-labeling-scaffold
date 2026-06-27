@@ -8,14 +8,19 @@ import {
   agreementAuditsForAnnotationJob,
   annotationJobActionAvailability,
   annotationJobBatchSummary,
+  annotationJobKey,
   annotationJobLabel,
+  annotationJobLineageFields,
   annotationJobStatusLabel,
   batchPlanDebugFields,
   batchPlanFromManifest,
   batchPlanOptionLabel,
+  decisionArtifactKey,
   decisionArtifactLabel,
   decisionArtifactLineageFields,
   decisionArtifactStatusLabel,
+  agreementAuditKey,
+  firstDefinedString,
   formatBatchPlanSummary,
 } from "./batchPlanDisplay.js";
 
@@ -96,6 +101,25 @@ test("annotation job table summary prefers readable batch information", () => {
   assert.equal(summary.includes("dispatch_mode"), false);
 });
 
+test("lineage fields preserve zero counts", () => {
+  const jobFields = Object.fromEntries(annotationJobLineageFields({
+    dispatch_mode: "batch_plan",
+    batch_ids: [],
+    overlap_item_ids: [],
+  }));
+  const decisionFields = Object.fromEntries(decisionArtifactLineageFields({
+    dispatch_mode: "batch_plan",
+    batch_ids: [],
+    overlap_item_ids: [],
+    path: "/tmp/decisions.jsonl",
+  }));
+
+  assert.equal(jobFields["批次数"], 0);
+  assert.equal(jobFields["一致性样本"], 0);
+  assert.equal(decisionFields["批次数"], 0);
+  assert.equal(decisionFields["一致性样本"], 0);
+});
+
 test("annotation job list uses business labels and readable statuses", () => {
   const job = {
     annotation_id: "round_1",
@@ -110,6 +134,16 @@ test("annotation job list uses business labels and readable statuses", () => {
   assert.equal(annotationJobStatusLabel({ status: "failed" }), "失败");
   assert.equal(annotationJobStatusLabel({ state: "incomplete" }), "记录不完整");
   assert.equal(annotationJobStatusLabel({ annotation_id: "round_2" }), "已记录");
+});
+
+test("empty annotation and decision keys do not stringify as undefined", () => {
+  assert.equal(firstDefinedString(undefined, null, ""), "");
+  assert.equal(annotationJobKey({}), "");
+  assert.equal(decisionArtifactKey({}), "");
+  assert.equal(agreementAuditKey({}), "");
+  assert.notEqual(annotationJobKey({}), "undefined");
+  assert.notEqual(decisionArtifactKey({}), "undefined");
+  assert.notEqual(agreementAuditKey({}), "undefined");
 });
 
 test("annotation job detail action availability explains disabled states", () => {
@@ -196,6 +230,7 @@ test("agreement audit detail summarizes status, coverage, issues, and decision l
   assert.deepEqual(agreementAuditsForDecision(decision, audits).map((item) => item.audit_id), ["round_1"]);
   assert.equal(agreementAuditStatusLabel(audits[0]), "未通过");
   assert.equal(agreementAuditCoverageLabel(audits[0]), "8/10（80%）");
+  assert.equal(agreementAuditCoverageLabel({ sample_coverage: { sample_ids: ["a", "b"], covered_ids: ["a"] } }), "1/2");
   assert.equal(agreementAuditIssueSummary(audits[0]), "缺主标签 1；提交数不足 2");
   assert.equal(agreementAuditIssueSummary({ passed: true }), "无阻塞问题");
 });

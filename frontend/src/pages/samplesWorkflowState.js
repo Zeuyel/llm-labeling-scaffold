@@ -103,6 +103,7 @@ export function computeSampleDetailActions({
   const hasSample = Boolean(sample);
   const hasPlan = hasBatchPlan(sample);
   const dependencies = sample?.dependencies || [];
+  const archived = sampleStateLabel(sample) === "已归档";
   const disabledByState = assetsLoading || busy || !hasSample;
 
   return {
@@ -115,8 +116,8 @@ export function computeSampleDetailActions({
       disabledReason: !hasSample ? "请选择样本集。" : !hasPlan ? "请先生成批次计划。" : assetsLoading ? "正在读取导入资产/样本集。" : busy ? "已有动作正在执行。" : "",
     },
     archive: {
-      enabled: !disabledByState && dependencies.length === 0,
-      disabledReason: !hasSample ? "请选择样本集。" : dependencies.length ? "样本已被下游资产使用，不能归档。" : assetsLoading ? "正在读取导入资产/样本集。" : busy ? "已有动作正在执行。" : "",
+      enabled: !disabledByState && !archived && dependencies.length === 0,
+      disabledReason: !hasSample ? "请选择样本集。" : archived ? "样本集已归档。" : dependencies.length ? "样本已被下游资产使用，不能归档。" : assetsLoading ? "正在读取导入资产/样本集。" : busy ? "已有动作正在执行。" : "",
     },
   };
 }

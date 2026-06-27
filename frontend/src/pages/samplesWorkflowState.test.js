@@ -95,6 +95,7 @@ test("sample detail actions enable argilla only after batch plan exists", () => 
   const blocked = computeSampleDetailActions({ sample: sampleWithoutPlan });
   const ready = computeSampleDetailActions({ sample: sampleWithPlan });
   const busy = computeSampleDetailActions({ sample: sampleWithPlan, busy: true });
+  const archived = computeSampleDetailActions({ sample: { ...sampleWithPlan, manifest: { state: "archived" } } });
 
   assert.equal(blocked.generateBatch.enabled, true);
   assert.equal(blocked.pushArgilla.enabled, false);
@@ -103,6 +104,8 @@ test("sample detail actions enable argilla only after batch plan exists", () => 
   assert.equal(ready.pushArgilla.enabled, true);
   assert.equal(busy.generateBatch.enabled, false);
   assert.equal(busy.pushArgilla.enabled, false);
+  assert.equal(archived.archive.enabled, false);
+  assert.equal(archived.archive.disabledReason, "样本集已归档。");
 });
 
 test("running and failed states are explicit", () => {

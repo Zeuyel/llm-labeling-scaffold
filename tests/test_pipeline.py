@@ -3,11 +3,12 @@ import hashlib
 import time
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.io import read_json, read_jsonl, write_json, write_jsonl
-from llm_labeling_scaffold import pipeline
+from llm_labeling_scaffold import pipeline, suggestions as suggestions_module
 from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE, list_profile_presets, profile_definition
 from llm_labeling_scaffold.sampling import sample_records
 
@@ -1641,6 +1642,82 @@ def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: 
     assert rows[0]["batch_plan_id"] == "plan_1"
     assert rows[0]["agent"] == "local_stub:v001"
     assert rows[0]["suggestions"]["label"] in {"yes", "no"}
+
+def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "suggest_publish_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    annotation_dir = tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_round_1"
+    dispatch_path = annotation_dir / "dispatch.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "remote service platform"}], dispatch_path)
+    write_json(
+        {
+            "annotation_id": "argilla_round_1",
+            "argilla_dataset": "argilla_dataset_1",
+            "dispatch_path": str(dispatch_path),
+        },
+        annotation_dir / "manifest.json",
+    )
+    suggestions_module.generate_suggestions_for_annotation_job(
+        tmp_path / "runs",
+        task,
+        "argilla_round_1",
+        "local_stub_v001",
+        provider="local_stub",
+        prompt_version="v001",
+    )
+    monkeypatch.setattr(
+        suggestions_module,
+        "push_suggestions",
+        lambda *args, **kwargs: {"status": "published", "records": 1},
+    )
+
+    result = suggestions_module.generate_suggestions_for_annotation_job(
+        tmp_path / "runs",
+        task,
+        "argilla_round_1",
+        "local_stub_v001",
+        provider="local_stub",
+        prompt_version="v001",
+        publish=True,
+    )
+
+    manifest = read_json(tmp_path / "runs" / task.task_id / "suggestions" / "argilla_round_1" / "local_stub_v001" / "manifest.json")
+    assert result["action"] == "reused"
+    assert result["publish"]["status"] == "published"
+    assert manifest["status"] == "published"
+    assert manifest["publish"]["records"] == 1
+
+
+def test_prelabel_provider_payload_must_be_dict(tmp_path: Path, monkeypatch):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "bad_provider_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = load_task(created["path"])
+
+    class BadProvider:
+        def annotate_batch(self, rows, task):
+            return ["not", "a", "dict"]
+
+    monkeypatch.setattr(suggestions_module, "get_provider", lambda name: BadProvider())
+
+    with pytest.raises(ValueError, match="必须返回 dict payload"):
+        suggestions_module._provider_results(task, [{"record_id": "r1", "title": "A"}], "bad_provider")
 
 
 def test_argilla_push_sample_dispatch_still_uses_sample_file_without_batch_plan(tmp_path: Path):

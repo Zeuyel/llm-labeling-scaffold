@@ -63,6 +63,9 @@ export default function JobsPage({ taskId, onError }) {
     if (latest && latest !== active) setActive(latest);
   }, [jobs, active]);
 
+  const activeErrorText = active?.error ?? active?.result?.error ?? "";
+  const activeHasResult = active?.result !== undefined && active?.result !== null;
+
   return (
     <div>
       <div className="crumbs"><Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 执行记录</div>
@@ -130,14 +133,14 @@ export default function JobsPage({ taskId, onError }) {
               <DetailField label="创建时间" value={(active.created_at || "").slice(0, 19)} />
               <DetailField label="更新时间" value={(active.updated_at || "").slice(0, 19)} />
             </div>
-            {active.error && <div className="status-line danger-line drawer-section">错误：{active.error}</div>}
+            {activeErrorText && <div className="status-line danger-line drawer-section">错误：{activeErrorText}</div>}
             <div className="drawer-section">
               <div className="toolbar"><h3>执行日志</h3></div>
               <pre className="log-box">{(active.logs || []).join("\n") || "(无日志)"}</pre>
             </div>
             <div className="drawer-section">
               <div className="toolbar"><h3>动作结果</h3></div>
-              <pre className="log-box">{active.result ? JSON.stringify(active.result, null, 2) : "(无结果)"}</pre>
+              <pre className="log-box">{activeHasResult ? JSON.stringify(active.result, null, 2) : "(无结果)"}</pre>
             </div>
             <details className="advanced-panel">
               <summary>高级详情 / 调试信息</summary>

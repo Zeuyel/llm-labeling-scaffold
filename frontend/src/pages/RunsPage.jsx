@@ -14,6 +14,7 @@ import {
   annotationJobBatchSummary,
   annotationJobDebugFields,
   annotationJobDispatchLabel,
+  annotationJobKey,
   annotationJobLabel,
   annotationJobLineageFields,
   annotationJobStatusLabel,
@@ -28,13 +29,10 @@ import {
   decisionArtifactStatusLabel,
   displayPlanValue,
   firstDefined,
+  firstDefinedString,
   formatBatchPlanSummary,
   getBatchPlans,
 } from "./batchPlanDisplay.js";
-
-function annotationJobKey(job) {
-  return String(firstDefined(job?.annotation_id, job?.argilla_dataset, job?.job_id, job?.id, job?.manifest_path, ""));
-}
 
 function statusBadgeClass(label) {
   if (label === "已推送" || label === "已记录" || label === "已回收" || label === "通过") return "badge-green";
@@ -52,25 +50,25 @@ function findSamplePathForJob(job, samples) {
 
 function decisionsForJob(job, decisions) {
   if (!job) return [];
-  const annotationId = String(job.annotation_id || "");
-  const dataset = String(job.argilla_dataset || "");
+  const annotationId = firstDefinedString(job.annotation_id, job.id);
+  const dataset = firstDefinedString(job.argilla_dataset, job.dataset);
   const sampleId = String(job.sample_id || "");
   return decisions.filter((item) => (
-    (annotationId && String(item.decision_id || "") === annotationId)
-    || (dataset && String(item.argilla_dataset || "") === dataset)
-    || (sampleId && String(item.sample_id || "") === sampleId)
+    (annotationId && firstDefinedString(item.annotation_id, item.source_annotation_id, item.decision_id) === annotationId)
+    || (dataset && firstDefinedString(item.argilla_dataset, item.dataset) === dataset)
+    || (!annotationId && !dataset && sampleId && !firstDefinedString(item.annotation_id, item.source_annotation_id, item.decision_id) && !firstDefinedString(item.argilla_dataset, item.dataset) && String(item.sample_id || "") === sampleId)
   ));
 }
 
 function findJobForDecision(decision, jobs) {
   if (!decision) return null;
-  const annotationId = String(firstDefined(decision.annotation_id, decision.source_annotation_id, decision.decision_id, ""));
-  const dataset = String(firstDefined(decision.argilla_dataset, decision.dataset, ""));
+  const annotationId = firstDefinedString(decision.annotation_id, decision.source_annotation_id, decision.decision_id);
+  const dataset = firstDefinedString(decision.argilla_dataset, decision.dataset);
   const sampleId = String(decision.sample_id || "");
   return jobs.find((job) => (
-    (annotationId && String(firstDefined(job.annotation_id, job.id, "")) === annotationId)
-    || (dataset && String(firstDefined(job.argilla_dataset, job.dataset, "")) === dataset)
-    || (sampleId && String(job.sample_id || "") === sampleId)
+    (annotationId && firstDefinedString(job.annotation_id, job.id) === annotationId)
+    || (dataset && firstDefinedString(job.argilla_dataset, job.dataset) === dataset)
+    || (!annotationId && !dataset && sampleId && !firstDefinedString(job.annotation_id, job.id) && !firstDefinedString(job.argilla_dataset, job.dataset) && String(job.sample_id || "") === sampleId)
   )) || null;
 }
 

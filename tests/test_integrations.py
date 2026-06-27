@@ -11,6 +11,7 @@ from llm_labeling_scaffold.integrations.argilla import (
     _argilla_text_fields,
     _guidelines_for_task,
     _human_label_from_values,
+    _make_suggestion,
     _prepare_dataset,
     _prepare_records_for_push,
     _questions_for_task,
@@ -427,6 +428,57 @@ def test_argilla_push_attaches_suggestions_without_responses(tmp_path: Path):
         "agent": "codex_exec:v001",
     }
     assert not hasattr(records[1], "responses")
+
+
+def test_argilla_push_ignores_non_numeric_suggestion_scores(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl(
+        [{"record_id": "r1", "title": "regular"}],
+        sample,
+    )
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "suggestions": {"label": "yes"},
+                "scores": {"label": "not-a-number"},
+                "agent": "codex_exec:v001",
+            }
+        ],
+        suggestions,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion)
+
+    records, _, _ = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+
+    assert len(records[0].suggestions) == 1
+    assert records[0].suggestions[0].kwargs == {
+        "question_name": "label",
+        "value": "yes",
+        "agent": "codex_exec:v001",
+    }
+
+
+def test_argilla_suggestion_fallback_drops_agent_before_score():
+    class ScoreOnlySuggestion:
+        def __init__(self, **kwargs):
+            if "agent" in kwargs:
+                raise TypeError("agent not supported")
+            self.kwargs = kwargs
+
+    fake_rg = types.SimpleNamespace(Suggestion=ScoreOnlySuggestion)
+
+    suggestion = _make_suggestion(fake_rg, question_name="label", value="yes", score=0.7, agent="local_stub:v001")
+
+    assert suggestion.kwargs == {"question_name": "label", "value": "yes", "score": 0.7}
 
 
 def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp_path: Path):

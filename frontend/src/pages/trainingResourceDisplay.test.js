@@ -1,12 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  firstDefinedString,
+  goldResourceKey,
   goldSummary,
   goldStatusLabel,
   goldTrainAction,
   labelCountsText,
   modelInferAction,
   modelMetricSummary,
+  modelResourceKey,
   modelSummary,
   modelStatusLabel,
 } from "./trainingResourceDisplay.js";
@@ -36,6 +39,14 @@ test("gold status identifies empty or incomplete versions", () => {
   assert.equal(goldStatusLabel({ version: "v001", rows: 1 }, "task_a"), "可用");
   assert.equal(goldStatusLabel({ version: "v002", rows: 0 }, "task_a"), "空版本");
   assert.equal(goldStatusLabel({ rows: 10 }, ""), "记录不完整");
+});
+
+test("empty training resource keys do not stringify as undefined", () => {
+  assert.equal(firstDefinedString(undefined, null, ""), "");
+  assert.equal(goldResourceKey({}, ""), "");
+  assert.equal(modelResourceKey({}), "");
+  assert.notEqual(goldResourceKey({}, ""), "undefined");
+  assert.notEqual(modelResourceKey({}), "undefined");
 });
 
 test("label count formatting handles missing and stable sorted counts", () => {
@@ -96,4 +107,5 @@ test("model inference action requires a model artifact path", () => {
 
 test("model metric summary degrades cleanly when metrics are unavailable", () => {
   assert.equal(modelMetricSummary({}), "-");
+  assert.equal(modelMetricSummary({ metrics: { accuracy: null, classification_report: { "macro avg": { "f1-score": "N/A" } } } }), "-");
 });

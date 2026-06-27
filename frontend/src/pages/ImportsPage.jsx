@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 import {
@@ -144,7 +144,7 @@ export default function ImportsPage({
   const dataLake = task?.data_lake || null;
   const hasDataLakeConfig = hasEffectiveDataLakeConfig(dataLake);
   const r2TaskSource = usesR2TaskSource(taskSource, task);
-  const localTaskSource = usesLocalTaskSource(taskSource);
+  const localTaskSource = usesLocalTaskSource(taskSource, task);
   const settingsAvailable = settingsReady && !settingsError;
   const manualAllowed = backendAllowsManualImports(task, allowManualImports);
   const showManualImports = settingsAvailable && localTaskSource && !r2TaskSource && manualAllowed;
@@ -153,6 +153,11 @@ export default function ImportsPage({
   const loadedDetail = detail?.import_id === selectedId ? detail : null;
   const selectedDetail = loadedDetail || selected;
   const selectedAuditEvents = filterImportAuditEvents(auditEvents, selectedId);
+  const selectedIdRef = useRef("");
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
 
   const reload = useCallback(async () => {
     if (!taskId) return;
@@ -181,7 +186,7 @@ export default function ImportsPage({
         limit: rowsData.limit || 25,
         query: opts.query ?? query,
       });
-      setRowsData(data);
+      setRowsData((current) => (selectedIdRef.current === importId ? data : current));
     } catch (error) {
       onError(String(error));
     }
@@ -205,12 +210,18 @@ export default function ImportsPage({
       setRowsData({ rows: [], fields: [], total: 0, offset: 0, limit: 25 });
       return;
     }
+    let cancelled = false;
     setDetail(null);
     setRowsData({ rows: [], fields: [], total: 0, offset: 0, limit: 25 });
     api.getImportDetail(taskId, selectedId)
-      .then((data) => setDetail(data.import || null))
+      .then((data) => {
+        if (!cancelled && selectedIdRef.current === selectedId) setDetail(data.import || null);
+      })
       .catch((error) => onError(String(error)));
     loadRows(selectedId, { offset: 0 });
+    return () => {
+      cancelled = true;
+    };
   }, [taskId, selectedId, loadRows, onError]);
 
   async function submit() {

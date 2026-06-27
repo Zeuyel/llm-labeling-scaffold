@@ -3,6 +3,7 @@ import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 import {
   displayResourceValue,
+  goldTrainAction,
   goldPathForTask,
   goldSummary,
   modelInferAction,
@@ -73,6 +74,20 @@ export default function ModelsPage({ task, taskId, onError }) {
   );
   const selectedSummary = selectedModel ? modelSummary(selectedModel) : null;
   const selectedInferAction = selectedModel ? modelInferAction(selectedModel) : null;
+  const trainableGoldOptions = useMemo(
+    () => golds.map((item) => ({
+      summary: goldSummary(item, taskId),
+      action: goldTrainAction(item, taskId),
+    })).filter(({ action }) => action.enabled),
+    [golds, taskId],
+  );
+  const inferableModelOptions = useMemo(
+    () => models.map((item) => ({
+      summary: modelSummary(item),
+      action: modelInferAction(item),
+    })).filter(({ action }) => action.enabled),
+    [models],
+  );
   const selectedTrainingGold = selectedSummary
     ? golds.find((item) => goldPathForTask(item, taskId) === selectedSummary.goldPath)
     : null;
@@ -198,7 +213,7 @@ export default function ModelsPage({ task, taskId, onError }) {
                 {models.map((item) => {
                   const summary = modelSummary(item);
                   return (
-                    <tr className="clickable-row" key={summary.key} onClick={() => openModelDetail(item)}>
+                    <tr key={summary.key}>
                       <td><span className="badge badge-blue">{summary.modelId}</span></td>
                       <td><span className={`badge ${statusBadgeClass(summary.status)}`}>{summary.status}</span></td>
                       <td>{summary.trainer}</td>
@@ -207,7 +222,10 @@ export default function ModelsPage({ task, taskId, onError }) {
                       <td>{summary.externalRecord}</td>
                       <td className="muted text-cell">{summary.labels}</td>
                       <td className="muted">{summary.createdAt}</td>
-                      <td className="muted path-cell">{summary.path}</td>
+                      <td className="muted path-cell">
+                        <div>{summary.path}</div>
+                        <button className="btn btn-sm" type="button" onClick={() => openModelDetail(item)}>详情</button>
+                      </td>
                     </tr>
                   );
                 })}
@@ -232,10 +250,9 @@ export default function ModelsPage({ task, taskId, onError }) {
                 <label>训练集版本</label>
                 <select value={gold} onChange={(event) => setGold(event.target.value)}>
                   <option value="">选择训练集版本</option>
-                  {golds.map((item) => {
-                    const summary = goldSummary(item, taskId);
+                  {trainableGoldOptions.map(({ summary, action }) => {
                     return (
-                      <option key={summary.key} value={summary.path}>
+                      <option key={summary.key} value={action.gold}>
                         {summary.version} · {summary.rows} 行
                       </option>
                     );
@@ -285,9 +302,9 @@ export default function ModelsPage({ task, taskId, onError }) {
                 />
               </div>
             </div>
-            {!golds.length && <div className="stage-tip">暂无训练集版本，请先进入 Gold 页面构建训练集。</div>}
+            {!trainableGoldOptions.length && <div className="stage-tip">暂无可训练的 Gold 版本，请先进入 Gold 页面构建训练集。</div>}
             <div className="drawer-actions">
-              <button className="btn btn-primary" disabled={busy || !golds.length} onClick={train}>开始训练</button>
+              <button className="btn btn-primary" disabled={busy || !trainableGoldOptions.length} onClick={train}>开始训练</button>
               <Link className="btn" to={`/task/${encodeURIComponent(taskId)}/gold`}>查看 Gold</Link>
             </div>
           </aside>
@@ -309,10 +326,9 @@ export default function ModelsPage({ task, taskId, onError }) {
                 <label>模型</label>
                 <select value={model} onChange={(event) => setModel(event.target.value)}>
                   <option value="">选择模型</option>
-                  {models.map((item) => {
-                    const summary = modelSummary(item);
+                  {inferableModelOptions.map(({ summary, action }) => {
                     return (
-                      <option key={summary.key} value={summary.path}>
+                      <option key={summary.key} value={action.model}>
                         {summary.modelId}
                       </option>
                     );
@@ -336,9 +352,9 @@ export default function ModelsPage({ task, taskId, onError }) {
                 />
               </div>
             </div>
-            {!models.length && <div className="stage-tip">暂无可推理模型，请先训练或登记模型。</div>}
+            {!inferableModelOptions.length && <div className="stage-tip">暂无可推理模型，请先训练或登记模型。</div>}
             <div className="drawer-actions">
-              <button className="btn btn-primary" disabled={busy || !models.length} onClick={infer}>开始推理</button>
+              <button className="btn btn-primary" disabled={busy || !inferableModelOptions.length} onClick={infer}>开始推理</button>
             </div>
           </aside>
         </div>

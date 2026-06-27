@@ -26,6 +26,7 @@ export const JOB_KIND_LABEL = {
   annotate: "本地调试标注",
   argilla_push: "推送 Argilla",
   argilla_pull: "拉回标注结果",
+  prelabel_suggest: "生成预标注建议",
   agreement_audit: "一致性检查",
   audit: "审核摘要",
   merge: "合并输出",

@@ -2,6 +2,11 @@ export function firstDefined(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== "");
 }
 
+export function firstDefinedString(...values) {
+  const value = firstDefined(...values);
+  return value === undefined || value === null ? "" : String(value);
+}
+
 export function displayResourceValue(value) {
   if (value === undefined || value === null || value === "") return "-";
   if (Array.isArray(value)) return value.length ? value.join(", ") : "-";
@@ -34,6 +39,12 @@ function normalizedState(...values) {
   return value === undefined || value === null ? "" : String(value).trim().toLowerCase();
 }
 
+function finiteMetric(value) {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 export function goldStatusLabel(gold, taskId = "") {
   const state = normalizedState(gold?.status, gold?.state);
   if (["archived", "已归档"].includes(state)) return "已归档";
@@ -64,7 +75,7 @@ export function goldManifestPathForTask(gold, taskId = "") {
 }
 
 export function goldResourceKey(gold, taskId = "") {
-  return String(firstDefined(gold?.version, goldPathForTask(gold, taskId), gold?.created_at, ""));
+  return firstDefinedString(gold?.version, goldPathForTask(gold, taskId), gold?.created_at);
 }
 
 export function goldSummary(gold, taskId = "") {
@@ -106,7 +117,7 @@ export function modelStatusLabel(model) {
 }
 
 export function modelResourceKey(model) {
-  return String(firstDefined(model?.model_id, modelPath(model), model?.manifest?.metrics_path, ""));
+  return firstDefinedString(model?.model_id, modelPath(model), model?.manifest?.metrics_path);
 }
 
 export function modelTrainer(model) {
@@ -119,11 +130,11 @@ export function modelLabelsText(model) {
 
 export function modelMetricSummary(model) {
   const report = model?.metrics?.classification_report || {};
-  const macroF1 = report["macro avg"]?.["f1-score"];
-  const accuracy = model?.metrics?.accuracy;
+  const macroF1 = finiteMetric(report["macro avg"]?.["f1-score"]);
+  const accuracy = finiteMetric(model?.metrics?.accuracy);
   const parts = [];
-  if (macroF1 !== undefined) parts.push(`macro F1 ${Number(macroF1).toFixed(3)}`);
-  if (accuracy !== undefined) parts.push(`accuracy ${Number(accuracy).toFixed(3)}`);
+  if (macroF1 !== null) parts.push(`macro F1 ${macroF1.toFixed(3)}`);
+  if (accuracy !== null) parts.push(`accuracy ${accuracy.toFixed(3)}`);
   if (model?.metrics?.test_rows !== undefined) parts.push(`测试 ${model.metrics.test_rows} 行`);
   if (model?.metrics?.train_rows !== undefined) parts.push(`训练 ${model.metrics.train_rows} 行`);
   return parts.length ? parts.join(" · ") : "-";

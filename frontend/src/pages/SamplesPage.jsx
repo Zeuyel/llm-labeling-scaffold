@@ -125,6 +125,7 @@ export default function SamplesPage({ task, taskId, onError }) {
   const [samples, setSamples] = useState([]);
   const [imports, setImports] = useState([]);
   const [auditEvents, setAuditEvents] = useState([]);
+  const [auditLoadError, setAuditLoadError] = useState("");
   const [sampleId, setSampleId] = useState("");
   const [source, setSource] = useState("");
   const [rows, setRows] = useState(6);
@@ -150,15 +151,17 @@ export default function SamplesPage({ task, taskId, onError }) {
       return;
     }
     setAssetsLoading(true);
+    setAuditLoadError("");
     try {
       const [s, i, a] = await Promise.all([
         api.getTaskSamples(taskId),
         api.getImports(taskId),
-        api.getAuditEvents(taskId).catch(() => ({ events: [] })),
+        api.getAuditEvents(taskId).catch((error) => ({ events: [], error })),
       ]);
       setSamples(s.samples || []);
       setImports(i.imports || []);
       setAuditEvents(a.events || []);
+      setAuditLoadError(a.error ? String(a.error) : "");
     } catch (e) {
       onError(String(e));
     } finally {
@@ -661,7 +664,8 @@ export default function SamplesPage({ task, taskId, onError }) {
 
             <details className="secondary-panel" open>
               <summary>资产审计</summary>
-              {!selectedAuditEvents.length && <div className="empty">暂无该样本的审计事件</div>}
+              {auditLoadError && <div className="status-line danger-line">审计事件读取失败：{auditLoadError}</div>}
+              {!auditLoadError && !selectedAuditEvents.length && <div className="empty">暂无该样本的审计事件</div>}
               {selectedAuditEvents.length > 0 && (
                 <div className="table-wrap">
                   <table>
