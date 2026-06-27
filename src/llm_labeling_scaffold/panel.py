@@ -25,6 +25,14 @@ def _safe_segment(value: str) -> bool:
     return bool(value) and ".." not in value and "/" not in value and "\\" not in value
 
 
+def _truthy_env(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allow_data_lake_overrides() -> bool:
+    return _truthy_env("LLS_ALLOW_DATA_LAKE_OVERRIDES")
+
+
 def _count_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -254,6 +262,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"gold": list_gold(self.runs_root, task)})
         elif path == "/api/tasks":
             self._json({"tasks": pipeline.list_tasks(self.tasks_root)})
+        elif path == "/api/config":
+            self._json({
+                "allow_data_lake_overrides": _allow_data_lake_overrides(),
+            })
         elif path == "/api/task/runs":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
@@ -434,6 +446,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/tasks":
             body = self._read_body()
             try:
+                if not _allow_data_lake_overrides() and "data_lake" in body:
+                    body = dict(body)
+                    body.pop("data_lake", None)
                 task = pipeline.create_task(self.tasks_root, body)
                 self._json({"ok": True, "task": task})
             except Exception as exc:
@@ -525,16 +540,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "bad task"}, status=400)
             return
         import_id = str(body.get("import_id") or params.get("import_id", [""])[0] or "").strip()
-        overrides = {
-            key: body.get(key)
-            for key in (
-                "lake_registry_uri",
-                "source_dataset_id",
-                "source_manifest_uri",
-                "source_object_path",
-            )
-            if body.get(key) not in (None, "")
-        }
+        override_keys = (
+            "lake_registry_uri",
+            "source_dataset_id",
+            "source_manifest_uri",
+            "source_object_path",
+        )
+        provided_overrides = {key: body.get(key) for key in override_keys if body.get(key) not in (None, "")}
+        if provided_overrides and not _allow_data_lake_overrides():
+            self._json({"error": "生产模式不允许覆盖数据湖来源；请在 task.yaml 中使用治理登记表配置"}, status=400)
+            return
+        overrides = provided_overrides if _allow_data_lake_overrides() else {}
         max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
         try:
             task_cfg = pipeline.load_task_by_id(self.tasks_root, task_id)

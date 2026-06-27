@@ -99,8 +99,8 @@ git clone <repo-url>
 cd llm-labeling-scaffold
 cp .env.example .env
 export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:main
-docker compose pull panel
-docker compose up -d --no-build
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull panel
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
 ```
 
 如果要同时测试可选模型记录服务：
@@ -173,7 +173,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 
 数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
 
-配置了 `data_lake` 的任务可以直接从 R2 数据湖 manifest 生成本地导入。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。Docker 部署时需要把 rclone 配置以只读方式映射到面板容器，例如 `~/.config/rclone/rclone.conf:/run/secrets/rclone/rclone.conf:ro`，并设置 `RCLONE_CONFIG=/run/secrets/rclone/rclone.conf`。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
+配置了 `data_lake` 的任务可以直接从 R2 数据湖 manifest 生成本地导入。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。生产面板默认不能覆盖数据湖来源，只按 `task.yaml` 中的治理登记表配置导入；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。Docker 部署时需要叠加 `docker-compose.rclone.example.yml`，把 rclone 配置以只读方式映射到面板容器。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
 
 推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题。拉回标注结果时，这些字段会完整写入 `human_label`，再进入训练集版本构建。
 

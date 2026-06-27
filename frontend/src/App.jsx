@@ -26,6 +26,7 @@ const ROUTES = [
 function Shell() {
   const { path } = useRouter();
   const [tasks, setTasks] = useState([]);
+  const [config, setConfig] = useState({ allow_data_lake_overrides: false });
   const [err, setErr] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("lls.sidebarCollapsed") === "1");
 
@@ -33,6 +34,9 @@ function Shell() {
     api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
   []);
   useEffect(() => { loadTasks(); }, [loadTasks]);
+  useEffect(() => {
+    api.getConfig().then((d) => setConfig(d || {})).catch(() => setConfig({ allow_data_lake_overrides: false }));
+  }, []);
 
   let matched = { page: "tasks", params: {} };
   for (const r of ROUTES) {
@@ -44,7 +48,7 @@ function Shell() {
 
   const common = { onError: setErr };
   let page = null;
-  if (matched.page === "tasks") page = <TasksPage tasks={tasks} onReload={loadTasks} {...common} />;
+  if (matched.page === "tasks") page = <TasksPage tasks={tasks} onReload={loadTasks} allowDataLakeOverrides={Boolean(config.allow_data_lake_overrides)} {...common} />;
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "imports") page = <ImportsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;

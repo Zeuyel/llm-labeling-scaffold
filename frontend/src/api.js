@@ -14,6 +14,7 @@ const q = (obj) =>
     .join("&");
 
 export const getTasks = () => req("/api/tasks");
+export const getConfig = () => req("/api/config");
 export const getImports = (taskId) => req(`/api/task/imports?${q({ task_id: taskId })}`);
 export const getImportDetail = (taskId, importId) => req(`/api/import/detail?${q({ task_id: taskId, import_id: importId })}`);
 export const getImportRows = (taskId, importId, opts = {}) =>

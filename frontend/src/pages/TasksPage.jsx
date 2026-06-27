@@ -27,7 +27,7 @@ function parseList(value) {
     .filter(Boolean);
 }
 
-export default function TasksPage({ tasks, onReload, onError }) {
+export default function TasksPage({ tasks, onReload, onError, allowDataLakeOverrides = false }) {
   const { navigate } = useRouter();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -86,7 +86,7 @@ export default function TasksPage({ tasks, onReload, onError }) {
     if (parseList(form.primary_label_values).length < 2) { onError("主标签至少需要两个取值"); return; }
     setBusy(true);
     try {
-      await api.createTask({
+      const payload = {
         task_id: form.task_id.trim(),
         id_field: form.id_field.trim() || "record_id",
         text_fields: parseList(form.text_fields),
@@ -96,14 +96,6 @@ export default function TasksPage({ tasks, onReload, onError }) {
         primary_label_values: parseList(form.primary_label_values),
         annotation_guidelines: form.annotation_guidelines.trim(),
         prompt: form.prompt,
-        data_lake: {
-          lake_registry_uri: form.lake_registry_uri.trim(),
-          source_dataset_id: form.source_dataset_id.trim(),
-          source_manifest_uri: form.source_manifest_uri.trim(),
-          source_object_path: form.source_object_path.trim(),
-          default_import_id: form.default_import_id.trim(),
-          output_base_uri: form.output_base_uri.trim(),
-        },
         auxiliary_labels: auxiliary
           .filter((item) => item.name.trim())
           .map((item) => ({
@@ -115,7 +107,18 @@ export default function TasksPage({ tasks, onReload, onError }) {
             max: item.max,
             required: item.required,
           })),
-      });
+      };
+      if (allowDataLakeOverrides) {
+        payload.data_lake = {
+          lake_registry_uri: form.lake_registry_uri.trim(),
+          source_dataset_id: form.source_dataset_id.trim(),
+          source_manifest_uri: form.source_manifest_uri.trim(),
+          source_object_path: form.source_object_path.trim(),
+          default_import_id: form.default_import_id.trim(),
+          output_base_uri: form.output_base_uri.trim(),
+        };
+      }
+      await api.createTask(payload);
       resetForm();
       setOpen(false);
       await onReload();
@@ -199,30 +202,34 @@ export default function TasksPage({ tasks, onReload, onError }) {
               <label>提示词</label>
               <textarea rows={5} value={form.prompt} onChange={(event) => update("prompt", event.target.value)} placeholder="可留空，后续再补充" />
             </div>
-            <div className="field field-wide">
-              <label>数据湖登记表 URI</label>
-              <input value={form.lake_registry_uri} onChange={(event) => update("lake_registry_uri", event.target.value)} placeholder="可留空，默认读取 R2 当前数据湖登记表" />
-            </div>
-            <div className="field">
-              <label>源数据集编号</label>
-              <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 patent_boundary_v0_1_label_inputs" />
-            </div>
-            <div className="field">
-              <label>默认导入编号</label>
-              <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="例如 patent_boundary_manual_seed" />
-            </div>
-            <div className="field field-wide">
-              <label>源 manifest URI</label>
-              <input value={form.source_manifest_uri} onChange={(event) => update("source_manifest_uri", event.target.value)} placeholder="可留空，系统按源数据集编号从登记表解析" />
-            </div>
-            <div className="field field-wide">
-              <label>源对象路径</label>
-              <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="manifest objects 中的 path，用于唯一选中 JSONL 对象" />
-            </div>
-            <div className="field field-wide">
-              <label>标签回写根 URI</label>
-              <input value={form.output_base_uri} onChange={(event) => update("output_base_uri", event.target.value)} placeholder="例如 r2:ai-innovation-data-lake/labels/patent/<task_id>/" />
-            </div>
+            {allowDataLakeOverrides && (
+              <>
+                <div className="field field-wide">
+                  <label>数据湖登记表 URI</label>
+                  <input value={form.lake_registry_uri} onChange={(event) => update("lake_registry_uri", event.target.value)} placeholder="可留空，默认读取 R2 当前数据湖登记表" />
+                </div>
+                <div className="field">
+                  <label>源数据集编号</label>
+                  <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 patent_boundary_v0_1_label_inputs" />
+                </div>
+                <div className="field">
+                  <label>默认导入编号</label>
+                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="例如 patent_boundary_manual_seed" />
+                </div>
+                <div className="field field-wide">
+                  <label>源 manifest URI</label>
+                  <input value={form.source_manifest_uri} onChange={(event) => update("source_manifest_uri", event.target.value)} placeholder="可留空，系统按源数据集编号从登记表解析" />
+                </div>
+                <div className="field field-wide">
+                  <label>源对象路径</label>
+                  <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="manifest objects 中的 path，用于唯一选中 JSONL 对象" />
+                </div>
+                <div className="field field-wide">
+                  <label>标签回写根 URI</label>
+                  <input value={form.output_base_uri} onChange={(event) => update("output_base_uri", event.target.value)} placeholder="例如 r2:ai-innovation-data-lake/labels/patent/<task_id>/" />
+                </div>
+              </>
+            )}
           </div>
 
           <div className="toolbar">

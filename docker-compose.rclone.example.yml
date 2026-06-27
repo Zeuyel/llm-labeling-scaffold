@@ -1,0 +1,6 @@
+services:
+  panel:
+    volumes:
+      - ${RCLONE_CONFIG_HOST:-${HOME}/.config/rclone/rclone.conf}:/run/secrets/rclone/rclone.conf:ro
+    environment:
+      - RCLONE_CONFIG=/run/secrets/rclone/rclone.conf

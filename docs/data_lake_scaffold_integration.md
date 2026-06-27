@@ -120,15 +120,10 @@ source_dataset_id
 
 宿主机直接运行时，使用当前用户的 rclone 配置即可。
 
-Docker 部署时，不要把密钥写进镜像。使用 compose override、secret 或额外 volume 把只读配置映射到容器：
+Docker 部署时，不要把密钥写进镜像。默认提供了 `docker-compose.rclone.example.yml`，用于把只读配置映射到容器：
 
-```yaml
-services:
-  panel:
-    environment:
-      - RCLONE_CONFIG=/run/secrets/rclone/rclone.conf
-    volumes:
-      - ~/.config/rclone/rclone.conf:/run/secrets/rclone/rclone.conf:ro
+```bash
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
 ```
 
 也可以设置：
@@ -138,9 +133,17 @@ RCLONE_CONFIG=/run/secrets/rclone/rclone.conf
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
 
+生产默认只允许访问 `r2:ai-innovation-data-lake/...`。本地路径和 `file://` 只在单测或开发排查时允许，需显式设置：
+
+```text
+LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1
+```
+
 ## 边界
 
 大数据抽样在 data lake / ETL 层完成。任务级 JSONL 在 R2 `labels/.../inputs/...` 中权威保存。scaffold 只 materialize 任务输入并做标注执行缓存。
+
+生产面板默认不允许实验人员覆盖 `lake_registry_uri`、`source_dataset_id`、`source_manifest_uri` 或 `source_object_path`。这些字段应由治理配置写入 `task.yaml`；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。
 
 scaffold 不长期保存上游大数据，不把 `raw`、`bronze`、`silver` 或 `mart` 数据复制成第二份权威。它只缓存：
 

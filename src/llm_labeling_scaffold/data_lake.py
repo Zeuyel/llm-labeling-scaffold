@@ -20,6 +20,7 @@ from .io import read_jsonl
 
 DEFAULT_REGISTRY_URI = "r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml"
 JSONL_SUFFIXES = (".jsonl", ".ndjson")
+DEFAULT_R2_PREFIX = "r2:ai-innovation-data-lake/"
 
 
 class DataLakeError(RuntimeError):
@@ -75,6 +76,19 @@ def _rclone_timeout() -> int:
     return int(os.environ.get("LLS_RCLONE_TIMEOUT_SECONDS", "120"))
 
 
+def _truthy_env(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allow_local_data_lake_uris() -> bool:
+    return _truthy_env("LLS_ALLOW_LOCAL_DATA_LAKE_URIS")
+
+
+def _allowed_r2_prefix() -> str:
+    value = str(os.environ.get("LLS_DATA_LAKE_R2_PREFIX") or DEFAULT_R2_PREFIX).strip()
+    return value.rstrip("/") + "/"
+
+
 def _normalize_registry_uri(uri: str) -> str:
     text = str(uri or "").strip() or DEFAULT_REGISTRY_URI
     if text.endswith("/"):
@@ -114,6 +128,9 @@ def _validate_rclone_uri(uri: str) -> None:
         raise DataLakeError(f"非法 rclone remote: {remote}")
     if path.startswith("/") or any(part == ".." for part in path.split("/")):
         raise DataLakeError(f"数据湖对象路径不允许路径穿越: {uri}")
+    allowed_prefix = _allowed_r2_prefix()
+    if uri != allowed_prefix.rstrip("/") and not uri.startswith(allowed_prefix):
+        raise DataLakeError(f"数据湖 URI 必须位于 {allowed_prefix}: {uri}")
 
 
 def _validate_manifest_path(path: str) -> str:
@@ -140,7 +157,10 @@ def _validate_storage_uri(uri: str) -> str:
         raise DataLakeError("manifest 对象缺少 storage_uri")
     if _is_rclone_uri(value):
         _validate_rclone_uri(value)
-    elif not _is_local_path(value):
+    elif _is_local_path(value):
+        if not _allow_local_data_lake_uris():
+            raise DataLakeError("生产模式不允许本地数据湖 URI；如需单测请设置 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1")
+    else:
         raise DataLakeError(f"不支持的数据湖对象 URI: {uri}")
     return value
 
@@ -157,6 +177,8 @@ def copy_uri_to_path(uri: str, target: str | Path) -> Path:
     target_path = Path(target)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     if _is_local_path(uri):
+        if not _allow_local_data_lake_uris():
+            raise DataLakeError("生产模式不允许本地数据湖 URI；如需单测请设置 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1")
         source = _local_path(uri)
         if not source.is_file():
             raise DataLakeError(f"本地数据湖文件不存在: {source}")
@@ -188,6 +210,8 @@ def copy_path_to_uri(source: str | Path, uri: str) -> str:
     if not source_path.is_file():
         raise DataLakeError(f"本地文件不存在: {source_path}")
     if _is_local_path(uri):
+        if not _allow_local_data_lake_uris():
+            raise DataLakeError("生产模式不允许本地数据湖 URI；如需单测请设置 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1")
         target = _local_path(uri)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_path, target)
@@ -379,6 +403,19 @@ def resolve_source(task: TaskConfig, overrides: dict[str, Any] | None = None) ->
         )
     manifest_uri = registry_manifest_uri
     manifest = read_json_uri(manifest_uri)
+    manifest_dataset_id = str(manifest.get("dataset_id") or "").strip()
+    if not manifest_dataset_id:
+        raise DataLakeError("manifest 缺少 dataset_id")
+    if manifest_dataset_id != dataset_id:
+        raise DataLakeError(f"manifest.dataset_id 与 registry 不一致: dataset={dataset_id}, manifest={manifest_dataset_id}")
+    for key in ("layer", "domain"):
+        registry_value = str(dataset.get(key) or "").strip()
+        manifest_value = str(manifest.get(key) or "").strip()
+        if registry_value:
+            if not manifest_value:
+                raise DataLakeError(f"manifest 缺少 {key}")
+            if registry_value != manifest_value:
+                raise DataLakeError(f"manifest.{key} 与 registry 不一致: registry={registry_value}, manifest={manifest_value}")
     selected = _validate_label_import_object(_select_object(manifest, cfg), task)
     object_uri = str(selected.get("storage_uri") or "").strip()
     if not object_uri:
