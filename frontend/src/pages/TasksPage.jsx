@@ -39,6 +39,7 @@ export default function TasksPage({
   const r2TaskSource = taskSource === "r2";
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [archiving, setArchiving] = useState("");
   const [form, setForm] = useState({
     task_id: "",
@@ -137,10 +138,19 @@ export default function TasksPage({
     }
   }
 
+  async function reloadTasks() {
+    setSyncing(true);
+    try {
+      await onReload();
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   async function archiveTask(task) {
     if (!task?.task_id) return;
     if (!task.deletable) {
-      onError(r2TaskSource ? "这个任务来自 R2 数据湖登记表，不能在面板中归档本地缓存；请在登记表中标记为非启用状态" : "这个任务来自只读目录，不能在面板中归档");
+      onError(r2TaskSource ? "这个任务来自 R2 登记表，不能在面板中归档本地缓存；请在登记表中标记为非启用状态" : "这个任务来自只读目录，不能在面板中归档");
       return;
     }
     const ok = window.confirm(`归档任务 ${task.task_id}？\n\n归档会把任务配置移到 _archive，不会删除数据。若该任务已有导入、样本、标注或模型产物，系统会拒绝归档。`);
@@ -161,15 +171,20 @@ export default function TasksPage({
     <div>
       <div className="page-header">
         <h2>全部任务</h2>
-        <p>{r2TaskSource ? "任务配置来自 R2 数据湖登记表，本地只缓存执行配置" : "选择一个标注任务进入其数据流水线"}</p>
+        <p>{r2TaskSource ? "任务配置来自系统设置中的 R2 登记表，本地只缓存执行配置" : "选择一个标注任务进入其数据流水线"}</p>
       </div>
       <div className="toolbar">
-        <span className="muted">{tasks.length} 个任务{r2TaskSource && taskRegistryUri ? ` · ${taskRegistryUri}` : ""}</span>
+        <div className="toolbar-stack">
+          <span className="muted">{tasks.length} 个任务{r2TaskSource && taskRegistryUri ? ` · ${taskRegistryUri}` : ""}</span>
+          {r2TaskSource && <span className="status-line">从系统设置中的 R2 登记表同步</span>}
+        </div>
         <div className="action-row">
           {!r2TaskSource && (
             <button className="btn btn-sm" onClick={() => setOpen((value) => !value)}>{open ? "收起" : "新建任务"}</button>
           )}
-          <button className="btn btn-sm" onClick={onReload}>刷新</button>
+          <button className={r2TaskSource ? "btn btn-sm btn-primary" : "btn btn-sm"} disabled={syncing} onClick={reloadTasks}>
+            {r2TaskSource ? (syncing ? "同步中..." : "同步任务配置") : "刷新"}
+          </button>
         </div>
       </div>
       {open && !r2TaskSource && (
@@ -178,35 +193,35 @@ export default function TasksPage({
           <div className="form-grid">
             <div className="field">
               <label>任务编号</label>
-              <input value={form.task_id} onChange={(event) => update("task_id", event.target.value)} placeholder="例如 patent_boundary_v1" />
+              <input value={form.task_id} onChange={(event) => update("task_id", event.target.value)} placeholder="例如 feedback_labeling_v1" />
             </div>
             <div className="field">
-              <label>ID 字段</label>
-              <input value={form.id_field} onChange={(event) => update("id_field", event.target.value)} placeholder="例如 patent_id" />
+              <label>记录编号字段</label>
+              <input value={form.id_field} onChange={(event) => update("id_field", event.target.value)} placeholder="例如 record_id" />
             </div>
             <div className="field field-wide">
               <label>文本字段</label>
-              <textarea rows={2} value={form.text_fields} onChange={(event) => update("text_fields", event.target.value)} placeholder="例如 patent_title, patent_abstract, patent_claim_excerpt" />
+              <textarea rows={2} value={form.text_fields} onChange={(event) => update("text_fields", event.target.value)} placeholder="例如 title, body, summary" />
             </div>
             <div className="field field-wide">
               <label>元数据字段</label>
-              <textarea rows={2} value={form.metadata_fields} onChange={(event) => update("metadata_fields", event.target.value)} placeholder="例如 firm_name, application_year, ipc_main" />
+              <textarea rows={2} value={form.metadata_fields} onChange={(event) => update("metadata_fields", event.target.value)} placeholder="例如 source, created_at, language" />
             </div>
             <div className="field">
               <label>主标签字段</label>
-              <input value={form.primary_label_name} onChange={(event) => update("primary_label_name", event.target.value)} placeholder="例如 innovation_boundary_label" />
+              <input value={form.primary_label_name} onChange={(event) => update("primary_label_name", event.target.value)} placeholder="例如 category" />
             </div>
             <div className="field">
               <label>主标签标题</label>
-              <input value={form.primary_label_title} onChange={(event) => update("primary_label_title", event.target.value)} placeholder="例如 创新边界判断" />
+              <input value={form.primary_label_title} onChange={(event) => update("primary_label_title", event.target.value)} placeholder="例如 内容分类" />
             </div>
             <div className="field field-wide">
               <label>主标签取值</label>
               <textarea rows={3} value={form.primary_label_values} onChange={(event) => update("primary_label_values", event.target.value)} placeholder="每行一个取值，或用逗号分隔" />
             </div>
             <div className="field field-wide">
-              <label>Argilla 标注说明</label>
-              <textarea rows={5} value={form.annotation_guidelines} onChange={(event) => update("annotation_guidelines", event.target.value)} placeholder="写给人工标注员的说明，会显示在 Argilla 数据集页面" />
+              <label>人工标注说明</label>
+              <textarea rows={5} value={form.annotation_guidelines} onChange={(event) => update("annotation_guidelines", event.target.value)} placeholder="写给人工标注员的说明，会显示在标注数据集页面" />
             </div>
             <div className="field field-wide">
               <label>提示词</label>
@@ -215,28 +230,28 @@ export default function TasksPage({
             {allowDataLakeOverrides && (
               <>
                 <div className="field field-wide">
-                  <label>数据湖登记表 URI</label>
+                  <label>数据湖登记表地址</label>
                   <input value={form.lake_registry_uri} onChange={(event) => update("lake_registry_uri", event.target.value)} placeholder="可留空，默认读取 R2 当前数据湖登记表" />
                 </div>
                 <div className="field">
                   <label>源数据集编号</label>
-                  <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 patent_boundary_v0_1_label_inputs" />
+                  <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 raw_feedback_records" />
                 </div>
                 <div className="field">
                   <label>默认导入编号</label>
-                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="例如 patent_boundary_manual_seed" />
+                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="例如 manual_seed_20260627" />
                 </div>
                 <div className="field field-wide">
-                  <label>源 manifest URI</label>
+                  <label>源清单文件地址</label>
                   <input value={form.source_manifest_uri} onChange={(event) => update("source_manifest_uri", event.target.value)} placeholder="可留空，系统按源数据集编号从登记表解析" />
                 </div>
                 <div className="field field-wide">
                   <label>源对象路径</label>
-                  <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="manifest objects 中的 path，用于唯一选中 JSONL 对象" />
+                  <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="清单对象中的路径，用于唯一选中数据文件" />
                 </div>
                 <div className="field field-wide">
-                  <label>标签回写根 URI</label>
-                  <input value={form.output_base_uri} onChange={(event) => update("output_base_uri", event.target.value)} placeholder="例如 r2:ai-innovation-data-lake/labels/patent/<task_id>/" />
+                  <label>标签回写根地址</label>
+                  <input value={form.output_base_uri} onChange={(event) => update("output_base_uri", event.target.value)} placeholder="例如 r2:bucket/prefix/labels/<task_id>/" />
                 </div>
               </>
             )}
@@ -288,7 +303,7 @@ export default function TasksPage({
           </div>
         </div>
       )}
-      {!tasks.length && <div className="empty">{r2TaskSource ? "数据湖登记表暂无启用任务" : "未发现任务（检查 --tasks-root 目录下的 task.yaml）"}</div>}
+      {!tasks.length && <div className="empty">{r2TaskSource ? "R2 登记表暂无启用任务" : "未发现任务，可新建任务或检查任务目录"}</div>}
       <div className="grid grid-cards">
         {tasks.map((t) => (
           <div key={t.path} className="card task-card">
@@ -312,7 +327,7 @@ export default function TasksPage({
               <span className="badge badge-red">{t.error}</span>
             ) : (
               <div className="muted">
-                <div>id 字段：{t.id_field}</div>
+                <div>记录编号字段：{t.id_field}</div>
                 <div>主标签：{t.primary_label ? t.primary_label.name : "-"}</div>
                 <div>来源：{t.source || "-"}</div>
               </div>

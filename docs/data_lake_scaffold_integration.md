@@ -1,31 +1,43 @@
 # 数据湖接入说明
 
-R2 数据湖是数据权威，scaffold 只是标注执行器。数据湖治理文件的权威位置是：
+平台部署按三层理解：
 
-```text
-r2:ai-innovation-data-lake/governance/data_lake/v1/current/
-```
+1. **R2 数据湖 / registry 是权威层**：任务列表、远端 `task.yaml`、源数据集 manifest、任务级输入对象和需要回写的数据湖产物，都以 R2 registry 中登记的 URI 为准。
+2. **panel settings 是运行配置层**：每个部署在“系统设置”中保存当前要使用的 `task_registry_uri` 和 `data_lake_r2_prefix`。同一套镜像可以连接不同团队、不同环境或不同 bucket。
+3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 只缓存从 registry 同步下来的任务配置；`runs/` 保存本次部署产生的导入、样本、标注结果、训练集、模型、推理结果和审计日志。
 
-本仓库不复制维护数据湖路径规则，也不在本地长期维护任务配置。生产面板先从登记表读取 `tasks.<task_id>.task_uri`，再把远端 `task.yaml` materialize 到本地 `tasks/` 缓存。
+不要把某个单一项目、业务域或固定 R2 bucket 写死到部署说明中。生产环境必须按自己的 R2 registry 填写配置。
+
+## 首次部署
+
+服务器部署后第一步不是新建本地任务，而是进入轻量控制台的“系统设置”：
+
+1. 填写 `task_registry_uri`，例如 `r2:my-labeling-lake/governance/data_lake/v1/current/data_lake.yaml`。
+2. 填写 `data_lake_r2_prefix`，例如 `r2:my-labeling-lake/`。
+3. 保存设置。
+4. 返回任务列表并同步任务配置，让面板从 registry 读取启用任务，把远端 `task.yaml` 缓存到本地 `tasks/<task_id>/task.yaml`。
+
+`.env` 中的 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 是启动兜底配置，适合无人值守部署或系统设置初始化前使用。它们必须与当前部署自己的 R2 registry 保持一致，不要直接使用示例 bucket。
 
 ## 任务配置来源
 
-生产环境必须设置：
+生产环境使用 R2 registry 作为任务来源：
 
 ```text
 LLS_TASK_SOURCE=r2
-LLS_TASK_REGISTRY_URI=r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml
+LLS_TASK_REGISTRY_URI=r2:my-labeling-lake/governance/data_lake/v1/current/data_lake.yaml
+LLS_DATA_LAKE_R2_PREFIX=r2:my-labeling-lake/
 ```
 
 登记表中任务段示例：
 
 ```yaml
 tasks:
-  patent_boundary_v0_1:
-    domain: patent
+  customer_feedback_v1:
+    domain: customer_feedback
     status: active
-    task_uri: r2:ai-innovation-data-lake/labels/patent/patent_boundary_v0_1/task_snapshot/created_date=2026-06-27/task.yaml
-    source_dataset_id: patent_boundary_v0_1_label_inputs
+    task_uri: r2:my-labeling-lake/labels/customer_feedback/customer_feedback_v1/task_snapshot/created_date=2026-06-27/task.yaml
+    source_dataset_id: customer_feedback_v1_label_inputs
 ```
 
 面板同步时会校验：
@@ -34,7 +46,7 @@ tasks:
 - 如果登记表写了 `source_dataset_id`，`task.yaml` 中的 `data_lake.source_dataset_id` 必须一致。
 - 如果 `task.yaml` 写了 `data_lake.lake_registry_uri`，必须指向当前 registry。
 
-本地 `tasks/<task_id>/task.yaml` 只是缓存。生产面板不允许在本地新建或归档任务配置；任务下线应修改 R2 登记表状态。
+本地 `tasks/<task_id>/task.yaml` 只是缓存。生产面板不允许在本地新建或归档任务配置；任务下线应修改 R2 registry 中的任务状态。
 
 ## task.yaml 字段
 
@@ -42,48 +54,48 @@ tasks:
 
 ```yaml
 data_lake:
-  lake_registry_uri: r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml
-  source_dataset_id: patent_boundary_v0_1_label_inputs
-  source_manifest_uri: r2:ai-innovation-data-lake/manifests/patent/patent_boundary_v0_1_label_inputs/manifest.json
-  source_object_path: inputs/manual_seed_500/v1/raw.jsonl
-  default_import_id: patent_boundary_manual_seed_500_2026_06_26
-  output_base_uri: r2:ai-innovation-data-lake/labels/patent/patent_boundary_v0_1/
+  lake_registry_uri: r2:my-labeling-lake/governance/data_lake/v1/current/data_lake.yaml
+  source_dataset_id: customer_feedback_v1_label_inputs
+  source_manifest_uri: r2:my-labeling-lake/manifests/customer_feedback/customer_feedback_v1_label_inputs/manifest.json
+  source_object_path: manual_seed_500/v1/raw.jsonl
+  default_import_id: customer_feedback_manual_seed_500_2026_06_27
+  output_base_uri: r2:my-labeling-lake/labels/customer_feedback/customer_feedback_v1/
 ```
 
 字段含义：
 
-- `lake_registry_uri`：数据湖登记表。可省略，默认读取 R2 当前登记表。若只写到目录，系统会补 `data_lake.yaml`。
-- `source_dataset_id`：登记表中的数据集编号。
-- `source_manifest_uri`：源数据集 manifest。可省略；如果显式填写，必须和登记表中的 manifest 完全一致。
-- `source_object_path`：manifest `objects[].path` 中的安全相对路径。scaffold 不接受任意 `storage_uri` 作为导入源。
+- `lake_registry_uri`：数据湖登记表。可省略，默认读取当前部署的 `task_registry_uri`。若只写到目录，系统会补 `data_lake.yaml`。
+- `source_dataset_id`：registry 中的数据集编号。
+- `source_manifest_uri`：源数据集 manifest。可省略；如果显式填写，必须和 registry 中的 manifest 完全一致。
+- `source_object_path`：安全相对路径。优先精确匹配 manifest `objects[].path`；若登记表的 dataset 写了 `canonical_uri`，也可填写相对该 `canonical_uri` 的路径。平台不接受任意 `storage_uri` 作为导入源。
 - `default_import_id`：面板从数据湖生成本地导入时使用的默认导入编号。
 - `output_base_uri`：后续标注结果、训练集、预测结果回写 R2 的根路径。
 
 ## labels 层结构
 
-labels 层要区分输入和输出：
+labels 层要区分输入和输出，推荐使用稳定的 `<domain>/<task_id>/` 结构：
 
 ```text
-labels/patent/patent_boundary_v0_1/inputs/...
-labels/patent/patent_boundary_v0_1/annotation_jobs/...
-labels/patent/patent_boundary_v0_1/decisions/...
-labels/patent/patent_boundary_v0_1/gold/...
-labels/patent/patent_boundary_v0_1/predictions/...
+labels/<domain>/<task_id>/inputs/...
+labels/<domain>/<task_id>/annotation_jobs/...
+labels/<domain>/<task_id>/decisions/...
+labels/<domain>/<task_id>/gold/...
+labels/<domain>/<task_id>/predictions/...
 ```
 
-建议 dataset_id 明确表达资产类型：
+建议 `dataset_id` 明确表达资产类型：
 
 ```text
-patent_boundary_v0_1_label_inputs
-patent_boundary_v0_1_gold
-patent_boundary_v0_1_predictions
+<task_id>_label_inputs
+<task_id>_gold
+<task_id>_predictions
 ```
 
 ## 导入流程
 
 在“数据导入”页：
 
-1. 点击“检查配置”，面板会通过 `rclone` 读取登记表和 manifest。
+1. 点击“检查配置”，面板会通过 `rclone` 读取 registry 和 manifest。
 2. 确认源数据集、源对象和对象大小。
 3. 点击“从数据湖生成导入”。
 4. 面板只把选中的任务级 JSONL 原样缓存到 `runs/<task_id>/imports/<import_id>/raw.jsonl`。
@@ -93,14 +105,14 @@ patent_boundary_v0_1_predictions
 ```text
 source_dataset_id
   -> registry 找 manifest
-  -> manifest.objects[] 精确匹配 source_object_path
+  -> manifest.objects[] 精确匹配 source_object_path，或按 dataset.canonical_uri 匹配相对路径
   -> 得到 storage_uri / bytes / sha256 / rows
   -> rclone copyto 到本地临时文件
   -> 校验 bytes、sha256、rows、id_field、unique_ids
   -> 原子提交为本地 import
 ```
 
-如果 manifest 中有多个 JSONL，而任务没有指定 `source_object_path`，scaffold 必须失败，不做猜测。
+如果 manifest 中有多个 JSONL，而任务没有指定 `source_object_path`，平台必须失败，不做猜测。
 
 ## 输入对象 manifest
 
@@ -108,15 +120,15 @@ source_dataset_id
 
 ```json
 {
-  "path": "inputs/manual_seed_500/v1/raw.jsonl",
-  "storage_uri": "r2:...",
+  "path": "manual_seed_500/v1/raw.jsonl",
+  "storage_uri": "r2:my-labeling-lake/labels/customer_feedback/customer_feedback_v1/inputs/manual_seed_500/v1/raw.jsonl",
   "asset_type": "label_import_jsonl",
   "rows": 500,
-  "id_field": "patent_id",
+  "id_field": "record_id",
   "unique_ids": 500,
   "bytes": 123456,
   "sha256": "...",
-  "created_by": "scripts/export_patent_boundary_labeling_units.py",
+  "created_by": "scripts/export_label_units.py",
   "upstream_uri": ["..."],
   "sampling_strategy": "stratified_manual_seed"
 }
@@ -144,24 +156,24 @@ source_dataset_id
 
 ## rclone 要求
 
-面板运行环境必须能执行 `rclone`，并且 rclone 配置中要有 `r2` remote。
+R2 操作层只使用 `rclone`。应用、镜像和 compose 文件都不直接保存 R2 access key / secret key。
 
-宿主机直接运行时，使用当前用户的 rclone 配置即可。
-
-Docker 部署时，不要把密钥写进镜像。默认提供了 `docker-compose.rclone.example.yml`，用于把只读配置映射到容器：
+面板运行环境必须能执行 `rclone`，并且 rclone 配置中要有可访问目标 bucket 的 remote，例如 `r2`。Docker 部署时使用 `docker-compose.rclone.example.yml` 把宿主机 `rclone.conf` 只读映射到容器：
 
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
 ```
 
-也可以设置：
+相关运行配置：
 
 ```text
 RCLONE_CONFIG=/run/secrets/rclone/rclone.conf
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
 
-生产默认只允许访问 `r2:ai-innovation-data-lake/...`。本地路径和 `file://` 只在单测或开发排查时允许，需显式设置：
+不要把 `rclone.conf` 写进镜像，不要在 `.env` 或 compose 文件中暴露 R2 密钥。`.env` 只保存 registry URI、允许访问的 R2 前缀和 rclone 配置文件路径。
+
+生产环境只允许访问 `data_lake_r2_prefix` / `LLS_DATA_LAKE_R2_PREFIX` 下的 R2 URI。本地路径和 `file://` 只在单测或开发排查时允许，需显式设置：
 
 ```text
 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1
@@ -169,11 +181,11 @@ LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1
 
 ## 边界
 
-大数据抽样在 data lake / ETL 层完成。任务级 JSONL 在 R2 `labels/.../inputs/...` 中权威保存。scaffold 只 materialize 任务输入并做标注执行缓存。
+大数据抽样在 data lake / ETL 层完成。任务级 JSONL 在 R2 `labels/.../inputs/...` 中权威保存。平台只把任务输入同步成本地执行缓存，不维护上游大数据的第二份路径体系。
 
 生产面板默认不允许实验人员覆盖 `lake_registry_uri`、`source_dataset_id`、`source_manifest_uri` 或 `source_object_path`。这些字段应由治理配置写入 `task.yaml`；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。
 
-scaffold 不长期保存上游大数据，不把 `raw`、`bronze`、`silver` 或 `mart` 数据复制成第二份权威。它只缓存：
+平台不长期保存上游大数据，不把 `raw`、`bronze`、`silver` 或 `mart` 数据复制成第二份权威。它只缓存：
 
 - 当前任务导入文件
 - 当前任务样本

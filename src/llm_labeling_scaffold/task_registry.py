@@ -11,7 +11,7 @@ import uuid
 from typing import Any
 
 from .config import load_task
-from .data_lake import DEFAULT_REGISTRY_URI, DataLakeError, _normalize_registry_uri, copy_uri_to_path
+from .data_lake import DataLakeError, _normalize_registry_uri, copy_uri_to_path, default_registry_uri
 from .io import write_text_atomic
 
 
@@ -26,7 +26,7 @@ class SyncedTaskRegistry:
 
 
 def task_registry_uri(value: str | None = None) -> str:
-    return _normalize_registry_uri(value or os.environ.get("LLS_TASK_REGISTRY_URI") or DEFAULT_REGISTRY_URI)
+    return _normalize_registry_uri(value or default_registry_uri())
 
 
 def _task_roots(tasks_root: str | Path) -> list[Path]:

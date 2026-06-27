@@ -386,6 +386,73 @@ def test_import_from_data_lake_manifest_records_lineage(tmp_path: Path):
         raise AssertionError("same import id with different lake lineage should fail")
 
 
+def test_data_lake_import_accepts_source_path_relative_to_canonical_uri(tmp_path: Path):
+    canonical_root = tmp_path / "canonical"
+    source = canonical_root / "manual_seed_500" / "v1" / "raw.jsonl"
+    source.parent.mkdir(parents=True)
+    source.write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    manifest_path = tmp_path / "manifest.json"
+    write_json(
+        {
+            "dataset_id": "lake_seed",
+            "objects": [
+                {
+                    "path": "inputs/manual_seed_500/v1/raw.jsonl",
+                    "storage_uri": str(source),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 1,
+                    "id_field": "record_id",
+                    "unique_ids": 1,
+                    "bytes": source.stat().st_size,
+                    "sha256": _file_sha256(source),
+                    "created_by": "tests",
+                    "upstream_uri": ["r2:test/upstream/source.jsonl"],
+                    "sampling_strategy": "unit_test_seed",
+                }
+            ],
+        },
+        manifest_path,
+    )
+    registry_path = tmp_path / "data_lake.yaml"
+    registry_path.write_text(
+        yaml.safe_dump(
+            {
+                "datasets": {
+                    "lake_seed": {
+                        "manifest": str(manifest_path),
+                        "canonical_uri": str(canonical_root),
+                    }
+                }
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "data_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+            "data_lake": {
+                "lake_registry_uri": str(registry_path),
+                "source_dataset_id": "lake_seed",
+                "source_object_path": "manual_seed_500/v1/raw.jsonl",
+                "default_import_id": "lake_import",
+            },
+        },
+    )
+    task = load_task(created["path"])
+
+    with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
+        imported = pipeline.import_from_data_lake(tmp_path / "runs", task)
+
+    assert imported["import_id"] == "lake_import"
+    assert imported["data_lake"]["source_object_path"] == "inputs/manual_seed_500/v1/raw.jsonl"
+
+
 def test_data_lake_import_requires_manifest_relative_object_and_matching_manifest(tmp_path: Path):
     source_a = tmp_path / "a.jsonl"
     source_b = tmp_path / "b.jsonl"

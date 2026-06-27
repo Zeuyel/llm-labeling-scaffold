@@ -13,7 +13,7 @@ from urllib.parse import urlparse, parse_qs
 from .config import load_task
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
-from .task_registry import task_registry_uri
+from . import panel_settings
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -32,18 +32,35 @@ def _truthy_env(name: str) -> bool:
 
 
 def _allow_data_lake_overrides() -> bool:
-    return _truthy_env("LLS_ALLOW_DATA_LAKE_OVERRIDES")
+    return panel_settings.allow_data_lake_overrides()
 
 
 def _task_source_mode() -> str:
-    value = str(os.environ.get("LLS_TASK_SOURCE") or "local").strip().lower()
-    if value in {"r2", "data_lake", "registry"}:
-        return "r2"
-    return "local"
+    return panel_settings.task_source_mode()
 
 
 def _r2_task_source_enabled() -> bool:
     return _task_source_mode() == "r2"
+
+
+def _apply_runtime_settings(runs_root: str | Path, settings: dict | None = None) -> dict:
+    effective = settings or panel_settings.effective_settings(runs_root)
+    from .data_lake import set_allowed_r2_prefix_override, set_default_registry_uri_override
+
+    set_default_registry_uri_override(effective["task_registry_uri"])
+    set_allowed_r2_prefix_override(effective["data_lake_r2_prefix"])
+    return effective
+
+
+def _settings_response(settings: dict, *, include_legacy: bool = False) -> dict:
+    payload = {"settings": settings}
+    if include_legacy:
+        payload.update({
+            "allow_data_lake_overrides": settings["allow_data_lake_overrides"],
+            "task_source": settings["task_source"],
+            "task_registry_uri": settings["task_registry_uri"] if settings["task_source"] == "r2" else None,
+        })
+    return payload
 
 
 def _count_lines(path: Path) -> int:
@@ -221,7 +238,8 @@ class _Handler(BaseHTTPRequestHandler):
             return None
         from .task_registry import sync_tasks_from_registry
 
-        return sync_tasks_from_registry(self.tasks_root, registry_uri=task_registry_uri())
+        settings = _apply_runtime_settings(self.runs_root)
+        return sync_tasks_from_registry(self.tasks_root, registry_uri=settings["task_registry_uri"])
 
     def _list_tasks(self) -> list[dict]:
         synced = self._sync_tasks_if_needed()
@@ -330,12 +348,18 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(pipeline.task_profile_status(self.runs_root, task_cfg))
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/settings":
+            try:
+                settings = _apply_runtime_settings(self.runs_root)
+                self._json(_settings_response(settings))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/config":
-            self._json({
-                "allow_data_lake_overrides": _allow_data_lake_overrides(),
-                "task_source": _task_source_mode(),
-                "task_registry_uri": task_registry_uri() if _r2_task_source_enabled() else None,
-            })
+            try:
+                settings = _apply_runtime_settings(self.runs_root)
+                self._json(_settings_response(settings, include_legacy=True))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/task/runs":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
@@ -439,6 +463,7 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 from .data_lake import preview_source
 
+                _apply_runtime_settings(self.runs_root)
                 task_cfg = self._load_task_by_id(task)
                 self._json({
                     "enabled": bool(task_cfg.data_lake),
@@ -536,6 +561,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._import(params)
         elif path == "/api/import/data_lake":
             self._import_data_lake(params)
+        elif path == "/api/settings":
+            body = self._read_body()
+            if not isinstance(body, dict):
+                self._json({"error": "settings payload must be a JSON object"}, status=400)
+                return
+            try:
+                settings = panel_settings.update_settings(self.runs_root, body)
+                _apply_runtime_settings(self.runs_root, settings)
+                self._json({"ok": True, **_settings_response(settings)})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         else:
             self._json({"error": "not found"}, status=404)
 
@@ -635,6 +671,7 @@ class _Handler(BaseHTTPRequestHandler):
         overrides = provided_overrides if _allow_data_lake_overrides() else {}
         max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
         try:
+            _apply_runtime_settings(self.runs_root)
             task_cfg = self._load_task_by_id(task_id)
             result = pipeline.import_from_data_lake(
                 self.runs_root,

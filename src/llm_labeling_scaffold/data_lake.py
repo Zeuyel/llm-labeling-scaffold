@@ -21,6 +21,8 @@ from .io import read_jsonl
 DEFAULT_REGISTRY_URI = "r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml"
 JSONL_SUFFIXES = (".jsonl", ".ndjson")
 DEFAULT_R2_PREFIX = "r2:ai-innovation-data-lake/"
+_DEFAULT_REGISTRY_URI_OVERRIDE: str | None = None
+_ALLOWED_R2_PREFIX_OVERRIDE: str | None = None
 
 
 class DataLakeError(RuntimeError):
@@ -84,9 +86,44 @@ def _allow_local_data_lake_uris() -> bool:
     return _truthy_env("LLS_ALLOW_LOCAL_DATA_LAKE_URIS")
 
 
+def _normalize_r2_prefix(value: str) -> str:
+    text = str(value or "").strip()
+    remote, sep, path = text.partition(":")
+    if not text or text.startswith("file://") or text.startswith("/") or text.startswith("./") or text.startswith("../"):
+        raise DataLakeError(f"非法 R2 前缀: {value}")
+    if not sep or not remote or not path:
+        raise DataLakeError(f"R2 前缀必须是 rclone remote:path: {value}")
+    if any(ch in remote for ch in "/\\"):
+        raise DataLakeError(f"非法 rclone remote: {remote}")
+    if path.startswith("/") or "\\" in path or any(part == ".." for part in path.split("/")):
+        raise DataLakeError(f"R2 前缀不允许路径穿越: {value}")
+    return text.rstrip("/") + "/"
+
+
+def set_default_registry_uri_override(value: str | None) -> None:
+    global _DEFAULT_REGISTRY_URI_OVERRIDE
+    _DEFAULT_REGISTRY_URI_OVERRIDE = _normalize_registry_uri(value) if value else None
+
+
+def default_registry_uri() -> str:
+    return _normalize_registry_uri(
+        _DEFAULT_REGISTRY_URI_OVERRIDE
+        or os.environ.get("LLS_TASK_REGISTRY_URI")
+        or DEFAULT_REGISTRY_URI
+    )
+
+
+def set_allowed_r2_prefix_override(value: str | None) -> None:
+    global _ALLOWED_R2_PREFIX_OVERRIDE
+    _ALLOWED_R2_PREFIX_OVERRIDE = _normalize_r2_prefix(value) if value else None
+
+
 def _allowed_r2_prefix() -> str:
-    value = str(os.environ.get("LLS_DATA_LAKE_R2_PREFIX") or DEFAULT_R2_PREFIX).strip()
-    return value.rstrip("/") + "/"
+    return _normalize_r2_prefix(
+        _ALLOWED_R2_PREFIX_OVERRIDE
+        or os.environ.get("LLS_DATA_LAKE_R2_PREFIX")
+        or DEFAULT_R2_PREFIX
+    )
 
 
 def _normalize_registry_uri(uri: str) -> str:
@@ -126,7 +163,7 @@ def _validate_rclone_uri(uri: str) -> None:
         raise DataLakeError(f"非法数据湖 URI: {uri}")
     if any(ch in remote for ch in "/\\"):
         raise DataLakeError(f"非法 rclone remote: {remote}")
-    if path.startswith("/") or any(part == ".." for part in path.split("/")):
+    if path.startswith("/") or "\\" in path or any(part == ".." for part in path.split("/")):
         raise DataLakeError(f"数据湖对象路径不允许路径穿越: {uri}")
     allowed_prefix = _allowed_r2_prefix()
     if uri != allowed_prefix.rstrip("/") and not uri.startswith(allowed_prefix):
@@ -269,7 +306,7 @@ def _data_lake_config(task: TaskConfig, overrides: dict[str, Any] | None = None)
 
 
 def _registry_uri(cfg: dict[str, Any]) -> str:
-    return _normalize_registry_uri(str(cfg.get("lake_registry_uri") or DEFAULT_REGISTRY_URI))
+    return _normalize_registry_uri(str(cfg.get("lake_registry_uri") or default_registry_uri()))
 
 
 def _resolve_dataset(registry: dict[str, Any], dataset_id: str) -> dict[str, Any]:
@@ -365,13 +402,23 @@ def _validate_label_import_object(item: dict[str, Any], task: TaskConfig) -> dic
     }
 
 
-def _select_object(manifest: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
+def _canonical_relative_storage_uri(dataset: dict[str, Any], source_object_path: str) -> str | None:
+    canonical_uri = str(dataset.get("canonical_uri") or "").strip()
+    if not canonical_uri:
+        return None
+    return canonical_uri.rstrip("/") + "/" + source_object_path
+
+
+def _select_object(manifest: dict[str, Any], cfg: dict[str, Any], dataset: dict[str, Any] | None = None) -> dict[str, Any]:
     objects = _manifest_objects(manifest)
     source_object_path = str(cfg.get("source_object_path") or "").strip()
 
     if source_object_path:
         safe_path = _validate_manifest_path(source_object_path)
         matches = [item for item in objects if item.get("path") == safe_path]
+        if not matches and dataset:
+            expected_uri = _canonical_relative_storage_uri(dataset, safe_path)
+            matches = [item for item in objects if item.get("storage_uri") == expected_uri] if expected_uri else []
     else:
         matches = candidate_objects(manifest)
 
@@ -416,7 +463,7 @@ def resolve_source(task: TaskConfig, overrides: dict[str, Any] | None = None) ->
                 raise DataLakeError(f"manifest 缺少 {key}")
             if registry_value != manifest_value:
                 raise DataLakeError(f"manifest.{key} 与 registry 不一致: registry={registry_value}, manifest={manifest_value}")
-    selected = _validate_label_import_object(_select_object(manifest, cfg), task)
+    selected = _validate_label_import_object(_select_object(manifest, cfg, dataset), task)
     object_uri = str(selected.get("storage_uri") or "").strip()
     if not object_uri:
         raise DataLakeError("匹配对象缺少 storage_uri")

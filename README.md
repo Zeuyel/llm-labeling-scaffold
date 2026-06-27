@@ -80,6 +80,16 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 模型训练按“控制面和计算面分离”设计。控制台服务器可以是低配机器，高性能训练服务器作为计算面接入。详细设计见 [远程训练设计](docs/remote_training_design.md)。
 
+## 部署配置分层
+
+平台部署时按三层管理配置和数据：
+
+1. **R2 数据湖 / registry 是权威层**：任务列表、任务快照、源数据 manifest、任务级输入对象以及需要回写的数据湖产物，都以 R2 registry 中登记的 URI 为准。
+2. **panel settings 是运行配置层**：当前部署在“系统设置”中保存 `task_registry_uri` 和 `data_lake_r2_prefix`，决定本控制台连接哪一个 R2 registry 和允许访问哪个 R2 前缀。
+3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 只缓存从 registry 同步下来的任务配置；`runs/` 保存导入、样本、标注结果、训练集、模型、推理结果和审计日志。
+
+服务器部署后，第一步是在轻量控制台的“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，保存后同步任务配置。不要把示例 bucket 当成生产配置；同一套镜像应能连接任意符合约定的 R2 数据湖。
+
 ## 服务器测试
 
 有两种部署方式。
@@ -104,6 +114,8 @@ export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:main
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull panel
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
 ```
+
+启动后先访问轻量控制台，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。
 
 如果要同时测试可选模型记录服务：
 
@@ -145,9 +157,12 @@ ARGILLA_WORKSPACE=argilla
 
 MLFLOW_PORT=5000
 LLS_TASK_SOURCE=r2
-LLS_TASK_REGISTRY_URI=r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml
+LLS_TASK_REGISTRY_URI=r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.yaml
+LLS_DATA_LAKE_R2_PREFIX=r2:YOUR_BUCKET/
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
+
+`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。
 
 `MLFLOW_TRACKING_URI` 默认不设置。只有需要把训练记录同步到可选模型记录服务时，才设置：
 
@@ -173,7 +188,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - `./tasks:/app/tasks`：R2 任务配置的本地执行缓存
 - `./configs:/app/configs:ro`：配置示例
 
-生产面板默认使用 `LLS_TASK_SOURCE=r2`：启动和刷新任务时会从 `LLS_TASK_REGISTRY_URI` 指向的数据湖登记表读取 `tasks.<任务编号>.task_uri`，把远端 `task.yaml` 同步到 `tasks/<任务编号>/task.yaml` 作为本地缓存。面板不允许新建或归档本地任务配置；任务下线应在 R2 数据湖登记表中把对应任务标记为非启用状态。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
+生产面板默认使用 `LLS_TASK_SOURCE=r2`。当前部署应在“系统设置”保存 `task_registry_uri` 和 `data_lake_r2_prefix`；启动兜底值可由 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 提供。刷新或同步任务时，面板会从 registry 读取 `tasks.<任务编号>.task_uri`，把远端 `task.yaml` 同步到 `tasks/<任务编号>/task.yaml` 作为本地缓存。面板不允许新建或归档本地任务配置；任务下线应在 R2 registry 中把对应任务标记为非启用状态。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
 
 数据导入页支持上传 JSONL/NDJSON 文件，也支持粘贴数据。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
 

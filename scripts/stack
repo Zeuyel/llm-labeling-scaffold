@@ -88,6 +88,9 @@ if [ "$enable_mlflow" -eq 1 ]; then
 fi
 
 print_urls() {
+  local registry_uri
+  local data_lake_prefix
+
   echo
   echo "light panel： http://localhost:$(env_value PANEL_PORT 8765)"
   echo "Argilla：     http://localhost:$(env_value ARGILLA_PORT 6900)"
@@ -100,6 +103,16 @@ print_urls() {
   if [ "$enable_mlflow" -eq 0 ]; then
     echo
     echo "默认未启动模型记录服务；需要时运行：scripts/stack up --mlflow"
+  fi
+  if [ "${task_source,,}" != "local" ]; then
+    registry_uri="$(env_value LLS_TASK_REGISTRY_URI "")"
+    data_lake_prefix="$(env_value LLS_DATA_LAKE_R2_PREFIX "")"
+    echo
+    echo "首次部署：进入 light panel 的“系统设置”，填写 task_registry_uri 和 data_lake_r2_prefix，然后同步任务配置。"
+    echo "R2 访问只通过 rclone；容器只读挂载宿主机 rclone.conf，不把密钥写进镜像。"
+    if [[ "$registry_uri" == *YOUR_BUCKET* || "$data_lake_prefix" == *YOUR_BUCKET* ]]; then
+      echo "注意：.env 仍是 YOUR_BUCKET 占位值，请替换为自己的 R2 registry。"
+    fi
   fi
 }
 

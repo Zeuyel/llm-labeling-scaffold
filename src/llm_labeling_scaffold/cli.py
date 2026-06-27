@@ -27,6 +27,20 @@ def _parse_params(values: list[str] | None) -> dict:
     return out
 
 
+def _print_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _load_task_reference(task_path: str | None, task_id: str | None, tasks_root: str):
+    if task_path:
+        return load_task(task_path)
+    if task_id:
+        from .pipeline import load_task_by_id
+
+        return load_task_by_id(tasks_root, task_id)
+    raise SystemExit("requires --task or --task-id")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lls")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -105,6 +119,30 @@ def build_parser() -> argparse.ArgumentParser:
     lake_export.add_argument("--target-uri")
     lake_export.add_argument("--target-path")
 
+    task_cmd = sub.add_parser("task")
+    task_sub = task_cmd.add_subparsers(dest="task_cmd", required=True)
+    task_list = task_sub.add_parser("list")
+    task_list.add_argument("--tasks-root", default="tasks")
+    task_status = task_sub.add_parser("status")
+    task_status.add_argument("--task")
+    task_status.add_argument("--task-id")
+    task_status.add_argument("--tasks-root", default="tasks")
+    task_status.add_argument("--runs-root", default="runs")
+
+    imports = sub.add_parser("import")
+    import_sub = imports.add_subparsers(dest="import_cmd", required=True)
+    import_list = import_sub.add_parser("list")
+    import_list.add_argument("--task")
+    import_list.add_argument("--task-id")
+    import_list.add_argument("--tasks-root", default="tasks")
+    import_list.add_argument("--runs-root", default="runs")
+    import_detail = import_sub.add_parser("detail")
+    import_detail.add_argument("--task")
+    import_detail.add_argument("--task-id")
+    import_detail.add_argument("--tasks-root", default="tasks")
+    import_detail.add_argument("--runs-root", default="runs")
+    import_detail.add_argument("--import-id", required=True)
+
     panel = sub.add_parser("panel")
     panel.add_argument("--runs-root", default="runs")
     panel.add_argument("--host", default="127.0.0.1")
@@ -164,26 +202,42 @@ def main(argv: list[str] | None = None) -> None:
         if args.lake_cmd == "check":
             from .data_lake import preview_source
 
-            print(json.dumps(preview_source(task), ensure_ascii=False, indent=2))
+            _print_json(preview_source(task))
         elif args.lake_cmd == "import":
             from .pipeline import import_from_data_lake
 
             overrides = {
                 "source_object_path": args.source_object_path,
             }
-            print(json.dumps(
+            _print_json(
                 import_from_data_lake(args.runs_root, task, import_id=args.import_id, overrides=overrides, max_bytes=args.max_bytes),
-                ensure_ascii=False,
-                indent=2,
-            ))
+            )
         elif args.lake_cmd == "export":
             from .data_lake import export_artifact
 
-            print(json.dumps(
+            _print_json(
                 export_artifact(task, args.local, target_uri=args.target_uri, target_path=args.target_path),
-                ensure_ascii=False,
-                indent=2,
-            ))
+            )
+
+    elif args.cmd == "task":
+        if args.task_cmd == "list":
+            from .pipeline import list_tasks
+
+            _print_json({"tasks": list_tasks(args.tasks_root)})
+        elif args.task_cmd == "status":
+            from .pipeline import task_profile_status
+
+            task = _load_task_reference(args.task, args.task_id, args.tasks_root)
+            _print_json(task_profile_status(args.runs_root, task))
+
+    elif args.cmd == "import":
+        from .pipeline import import_detail, list_imports
+
+        task = _load_task_reference(args.task, args.task_id, args.tasks_root)
+        if args.import_cmd == "list":
+            _print_json({"imports": list_imports(args.runs_root, task.task_id, id_field=task.id_field)})
+        elif args.import_cmd == "detail":
+            _print_json({"import": import_detail(args.runs_root, task.task_id, args.import_id, id_field=task.id_field)})
 
     elif args.cmd == "panel":
         from .panel import serve_panel

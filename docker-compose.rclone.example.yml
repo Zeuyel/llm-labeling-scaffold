@@ -1,5 +1,7 @@
 services:
   panel:
+    # 只把宿主机 rclone.conf 作为只读运行时配置挂载进容器。
+    # 不要把 rclone.conf COPY 进镜像，也不要在 compose 文件里写 R2 密钥。
     volumes:
       - ${RCLONE_CONFIG_HOST:-${HOME}/.config/rclone/rclone.conf}:/run/secrets/rclone/rclone.conf:ro
     environment:

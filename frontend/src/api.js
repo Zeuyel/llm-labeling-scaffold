@@ -14,7 +14,10 @@ const q = (obj) =>
     .join("&");
 
 export const getTasks = () => req("/api/tasks");
-export const getConfig = () => req("/api/config");
+const unwrapSettings = (data) => data.settings || data.config || data || {};
+
+export const getSettings = () => req("/api/settings").then(unwrapSettings);
+export const getConfig = getSettings;
 export const getImports = (taskId) => req(`/api/task/imports?${q({ task_id: taskId })}`);
 export const getImportDetail = (taskId, importId) => req(`/api/import/detail?${q({ task_id: taskId, import_id: importId })}`);
 export const getImportRows = (taskId, importId, opts = {}) =>
@@ -38,6 +41,13 @@ export const createTask = (payload) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   }).then((data) => data.task || data);
+
+export const updateSettings = (payload) =>
+  req("/api/settings", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then(unwrapSettings);
 
 export const deleteTask = (taskId, opts = {}) =>
   req(`/api/tasks?${q({ task_id: taskId, delete_runs: opts.deleteRuns ? 1 : undefined })}`, {

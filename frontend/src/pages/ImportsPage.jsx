@@ -18,6 +18,19 @@ function stateLabel(value) {
   return value || "-";
 }
 
+const DATA_LAKE_SOURCE_FIELDS = [
+  "source_dataset_id",
+  "source_object_path",
+  "source_manifest_uri",
+  "source_object_uri",
+  "lake_registry_uri",
+];
+
+function hasEffectiveDataLakeConfig(dataLake) {
+  if (!dataLake || typeof dataLake !== "object" || Array.isArray(dataLake)) return false;
+  return DATA_LAKE_SOURCE_FIELDS.some((field) => typeof dataLake[field] === "string" && dataLake[field].trim() !== "");
+}
+
 export default function ImportsPage({ task, taskId, onError }) {
   const [items, setItems] = useState([]);
   const [name, setName] = useState("");
@@ -37,6 +50,8 @@ export default function ImportsPage({ task, taskId, onError }) {
     () => items.find((item) => item.import_id === selectedId) || null,
     [items, selectedId],
   );
+  const dataLake = task?.data_lake || null;
+  const hasDataLakeConfig = hasEffectiveDataLakeConfig(dataLake);
 
   const reload = useCallback(async () => {
     if (!taskId) return;
@@ -146,12 +161,16 @@ export default function ImportsPage({ task, taskId, onError }) {
 
   async function checkDataLake() {
     if (!taskId) return;
+    if (!hasDataLakeConfig) {
+      onError("当前任务未配置数据湖来源，请在 R2 任务配置中登记 data_lake 后同步任务。");
+      return;
+    }
     setLakeBusy(true);
     setNotice("");
     try {
       const data = await api.getDataLakeStatus(taskId);
       setLakeStatus(data.preview || null);
-      if (!lakeImportId && task?.data_lake?.default_import_id) setLakeImportId(task.data_lake.default_import_id);
+      if (!lakeImportId && dataLake?.default_import_id) setLakeImportId(dataLake.default_import_id);
       setNotice("数据湖配置可读取。");
     } catch (error) {
       onError(String(error));
@@ -162,6 +181,10 @@ export default function ImportsPage({ task, taskId, onError }) {
 
   async function importLake() {
     if (!taskId) return;
+    if (!hasDataLakeConfig) {
+      onError("当前任务未配置数据湖来源，请在 R2 任务配置中登记 data_lake 后同步任务。");
+      return;
+    }
     setLakeBusy(true);
     setNotice("");
     try {
@@ -200,48 +223,64 @@ export default function ImportsPage({ task, taskId, onError }) {
 
       {notice && <div className="status-banner">{notice}</div>}
 
-      {task?.data_lake && (
-        <div className="card section-card">
-          <div className="toolbar">
-            <div>
-              <h3>从数据湖导入</h3>
-              <div className="status-line">按任务配置读取 R2 数据湖 manifest，并生成当前任务的本地导入缓存</div>
+      <div className={hasDataLakeConfig ? "card section-card primary-import-card" : "card section-card primary-import-card muted-import-card"}>
+        <div className="toolbar">
+          <div>
+            <h3>从数据湖导入</h3>
+            <div className="status-line">
+              {hasDataLakeConfig
+                ? "按任务配置读取 R2 数据湖清单文件，并生成当前任务的本地导入缓存"
+                : "当前任务未配置数据湖来源，请在 R2 任务配置中登记 data_lake 后同步任务。"}
             </div>
-            <button className="btn btn-sm" disabled={lakeBusy} onClick={checkDataLake}>检查配置</button>
           </div>
+          {!hasDataLakeConfig && <Link to="/" className="btn btn-sm">去同步任务配置</Link>}
+        </div>
+        {hasDataLakeConfig ? (
+          <>
           <div className="form-grid">
             <div className="field">
               <label>目标导入编号</label>
-              <input value={lakeImportId} onChange={(event) => setLakeImportId(event.target.value)} placeholder={task.data_lake.default_import_id || "留空则自动生成"} />
+              <input value={lakeImportId} onChange={(event) => setLakeImportId(event.target.value)} placeholder={dataLake.default_import_id || "留空则自动生成"} />
               <span className="hint">同名同内容会幂等复用，同名不同内容会拒绝写入。</span>
             </div>
             <div className="field">
               <label>源数据集</label>
-              <input value={task.data_lake.source_dataset_id || "-"} readOnly />
+              <input value={dataLake.source_dataset_id || "-"} readOnly />
             </div>
             <div className="field field-wide">
               <label>源对象</label>
-              <input value={lakeStatus?.selected_object?.path || task.data_lake.source_object_path || "-"} readOnly />
+              <input value={lakeStatus?.selected_object?.path || dataLake.source_object_path || "-"} readOnly />
             </div>
           </div>
           {lakeStatus && (
             <div className="data-profile">
               <div><span>数据层</span><strong>{lakeStatus.dataset?.layer || "-"}</strong></div>
               <div><span>领域</span><strong>{lakeStatus.dataset?.domain || "-"}</strong></div>
-              <div><span>manifest 对象数</span><strong>{lakeStatus.manifest?.object_count ?? "-"}</strong></div>
+              <div><span>清单对象数</span><strong>{lakeStatus.manifest?.object_count ?? "-"}</strong></div>
               <div><span>选中对象大小</span><strong>{lakeStatus.selected_object?.bytes ?? "-"}</strong></div>
             </div>
           )}
-          <button className="btn btn-primary" disabled={lakeBusy} onClick={importLake}>从数据湖生成导入</button>
-        </div>
-      )}
+          <div className="action-row">
+            <button className="btn btn-primary" disabled={lakeBusy} onClick={importLake}>
+              {lakeBusy ? "导入中..." : "从数据湖生成导入"}
+            </button>
+            <button className="btn" disabled={lakeBusy} onClick={checkDataLake}>检查配置</button>
+          </div>
+          </>
+        ) : (
+          <div className="info-callout">
+            <strong>当前任务未配置数据湖来源</strong>
+            <p>请在 R2 任务配置中登记 data_lake 后同步任务。</p>
+          </div>
+        )}
+      </div>
 
       <div className="card section-card">
-        <h3>新增导入</h3>
+        <h3>手动新增导入</h3>
         <div className="form-grid">
           <div className="field">
             <label>导入编号</label>
-            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 patent_manual_seed_20260626" />
+            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 manual_seed_20260627" />
             <span className="hint">同一编号不能覆盖不同内容；修正数据请使用新的导入编号。</span>
           </div>
           <div className="field">
@@ -259,7 +298,7 @@ export default function ImportsPage({ task, taskId, onError }) {
             />
           </div>
         </div>
-        <button className="btn btn-primary" disabled={busy} onClick={submit}>保存导入数据</button>
+        <button className="btn" disabled={busy} onClick={submit}>保存手动导入</button>
       </div>
 
       <div className="card section-card">
@@ -275,8 +314,8 @@ export default function ImportsPage({ task, taskId, onError }) {
                 <tr>
                   <th>导入编号</th>
                   <th>行数</th>
-                  <th>ID 唯一数</th>
-                  <th>缺失/重复 ID</th>
+                  <th>记录编号唯一数</th>
+                  <th>缺失/重复记录编号</th>
                   <th>关联样本</th>
                   <th>内容哈希</th>
                   <th>保存路径</th>
@@ -321,15 +360,15 @@ export default function ImportsPage({ task, taskId, onError }) {
           <div className="data-profile">
             <div><span>状态</span><strong>{stateLabel(detail?.state || selected.state || "active")}</strong></div>
             <div><span>行数</span><strong>{detail?.rows ?? selected.rows}</strong></div>
-            <div><span>ID 字段</span><strong>{detail?.id_field || "-"}</strong></div>
-            <div><span>ID 唯一数</span><strong>{detail?.unique_ids ?? "-"}</strong></div>
-            <div><span>缺失 ID</span><strong>{detail?.missing_ids ?? "-"}</strong></div>
-            <div><span>重复 ID</span><strong>{detail?.duplicate_ids ?? "-"}</strong></div>
+            <div><span>记录编号字段</span><strong>{detail?.id_field || "-"}</strong></div>
+            <div><span>记录编号唯一数</span><strong>{detail?.unique_ids ?? "-"}</strong></div>
+            <div><span>缺失记录编号</span><strong>{detail?.missing_ids ?? "-"}</strong></div>
+            <div><span>重复记录编号</span><strong>{detail?.duplicate_ids ?? "-"}</strong></div>
             <div><span>字段数</span><strong>{(detail?.fields || selected.fields || []).length}</strong></div>
             <div><span>内容哈希</span><strong className="mono-cell">{shortHash(detail?.content_sha256 || selected.content_sha256)}</strong></div>
           </div>
           {detail?.declared_path && (
-            <div className="status-line">历史 manifest 中记录的原路径：{detail.declared_path}；当前面板读取的是保存路径：{detail.path}</div>
+            <div className="status-line">历史清单文件中记录的原路径：{detail.declared_path}；当前面板读取的是保存路径：{detail.path}</div>
           )}
           {(detail?.linked_samples || []).length > 0 && (
             <div className="status-line">关联样本：{detail.linked_samples.map((sample) => sample.sample_id).join(", ")}</div>

@@ -27,7 +27,9 @@ services:
       - RCLONE_CONFIG=${RCLONE_CONFIG:-/run/secrets/rclone/rclone.conf}
       - LLS_RCLONE_TIMEOUT_SECONDS=${LLS_RCLONE_TIMEOUT_SECONDS:-120}
       - LLS_TASK_SOURCE=${LLS_TASK_SOURCE:-r2}
-      - LLS_TASK_REGISTRY_URI=${LLS_TASK_REGISTRY_URI:-r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml}
+      # 必须指向本部署自己的 R2 registry；YOUR_BUCKET 是占位示例。
+      - LLS_TASK_REGISTRY_URI=${LLS_TASK_REGISTRY_URI:-r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.yaml}
+      - LLS_DATA_LAKE_R2_PREFIX=${LLS_DATA_LAKE_R2_PREFIX:-r2:YOUR_BUCKET/}
     volumes:
       - ./runs:/app/runs
       - ./tasks:/app/tasks

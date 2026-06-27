@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from "react";
 import * as api from "./api.js";
-import { RouterProvider, useRouter, matchRoute, Link } from "./router.jsx";
+import { RouterProvider, useRouter, matchRoute } from "./router.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import TasksPage from "./pages/TasksPage.jsx";
 import TaskOverviewPage from "./pages/TaskOverviewPage.jsx";
@@ -10,9 +10,11 @@ import RunsPage from "./pages/RunsPage.jsx";
 import JobsPage from "./pages/JobsPage.jsx";
 import GoldPage from "./pages/GoldPage.jsx";
 import ModelsPage from "./pages/ModelsPage.jsx";
+import SettingsPage from "./pages/SettingsPage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
+  { pattern: "/settings", page: "settings" },
   { pattern: "/task/:id", page: "overview" },
   { pattern: "/task/:id/imports", page: "imports" },
   { pattern: "/task/:id/samples", page: "samples" },
@@ -23,10 +25,18 @@ const ROUTES = [
   { pattern: "/task/:id/models", page: "models" },
 ];
 
+const DEFAULT_SETTINGS = {
+  allow_data_lake_overrides: false,
+  data_lake_r2_prefix: "",
+  rclone_config_path: "",
+  task_registry_uri: "",
+  task_source: "local",
+};
+
 function Shell() {
   const { path } = useRouter();
   const [tasks, setTasks] = useState([]);
-  const [config, setConfig] = useState({ allow_data_lake_overrides: false, task_source: "local" });
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [err, setErr] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("lls.sidebarCollapsed") === "1");
 
@@ -34,9 +44,14 @@ function Shell() {
     api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
   []);
   useEffect(() => { loadTasks(); }, [loadTasks]);
+  const loadSettings = useCallback(() =>
+    api.getSettings()
+      .then((d) => setSettings({ ...DEFAULT_SETTINGS, ...(d || {}) }))
+      .catch(() => setSettings(DEFAULT_SETTINGS)),
+  []);
   useEffect(() => {
-    api.getConfig().then((d) => setConfig(d || {})).catch(() => setConfig({ allow_data_lake_overrides: false, task_source: "local" }));
-  }, []);
+    loadSettings();
+  }, [loadSettings]);
 
   let matched = { page: "tasks", params: {} };
   for (const r of ROUTES) {
@@ -46,18 +61,24 @@ function Shell() {
   const activeTaskId = matched.params.id || null;
   const taskOf = (id) => tasks.find((t) => t.task_id === id) || null;
 
+  async function handleSettingsSaved(next) {
+    setSettings({ ...DEFAULT_SETTINGS, ...(next || {}) });
+    await loadTasks();
+  }
+
   const common = { onError: setErr };
   let page = null;
   if (matched.page === "tasks") page = (
     <TasksPage
       tasks={tasks}
       onReload={loadTasks}
-      allowDataLakeOverrides={Boolean(config.allow_data_lake_overrides)}
-      taskSource={config.task_source || "local"}
-      taskRegistryUri={config.task_registry_uri || ""}
+      allowDataLakeOverrides={Boolean(settings.allow_data_lake_overrides)}
+      taskSource={settings.task_source || "local"}
+      taskRegistryUri={settings.task_registry_uri || ""}
       {...common}
     />
   );
+  else if (matched.page === "settings") page = <SettingsPage settings={settings} onSettingsSaved={handleSettingsSaved} {...common} />;
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "imports") page = <ImportsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;

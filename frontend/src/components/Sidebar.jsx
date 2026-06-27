@@ -15,16 +15,20 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
   return (
     <aside className={collapsed ? "sidebar is-collapsed" : "sidebar"}>
       <div className="sidebar-head">
-        <div className="brand-mark" title="实验控制台">实</div>
+        <div className="brand-mark" title="标注控制台">标</div>
         <div className="brand-copy">
-          <h1>实验控制台</h1>
-          <div className="sub">标注数据流管理</div>
+          <h1>标注控制台</h1>
+          <div className="sub">任务与数据流管理</div>
         </div>
         <button className="sidebar-toggle" type="button" onClick={onToggle} title={collapsed ? "展开侧栏" : "收起侧栏"}>
           {collapsed ? "›" : "‹"}
         </button>
       </div>
-      <Link to="/" className={!activeTaskId ? "nav-item active" : "nav-item"} title="全部任务">
+      <Link to="/settings" className={activePage === "settings" ? "nav-item active" : "nav-item"} title="系统设置">
+        <span className="nav-short">设</span>
+        <span className="nav-label">系统设置</span>
+      </Link>
+      <Link to="/" className={!activeTaskId && activePage === "tasks" ? "nav-item active" : "nav-item"} title="全部任务">
         <span className="nav-short">全</span>
         <span className="nav-label">全部任务</span>
       </Link>

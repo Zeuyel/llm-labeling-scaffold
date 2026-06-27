@@ -11,6 +11,16 @@
 7. 原子写入：关键 JSON/JSONL 文件必须先写临时文件，再通过原子替换提交；新资产目录必须先写入 `_staging`，完整后再发布到正式目录。
 8. 审计日志：资产创建、复用、归档和失败必须写入 `runs/<task_id>/_audit/events.jsonl`。
 
+## 配置与权威源
+
+平台按三层划分配置和数据权威：
+
+- R2 数据湖 / registry 是任务与数据权威。任务启用状态、远端 `task.yaml`、源数据 manifest、源对象 URI 和需要回写的数据湖产物，都以 registry 登记内容为准。
+- panel settings 是当前部署的运行配置。服务器部署后应先在“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，再同步任务配置。
+- 本地 `tasks/` 和 `runs/` 是执行缓存与产物目录。`tasks/` 可以从 registry 重建；`runs/` 记录本部署产生的导入、样本、标注、训练集、模型、推理结果和审计日志。
+
+R2 访问只通过 `rclone` 完成。应用不保存 R2 密钥，Docker 镜像不内置 `rclone.conf`，compose 只允许把宿主机 `rclone.conf` 只读挂载到容器。
+
 ## 导入数据
 
 导入数据保存在：
@@ -83,12 +93,12 @@ runs/<task_id>/samples/<sample_id>/manifest.json
 
 ## 任务配置
 
-生产环境中，任务配置的权威来源是 R2 数据湖登记表，不是本地 `tasks/` 目录。规则：
+生产环境中，任务配置的权威来源是当前 `task_registry_uri` 指向的 R2 registry，不是本地 `tasks/` 目录。规则：
 
-- 新任务必须先写入 R2 任务快照，再在 `data_lake.yaml` 的 `tasks` 段登记。
-- 面板只把 R2 的 `task.yaml` materialize 为本地执行缓存。
+- 新任务必须先写入 R2 任务快照，再在 registry 的 `tasks` 段登记。
+- 面板只把 R2 的 `task.yaml` 同步为本地执行缓存。
 - 本地任务缓存可以重建，不作为长期权威资产。
-- 任务下线应在 R2 登记表中把状态改为非启用状态，不能只删除本地缓存。
+- 任务下线应在 R2 registry 中把状态改为非启用状态，不能只删除本地缓存。
 
 本地开发模式下，任务配置归档而不是删除。归档规则：
 
