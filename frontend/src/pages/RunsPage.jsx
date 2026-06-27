@@ -17,8 +17,12 @@ function defaultDatasetName(taskId, sampleId) {
 export default function RunsPage({ task, taskId, onError }) {
   const [runs, setRuns] = useState([]);
   const [samples, setSamples] = useState([]);
+  const [annotationJobs, setAnnotationJobs] = useState([]);
   const [decisions, setDecisions] = useState([]);
+  const [agreementAudits, setAgreementAudits] = useState([]);
   const [sample, setSample] = useState("");
+  const [decisionPath, setDecisionPath] = useState("");
+  const [agreementAuditId, setAgreementAuditId] = useState("");
   const [annotationId, setAnnotationId] = useState("");
   const [runId, setRunId] = useState("");
   const [provider, setProvider] = useState("local_stub");
@@ -33,20 +37,25 @@ export default function RunsPage({ task, taskId, onError }) {
   const reload = useCallback(async () => {
     if (!taskId) return;
     try {
-      const [r, s, d] = await Promise.all([
+      const [r, s, a, d, q] = await Promise.all([
         api.getTaskRuns(taskId),
         api.getTaskSamples(taskId),
+        api.getAnnotationJobs(taskId),
         api.getDecisionArtifacts(taskId),
+        api.getAgreementAudits(taskId),
       ]);
       setRuns(r.runs || []);
       setSamples(s.samples || []);
+      setAnnotationJobs(a.annotation_jobs || []);
       setDecisions(d.decision_artifacts || []);
+      setAgreementAudits(q.agreement_audits || []);
     } catch (e) { onError(String(e)); }
   }, [taskId, onError]);
 
   useEffect(() => { reload(); }, [reload]);
 
   const selectedSample = samples.find((item) => item.path === sample);
+  const selectedDecision = decisions.find((item) => item.path === decisionPath);
   const generatedDataset = defaultDatasetName(taskId, selectedSample?.sample_id);
 
   useEffect(() => {
@@ -97,6 +106,38 @@ export default function RunsPage({ task, taskId, onError }) {
       dataset,
       decision_id: annotationId || dataset,
     }, "拉回标注结果");
+  }
+
+  async function runAgreementAudit() {
+    const samplePath = selectedDecision?.sample_path || sample;
+    const auditId = agreementAuditId.trim() || selectedDecision?.decision_id || annotationId || "agreement_v001";
+    if (!samplePath || !decisionPath || !auditId) {
+      onError("请选择样本和标注结果产物");
+      return;
+    }
+    await action("agreement_audit", {
+      sample: samplePath,
+      decisions: decisionPath,
+      audit_id: auditId,
+      min_submitted: Number(argillaMinSubmitted),
+    }, "一致性检查");
+  }
+
+  function useAnnotationJob(job) {
+    if (!job) return;
+    const samplePath = job.sample_path || samples.find((item) => item.sample_id === job.sample_id)?.path || "";
+    if (samplePath) setSample(samplePath);
+    setAnnotationId(job.annotation_id || job.argilla_dataset || "");
+    setArgillaDataset(job.argilla_dataset || "");
+    setDatasetAuto(false);
+  }
+
+  function useDecisionArtifact(decision) {
+    if (!decision) return;
+    setDecisionPath(decision.path || "");
+    if (decision.sample_path) setSample(decision.sample_path);
+    setAnnotationId(decision.decision_id || decision.argilla_dataset || "");
+    setAgreementAuditId(decision.decision_id || decision.argilla_dataset || "");
   }
 
   async function testArgilla() {
@@ -171,12 +212,36 @@ export default function RunsPage({ task, taskId, onError }) {
         )}
       </div>
       <div className="card section-card">
+        <div className="toolbar"><h3>已推送标注任务（{annotationJobs.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+        {!annotationJobs.length && <div className="empty">暂无已推送的 Argilla 标注任务</div>}
+        {annotationJobs.length > 0 && (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>标注任务编号</th><th>Argilla 数据集</th><th>样本</th><th>行数</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+              <tbody>
+                {annotationJobs.map((job) => (
+                  <tr key={job.annotation_id || job.argilla_dataset}>
+                    <td><span className="badge badge-blue">{job.annotation_id || "-"}</span></td>
+                    <td>{job.argilla_dataset || "-"}</td>
+                    <td>{job.sample_id || "-"}</td>
+                    <td>{job.rows ?? job.result?.records ?? "-"}</td>
+                    <td>{job.status || "-"}</td>
+                    <td className="muted">{(job.created_at || "").slice(0, 19)}</td>
+                    <td><button className="btn btn-sm" disabled={busy} onClick={() => useAnnotationJob(job)}>用于回收</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      <div className="card section-card">
         <div className="toolbar"><h3>标注结果产物（{decisions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
         {!decisions.length && <div className="empty">暂无标注结果产物</div>}
         {decisions.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>产物编号</th><th>来源</th><th>Argilla 数据集</th><th>样本</th><th>行数</th><th>存储路径</th></tr></thead>
+              <thead><tr><th>产物编号</th><th>来源</th><th>Argilla 数据集</th><th>样本</th><th>行数</th><th>存储路径</th><th>操作</th></tr></thead>
               <tbody>
                 {decisions.map((d) => (
                   <tr key={d.decision_id || d.path}>
@@ -186,6 +251,59 @@ export default function RunsPage({ task, taskId, onError }) {
                     <td>{d.sample_id || "-"}</td>
                     <td>{d.rows ?? d.result?.responses ?? "-"}</td>
                     <td className="muted path-cell">{d.path}</td>
+                    <td><button className="btn btn-sm" disabled={busy} onClick={() => useDecisionArtifact(d)}>用于检查</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+      <div className="card section-card">
+        <h3>一致性检查</h3>
+        <div className="form-grid">
+          <div className="field">
+            <label>样本</label>
+            <select value={sample} onChange={(e) => setSample(e.target.value)}>
+              <option value="">选择样本</option>
+              {samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}
+            </select>
+          </div>
+          <div className="field">
+            <label>标注结果产物</label>
+            <select value={decisionPath} onChange={(e) => setDecisionPath(e.target.value)}>
+              <option value="">选择标注结果</option>
+              {decisions.map((d) => (
+                <option key={d.decision_id || d.path} value={d.path}>
+                  {(d.decision_id || d.argilla_dataset || "未命名")} · {d.rows ?? d.result?.responses ?? "-"} 行
+                </option>
+              ))}
+            </select>
+            {selectedDecision?.sample_path && <span className="hint">所选标注结果已记录样本路径。</span>}
+          </div>
+          <div className="field">
+            <label>检查编号</label>
+            <input value={agreementAuditId} onChange={(e) => setAgreementAuditId(e.target.value)} placeholder={selectedDecision?.decision_id || "agreement_v001"} />
+          </div>
+        </div>
+        <button className="btn btn-primary" disabled={busy || !decisions.length} onClick={runAgreementAudit}>运行一致性检查</button>
+        <div className="toolbar debug-toolbar"><h3>检查记录（{agreementAudits.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+        {!agreementAudits.length && <div className="empty">暂无一致性检查记录</div>}
+        {agreementAudits.length > 0 && (
+          <div className="table-wrap">
+            <table>
+              <thead><tr><th>检查编号</th><th>结果</th><th>样本数</th><th>覆盖数</th><th>低于提交数</th><th>缺主标签</th><th>标签分布</th><th>摘要路径</th></tr></thead>
+              <tbody>
+                {agreementAudits.map((item) => (
+                  <tr key={item.audit_id || item.summary_path}>
+                    <td><span className="badge badge-blue">{item.audit_id || "-"}</span></td>
+                    <td>{item.passed ? <span className="badge badge-green">通过</span> : <span className="badge badge-red">未通过</span>}</td>
+                    <td>{item.sample_unique_ids ?? "-"}</td>
+                    <td>{item.sample_coverage?.covered_ids ?? "-"}</td>
+                    <td>{item.issue_counts?.below_min_submitted_ids ?? "-"}</td>
+                    <td>{item.issue_counts?.primary_label_missing ?? "-"}</td>
+                    <td className="muted text-cell">{JSON.stringify(item.label_distribution || {})}</td>
+                    <td className="muted path-cell">{item.summary_path}</td>
                   </tr>
                 ))}
               </tbody>

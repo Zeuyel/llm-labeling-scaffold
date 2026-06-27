@@ -310,6 +310,24 @@ def _inference_artifact_state(base: Path) -> dict[str, Any]:
 
 
 def _agreement_audit_artifact_state(task_dir: Path) -> dict[str, Any]:
+    agreement_summaries = sorted((task_dir / "agreement_audits").glob("*/summary.json"))
+    passed_evidence: list[str] = []
+    failed_evidence: list[str] = []
+    for path in agreement_summaries:
+        try:
+            summary = read_json(path)
+        except Exception:
+            failed_evidence.append(str(path))
+            continue
+        if summary.get("passed") is True:
+            passed_evidence.append(str(path))
+        else:
+            failed_evidence.append(str(path))
+    if passed_evidence:
+        return {"done": True, "partial": False, "evidence": passed_evidence}
+    if failed_evidence:
+        return {"done": False, "partial": True, "evidence": failed_evidence}
+
     reserved = {
         "samples",
         "gold",
@@ -319,6 +337,7 @@ def _agreement_audit_artifact_state(task_dir: Path) -> dict[str, Any]:
         "inference",
         "decisions",
         "annotation_jobs",
+        "agreement_audits",
         "_jobs",
     }
     evidence = [
@@ -731,6 +750,26 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
         if action == "audit":
             from .audit import audit_run
             return {"summary": audit_run(task, params["run"]), "kind": "audit"}
+        if action == "agreement_audit":
+            from .agreement import audit_agreement
+            audit_id = str(params.get("audit_id") or "").strip()
+            if not audit_id:
+                raise ValueError("缺少一致性检查编号 audit_id")
+            sample = params.get("sample")
+            decisions = params.get("decisions")
+            if not sample:
+                raise ValueError("缺少样本文件 sample")
+            if not decisions:
+                raise ValueError("缺少标注决策文件 decisions")
+            with _asset_lock(runs_root, task.task_id, f"agreement-audit-{audit_id}"):
+                result = audit_agreement(
+                    task,
+                    sample,
+                    decisions,
+                    audit_id,
+                    min_submitted=int(params.get("min_submitted", 1)),
+                )
+            return {"kind": "agreement_audit", **result}
         if action == "merge":
             from .merge import merge_run
             return {"summary": merge_run(task, params["run"]), "kind": "merge"}
@@ -1357,6 +1396,30 @@ def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
                 "task_id": task_id,
                 "annotation_id": dd.name,
                 "source": "unknown",
+            })
+    return out
+
+
+def list_agreement_audits(runs_root: Path, task_id: str) -> list[dict]:
+    out: list[dict] = []
+    base = Path(runs_root) / task_id / "agreement_audits"
+    if not base.is_dir():
+        return out
+    for dd in sorted(p for p in base.iterdir() if p.is_dir()):
+        summary_path = dd / "summary.json"
+        if summary_path.exists():
+            summary = read_json(summary_path)
+            out.append({
+                **summary,
+                "audit_id": summary.get("audit_id") or dd.name,
+                "summary_path": str(summary_path),
+            })
+        else:
+            out.append({
+                "task_id": task_id,
+                "audit_id": dd.name,
+                "summary_path": str(summary_path),
+                "state": "incomplete",
             })
     return out
 

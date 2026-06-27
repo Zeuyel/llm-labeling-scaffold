@@ -6,7 +6,7 @@ const STATUS_LABEL = {
   not_started: "未开始",
   ready: "可执行",
   completed: "已完成",
-  blocked: "阻塞",
+  blocked: "受阻",
 };
 
 const STATUS_BADGE = {
@@ -83,6 +83,38 @@ function stageActionHint(stage, status, index, total) {
   return "等待前置阶段完成";
 }
 
+function stageRoute(taskId, stage) {
+  const action = String(stage.action || stage.id || "");
+  const target = {
+    import: "imports",
+    lake_import: "imports",
+    sample: "samples",
+    argilla_push: "annotations",
+    argilla_dispatch: "annotations",
+    argilla_pull: "annotations",
+    audit: "annotations",
+    agreement_audit: "annotations",
+    gold: "gold",
+    gold_build: "gold",
+    train: "models",
+    infer: "models",
+    batch_infer: "models",
+  }[action];
+  if (!target) return `/task/${encodeURIComponent(taskId)}`;
+  return `/task/${encodeURIComponent(taskId)}/${target}`;
+}
+
+function stageRouteLabel(stage, status) {
+  const action = String(stage.action || stage.id || "");
+  const verb = status === "completed" ? "查看" : "进入";
+  if (["import", "lake_import"].includes(action)) return `${verb}导入`;
+  if (action === "sample") return `${verb}样本`;
+  if (["argilla_push", "argilla_dispatch", "argilla_pull", "audit", "agreement_audit"].includes(action)) return `${verb}标注`;
+  if (["gold", "gold_build"].includes(action)) return `${verb}训练集`;
+  if (["train", "infer", "batch_infer"].includes(action)) return `${verb}模型`;
+  return `${verb}处理`;
+}
+
 export default function TaskOverviewPage({ task, taskId, onError }) {
   const [counts, setCounts] = useState({ imports: 0, samples: 0, decisions: 0, gold: 0, models: 0, jobs: 0 });
   const [profile, setProfile] = useState({ loading: false, data: null, error: "" });
@@ -135,7 +167,8 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
   ];
 
   const stages = profileStages(profile.data);
-  const profileTitle = profile.data ? profileName(profile.data) : "等待后端 profile";
+  const profileTitle = profile.data ? profileName(profile.data) : "等待流程预设";
+  const nextStage = stages.find((stage) => normalizeStageStatus(stage.status) === "ready");
 
   return (
     <div>
@@ -148,12 +181,15 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
         <div className="toolbar profile-toolbar">
           <div>
             <h3>流程预设</h3>
-            <div className="status-line">当前预设：{profileTitle}{stages.length ? ` · ${stages.length} 个阶段` : ""}</div>
+            <div className="status-line">
+              当前预设：{profileTitle}{stages.length ? ` · ${stages.length} 个阶段` : ""}
+              {nextStage ? ` · 下一步：${nextStage.title || nextStage.name || nextStage.id}` : ""}
+            </div>
           </div>
         </div>
         {profile.loading && <div className="empty profile-empty">正在读取流程预设...</div>}
         {!profile.loading && profile.error && <div className="empty profile-empty">{profile.error}</div>}
-        {!profile.loading && !profile.error && !stages.length && <div className="empty profile-empty">当前 profile 未返回阶段列表。</div>}
+        {!profile.loading && !profile.error && !stages.length && <div className="empty profile-empty">当前流程预设没有返回阶段列表。</div>}
         {!profile.loading && !profile.error && stages.length > 0 && (
           <div className="profile-stage-list">
             {stages.map((stage, index) => {
@@ -168,7 +204,15 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
                         <h4>{title}</h4>
                         {stage.description && <p>{stage.description}</p>}
                       </div>
-                      <span className={`badge ${STATUS_BADGE[status]}`}>{STATUS_LABEL[status]}</span>
+                      <div className="profile-stage-actions">
+                        <span className={`badge ${STATUS_BADGE[status]}`}>{STATUS_LABEL[status]}</span>
+                        <Link
+                          className={status === "ready" ? "btn btn-sm btn-primary" : "btn btn-sm"}
+                          to={stageRoute(taskId, stage)}
+                        >
+                          {stageRouteLabel(stage, status)}
+                        </Link>
+                      </div>
                     </div>
                     <div className="profile-stage-details">
                       <div><span>输入条件</span><strong>{detailText(stage.required_inputs, "无前置输入")}</strong></div>

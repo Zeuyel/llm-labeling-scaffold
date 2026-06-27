@@ -328,6 +328,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"annotation_jobs": pipeline.list_annotation_jobs(self.runs_root, task)})
+        elif path == "/api/task/agreement_audits":
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            self._json({"agreement_audits": pipeline.list_agreement_audits(self.runs_root, task)})
         elif path == "/api/task/models":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):

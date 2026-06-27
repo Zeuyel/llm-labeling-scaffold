@@ -1,9 +1,17 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 
 function shortHash(value) {
   return value ? `${String(value).slice(0, 12)}...` : "-";
+}
+
+function sampleIdFromImport(importId) {
+  return String(importId || "sample")
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[_.-]+|[_.-]+$/g, "") || "sample";
 }
 
 export default function SamplesPage({ task, taskId, onError }) {
@@ -15,6 +23,7 @@ export default function SamplesPage({ task, taskId, onError }) {
   const [strategy, setStrategy] = useState("head");
   const [batchSize, setBatchSize] = useState(5);
   const [batchSample, setBatchSample] = useState("");
+  const [sampleAuto, setSampleAuto] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
 
@@ -28,6 +37,29 @@ export default function SamplesPage({ task, taskId, onError }) {
   }, [taskId, onError]);
 
   useEffect(() => { reload(); }, [reload]);
+
+  const selectedImport = useMemo(
+    () => imports.find((item) => item.path === source) || null,
+    [imports, source],
+  );
+
+  useEffect(() => {
+    if (!source && imports.length) {
+      setSource(imports[0].path);
+    }
+  }, [imports, source]);
+
+  useEffect(() => {
+    if (!selectedImport) return;
+    if (sampleAuto) {
+      setSampleId(sampleIdFromImport(selectedImport.import_id));
+    }
+    setRows((current) => {
+      const numeric = Number(current);
+      if (!current || numeric === 6) return selectedImport.rows || current;
+      return current;
+    });
+  }, [sampleAuto, selectedImport]);
 
   async function runAction(action, params, label) {
     if (!task) return false;
@@ -48,7 +80,6 @@ export default function SamplesPage({ task, taskId, onError }) {
 
   async function createSample() {
     if (!task || !sampleId) { onError("请填写样本编号"); return; }
-    const selectedImport = imports.find((item) => item.path === source);
     setNotice("");
     const ok = await runAction("sample", {
       sample_id: sampleId,
@@ -104,11 +135,18 @@ export default function SamplesPage({ task, taskId, onError }) {
           <div className="field"><label>样本编号</label><input value={sampleId} onChange={(e) => setSampleId(e.target.value)} placeholder="例如 seed_v1" /></div>
           <div className="field">
             <label>数据来源</label>
-            <select value={source} onChange={(e) => setSource(e.target.value)}>
+            <select value={source} onChange={(e) => { setSource(e.target.value); setSampleAuto(true); }}>
               <option value="">任务配置中的原始语料</option>
               {imports.map((item) => (
                 <option key={item.import_id} value={item.path}>{item.import_id} · {item.rows} 行</option>
               ))}
+            </select>
+          </div>
+          <div className="field">
+            <label>编号方式</label>
+            <select value={sampleAuto ? "auto" : "manual"} onChange={(e) => setSampleAuto(e.target.value === "auto")}>
+              <option value="auto">按导入编号自动生成</option>
+              <option value="manual">手动填写样本编号</option>
             </select>
           </div>
           <div className="field"><label>抽样行数</label><input type="number" min="1" value={rows} onChange={(e) => setRows(e.target.value)} /></div>
