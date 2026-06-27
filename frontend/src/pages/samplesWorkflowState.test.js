@@ -4,9 +4,12 @@ import {
   computeSampleDetailActions,
   computeSampleWorkflow,
   computeSamplesListView,
+  filterSampleAuditEvents,
   hasBatchPlan,
   newestSample,
+  sampleCreatedAt,
   sampleCompletionNotice,
+  sampleStateLabel,
   STAGE_STATUS,
 } from "./samplesWorkflowState.js";
 
@@ -124,4 +127,21 @@ test("sample completion notice is clear for idempotent reuse", () => {
     sampleCompletionNotice({ existedBefore: true, result: { artifact: "/tmp/sample.jsonl" } }),
     /样本已存在且内容一致，已复用/,
   );
+});
+
+test("sample detail display exposes state, creation time, and filtered audit events", () => {
+  const sample = {
+    sample_id: "sample_a",
+    manifest: { state: "active", created_at: "2026-06-17T06:21:55.037431+00:00" },
+  };
+  const events = filterSampleAuditEvents([
+    { asset_type: "sample", asset_id: "sample_a", event: "sample.create" },
+    { asset_type: "sample", asset_id: "sample_b", event: "sample.create" },
+    { asset_type: "import", asset_id: "sample_a", event: "import.create" },
+  ], "sample_a");
+
+  assert.equal(sampleStateLabel(sample), "可用");
+  assert.equal(sampleStateLabel({ manifest: { state: "archived" } }), "已归档");
+  assert.equal(sampleCreatedAt(sample), "2026-06-17T06:21:55");
+  assert.deepEqual(events.map((event) => event.event), ["sample.create"]);
 });

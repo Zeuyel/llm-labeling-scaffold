@@ -5,10 +5,13 @@ import {
   computeSampleDetailActions,
   computeSampleWorkflow,
   computeSamplesListView,
+  filterSampleAuditEvents,
   getBatchManifests,
   hasBatchPlan,
   newestSample,
+  sampleCreatedAt,
   sampleCompletionNotice,
+  sampleStateLabel,
 } from "./samplesWorkflowState.js";
 import {
   batchPlanDebugFields,
@@ -111,9 +114,17 @@ function manifestJson(value) {
   return JSON.stringify(value || {}, null, 2);
 }
 
+const EVENT_LABEL = {
+  "sample.create": "创建样本",
+  "sample.reuse": "复用样本",
+  "sample.save": "保存样本",
+  "sample.archive": "归档样本",
+};
+
 export default function SamplesPage({ task, taskId, onError }) {
   const [samples, setSamples] = useState([]);
   const [imports, setImports] = useState([]);
+  const [auditEvents, setAuditEvents] = useState([]);
   const [sampleId, setSampleId] = useState("");
   const [source, setSource] = useState("");
   const [rows, setRows] = useState(6);
@@ -140,9 +151,14 @@ export default function SamplesPage({ task, taskId, onError }) {
     }
     setAssetsLoading(true);
     try {
-      const [s, i] = await Promise.all([api.getTaskSamples(taskId), api.getImports(taskId)]);
+      const [s, i, a] = await Promise.all([
+        api.getTaskSamples(taskId),
+        api.getImports(taskId),
+        api.getAuditEvents(taskId).catch(() => ({ events: [] })),
+      ]);
       setSamples(s.samples || []);
       setImports(i.imports || []);
+      setAuditEvents(a.events || []);
     } catch (e) {
       onError(String(e));
     } finally {
@@ -203,6 +219,10 @@ export default function SamplesPage({ task, taskId, onError }) {
   const detailActions = useMemo(
     () => computeSampleDetailActions({ assetsLoading, busy, sample: selectedDetailSample }),
     [assetsLoading, busy, selectedDetailSample],
+  );
+  const selectedAuditEvents = useMemo(
+    () => filterSampleAuditEvents(auditEvents, selectedDetailSample?.sample_id),
+    [auditEvents, selectedDetailSample],
   );
 
   const selectedSampleRows = Number(selectedBatchSample?.manifest?.rows || 0);
@@ -412,12 +432,14 @@ export default function SamplesPage({ task, taskId, onError }) {
               <thead>
                 <tr>
                   <th>样本集</th>
+                  <th>状态</th>
                   <th>行数</th>
                   <th>抽样策略</th>
                   <th>来源导入</th>
                   <th>批次计划</th>
                   <th>一致性策略</th>
                   <th>关联资产</th>
+                  <th>创建时间</th>
                   <th>存储路径</th>
                   <th>操作</th>
                 </tr>
@@ -431,12 +453,14 @@ export default function SamplesPage({ task, taskId, onError }) {
                         <strong>{s.sample_id}</strong>
                         <div className="status-line mono-cell">{shortHash(s.manifest?.content_sha256)}</div>
                       </td>
+                      <td><span className={`badge ${sampleStateLabel(s) === "可用" ? "badge-green" : "badge-gray"}`}>{sampleStateLabel(s)}</span></td>
                       <td>{s.manifest ? s.manifest.rows : "-"}</td>
                       <td>{formatStrategy(s.manifest?.strategy)}</td>
                       <td>{s.manifest?.source_import_id || "-"}</td>
                       <td>{summary.batchText}</td>
                       <td className="text-cell">{summary.policyText}</td>
                       <td>{sampleDependencies(s)}</td>
+                      <td className="muted">{sampleCreatedAt(s)}</td>
                       <td className="muted path-cell">{s.path}</td>
                       <td>
                         <div className="action-row">
@@ -616,6 +640,8 @@ export default function SamplesPage({ task, taskId, onError }) {
             </div>
 
             <div className="drawer-detail-grid">
+              <DetailField label="状态" value={sampleStateLabel(selectedDetailSample)} />
+              <DetailField label="创建时间" value={sampleCreatedAt(selectedDetailSample)} />
               <DetailField label="行数" value={selectedDetailSample.manifest?.rows} />
               <DetailField label="抽样策略" value={formatStrategy(selectedDetailSample.manifest?.strategy)} />
               <DetailField label="来源导入" value={selectedDetailSample.manifest?.source_import_id || detailSourceImport?.import_id} />
@@ -631,6 +657,28 @@ export default function SamplesPage({ task, taskId, onError }) {
             <details className="secondary-panel">
               <summary>样本 manifest</summary>
               <pre className="log-box">{manifestJson(selectedDetailSample.manifest)}</pre>
+            </details>
+
+            <details className="secondary-panel" open>
+              <summary>资产审计</summary>
+              {!selectedAuditEvents.length && <div className="empty">暂无该样本的审计事件</div>}
+              {selectedAuditEvents.length > 0 && (
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>时间</th><th>事件</th><th>状态</th><th>详情</th></tr></thead>
+                    <tbody>
+                      {selectedAuditEvents.map((event, index) => (
+                        <tr key={`${event.created_at}-${index}`}>
+                          <td className="muted">{(event.created_at || "").slice(0, 19)}</td>
+                          <td>{EVENT_LABEL[event.event] || event.event}</td>
+                          <td><span className={`badge ${event.status === "failed" ? "badge-red" : "badge-green"}`}>{event.status === "failed" ? "失败" : "成功"}</span></td>
+                          <td className="muted path-cell">{JSON.stringify(event.details || {}).slice(0, 180)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </details>
 
             <details className="secondary-panel" open>

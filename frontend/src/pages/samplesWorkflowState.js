@@ -33,6 +33,26 @@ export function hasBatchPlan(sample) {
   return getBatchManifests(sample).length > 0;
 }
 
+export function sampleStateLabel(sample) {
+  const state = String(sample?.state || sample?.manifest?.state || "active").trim().toLowerCase();
+  if (state === "active") return "可用";
+  if (state === "archived") return "已归档";
+  if (state === "incomplete") return "记录不完整";
+  if (state === "failed") return "失败";
+  return state || "-";
+}
+
+export function sampleCreatedAt(sample) {
+  const value = sample?.created_at || sample?.manifest?.created_at || "";
+  return value ? String(value).slice(0, 19) : "-";
+}
+
+export function filterSampleAuditEvents(events = [], sampleId = "") {
+  const target = String(sampleId || "");
+  if (!target) return [];
+  return events.filter((event) => event?.asset_type === "sample" && String(event.asset_id || "") === target);
+}
+
 export function newestSample(samples = []) {
   if (!samples.length) return null;
   return [...samples].sort((a, b) => {
