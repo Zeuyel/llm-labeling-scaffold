@@ -80,7 +80,7 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
                 "action": "agreement_audit",
                 "artifact_dir": "agreement_audits",
                 "depends_on": ["argilla_pull"],
-                "description": "检查标注一致性并确认可进入 gold 构建。",
+                "description": "检查标注一致性并确认可进入训练集构建。",
                 "required_inputs": ["标注结果产物", "一致性和裁决规则"],
                 "outputs": ["runs/<task_id>/agreement_audits/<audit_id>/summary.json"],
                 "action_hint": "检查多人标注一致性、冲突裁决和最低提交数。",
@@ -92,10 +92,10 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
                 "action": "gold",
                 "artifact_dir": "gold",
                 "depends_on": ["agreement_audit"],
-                "description": "生成 gold 数据集和数据卡。",
+                "description": "生成训练集数据和数据卡。",
                 "required_inputs": ["通过质量检查的标注结果", "样本清单"],
                 "outputs": ["runs/<task_id>/gold/gold_<version>.jsonl", "gold_<version>.manifest.json"],
-                "action_hint": "进入训练集页，从标注结果构建 gold 版本。",
+                "action_hint": "进入训练集页，从标注结果构建训练集版本。",
             },
             {
                 "id": "train",
@@ -104,10 +104,10 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
                 "action": "train",
                 "artifact_dir": "models",
                 "depends_on": ["gold_build"],
-                "description": "基于 gold 数据训练模型版本。",
+                "description": "基于训练集数据训练模型版本。",
                 "required_inputs": ["训练集版本", "训练配置"],
                 "outputs": ["runs/<task_id>/models/<model_id>/manifest.json", "metrics.json"],
-                "action_hint": "进入模型页，选择 gold 版本训练模型；交叉验证参数由 trainer 读取。",
+                "action_hint": "进入模型页，选择训练集版本训练模型；交叉验证参数由训练器读取。",
             },
             {
                 "id": "batch_infer",
@@ -117,7 +117,7 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
                 "artifact_dir": "inference",
                 "depends_on": ["train"],
                 "description": "使用模型对语料执行批量推理。",
-                "required_inputs": ["model version", "corpus JSONL"],
+                "required_inputs": ["模型版本", "语料文件"],
                 "outputs": ["runs/<task_id>/inference/<run_id>/predictions.jsonl"],
                 "action_hint": "进入模型页，选择模型和语料执行批量推理。",
             },
@@ -129,7 +129,7 @@ BUILTIN_PROFILES: dict[str, dict[str, Any]] = {
 def profile_definition(profile_id: str | None = None) -> dict[str, Any]:
     resolved = str(profile_id or DEFAULT_PROFILE).strip() or DEFAULT_PROFILE
     if resolved not in BUILTIN_PROFILES:
-        raise ValueError(f"未知 profile: {resolved}")
+        raise ValueError(f"未知流程预设: {resolved}")
     return deepcopy(BUILTIN_PROFILES[resolved])
 
 
