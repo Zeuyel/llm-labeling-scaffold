@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  agreementAuditCoverageLabel,
+  agreementAuditIssueSummary,
+  agreementAuditStatusLabel,
+  agreementAuditsForDecision,
   agreementAuditsForAnnotationJob,
   annotationJobActionAvailability,
   annotationJobBatchSummary,
@@ -9,6 +13,9 @@ import {
   batchPlanDebugFields,
   batchPlanFromManifest,
   batchPlanOptionLabel,
+  decisionArtifactLabel,
+  decisionArtifactLineageFields,
+  decisionArtifactStatusLabel,
   formatBatchPlanSummary,
 } from "./batchPlanDisplay.js";
 
@@ -102,6 +109,7 @@ test("annotation job list uses business labels and readable statuses", () => {
   assert.equal(annotationJobStatusLabel({ state: "running" }), "执行中");
   assert.equal(annotationJobStatusLabel({ status: "failed" }), "失败");
   assert.equal(annotationJobStatusLabel({ state: "incomplete" }), "记录不完整");
+  assert.equal(annotationJobStatusLabel({ annotation_id: "round_2" }), "已记录");
 });
 
 test("annotation job detail action availability explains disabled states", () => {
@@ -136,4 +144,58 @@ test("annotation job detail finds related agreement audits", () => {
     agreementAuditsForAnnotationJob(job, decisions, audits).map((item) => item.audit_id),
     ["round_1", "other"],
   );
+});
+
+test("decision artifact detail uses readable labels and lineage fields", () => {
+  const decision = {
+    decision_id: "round_1",
+    source: "argilla",
+    argilla_dataset: "dataset_round_1",
+    sample_id: "sample_a",
+    sample_path: "/tmp/sample.jsonl",
+    path: "/tmp/decisions.jsonl",
+    rows: 12,
+    dispatch_mode: "batch_plan",
+    batch_plan_id: "qc_round_1",
+    batch_ids: ["batch_1", "batch_2"],
+  };
+
+  assert.equal(decisionArtifactLabel(decision), "round_1");
+  assert.equal(decisionArtifactStatusLabel(decision), "已回收");
+  assert.equal(decisionArtifactStatusLabel({ decision_id: "broken" }), "记录不完整");
+
+  const fields = Object.fromEntries(decisionArtifactLineageFields(decision));
+  assert.equal(fields["来源"], "Argilla");
+  assert.equal(fields["分发方式"], "按批次计划分发");
+  assert.equal(fields["批次数"], 2);
+});
+
+test("agreement audit detail summarizes status, coverage, issues, and decision linkage", () => {
+  const decision = {
+    decision_id: "round_1",
+    argilla_dataset: "dataset_round_1",
+    path: "/tmp/decisions.jsonl",
+    sample_path: "/tmp/sample.jsonl",
+  };
+  const audits = [
+    {
+      audit_id: "round_1",
+      passed: false,
+      sample_path: "/tmp/sample.jsonl",
+      decisions_path: "/tmp/decisions.jsonl",
+      sample_coverage: { sample_ids: 10, covered_ids: 8, coverage_rate: 0.8 },
+      issue_counts: { below_min_submitted_ids: 2, primary_label_missing: 1 },
+    },
+    {
+      audit_id: "unrelated",
+      passed: true,
+      decisions_path: "/tmp/other.jsonl",
+    },
+  ];
+
+  assert.deepEqual(agreementAuditsForDecision(decision, audits).map((item) => item.audit_id), ["round_1"]);
+  assert.equal(agreementAuditStatusLabel(audits[0]), "未通过");
+  assert.equal(agreementAuditCoverageLabel(audits[0]), "8/10（80%）");
+  assert.equal(agreementAuditIssueSummary(audits[0]), "缺主标签 1；提交数不足 2");
+  assert.equal(agreementAuditIssueSummary({ passed: true }), "无阻塞问题");
 });

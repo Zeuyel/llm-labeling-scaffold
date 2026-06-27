@@ -2,6 +2,13 @@ import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 import {
+  agreementAuditCoverageLabel,
+  agreementAuditDebugFields,
+  agreementAuditIssueSummary,
+  agreementAuditKey,
+  agreementAuditLabel,
+  agreementAuditStatusLabel,
+  agreementAuditsForDecision,
   agreementAuditsForAnnotationJob,
   annotationJobActionAvailability,
   annotationJobBatchSummary,
@@ -13,6 +20,12 @@ import {
   batchPlanDebugFields,
   batchPlanOptionLabel,
   defaultDatasetName,
+  decisionArtifactDebugFields,
+  decisionArtifactKey,
+  decisionArtifactLabel,
+  decisionArtifactLineageFields,
+  decisionArtifactSourceLabel,
+  decisionArtifactStatusLabel,
   displayPlanValue,
   firstDefined,
   formatBatchPlanSummary,
@@ -24,9 +37,9 @@ function annotationJobKey(job) {
 }
 
 function statusBadgeClass(label) {
-  if (label === "已推送" || label === "已记录") return "badge-green";
+  if (label === "已推送" || label === "已记录" || label === "已回收" || label === "通过") return "badge-green";
   if (label === "执行中") return "badge-blue";
-  if (label === "失败") return "badge-red";
+  if (label === "失败" || label === "未通过") return "badge-red";
   return "badge-gray";
 }
 
@@ -47,6 +60,39 @@ function decisionsForJob(job, decisions) {
     || (dataset && String(item.argilla_dataset || "") === dataset)
     || (sampleId && String(item.sample_id || "") === sampleId)
   ));
+}
+
+function findJobForDecision(decision, jobs) {
+  if (!decision) return null;
+  const annotationId = String(firstDefined(decision.annotation_id, decision.source_annotation_id, decision.decision_id, ""));
+  const dataset = String(firstDefined(decision.argilla_dataset, decision.dataset, ""));
+  const sampleId = String(decision.sample_id || "");
+  return jobs.find((job) => (
+    (annotationId && String(firstDefined(job.annotation_id, job.id, "")) === annotationId)
+    || (dataset && String(firstDefined(job.argilla_dataset, job.dataset, "")) === dataset)
+    || (sampleId && String(job.sample_id || "") === sampleId)
+  )) || null;
+}
+
+function findDecisionForAudit(audit, decisions) {
+  if (!audit) return null;
+  const auditId = String(audit.audit_id || "");
+  const decisionsPath = String(audit.decisions_path || "");
+  const samplePath = String(audit.sample_path || "");
+  return decisions.find((decision) => (
+    (decisionsPath && String(decision.path || "") === decisionsPath)
+    || (auditId && [decision.decision_id, decision.argilla_dataset, decision.annotation_id, decision.source_annotation_id]
+      .map((value) => String(value || ""))
+      .includes(auditId))
+    || (samplePath && String(decision.sample_path || "") === samplePath && auditId && String(decision.decision_id || "") === auditId)
+  )) || null;
+}
+
+function agreementDisabledReason(decision, samplePath) {
+  if (!decision) return "未选择标注结果。";
+  if (!decision.path) return "标注结果缺少产物路径，不能运行一致性检查。";
+  if (!samplePath) return "标注结果缺少样本路径，不能运行一致性检查。";
+  return "";
 }
 
 function DetailField({ label, value }) {
@@ -79,6 +125,8 @@ export default function RunsPage({ task, taskId, onError }) {
   const [busy, setBusy] = useState(false);
   const [showCreatePanel, setShowCreatePanel] = useState(false);
   const [selectedJobKey, setSelectedJobKey] = useState("");
+  const [selectedDecisionKey, setSelectedDecisionKey] = useState("");
+  const [selectedAuditKey, setSelectedAuditKey] = useState("");
 
   const reload = useCallback(async () => {
     if (!taskId) return;
@@ -104,6 +152,20 @@ export default function RunsPage({ task, taskId, onError }) {
   const batchPlans = useMemo(() => getBatchPlans(selectedSample), [selectedSample]);
   const selectedBatchPlan = batchPlans.find((item) => item.key === batchPlanKey) || null;
   const selectedAnnotationJob = annotationJobs.find((item) => annotationJobKey(item) === selectedJobKey) || null;
+  const selectedDecision = decisions.find((item) => decisionArtifactKey(item) === selectedDecisionKey) || null;
+  const selectedAudit = agreementAudits.find((item) => agreementAuditKey(item) === selectedAuditKey) || null;
+  const selectedDecisionJob = useMemo(
+    () => findJobForDecision(selectedDecision, annotationJobs),
+    [selectedDecision, annotationJobs],
+  );
+  const selectedAuditDecision = useMemo(
+    () => findDecisionForAudit(selectedAudit, decisions),
+    [selectedAudit, decisions],
+  );
+  const selectedAuditJob = useMemo(
+    () => findJobForDecision(selectedAuditDecision, annotationJobs),
+    [selectedAuditDecision, annotationJobs],
+  );
   const selectedJobDecisions = useMemo(
     () => decisionsForJob(selectedAnnotationJob, decisions),
     [selectedAnnotationJob, decisions],
@@ -120,6 +182,15 @@ export default function RunsPage({ task, taskId, onError }) {
     () => agreementAuditsForAnnotationJob(selectedAnnotationJob, selectedJobDecisions, agreementAudits),
     [selectedAnnotationJob, selectedJobDecisions, agreementAudits],
   );
+  const selectedDecisionSamplePath = useMemo(
+    () => selectedDecision?.sample_path || findSamplePathForJob(selectedDecisionJob, samples),
+    [selectedDecision, selectedDecisionJob, samples],
+  );
+  const selectedDecisionAudits = useMemo(
+    () => agreementAuditsForDecision(selectedDecision, agreementAudits),
+    [selectedDecision, agreementAudits],
+  );
+  const selectedDecisionAgreementReason = agreementDisabledReason(selectedDecision, selectedDecisionSamplePath);
   const generatedDataset = defaultDatasetName(taskId, selectedSample?.sample_id, selectedBatchPlan?.plan_id);
   const pushDisabledReason = !sample
     ? "请选择样本集。"
@@ -143,6 +214,18 @@ export default function RunsPage({ task, taskId, onError }) {
     }
   }, [selectedSample, batchPlans, batchPlanKey]);
 
+  useEffect(() => {
+    if (selectedJobKey && !selectedAnnotationJob) setSelectedJobKey("");
+  }, [selectedJobKey, selectedAnnotationJob]);
+
+  useEffect(() => {
+    if (selectedDecisionKey && !selectedDecision) setSelectedDecisionKey("");
+  }, [selectedDecisionKey, selectedDecision]);
+
+  useEffect(() => {
+    if (selectedAuditKey && !selectedAudit) setSelectedAuditKey("");
+  }, [selectedAuditKey, selectedAudit]);
+
   async function action(name, params, label) {
     if (!task) return false;
     setBusy(true);
@@ -162,6 +245,8 @@ export default function RunsPage({ task, taskId, onError }) {
 
   function openCreatePanel() {
     setSelectedJobKey("");
+    setSelectedDecisionKey("");
+    setSelectedAuditKey("");
     if (!sample && samples.length) {
       setSample(samples[samples.length - 1].path);
     }
@@ -170,7 +255,23 @@ export default function RunsPage({ task, taskId, onError }) {
 
   function openJobDetail(job) {
     setShowCreatePanel(false);
+    setSelectedDecisionKey("");
+    setSelectedAuditKey("");
     setSelectedJobKey(annotationJobKey(job));
+  }
+
+  function openDecisionDetail(decision) {
+    setShowCreatePanel(false);
+    setSelectedJobKey("");
+    setSelectedAuditKey("");
+    setSelectedDecisionKey(decisionArtifactKey(decision));
+  }
+
+  function openAuditDetail(audit) {
+    setShowCreatePanel(false);
+    setSelectedJobKey("");
+    setSelectedDecisionKey("");
+    setSelectedAuditKey(agreementAuditKey(audit));
   }
 
   async function annotate() {
@@ -349,19 +450,41 @@ export default function RunsPage({ task, taskId, onError }) {
         {decisions.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>产物编号</th><th>来源</th><th>Argilla 数据集</th><th>样本</th><th>行数</th><th>存储路径</th><th>操作</th></tr></thead>
+              <thead><tr><th>产物编号</th><th>状态</th><th>来源</th><th>Argilla 数据集</th><th>样本</th><th>行数</th><th>检查记录</th><th>存储路径</th><th>操作</th></tr></thead>
               <tbody>
-                {decisions.map((d) => (
-                  <tr key={d.decision_id || d.path}>
-                    <td><span className="badge badge-blue">{d.decision_id || "-"}</span></td>
-                    <td>{d.source === "argilla" ? "Argilla" : (d.source || "-")}</td>
-                    <td>{d.argilla_dataset || "-"}</td>
-                    <td>{d.sample_id || "-"}</td>
-                    <td>{d.rows ?? d.result?.responses ?? "-"}</td>
-                    <td className="muted path-cell">{d.path}</td>
-                    <td><button className="btn btn-sm" disabled={busy} onClick={() => runAgreementAuditForDecision(d)}>运行检查</button></td>
-                  </tr>
-                ))}
+                {decisions.map((d) => {
+                  const key = decisionArtifactKey(d);
+                  const status = decisionArtifactStatusLabel(d);
+                  const auditCount = agreementAuditsForDecision(d, agreementAudits).length;
+                  return (
+                    <tr
+                      key={key}
+                      className={selectedDecisionKey === key ? "row-selected clickable-row" : "clickable-row"}
+                      onClick={() => openDecisionDetail(d)}
+                    >
+                      <td><span className="badge badge-blue">{decisionArtifactLabel(d)}</span></td>
+                      <td><span className={`badge ${statusBadgeClass(status)}`}>{status}</span></td>
+                      <td>{decisionArtifactSourceLabel(d)}</td>
+                      <td>{d.argilla_dataset || "-"}</td>
+                      <td>{d.sample_id || "-"}</td>
+                      <td>{d.rows ?? d.result?.responses ?? "-"}</td>
+                      <td>{auditCount ? `${auditCount} 条` : "未检查"}</td>
+                      <td className="muted path-cell">{d.path}</td>
+                      <td>
+                        <button
+                          className="btn btn-sm"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openDecisionDetail(d);
+                          }}
+                        >
+                          详情
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -374,20 +497,39 @@ export default function RunsPage({ task, taskId, onError }) {
         {agreementAudits.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>检查编号</th><th>结果</th><th>样本数</th><th>覆盖数</th><th>低于提交数</th><th>缺主标签</th><th>标签分布</th><th>摘要路径</th></tr></thead>
+              <thead><tr><th>检查编号</th><th>状态</th><th>样本数</th><th>覆盖</th><th>问题摘要</th><th>标签分布</th><th>摘要路径</th><th>操作</th></tr></thead>
               <tbody>
-                {agreementAudits.map((item) => (
-                  <tr key={item.audit_id || item.summary_path}>
-                    <td><span className="badge badge-blue">{item.audit_id || "-"}</span></td>
-                    <td>{item.passed ? <span className="badge badge-green">通过</span> : <span className="badge badge-red">未通过</span>}</td>
-                    <td>{item.sample_unique_ids ?? "-"}</td>
-                    <td>{item.sample_coverage?.covered_ids ?? "-"}</td>
-                    <td>{item.issue_counts?.below_min_submitted_ids ?? "-"}</td>
-                    <td>{item.issue_counts?.primary_label_missing ?? "-"}</td>
-                    <td className="muted text-cell">{JSON.stringify(item.label_distribution || {})}</td>
-                    <td className="muted path-cell">{item.summary_path}</td>
-                  </tr>
-                ))}
+                {agreementAudits.map((item) => {
+                  const key = agreementAuditKey(item);
+                  const status = agreementAuditStatusLabel(item);
+                  return (
+                    <tr
+                      key={key}
+                      className={selectedAuditKey === key ? "row-selected clickable-row" : "clickable-row"}
+                      onClick={() => openAuditDetail(item)}
+                    >
+                      <td><span className="badge badge-blue">{agreementAuditLabel(item)}</span></td>
+                      <td><span className={`badge ${statusBadgeClass(status)}`}>{status}</span></td>
+                      <td>{item.sample_unique_ids ?? item.sample_rows ?? "-"}</td>
+                      <td>{agreementAuditCoverageLabel(item)}</td>
+                      <td className="muted text-cell">{agreementAuditIssueSummary(item)}</td>
+                      <td className="muted text-cell">{JSON.stringify(item.label_distribution || {})}</td>
+                      <td className="muted path-cell">{item.summary_path}</td>
+                      <td>
+                        <button
+                          className="btn btn-sm"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openAuditDetail(item);
+                          }}
+                        >
+                          详情
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -600,7 +742,7 @@ export default function RunsPage({ task, taskId, onError }) {
                     <strong>{decision.decision_id || decision.argilla_dataset || "未命名结果"}</strong>
                     <span>{decision.rows ?? decision.result?.responses ?? "-"} 行 · {decision.path || "缺少产物路径"}</span>
                   </div>
-                  <button className="btn btn-sm" disabled={busy} onClick={() => runAgreementAuditForDecision(decision, selectedAnnotationJob)}>运行检查</button>
+                  <button className="btn btn-sm" type="button" onClick={() => openDecisionDetail(decision)}>详情</button>
                 </div>
               ))}
             </div>
@@ -617,9 +759,7 @@ export default function RunsPage({ task, taskId, onError }) {
                       {audit.summary_path || "缺少摘要路径"}
                     </span>
                   </div>
-                  <span className={`badge ${audit.passed === true ? "badge-green" : audit.passed === false ? "badge-red" : "badge-gray"}`}>
-                    {audit.passed === true ? "通过" : audit.passed === false ? "未通过" : "未完成"}
-                  </span>
+                  <button className="btn btn-sm" type="button" onClick={() => openAuditDetail(audit)}>详情</button>
                 </div>
               ))}
             </div>
@@ -627,6 +767,173 @@ export default function RunsPage({ task, taskId, onError }) {
               <summary>高级详情 / 调试信息</summary>
               <div className="debug-field-list">
                 {annotationJobDebugFields(selectedAnnotationJob).map(([key, value]) => (
+                  <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                ))}
+              </div>
+            </details>
+          </aside>
+        </div>
+      )}
+
+      {selectedDecision && (
+        <div className="drawer-backdrop" onClick={() => setSelectedDecisionKey("")}>
+          <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <h3>{decisionArtifactLabel(selectedDecision)}</h3>
+                <p>标注结果产物详情、来源血缘、一致性检查和后续 Gold 构建入口。</p>
+              </div>
+              <button className="btn btn-sm" type="button" onClick={() => setSelectedDecisionKey("")}>关闭</button>
+            </div>
+            <div className="drawer-detail-grid">
+              <DetailField label="状态" value={decisionArtifactStatusLabel(selectedDecision)} />
+              <DetailField label="来源" value={decisionArtifactSourceLabel(selectedDecision)} />
+              <DetailField label="Argilla 数据集" value={selectedDecision.argilla_dataset} />
+              <DetailField label="样本集" value={selectedDecision.sample_id} />
+              <DetailField label="行数" value={selectedDecision.rows ?? selectedDecision.result?.responses} />
+              <DetailField label="标注任务" value={selectedDecisionJob ? annotationJobLabel(selectedDecisionJob) : firstDefined(selectedDecision.annotation_id, selectedDecision.source_annotation_id)} />
+              <DetailField label="创建时间" value={(selectedDecision.created_at || "").slice(0, 19)} />
+              <DetailField label="产物路径" value={selectedDecision.path} />
+            </div>
+            <div className="drawer-actions">
+              <button
+                className="btn btn-primary"
+                disabled={busy || Boolean(selectedDecisionAgreementReason)}
+                title={selectedDecisionAgreementReason}
+                onClick={() => runAgreementAuditForDecision(selectedDecision, selectedDecisionJob)}
+              >
+                运行一致性检查
+              </button>
+              {selectedDecisionAudits.some((audit) => audit.passed === true) ? (
+                <Link className="btn btn-accent" to={`/task/${encodeURIComponent(taskId)}/gold`}>进入 Gold 构建</Link>
+              ) : (
+                <button className="btn" type="button" disabled>通过一致性检查后构建 Gold</button>
+              )}
+            </div>
+            {selectedDecisionAgreementReason && <div className="status-line danger-line">{selectedDecisionAgreementReason}</div>}
+
+            <div className="info-callout drawer-section">
+              <strong>回收血缘</strong>
+              <p>{selectedDecision.path || "缺少产物路径"}</p>
+              <div className="lineage-grid">
+                {decisionArtifactLineageFields(selectedDecision).map(([label, value]) => (
+                  <div key={label}><span>{label}</span><strong>{displayPlanValue(value)}</strong></div>
+                ))}
+              </div>
+            </div>
+
+            {selectedDecisionJob && (
+              <div className="secondary-panel drawer-section">
+                <div className="toolbar"><h3>来源标注任务</h3></div>
+                <div className="resource-mini-row">
+                  <div>
+                    <strong>{annotationJobLabel(selectedDecisionJob)}</strong>
+                    <span>{annotationJobBatchSummary(selectedDecisionJob)}</span>
+                  </div>
+                  <button className="btn btn-sm" type="button" onClick={() => openJobDetail(selectedDecisionJob)}>详情</button>
+                </div>
+              </div>
+            )}
+
+            <div className="secondary-panel drawer-section">
+              <div className="toolbar"><h3>一致性检查记录（{selectedDecisionAudits.length}）</h3></div>
+              {!selectedDecisionAudits.length && <div className="empty">暂无该产物的一致性检查记录。</div>}
+              {selectedDecisionAudits.map((audit) => (
+                <div className="resource-mini-row" key={agreementAuditKey(audit)}>
+                  <div>
+                    <strong>{agreementAuditLabel(audit)}</strong>
+                    <span>{agreementAuditStatusLabel(audit)} · {agreementAuditIssueSummary(audit)}</span>
+                  </div>
+                  <button className="btn btn-sm" type="button" onClick={() => openAuditDetail(audit)}>详情</button>
+                </div>
+              ))}
+            </div>
+
+            <details className="advanced-panel">
+              <summary>高级详情 / 调试信息</summary>
+              <div className="debug-field-list">
+                {decisionArtifactDebugFields(selectedDecision).map(([key, value]) => (
+                  <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                ))}
+              </div>
+            </details>
+          </aside>
+        </div>
+      )}
+
+      {selectedAudit && (
+        <div className="drawer-backdrop" onClick={() => setSelectedAuditKey("")}>
+          <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <h3>{agreementAuditLabel(selectedAudit)}</h3>
+                <p>一致性检查详情、覆盖率、问题摘要、输入血缘和后续动作。</p>
+              </div>
+              <button className="btn btn-sm" type="button" onClick={() => setSelectedAuditKey("")}>关闭</button>
+            </div>
+            <div className="drawer-detail-grid">
+              <DetailField label="状态" value={agreementAuditStatusLabel(selectedAudit)} />
+              <DetailField label="覆盖率" value={agreementAuditCoverageLabel(selectedAudit)} />
+              <DetailField label="样本数" value={selectedAudit.sample_unique_ids ?? selectedAudit.sample_rows} />
+              <DetailField label="标注行数" value={selectedAudit.decision_rows} />
+              <DetailField label="最少提交数" value={selectedAudit.min_submitted} />
+              <DetailField label="主标签" value={selectedAudit.primary_label} />
+              <DetailField label="创建时间" value={(selectedAudit.created_at || "").slice(0, 19)} />
+              <DetailField label="摘要路径" value={selectedAudit.summary_path} />
+              <DetailField label="样本路径" value={selectedAudit.sample_path} />
+              <DetailField label="标注结果路径" value={selectedAudit.decisions_path} />
+            </div>
+            <div className="drawer-actions">
+              {selectedAuditDecision ? (
+                <button className="btn" type="button" onClick={() => openDecisionDetail(selectedAuditDecision)}>查看标注结果</button>
+              ) : (
+                <button className="btn" type="button" disabled>未匹配到标注结果</button>
+              )}
+              {selectedAudit.passed === true ? (
+                <Link className="btn btn-accent" to={`/task/${encodeURIComponent(taskId)}/gold`}>进入 Gold 构建</Link>
+              ) : (
+                <button className="btn" type="button" disabled>检查通过后构建 Gold</button>
+              )}
+            </div>
+
+            <div className={selectedAudit.passed === true ? "info-callout drawer-section" : "status-line danger-line drawer-section"}>
+              <strong>问题摘要</strong>
+              <p>{agreementAuditIssueSummary(selectedAudit)}</p>
+            </div>
+
+            <div className="secondary-panel drawer-section">
+              <div className="toolbar"><h3>标签分布</h3></div>
+              <pre className="log-box">{JSON.stringify(selectedAudit.label_distribution || {}, null, 2)}</pre>
+            </div>
+
+            {(selectedAuditDecision || selectedAuditJob) && (
+              <div className="secondary-panel drawer-section">
+                <div className="toolbar"><h3>关联资源</h3></div>
+                {selectedAuditDecision && (
+                  <div className="resource-mini-row">
+                    <div>
+                      <strong>{decisionArtifactLabel(selectedAuditDecision)}</strong>
+                      <span>{selectedAuditDecision.path || "缺少产物路径"}</span>
+                    </div>
+                    <button className="btn btn-sm" type="button" onClick={() => openDecisionDetail(selectedAuditDecision)}>详情</button>
+                  </div>
+                )}
+                {selectedAuditJob && (
+                  <div className="resource-mini-row">
+                    <div>
+                      <strong>{annotationJobLabel(selectedAuditJob)}</strong>
+                      <span>{annotationJobBatchSummary(selectedAuditJob)}</span>
+                    </div>
+                    <button className="btn btn-sm" type="button" onClick={() => openJobDetail(selectedAuditJob)}>详情</button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <details className="advanced-panel">
+              <summary>高级详情 / 调试信息</summary>
+              <div className="debug-field-list">
+                {agreementAuditDebugFields(selectedAudit).map(([key, value]) => (
                   <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
                 ))}
               </div>
