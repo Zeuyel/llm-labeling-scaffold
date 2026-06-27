@@ -10,12 +10,16 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse, parse_qs
 
+from . import __version__
 from .config import load_task
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
+
+API_CONTRACT_VERSION = "2026-06-27"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -95,6 +99,158 @@ def _settings_response(settings: dict, *, include_legacy: bool = False) -> dict:
             "task_registry_uri": settings["task_registry_uri"] if settings["task_source"] == "r2" else None,
         })
     return payload
+
+
+def _public_settings_response(settings: dict) -> dict:
+    return {
+        "settings": {
+            "task_source": settings["task_source"],
+            "allow_manual_imports": settings["allow_manual_imports"],
+            "allow_data_lake_overrides": settings["allow_data_lake_overrides"],
+            "task_registry_configured": bool(settings["task_registry_uri"]),
+            "data_lake_r2_prefix_configured": bool(settings["data_lake_r2_prefix"]),
+            "rclone_configured": bool(settings["rclone_config_path"]),
+        }
+    }
+
+
+def _contract_capabilities() -> dict[str, Any]:
+    return {
+        "service": "llm-labeling-scaffold",
+        "api_contract_version": API_CONTRACT_VERSION,
+        "auth": {"type": "basic"},
+        "endpoints": [
+            {
+                "method": "GET",
+                "path": "/api/health",
+                "action": "health",
+                "side_effects": False,
+                "response_schema": {
+                    "type": "object",
+                    "required": ["ok", "status", "service"],
+                },
+            },
+            {
+                "method": "GET",
+                "path": "/api/version",
+                "action": "version",
+                "side_effects": False,
+                "response_schema": {
+                    "type": "object",
+                    "required": ["service", "version", "api_contract_version"],
+                },
+            },
+            {
+                "method": "GET",
+                "path": "/api/capabilities",
+                "action": "capabilities",
+                "side_effects": False,
+                "response_schema": {"type": "object", "required": ["endpoints"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/settings/public",
+                "action": "settings_public",
+                "side_effects": False,
+                "response_schema": {
+                    "type": "object",
+                    "required": ["settings"],
+                    "properties": {
+                        "settings": {
+                            "type": "object",
+                            "required": [
+                                "task_source",
+                                "allow_manual_imports",
+                                "allow_data_lake_overrides",
+                                "task_registry_configured",
+                                "data_lake_r2_prefix_configured",
+                                "rclone_configured",
+                            ],
+                        }
+                    },
+                },
+            },
+            {
+                "method": "GET",
+                "path": "/api/tasks/{task_id}",
+                "action": "task_detail",
+                "side_effects": False,
+                "path_params": {"task_id": {"type": "string"}},
+                "response_schema": {
+                    "type": "object",
+                    "required": ["task"],
+                    "properties": {"task": {"type": "object", "required": ["task_id", "profile", "data_lake"]}},
+                },
+            },
+            {
+                "method": "POST",
+                "path": "/api/tasks/{task_id}/check",
+                "action": "task_check",
+                "side_effects": False,
+                "path_params": {"task_id": {"type": "string"}},
+                "request_schema": {"type": "object", "additionalProperties": False},
+                "response_schema": {
+                    "type": "object",
+                    "required": ["ok", "task_id", "checks", "warnings", "errors"],
+                },
+            },
+        ],
+    }
+
+
+def _contract_task_path(path: str, *, suffix: str = "") -> str | None:
+    prefix = "/api/tasks/"
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):]
+    if suffix:
+        marker = f"/{suffix}"
+        if not rest.endswith(marker):
+            return None
+        rest = rest[: -len(marker)]
+    elif "/" in rest:
+        return None
+    task_id = rest.strip()
+    return task_id if _safe_segment(task_id) else None
+
+
+def _safe_data_lake_summary(data_lake: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "configured": bool(data_lake),
+        "source_dataset_id": data_lake.get("source_dataset_id"),
+        "source_object_path": data_lake.get("source_object_path"),
+        "lake_registry_uri_configured": bool(data_lake.get("lake_registry_uri")),
+        "source_manifest_uri_configured": bool(data_lake.get("source_manifest_uri")),
+        "output_base_uri_configured": bool(data_lake.get("output_base_uri")),
+    }
+
+
+def _task_detail_payload(task) -> dict[str, Any]:
+    try:
+        from .profiles import profile_definition
+
+        profile = profile_definition(task.profile)
+        profile_summary = {
+            "id": task.profile,
+            "valid": True,
+            "name": profile.get("name"),
+            "stage_count": len(profile.get("stages", [])),
+        }
+    except Exception as exc:  # noqa: BLE001
+        profile_summary = {"id": task.profile, "valid": False, "error": str(exc)}
+    return {
+        "task": {
+            "task_id": task.task_id,
+            "path": str(task.path),
+            "profile": profile_summary,
+            "id_field": task.id_field,
+            "text_fields": task.text_fields,
+            "metadata_fields": task.metadata_fields,
+            "primary_label": task.primary_label,
+            "auxiliary_labels": task.auxiliary_labels,
+            "data_lake": _safe_data_lake_summary(task.data_lake),
+        }
+    }
 
 
 def _count_lines(path: Path) -> int:
@@ -322,6 +478,85 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError(f"任务未在 R2 数据湖登记表中登记为启用状态: {task.task_id}")
         return str(meta["path"])
 
+    def _task_detail(self, task_id: str) -> None:
+        if not _safe_segment(task_id):
+            self._json({"error": "bad task"}, status=400)
+            return
+        try:
+            self._json(_task_detail_payload(self._load_task_by_id(task_id)))
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=404)
+
+    def _task_check(self, task_id: str) -> None:
+        if not _safe_segment(task_id):
+            self._json({"ok": False, "task_id": task_id, "checks": [], "warnings": [], "errors": [
+                {"check": "task_id", "message": "bad task"}
+            ]}, status=400)
+            return
+
+        checks: list[dict[str, Any]] = []
+        warnings: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+
+        def add_check(name: str, status: str, message: str, details: dict[str, Any] | None = None) -> None:
+            item = {"name": name, "status": status, "message": message}
+            if details:
+                item["details"] = details
+            checks.append(item)
+            if status == "warning":
+                warnings.append({"check": name, "message": message, "details": details or {}})
+            elif status == "error":
+                errors.append({"check": name, "message": message, "details": details or {}})
+
+        try:
+            task = self._load_task_by_id(task_id)
+            add_check("task_load", "ok", "task loaded", {"path": str(task.path)})
+        except Exception as exc:
+            add_check("task_load", "error", str(exc), {"error_class": exc.__class__.__name__})
+            self._json({
+                "ok": False,
+                "task_id": task_id,
+                "checks": checks,
+                "warnings": warnings,
+                "errors": errors,
+            }, status=404)
+            return
+
+        try:
+            from .profiles import profile_definition
+
+            profile = profile_definition(task.profile)
+            add_check("profile", "ok", "profile is valid", {
+                "profile_id": task.profile,
+                "stage_count": len(profile.get("stages", [])),
+            })
+        except Exception as exc:  # noqa: BLE001
+            add_check("profile", "error", str(exc), {
+                "profile_id": task.profile,
+                "error_class": exc.__class__.__name__,
+            })
+
+        if not task.data_lake:
+            add_check("data_lake_config", "error", "task has no data_lake configuration")
+        else:
+            add_check("data_lake_config", "ok", "task has data_lake configuration", _safe_data_lake_summary(task.data_lake))
+            try:
+                from .data_lake import preview_source
+
+                _apply_runtime_settings(self.runs_root)
+                preview = preview_source(task)
+                add_check("data_lake_preview", "ok", "data_lake source can be previewed", {"preview": preview})
+            except Exception as exc:  # noqa: BLE001
+                add_check("data_lake_preview", "error", str(exc), {"error_class": exc.__class__.__name__})
+
+        self._json({
+            "ok": not errors,
+            "task_id": task_id,
+            "checks": checks,
+            "warnings": warnings,
+            "errors": errors,
+        })
+
     def _serve_static(self, path: str) -> bool:
         if not self.static_dir:
             return False
@@ -358,7 +593,28 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
-        if path == "/api/runs":
+        contract_task_id = _contract_task_path(path)
+        if path == "/api/health":
+            self._json({"ok": True, "status": "ok", "service": "llm-labeling-scaffold"})
+        elif path == "/api/version":
+            self._json({
+                "service": "llm-labeling-scaffold",
+                "version": __version__,
+                "api_contract_version": API_CONTRACT_VERSION,
+            })
+        elif path == "/api/capabilities":
+            self._json(_contract_capabilities())
+        elif path == "/api/settings/public":
+            try:
+                settings = _apply_runtime_settings(self.runs_root)
+                self._json(_public_settings_response(settings))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif contract_task_id is not None:
+            self._task_detail(contract_task_id)
+        elif path.startswith("/api/tasks/"):
+            self._json({"error": "not found"}, status=404)
+        elif path == "/api/runs":
             self._json({"runs": discover_runs(self.runs_root)})
         elif path == "/api/run":
             run_dir = self._resolve_run(params)
@@ -568,7 +824,12 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
-        if path == "/api/adjudicate":
+        contract_check_task_id = _contract_task_path(path, suffix="check")
+        if contract_check_task_id is not None:
+            self._task_check(contract_check_task_id)
+        elif path.startswith("/api/tasks/"):
+            self._json({"error": "not found"}, status=404)
+        elif path == "/api/adjudicate":
             run_dir = self._resolve_run(params)
             if not run_dir:
                 self._json({"error": "unknown run"}, status=404)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
@@ -11,9 +12,10 @@ import urllib.error
 import urllib.request
 
 import pytest
+import yaml
 
 from llm_labeling_scaffold import data_lake, panel, panel_settings, pipeline, task_registry
-from llm_labeling_scaffold.io import read_json
+from llm_labeling_scaffold.io import read_json, write_json
 from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE
 
 
@@ -26,13 +28,89 @@ def _clear_settings_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "LLS_PANEL_SETTINGS_PATH",
         "LLS_ALLOW_DATA_LAKE_OVERRIDES",
         "LLS_ALLOW_MANUAL_IMPORTS",
+        "LLS_ALLOW_LOCAL_DATA_LAKE_URIS",
         "RCLONE_CONFIG",
         "LLS_RCLONE_CONFIG",
+        "LLS_RCLONE_BIN",
+        "ARGILLA_API_KEY",
+        "LLS_ARGILLA_API_KEY",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(data_lake, "_DEFAULT_REGISTRY_URI_OVERRIDE", None)
     monkeypatch.setattr(data_lake, "_ALLOWED_R2_PREFIX_OVERRIDE", None)
     panel._invalidate_task_registry_sync_cache()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _create_data_lake_contract_task(tmp_path: Path, tasks_root: Path, *, task_id: str = "contract_lake_task") -> dict:
+    source = tmp_path / f"{task_id}_source.jsonl"
+    source.write_text('{"record_id":"r1","title":"A"}\n{"record_id":"r2","title":"B"}\n', encoding="utf-8")
+    manifest_path = tmp_path / f"{task_id}_manifest.json"
+    object_path = "inputs/manual_seed/v1/raw.jsonl"
+    write_json(
+        {
+            "dataset_id": f"{task_id}_seed",
+            "layer": "labels",
+            "domain": "tests",
+            "object_count": 1,
+            "total_bytes": source.stat().st_size,
+            "objects": [
+                {
+                    "path": object_path,
+                    "storage_uri": str(source),
+                    "asset_type": "label_import_jsonl",
+                    "rows": 2,
+                    "id_field": "record_id",
+                    "unique_ids": 2,
+                    "bytes": source.stat().st_size,
+                    "sha256": _file_sha256(source),
+                    "created_by": "tests",
+                    "upstream_uri": ["r2:test/upstream/source.jsonl"],
+                    "sampling_strategy": "unit_test_seed",
+                }
+            ],
+        },
+        manifest_path,
+    )
+    registry_path = tmp_path / f"{task_id}_data_lake.yaml"
+    registry_path.write_text(
+        yaml.safe_dump(
+            {
+                "datasets": {
+                    f"{task_id}_seed": {
+                        "manifest": str(manifest_path),
+                        "layer": "labels",
+                        "domain": "tests",
+                    }
+                }
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    return pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": task_id,
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+            "data_lake": {
+                "lake_registry_uri": str(registry_path),
+                "source_dataset_id": f"{task_id}_seed",
+                "source_object_path": object_path,
+                "default_import_id": "lake_import",
+            },
+        },
+    )
 
 
 @contextmanager
@@ -149,6 +227,121 @@ def test_settings_api_reads_env_settings(tmp_path: Path, monkeypatch: pytest.Mon
     assert status == 200
     assert payload["settings"]["task_registry_uri"] == "r2:env/governance/data_lake.yaml"
     assert payload["settings"]["data_lake_r2_prefix"] == "r2:env/lake/"
+
+
+def test_contract_metadata_and_public_settings_do_not_leak_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    monkeypatch.setenv("LLS_TASK_REGISTRY_URI", "r2:tenant/governance/data_lake.yaml")
+    monkeypatch.setenv("LLS_DATA_LAKE_R2_PREFIX", "r2:tenant/lake")
+    monkeypatch.setenv("RCLONE_CONFIG", "/very/secret/rclone.conf")
+    monkeypatch.setenv("LLS_ARGILLA_API_KEY", "argilla-secret-value")
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, health = _request(base_url, "/api/health")
+        assert status == 200
+        assert health == {"ok": True, "status": "ok", "service": "llm-labeling-scaffold"}
+
+        status, version = _request(base_url, "/api/version")
+        assert status == 200
+        assert version["version"]
+        assert version["api_contract_version"] == panel.API_CONTRACT_VERSION
+
+        status, capabilities = _request(base_url, "/api/capabilities")
+        assert status == 200
+        advertised = {(item["method"], item["path"], item["action"]) for item in capabilities["endpoints"]}
+        assert ("GET", "/api/settings/public", "settings_public") in advertised
+        assert ("POST", "/api/tasks/{task_id}/check", "task_check") in advertised
+
+        status, public = _request(base_url, "/api/settings/public")
+
+    assert status == 200
+    assert public["settings"] == {
+        "task_source": "local",
+        "allow_manual_imports": True,
+        "allow_data_lake_overrides": False,
+        "task_registry_configured": True,
+        "data_lake_r2_prefix_configured": True,
+        "rclone_configured": True,
+    }
+    serialized = json.dumps(public, ensure_ascii=False)
+    assert "r2:tenant" not in serialized
+    assert "/very/secret" not in serialized
+    assert "argilla-secret-value" not in serialized
+    assert "rclone_config_path" not in serialized
+
+
+def test_contract_task_detail_and_check_preview_data_lake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clear_settings_env(monkeypatch)
+    monkeypatch.setenv("LLS_ALLOW_LOCAL_DATA_LAKE_URIS", "1")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    _create_data_lake_contract_task(tmp_path, tasks_root)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, detail = _request(base_url, "/api/tasks/contract_lake_task")
+        assert status == 200
+        assert detail["task"]["task_id"] == "contract_lake_task"
+        assert detail["task"]["profile"]["valid"] is True
+        assert detail["task"]["data_lake"] == {
+            "configured": True,
+            "source_dataset_id": "contract_lake_task_seed",
+            "source_object_path": "inputs/manual_seed/v1/raw.jsonl",
+            "lake_registry_uri_configured": True,
+            "source_manifest_uri_configured": False,
+            "output_base_uri_configured": False,
+        }
+
+        status, check = _request(base_url, "/api/tasks/contract_lake_task/check", method="POST", payload={})
+
+    assert status == 200
+    assert check["ok"] is True
+    assert check["errors"] == []
+    by_name = {item["name"]: item for item in check["checks"]}
+    assert by_name["task_load"]["status"] == "ok"
+    assert by_name["profile"]["status"] == "ok"
+    assert by_name["data_lake_config"]["status"] == "ok"
+    assert by_name["data_lake_preview"]["status"] == "ok"
+    assert by_name["data_lake_preview"]["details"]["preview"]["selected_object"]["rows"] == 2
+
+
+def test_contract_task_check_reports_unreachable_data_lake(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": "r2_unreachable_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+            "data_lake": {
+                "lake_registry_uri": "r2:tenant/governance/data_lake.yaml",
+                "source_dataset_id": "seed",
+                "source_object_path": "inputs/raw.jsonl",
+            },
+        },
+    )
+    monkeypatch.setenv("LLS_DATA_LAKE_R2_PREFIX", "r2:tenant/")
+    monkeypatch.setenv("LLS_RCLONE_BIN", "missing-rclone-for-contract-test")
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, check = _request(base_url, "/api/tasks/r2_unreachable_task/check", method="POST", payload={})
+
+    assert status == 200
+    assert check["ok"] is False
+    assert any(item["name"] == "data_lake_preview" and item["status"] == "error" for item in check["checks"])
+    assert check["errors"]
+    assert "rclone" in check["errors"][-1]["message"]
 
 
 def test_r2_task_source_forces_manual_imports_off(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

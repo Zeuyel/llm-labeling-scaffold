@@ -54,6 +54,21 @@ MCP 在生产调用 `data-lake import` 时不应传 `--source-object-path`。该
 
 面板 API 返回 JSON，并要求 Basic Auth：
 
+### Contract discovery endpoints
+
+这些端点是 scaffold server 对 MCP 暴露的第一阶段稳定 contract。它们不要求 MCP 读取或修改本地文件：
+
+| HTTP API | 说明 |
+| --- | --- |
+| `GET /api/health` | 返回服务存活状态。 |
+| `GET /api/version` | 返回 scaffold 包版本和 API contract 版本。 |
+| `GET /api/capabilities` | 返回机器可读 endpoint/action/schema 概要，用于 MCP 能力发现。 |
+| `GET /api/settings/public` | 只返回非敏感运行状态：任务来源模式、是否允许手工导入/数据湖覆盖、registry/R2/rclone 是否已配置。不会返回 token、rclone 配置内容、rclone 配置路径、Argilla 密钥或具体 R2 URI。 |
+| `GET /api/tasks/{task_id}` | 返回单个任务的稳定摘要，包括 profile、字段、标签和 data lake 配置摘要。 |
+| `POST /api/tasks/{task_id}/check` | 只读检查任务是否可加载、profile 是否有效、data lake 配置是否存在且可 preview。R2/rclone 不可访问时返回 `ok: false`、`checks[]` 和结构化 `errors[]`。 |
+
+`task_check` 不接受 data lake override。生产环境中的数据来源必须来自受控 `task.yaml` / R2 registry。
+
 | MCP tool | HTTP API |
 | --- | --- |
 | `scaffold_task_list` | `GET /api/tasks` |
