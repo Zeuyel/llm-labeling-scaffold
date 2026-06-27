@@ -146,6 +146,21 @@ def _guidelines_for_task(task: TaskConfig, params: dict[str, Any]) -> str:
     return str(params.get("guidelines") or task.annotation_guidelines or f"Label records for task {task.task_id}.")
 
 
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _annotation_argilla_options(task: TaskConfig) -> dict[str, Any]:
+    value = task.annotation.get("argilla")
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def _workspace_name(value) -> str:
     if isinstance(value, str):
         return value
@@ -198,6 +213,12 @@ _ROW_CONTEXT_METADATA_FIELDS = {
     "__lls_batch_manifest_path": "batch_manifest_path",
     "__lls_overlap_role": "overlap_role",
 }
+_VISIBLE_BATCH_CONTEXT_FIELDS = (
+    "dispatch_mode",
+    "batch_plan_id",
+    "batch_id",
+    "overlap_role",
+)
 
 
 def _truthy(value) -> bool:
@@ -283,6 +304,109 @@ def _record_metadata(
     return metadata
 
 
+def _argilla_context_field_name(task: TaskConfig, params: dict[str, Any]) -> str:
+    options = _annotation_argilla_options(task)
+    return str(
+        params.get("context_field")
+        or params.get("context_field_name")
+        or options.get("context_field")
+        or task.annotation.get("context_field")
+        or "context"
+    )
+
+
+def _argilla_context_title(task: TaskConfig, params: dict[str, Any]) -> str:
+    options = _annotation_argilla_options(task)
+    return str(
+        params.get("context_title")
+        or options.get("context_title")
+        or task.annotation.get("context_title")
+        or "Context"
+    )
+
+
+def _argilla_context_fields(task: TaskConfig, params: dict[str, Any]) -> list[str]:
+    options = _annotation_argilla_options(task)
+    explicit = (
+        params.get("context_fields")
+        if "context_fields" in params
+        else options.get("context_fields", task.annotation.get("context_fields"))
+    )
+    if explicit is False:
+        return []
+    fields = _string_list(explicit)
+    if not fields:
+        fields = [task.id_field, *task.metadata_fields]
+    for field in _VISIBLE_BATCH_CONTEXT_FIELDS:
+        if field not in fields:
+            fields.append(field)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for field in fields:
+        if field in seen:
+            continue
+        seen.add(field)
+        deduped.append(field)
+    return deduped
+
+
+def _truncate_context_value(value: Any, max_chars: int) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        text = "; ".join(str(item) for item in value)
+    elif isinstance(value, dict):
+        text = "; ".join(f"{key}={val}" for key, val in value.items())
+    else:
+        text = str(value)
+    text = text.strip()
+    if max_chars > 0 and len(text) > max_chars:
+        return text[: max_chars - 3].rstrip() + "..."
+    return text
+
+
+def _build_visible_context(task: TaskConfig, row: dict, sample_path: str | Path, params: dict[str, Any]) -> str:
+    fields = _argilla_context_fields(task, params)
+    if not fields:
+        return ""
+    options = _annotation_argilla_options(task)
+    max_chars = int(params.get("context_value_max_chars") or options.get("context_value_max_chars") or 500)
+    metadata = _record_metadata(task, row, sample_path, params)
+    lines: list[str] = []
+    for field in fields:
+        value = metadata.get(field)
+        if value in (None, ""):
+            value = row.get(field)
+        text = _truncate_context_value(value, max_chars)
+        if text:
+            lines.append(f"{field}: {text}")
+    return "\n".join(lines)
+
+
+def _record_fields(
+    task: TaskConfig,
+    row: dict,
+    sample_path: str | Path,
+    text_field: str,
+    params: dict[str, Any],
+) -> dict[str, str]:
+    fields = {text_field: build_text(row, task)}
+    context_field = _argilla_context_field_name(task, params)
+    if context_field and context_field != text_field:
+        context = _build_visible_context(task, row, sample_path, params)
+        if context:
+            fields[context_field] = context
+    return fields
+
+
+def _argilla_text_fields(rg, task: TaskConfig, text_field: str, params: dict[str, Any]) -> list:
+    fields = [rg.TextField(name=text_field, title=str(params.get("text_title") or "Text"))]
+    context_field = _argilla_context_field_name(task, params)
+    if context_field and context_field != text_field and _argilla_context_fields(task, params):
+        fields.append(rg.TextField(name=context_field, title=_argilla_context_title(task, params)))
+    return fields
+
+
 def _record_id_policy(task: TaskConfig, params: dict[str, Any]) -> dict[str, Any]:
     strategy = _record_id_strategy(params)
     policy: dict[str, Any] = {
@@ -360,7 +484,7 @@ def _prepare_records_for_push(
     records = [
         rg.Record(
             id=_record_id_for_row(row, task, str(policy["strategy"])),
-            fields={text_field: build_text(row, task)},
+            fields=_record_fields(task, row, sample_path, text_field, params),
             metadata=_record_metadata(task, row, sample_path, params),
         )
         for row in rows
@@ -386,7 +510,7 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
     client = _client(params.get("api_url"), params.get("api_key"))
     settings = rg.Settings(
         guidelines=_guidelines_for_task(task, params),
-        fields=[rg.TextField(name=text_field, title="Text")],
+        fields=_argilla_text_fields(rg, task, text_field, params),
         questions=_questions_for_task(rg, task),
         distribution=rg.TaskDistribution(min_submitted=min_submitted),
         allow_extra_metadata=True,
@@ -404,6 +528,7 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         "records": len(records),
         "record_id_policy": record_id_policy,
         "duplicate_record_ids": duplicate_record_ids,
+        "visible_fields": list(records[0].fields.keys()) if records else [text_field],
         "url": params.get("ui_url"),
     }
 

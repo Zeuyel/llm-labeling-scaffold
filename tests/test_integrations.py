@@ -8,6 +8,7 @@ import pytest
 from llm_labeling_scaffold.config import TaskConfig, load_task
 from llm_labeling_scaffold.integrations import argilla
 from llm_labeling_scaffold.integrations.argilla import (
+    _argilla_text_fields,
     _guidelines_for_task,
     _human_label_from_values,
     _prepare_dataset,
@@ -271,6 +272,53 @@ def test_argilla_push_passes_batch_context_metadata(tmp_path: Path):
     assert records[0].metadata["batch_id"] == "batch_00001.jsonl"
     assert records[0].metadata["batch_manifest_path"] == "/tmp/manifest.json"
     assert records[0].metadata["overlap_role"] == "regular"
+    assert records[0].fields["text"] == "one"
+    assert "context" in records[0].fields
+    assert "record_id: r1" in records[0].fields["context"]
+    assert "source: seed" in records[0].fields["context"]
+    assert "batch_id: batch_00001.jsonl" in records[0].fields["context"]
+    assert "overlap_role: regular" in records[0].fields["context"]
+
+
+def test_argilla_visible_context_can_be_configured_or_disabled(tmp_path: Path):
+    task = TaskConfig(
+        path=Path("task.yaml"),
+        raw={
+            **_argilla_push_task().raw,
+            "annotation": {
+                "context_field": "标注上下文",
+                "context_title": "标注上下文",
+                "context_fields": ["record_id", "source"],
+            },
+        },
+    )
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one", "source": "seed", "ignored": "hidden"}], sample)
+    fake_rg = types.SimpleNamespace(Record=_Record)
+
+    records, _, _ = _prepare_records_for_push(fake_rg, task, sample, "text", {})
+
+    assert records[0].fields["标注上下文"] == "record_id: r1\nsource: seed"
+
+    disabled_task = TaskConfig(
+        path=Path("task.yaml"),
+        raw={
+            **_argilla_push_task().raw,
+            "annotation": {"context_fields": False},
+        },
+    )
+    disabled_records, _, _ = _prepare_records_for_push(fake_rg, disabled_task, sample, "text", {})
+    assert disabled_records[0].fields == {"text": "one"}
+
+
+def test_argilla_settings_include_visible_context_field():
+    task = _argilla_push_task()
+    fake_rg = types.SimpleNamespace(TextField=_Question)
+
+    fields = _argilla_text_fields(fake_rg, task, "text", {})
+
+    assert [field.kwargs["name"] for field in fields] == ["text", "context"]
+    assert fields[1].kwargs["title"] == "Context"
 
 
 def test_argilla_push_batch_scoped_record_ids_keep_original_metadata_id(tmp_path: Path):
