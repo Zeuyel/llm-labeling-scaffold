@@ -6,7 +6,7 @@ from unittest.mock import patch
 import yaml
 
 from llm_labeling_scaffold.config import load_task
-from llm_labeling_scaffold.io import read_json, read_jsonl, write_json
+from llm_labeling_scaffold.io import read_json, read_jsonl, write_json, write_jsonl
 from llm_labeling_scaffold import pipeline
 from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE, list_profile_presets, profile_definition
 from llm_labeling_scaffold.sampling import sample_records
@@ -22,6 +22,16 @@ def _file_sha256(path: Path) -> str:
 
 def _stage_status(profile: dict, stage_id: str) -> str:
     return next(stage["status"] for stage in profile["stages"] if stage["id"] == stage_id)
+
+
+def _wait_for_job(runs_root: Path, task_id: str, job_id: str, *, attempts: int = 100) -> dict:
+    current = None
+    for _ in range(attempts):
+        current = next((item for item in pipeline.jobs_for_task(runs_root, task_id) if item["id"] == job_id), None)
+        if current and current["status"] in {"succeeded", "failed"}:
+            return current
+        time.sleep(0.05)
+    raise AssertionError(f"job did not finish: {job_id}")
 
 
 def _create_local_data_lake_task(tmp_path: Path, *, task_id: str = "data_task"):
@@ -435,6 +445,26 @@ def test_task_asset_graph_returns_stage_fallback_and_asset_lineage(tmp_path: Pat
         {"sample_id": "sample_a", "rows": 1, "source_import_id": "seed_1"},
         sample_dir / "manifest.json",
     )
+    batch_plan_dir = sample_dir / "batches" / "qc_round_1"
+    write_json(
+        {
+            "plan_id": "qc_round_1",
+            "sample_id": "sample_a",
+            "batch_count": 1,
+            "batches": [{"batch": "batch_00001.jsonl", "rows": 1}],
+        },
+        batch_plan_dir / "manifest.json",
+    )
+    write_json(
+        {
+            "annotation_id": "argilla_qc_round",
+            "source": "argilla",
+            "sample_id": "sample_a",
+            "batch_plan_id": "qc_round_1",
+            "argilla_dataset": "argilla_qc_dataset",
+        },
+        runs_root / task.task_id / "annotation_jobs" / "argilla_qc_round" / "manifest.json",
+    )
     decisions_dir = runs_root / task.task_id / "decisions" / "round_1"
     write_json(
         {
@@ -456,6 +486,7 @@ def test_task_asset_graph_returns_stage_fallback_and_asset_lineage(tmp_path: Pat
     assert nodes["sample:sample_a"]["status"] == "completed"
     assert nodes["decision:round_1"]["route"].endswith("/annotations")
     assert {"source": "import:seed_1", "target": "sample:sample_a", "reason": "抽样来源"} in graph["edges"]
+    assert {"source": "batch:sample_a:qc_round_1", "target": "annotation_job:argilla_qc_round", "reason": "批次分发"} in graph["edges"]
     assert {"source": "sample:sample_a", "target": "decision:round_1", "reason": "结果来源样本"} in graph["edges"]
 
 
@@ -1319,3 +1350,207 @@ def test_list_samples_returns_latest_batch_manifest_after_overlap_batch(tmp_path
     assert latest["plan_id"] == "qc_round_1"
     assert latest["overlap_item_count"] == 3
     assert latest["batch_count"] == 3
+
+
+def test_argilla_push_batch_plan_dispatch_writes_dispatch_file_and_lineage(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "qc_argilla_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        "".join(f'{{"record_id":"r{idx}","title":"Title {idx}"}}\n' for idx in range(1, 7)),
+        encoding="utf-8",
+    )
+    sample_path = sample_records(task, 6, "sample_a", "head", source_path=source)
+    pipeline.run_action(
+        tmp_path / "runs",
+        created["path"],
+        "batch",
+        {
+            "sample": str(sample_path),
+            "batch_size": 2,
+            "overlap_rate": 0.34,
+            "min_annotators_per_overlap_item": 2,
+            "strategy_id": "pipeline_qc_overlap",
+            "plan_id": "qc_round_1",
+        },
+    )
+    batch_manifest_path = tmp_path / "runs" / task.task_id / "samples" / "sample_a" / "batches" / "qc_round_1" / "manifest.json"
+    batch_manifest = read_json(batch_manifest_path)
+    captured: dict[str, object] = {}
+
+    def fake_push_sample(task_arg, path, dataset, argilla_params):
+        rows = read_jsonl(path)
+        captured["path"] = str(path)
+        captured["dataset"] = dataset
+        captured["argilla_params"] = dict(argilla_params)
+        captured["rows"] = rows
+        return {
+            "records": len(rows),
+            "record_id_policy": {
+                "strategy": argilla_params.get("record_id_strategy"),
+                "batch_id_field": "__lls_batch_id",
+                "format": "{original_id}__{batch_id}",
+            },
+            "duplicate_record_ids": {
+                "original_ids": ["r1"],
+                "record_ids": [],
+                "same_batch_original_ids": [],
+            },
+        }
+
+    with patch("llm_labeling_scaffold.integrations.argilla.push_sample", side_effect=fake_push_sample):
+        job = pipeline.start_action(
+            tmp_path / "runs",
+            created["path"],
+            "argilla_push",
+            {
+                "sample": str(sample_path),
+                "dispatch_mode": "batch_plan",
+                "batch_plan_id": "qc_round_1",
+                "annotation_id": "argilla_qc_round",
+                "dataset": "argilla_qc_dataset",
+            },
+        )
+        current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+
+    assert current["status"] == "succeeded"
+    dispatch_path = tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_qc_round" / "dispatch.jsonl"
+    assert captured["path"] == str(dispatch_path)
+    assert captured["path"] != str(sample_path)
+    assert captured["argilla_params"]["record_id_strategy"] == "batch_scoped"
+    dispatch_rows = read_jsonl(dispatch_path)
+    original_ids = [row["record_id"] for row in dispatch_rows]
+    argilla_record_ids = [row["__lls_argilla_record_id"] for row in dispatch_rows]
+    assert len(set(original_ids)) < len(original_ids)
+    assert len(set(argilla_record_ids)) == len(argilla_record_ids)
+    assert all(row["__lls_batch_plan_id"] == "qc_round_1" for row in dispatch_rows)
+    assert all(row["__lls_original_id"] == row["record_id"] for row in dispatch_rows)
+    assert {row["__lls_overlap_role"] for row in dispatch_rows} >= {"regular", "overlap"}
+
+    manifest = read_json(tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_qc_round" / "manifest.json")
+    expected_batch_ids = [entry["batch"] for entry in batch_manifest["batches"]]
+    expected_batch_files = [
+        str(batch_manifest_path.parent / "batches" / entry["batch"])
+        for entry in batch_manifest["batches"]
+    ]
+    assert manifest["dispatch_mode"] == "batch_plan"
+    assert manifest["sample_id"] == "sample_a"
+    assert manifest["sample_path"] == str(sample_path)
+    assert manifest["batch_plan_id"] == "qc_round_1"
+    assert manifest["batch_manifest_path"] == str(batch_manifest_path)
+    assert manifest["batch_ids"] == expected_batch_ids
+    assert manifest["batch_files"] == expected_batch_files
+    assert manifest["overlap_item_ids"] == batch_manifest["overlap_item_ids"]
+    assert manifest["argilla_dataset"] == "argilla_qc_dataset"
+    assert manifest["rows"] == len(dispatch_rows)
+    assert manifest["record_id_policy"]["strategy"] == "batch_scoped"
+
+
+def test_argilla_push_sample_dispatch_still_uses_sample_file_without_batch_plan(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "argilla_sample_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"record_id":"r1","title":"A"}\n{"record_id":"r2","title":"B"}\n', encoding="utf-8")
+    sample_path = sample_records(task, 2, "sample_a", "head", source_path=source)
+    captured: dict[str, object] = {}
+
+    def fake_push_sample(task_arg, path, dataset, argilla_params):
+        captured["path"] = str(path)
+        captured["dataset"] = dataset
+        captured["argilla_params"] = dict(argilla_params)
+        return {"records": len(read_jsonl(path)), "record_id_policy": {"strategy": "original"}}
+
+    with patch("llm_labeling_scaffold.integrations.argilla.push_sample", side_effect=fake_push_sample):
+        job = pipeline.start_action(
+            tmp_path / "runs",
+            created["path"],
+            "argilla_push",
+            {
+                "sample": str(sample_path),
+                "annotation_id": "argilla_sample_round",
+                "dataset": "argilla_sample_dataset",
+            },
+        )
+        current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+
+    assert current["status"] == "succeeded"
+    assert captured["path"] == str(sample_path)
+    assert captured["argilla_params"] == {}
+    manifest = read_json(tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_sample_round" / "manifest.json")
+    assert manifest["dispatch_mode"] == "sample"
+    assert manifest["sample_path"] == str(sample_path)
+    assert manifest["batch_plan_id"] is None
+    assert manifest["batch_manifest_path"] is None
+    assert manifest["batch_ids"] == []
+    assert manifest["rows"] == 2
+
+
+def test_argilla_push_batch_plan_fails_on_same_batch_duplicate_original_id(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "qc_argilla_duplicate_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text(
+        "".join(f'{{"record_id":"r{idx}","title":"Title {idx}"}}\n' for idx in range(1, 5)),
+        encoding="utf-8",
+    )
+    sample_path = sample_records(task, 4, "sample_a", "head", source_path=source)
+    pipeline.run_action(
+        tmp_path / "runs",
+        created["path"],
+        "batch",
+        {"sample": str(sample_path), "batch_size": 2, "plan_id": "round_1"},
+    )
+    batch_file = tmp_path / "runs" / task.task_id / "samples" / "sample_a" / "batches" / "round_1" / "batches" / "batch_00001.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "Title 1"},
+            {"record_id": "r1", "title": "Duplicate in same batch"},
+        ],
+        batch_file,
+    )
+
+    with patch("llm_labeling_scaffold.integrations.argilla.push_sample") as mock_push:
+        job = pipeline.start_action(
+            tmp_path / "runs",
+            created["path"],
+            "argilla_push",
+            {
+                "sample": str(sample_path),
+                "dispatch_mode": "batch_plan",
+                "batch_plan_id": "round_1",
+                "annotation_id": "argilla_bad_round",
+                "dataset": "argilla_bad_dataset",
+            },
+        )
+        current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+
+    assert current["status"] == "failed"
+    assert "同一 batch 内重复原始 ID" in current["error"]
+    mock_push.assert_not_called()

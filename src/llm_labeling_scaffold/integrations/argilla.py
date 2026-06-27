@@ -183,15 +183,207 @@ def _record_source_id(record, task: TaskConfig) -> str:
     return str(record.id)
 
 
+_BATCH_ID_ROW_FIELD = "__lls_batch_id"
+_CONTEXT_METADATA_FIELDS = (
+    "dispatch_mode",
+    "batch_plan_id",
+    "batch_id",
+    "batch_manifest_path",
+    "overlap_role",
+)
+_ROW_CONTEXT_METADATA_FIELDS = {
+    "__lls_dispatch_mode": "dispatch_mode",
+    "__lls_batch_plan_id": "batch_plan_id",
+    _BATCH_ID_ROW_FIELD: "batch_id",
+    "__lls_batch_manifest_path": "batch_manifest_path",
+    "__lls_overlap_role": "overlap_role",
+}
+
+
+def _truthy(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _record_id_strategy(params: dict[str, Any]) -> str:
+    strategy = str(params.get("record_id_strategy") or "original").strip().lower()
+    if strategy in {"", "original", "source", "source_id", "task_id_field"}:
+        return "original"
+    if strategy == "batch_scoped":
+        return strategy
+    raise ValueError("Argilla record_id_strategy 目前仅支持 original 或 batch_scoped")
+
+
+def _duplicate_values(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    duplicate_seen: set[str] = set()
+    duplicates: list[str] = []
+    for value in values:
+        if value in seen and value not in duplicate_seen:
+            duplicates.append(value)
+            duplicate_seen.add(value)
+        seen.add(value)
+    return duplicates
+
+
+def _duplicate_pairs(pairs: list[tuple[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str]] = set()
+    duplicate_seen: set[tuple[str, str]] = set()
+    duplicates: list[dict[str, str]] = []
+    for batch_id, original_id in pairs:
+        key = (batch_id, original_id)
+        if key in seen and key not in duplicate_seen:
+            duplicates.append({"batch_id": batch_id, "id": original_id})
+            duplicate_seen.add(key)
+        seen.add(key)
+    return duplicates
+
+
+def _batch_id(row: dict) -> str | None:
+    value = row.get(_BATCH_ID_ROW_FIELD)
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _record_id_for_row(row: dict, task: TaskConfig, strategy: str) -> str:
+    original_id = str(row[task.id_field])
+    if strategy == "batch_scoped":
+        batch_id = _batch_id(row)
+        if batch_id:
+            return f"{original_id}__{batch_id}"
+    return original_id
+
+
+def _record_context_metadata(row: dict, params: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for field in _CONTEXT_METADATA_FIELDS:
+        if field in params and params[field] not in (None, ""):
+            metadata[field] = params[field]
+    for row_field, metadata_field in _ROW_CONTEXT_METADATA_FIELDS.items():
+        if metadata_field not in metadata and row.get(row_field) not in (None, ""):
+            metadata[metadata_field] = row[row_field]
+    return metadata
+
+
+def _record_metadata(
+    task: TaskConfig,
+    row: dict,
+    sample_path: str | Path,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        task.id_field: str(row[task.id_field]),
+        "task_id": task.task_id,
+        "sample_path": str(sample_path),
+    }
+    metadata.update({field: row[field] for field in task.metadata_fields if field in row})
+    metadata.update(_record_context_metadata(row, params))
+    return metadata
+
+
+def _record_id_policy(task: TaskConfig, params: dict[str, Any]) -> dict[str, Any]:
+    strategy = _record_id_strategy(params)
+    policy: dict[str, Any] = {
+        "strategy": strategy,
+        "id_field": task.id_field,
+        "allow_duplicate_record_ids": _truthy(params.get("allow_duplicate_record_ids")),
+    }
+    if strategy == "batch_scoped":
+        policy.update({
+            "batch_id_field": _BATCH_ID_ROW_FIELD,
+            "format": "{original_id}__{batch_id}",
+        })
+    if "record_id_template" in params:
+        policy["record_id_template"] = params["record_id_template"]
+    if "record_id_fields" in params:
+        policy["record_id_fields"] = params["record_id_fields"]
+    return policy
+
+
+def _duplicate_record_id_info(rows: list[dict], task: TaskConfig, strategy: str) -> dict[str, Any]:
+    original_ids = [str(row[task.id_field]) for row in rows]
+    record_ids = [_record_id_for_row(row, task, strategy) for row in rows]
+    info: dict[str, Any] = {
+        "original_ids": _duplicate_values(original_ids),
+        "record_ids": _duplicate_values(record_ids),
+    }
+    if strategy == "batch_scoped":
+        batch_pairs = [(_batch_id(row) or "", str(row[task.id_field])) for row in rows]
+        info["same_batch_original_ids"] = _duplicate_pairs(batch_pairs)
+    return info
+
+
+def _validate_record_ids(
+    task: TaskConfig,
+    policy: dict[str, Any],
+    duplicate_record_ids: dict[str, Any],
+) -> None:
+    strategy = str(policy["strategy"])
+    allow_duplicates = bool(policy["allow_duplicate_record_ids"])
+    same_batch_duplicates = duplicate_record_ids.get("same_batch_original_ids") or []
+    if same_batch_duplicates:
+        preview = ", ".join(
+            f"{item['id']}@{item['batch_id'] or '<missing_batch>'}"
+            for item in same_batch_duplicates[:10]
+        )
+        raise ValueError(
+            f"batch_scoped record id 策略检测到同一 batch 内重复 {task.id_field}: {preview}；请先对该批次去重。"
+        )
+    if allow_duplicates:
+        return
+    duplicate_ids = duplicate_record_ids.get("record_ids") or []
+    if duplicate_ids:
+        preview = ", ".join(str(value) for value in duplicate_ids[:10])
+        if strategy == "batch_scoped":
+            raise ValueError(
+                f"Argilla Record.id 仍存在重复: {preview}；请检查 {_BATCH_ID_ROW_FIELD} 或显式去重策略。"
+            )
+        raise ValueError(
+            f"Argilla Record.id 存在重复: {preview}。输入可能是 overlap 批次的全量合并；"
+            "请推送单个批次，或使用 record_id_strategy='batch_scoped' / 显式去重策略后再推送。"
+        )
+
+
+def _prepare_records_for_push(
+    rg,
+    task: TaskConfig,
+    sample_path: str | Path,
+    text_field: str,
+    params: dict[str, Any],
+) -> tuple[list, dict[str, Any], dict[str, Any]]:
+    rows = read_jsonl(sample_path)
+    policy = _record_id_policy(task, params)
+    duplicate_record_ids = _duplicate_record_id_info(rows, task, str(policy["strategy"]))
+    _validate_record_ids(task, policy, duplicate_record_ids)
+    records = [
+        rg.Record(
+            id=_record_id_for_row(row, task, str(policy["strategy"])),
+            fields={text_field: build_text(row, task)},
+            metadata=_record_metadata(task, row, sample_path, params),
+        )
+        for row in rows
+    ]
+    return records, policy, duplicate_record_ids
+
+
 def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, params: dict[str, Any] | None = None) -> dict:
     params = params or {}
     rg = _load_argilla()
-    client = _client(params.get("api_url"), params.get("api_key"))
     workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
     text_field = params.get("text_field", "text")
     min_submitted = int(params.get("min_submitted", 1))
     if_exists = str(params.get("if_exists") or params.get("dataset_policy") or "fail")
+    records, record_id_policy, duplicate_record_ids = _prepare_records_for_push(
+        rg,
+        task,
+        sample_path,
+        text_field,
+        params,
+    )
 
+    client = _client(params.get("api_url"), params.get("api_key"))
     settings = rg.Settings(
         guidelines=_guidelines_for_task(task, params),
         fields=[rg.TextField(name=text_field, title="Text")],
@@ -202,20 +394,6 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
     dataset = rg.Dataset(name=dataset_name, workspace=workspace, settings=settings)
     dataset, dataset_action = _prepare_dataset(client, dataset, dataset_name, workspace, if_exists)
 
-    records = []
-    for row in read_jsonl(sample_path):
-        records.append(
-            rg.Record(
-                id=str(row[task.id_field]),
-                fields={text_field: build_text(row, task)},
-                metadata={
-                    task.id_field: str(row[task.id_field]),
-                    "task_id": task.task_id,
-                    "sample_path": str(sample_path),
-                    **{field: row[field] for field in task.metadata_fields if field in row},
-                },
-            )
-        )
     dataset.records.log(records)
     return {
         "backend": "argilla",
@@ -224,6 +402,8 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         "dataset_action": dataset_action,
         "if_exists": if_exists,
         "records": len(records),
+        "record_id_policy": record_id_policy,
+        "duplicate_record_ids": duplicate_record_ids,
         "url": params.get("ui_url"),
     }
 

@@ -3,11 +3,19 @@ import sys
 import tempfile
 import types
 
+import pytest
+
 from llm_labeling_scaffold.config import TaskConfig, load_task
 from llm_labeling_scaffold.integrations import argilla
-from llm_labeling_scaffold.integrations.argilla import _guidelines_for_task, _human_label_from_values, _prepare_dataset, _questions_for_task
+from llm_labeling_scaffold.integrations.argilla import (
+    _guidelines_for_task,
+    _human_label_from_values,
+    _prepare_dataset,
+    _prepare_records_for_push,
+    _questions_for_task,
+)
 from llm_labeling_scaffold.integrations.mlflow import log_training_result
-from llm_labeling_scaffold.io import read_json, write_json
+from llm_labeling_scaffold.io import read_json, write_json, write_jsonl
 
 
 class _RunInfo:
@@ -186,6 +194,135 @@ def test_argilla_guidelines_use_task_annotation_by_default():
 
     assert _guidelines_for_task(task, {}) == "请先判断是否属于目标创新，再填写证据。"
     assert _guidelines_for_task(task, {"guidelines": "临时说明"}) == "临时说明"
+
+
+class _Record:
+    def __init__(self, **kwargs):
+        self.id = kwargs["id"]
+        self.fields = kwargs["fields"]
+        self.metadata = kwargs["metadata"]
+
+
+def _argilla_push_task() -> TaskConfig:
+    return TaskConfig(
+        path=Path("task.yaml"),
+        raw={
+            "task_id": "argilla_push_task",
+            "id_field": "record_id",
+            "input": {
+                "path": "input.jsonl",
+                "text_fields": ["title"],
+                "metadata_fields": ["source"],
+            },
+            "labels": {
+                "primary": {
+                    "name": "label",
+                    "type": "categorical",
+                    "values": ["yes", "no"],
+                },
+            },
+        },
+    )
+
+
+def test_argilla_push_fails_fast_on_duplicate_record_ids(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "one"},
+            {"record_id": "r1", "title": "one overlap"},
+        ],
+        sample,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record)
+
+    with pytest.raises(ValueError, match="overlap"):
+        _prepare_records_for_push(fake_rg, task, sample, "text", {})
+
+
+def test_argilla_push_passes_batch_context_metadata(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one", "source": "seed"}], sample)
+    fake_rg = types.SimpleNamespace(Record=_Record)
+
+    records, policy, duplicate_record_ids = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {
+            "dispatch_mode": "batch_plan",
+            "batch_plan_id": "plan_1",
+            "batch_id": "batch_00001.jsonl",
+            "batch_manifest_path": "/tmp/manifest.json",
+            "overlap_role": "regular",
+        },
+    )
+
+    assert policy["strategy"] == "original"
+    assert duplicate_record_ids["record_ids"] == []
+    assert records[0].id == "r1"
+    assert records[0].metadata["record_id"] == "r1"
+    assert records[0].metadata["source"] == "seed"
+    assert records[0].metadata["dispatch_mode"] == "batch_plan"
+    assert records[0].metadata["batch_plan_id"] == "plan_1"
+    assert records[0].metadata["batch_id"] == "batch_00001.jsonl"
+    assert records[0].metadata["batch_manifest_path"] == "/tmp/manifest.json"
+    assert records[0].metadata["overlap_role"] == "regular"
+
+
+def test_argilla_push_batch_scoped_record_ids_keep_original_metadata_id(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "merged_batches.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "regular", "__lls_batch_id": "batch_00001.jsonl"},
+            {"record_id": "r1", "title": "overlap", "__lls_batch_id": "batch_00002.jsonl"},
+        ],
+        sample,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record)
+
+    records, policy, duplicate_record_ids = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {"record_id_strategy": "batch_scoped", "batch_plan_id": "plan_1"},
+    )
+
+    assert policy["strategy"] == "batch_scoped"
+    assert policy["batch_id_field"] == "__lls_batch_id"
+    assert duplicate_record_ids["original_ids"] == ["r1"]
+    assert duplicate_record_ids["record_ids"] == []
+    assert [record.id for record in records] == ["r1__batch_00001.jsonl", "r1__batch_00002.jsonl"]
+    assert [record.metadata["record_id"] for record in records] == ["r1", "r1"]
+    assert [record.metadata["batch_id"] for record in records] == ["batch_00001.jsonl", "batch_00002.jsonl"]
+    assert [record.metadata["batch_plan_id"] for record in records] == ["plan_1", "plan_1"]
+
+
+def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "bad_batch.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "one", "__lls_batch_id": "batch_00001.jsonl"},
+            {"record_id": "r1", "title": "duplicate", "__lls_batch_id": "batch_00001.jsonl"},
+        ],
+        sample,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record)
+
+    with pytest.raises(ValueError, match="同一 batch"):
+        _prepare_records_for_push(
+            fake_rg,
+            task,
+            sample,
+            "text",
+            {"record_id_strategy": "batch_scoped"},
+        )
 
 
 class _Workspace:

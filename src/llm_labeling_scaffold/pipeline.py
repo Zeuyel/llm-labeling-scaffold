@@ -750,7 +750,11 @@ def task_asset_graph(runs_root: str | Path, task, profile_id: str | None = None)
         if source_stage:
             _graph_add_edge(edges, seen_edges, source_stage, node_id, "分发标注")
         sample_id = str(item.get("sample_id") or "")
-        if f"sample:{sample_id}" in seen_nodes:
+        batch_plan_id = str(item.get("batch_plan_id") or "")
+        batch_node_id = f"batch:{sample_id}:{batch_plan_id}" if sample_id and batch_plan_id else ""
+        if batch_node_id in seen_nodes:
+            _graph_add_edge(edges, seen_edges, batch_node_id, node_id, "批次分发")
+        elif f"sample:{sample_id}" in seen_nodes:
             _graph_add_edge(edges, seen_edges, f"sample:{sample_id}", node_id, "标注输入")
 
     for item in agreement_audits:
@@ -1212,6 +1216,335 @@ def _default_argilla_dataset(task_id: str, sample_id: str | None) -> str:
     return f"{_slug(task_id)}_{_slug(sample_id or 'sample')}_v001"
 
 
+def _argilla_dispatch_mode(params: dict[str, Any]) -> str:
+    mode = str(params.get("dispatch_mode") or "").strip() or "sample"
+    if params.get("batch_plan_id") or params.get("batch_manifest_path"):
+        mode = "batch_plan" if mode == "sample" else mode
+    if mode not in {"batch_plan", "single_batch", "sample"}:
+        raise ValueError("dispatch_mode 只能是 batch_plan、single_batch 或 sample")
+    return mode
+
+
+def _resolve_batch_plan_manifest(runs_root: str | Path, task, params: dict[str, Any]) -> dict[str, Any]:
+    manifest_param = str(params.get("batch_manifest_path") or "").strip()
+    sample_param = str(params.get("sample") or params.get("sample_path") or "").strip()
+    plan_param = str(params.get("batch_plan_id") or params.get("plan_id") or "").strip()
+    if manifest_param:
+        manifest_path = Path(manifest_param)
+    else:
+        if not sample_param:
+            raise ValueError("批次计划分发需要 sample 或 batch_manifest_path")
+        if not plan_param:
+            raise ValueError("批次计划分发需要 batch_plan_id 或 batch_manifest_path")
+        if not _safe_segment(plan_param):
+            raise ValueError("批次计划编号只能使用单段名称，不能包含路径分隔符")
+        sample_path = Path(sample_param)
+        manifest_path = sample_path.parent / "batches" / plan_param / "manifest.json"
+        if not manifest_path.is_file():
+            sample_id = str(params.get("sample_id") or sample_path.parent.name)
+            candidate = Path(runs_root) / task.task_id / "samples" / sample_id / "batches" / plan_param / "manifest.json"
+            if candidate.is_file():
+                manifest_path = candidate
+    if not manifest_path.is_file():
+        raise ValueError(f"批次计划 manifest 不存在: {manifest_path}")
+
+    manifest = read_json(manifest_path)
+    plan_dir = manifest_path.parent
+    sample_path_text = str(sample_param or manifest.get("sample") or "").strip()
+    if not sample_path_text and plan_dir.parent.name == "batches":
+        candidate_sample = plan_dir.parent.parent / "sample.jsonl"
+        if candidate_sample.exists():
+            sample_path_text = str(candidate_sample)
+    sample_id = str(params.get("sample_id") or manifest.get("sample_id") or "").strip()
+    if not sample_id and sample_path_text:
+        sample_id = Path(sample_path_text).parent.name
+    if not sample_id and plan_dir.parent.name == "batches":
+        sample_id = plan_dir.parent.parent.name
+
+    return {
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "plan_dir": plan_dir,
+        "batch_plan_id": str(manifest.get("plan_id") or plan_param or plan_dir.name),
+        "sample_id": sample_id or None,
+        "sample_path": sample_path_text or None,
+    }
+
+
+def _batch_file_from_value(batch_root: Path, value: Any) -> Path:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("批次文件不能为空")
+    path = Path(text)
+    if not path.is_absolute():
+        path = batch_root / path
+    try:
+        path.resolve().relative_to(batch_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"批次文件必须位于批次计划目录内: {path}") from exc
+    return path
+
+
+def _select_batch_dispatch_files(plan: dict[str, Any], params: dict[str, Any], dispatch_mode: str) -> list[dict[str, Any]]:
+    batch_root = Path(plan["plan_dir"]) / "batches"
+    manifest = plan["manifest"]
+    manifest_entries = manifest.get("batches") if isinstance(manifest.get("batches"), list) else []
+    entries: list[dict[str, Any]] = []
+    for entry in manifest_entries:
+        if not isinstance(entry, dict):
+            continue
+        batch_name = str(entry.get("batch") or entry.get("file") or entry.get("path") or "").strip()
+        if not batch_name:
+            continue
+        path = _batch_file_from_value(batch_root, batch_name)
+        entries.append({"entry": entry, "path": path, "batch_id": path.name, "batch_file": str(path)})
+    if not entries and batch_root.is_dir():
+        entries = [
+            {"entry": {"batch": path.name}, "path": path, "batch_id": path.name, "batch_file": str(path)}
+            for path in sorted(batch_root.glob("batch_*.jsonl"))
+        ]
+    if not entries:
+        raise ValueError("批次计划没有可分发的 batch jsonl 文件")
+
+    by_key: dict[str, dict[str, Any]] = {}
+    for item in entries:
+        path = item["path"]
+        by_key[path.name] = item
+        by_key[path.stem] = item
+
+    selected: list[dict[str, Any]] = []
+    for batch_id in _string_list(params.get("batch_ids")):
+        item = by_key.get(batch_id)
+        if item is None:
+            item = by_key.get(Path(batch_id).name) or by_key.get(Path(batch_id).stem)
+        if item is None:
+            raise ValueError(f"批次计划中不存在 batch_id: {batch_id}")
+        selected.append(item)
+
+    for batch_file in _string_list(params.get("batch_files")):
+        path = _batch_file_from_value(batch_root, batch_file)
+        item = by_key.get(path.name) or by_key.get(path.stem)
+        if item is None:
+            item = {"entry": {"batch": path.name}, "path": path, "batch_id": path.name, "batch_file": str(path)}
+        selected.append(item)
+
+    if not selected:
+        if dispatch_mode == "single_batch":
+            if len(entries) != 1:
+                raise ValueError("single_batch 分发需要指定一个 batch_ids 或 batch_files")
+            selected = entries
+        else:
+            selected = entries
+
+    deduped: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for item in selected:
+        path = Path(item["path"])
+        if not path.is_file():
+            raise ValueError(f"批次文件不存在: {path}")
+        key = str(path.resolve())
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        deduped.append(item)
+
+    if dispatch_mode == "single_batch" and len(deduped) != 1:
+        raise ValueError("single_batch 分发只能选择一个 batch 文件")
+    return deduped
+
+
+def _overlap_role_for_row(entry: dict[str, Any], record_id: str) -> str:
+    overlap_ids = {str(item_id) for item_id in entry.get("overlap_item_ids") or []}
+    if record_id in overlap_ids:
+        return "overlap"
+    regular_ids = {str(item_id) for item_id in entry.get("regular_item_ids") or []}
+    if record_id in regular_ids:
+        return "regular"
+    return "unknown"
+
+
+def _collect_dispatch_rows(
+    selected: list[dict[str, Any]],
+    id_field: str,
+    *,
+    dispatch_mode: str,
+    batch_plan_id: str,
+    batch_manifest_path: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    missing: list[str] = []
+    same_batch_duplicates: list[str] = []
+    seen_record_ids: set[str] = set()
+    duplicate_record_ids: list[str] = []
+    for item in selected:
+        path = Path(item["path"])
+        batch_id = str(item["batch_id"])
+        seen_in_batch: set[str] = set()
+        for row_no, row in enumerate(iter_jsonl(path), start=1):
+            value = row.get(id_field)
+            if value in (None, ""):
+                missing.append(f"{path.name}:{row_no}")
+                continue
+            original_id = str(value)
+            if original_id in seen_in_batch:
+                same_batch_duplicates.append(f"{original_id}@{batch_id}")
+            seen_in_batch.add(original_id)
+
+            argilla_record_id = f"{original_id}__{batch_id}"
+            if argilla_record_id in seen_record_ids and argilla_record_id not in duplicate_record_ids:
+                duplicate_record_ids.append(argilla_record_id)
+            seen_record_ids.add(argilla_record_id)
+
+            rows.append({
+                **row,
+                "__lls_dispatch_mode": dispatch_mode,
+                "__lls_batch_plan_id": batch_plan_id,
+                "__lls_batch_manifest_path": batch_manifest_path,
+                "__lls_batch_file": str(path),
+                "__lls_batch_id": batch_id,
+                "__lls_original_id": original_id,
+                "__lls_overlap_role": _overlap_role_for_row(item["entry"], original_id),
+                "__lls_argilla_record_id": argilla_record_id,
+            })
+    if missing:
+        raise ValueError(f"批次分发文件存在缺失 Argilla record id 的行: {', '.join(missing[:5])}")
+    if same_batch_duplicates:
+        preview = ", ".join(same_batch_duplicates[:10])
+        raise ValueError(f"批次分发文件存在同一 batch 内重复原始 ID: {preview}")
+    if duplicate_record_ids:
+        preview = ", ".join(duplicate_record_ids[:10])
+        raise ValueError(f"批次分发生成的 Argilla record id 仍存在重复: {preview}")
+    return rows
+
+
+def _selected_overlap_item_ids(plan: dict[str, Any], selected: list[dict[str, Any]]) -> list[str]:
+    selected_names = {Path(item["path"]).name for item in selected}
+    out: list[str] = []
+    seen: set[str] = set()
+    batches = plan["manifest"].get("batches")
+    if isinstance(batches, list):
+        for entry in batches:
+            if not isinstance(entry, dict) or str(entry.get("batch") or "") not in selected_names:
+                continue
+            for item_id in entry.get("overlap_item_ids") or []:
+                text = str(item_id)
+                if text not in seen:
+                    seen.add(text)
+                    out.append(text)
+    return out
+
+
+def _resolve_argilla_dispatch(runs_root: str | Path, task, params: dict[str, Any], dispatch_mode: str) -> dict[str, Any]:
+    if dispatch_mode == "sample":
+        sample = params.get("sample") or params.get("sample_path")
+        if not sample:
+            raise ValueError("sample 分发需要 sample 文件")
+        sample_path = str(sample)
+        sample_id = str(params.get("sample_id") or Path(sample_path).parent.name)
+        return {
+            "dispatch_mode": "sample",
+            "dispatch_path": sample_path,
+            "sample_id": sample_id,
+            "sample_path": sample_path,
+            "batch_plan_id": None,
+            "batch_manifest_path": None,
+            "batch_ids": [],
+            "batch_files": [],
+            "overlap_item_ids": [],
+            "batch_plan_overlap_item_ids": [],
+            "rows": None,
+        }
+
+    plan = _resolve_batch_plan_manifest(runs_root, task, params)
+    selected = _select_batch_dispatch_files(plan, params, dispatch_mode)
+    selected_paths = [Path(item["path"]) for item in selected]
+    rows = _collect_dispatch_rows(
+        selected,
+        task.id_field,
+        dispatch_mode=dispatch_mode,
+        batch_plan_id=str(plan["batch_plan_id"]),
+        batch_manifest_path=str(plan["manifest_path"]),
+    )
+    selected_overlap_ids = _selected_overlap_item_ids(plan, selected)
+    return {
+        "dispatch_mode": dispatch_mode,
+        "dispatch_path": str(selected_paths[0]) if dispatch_mode == "single_batch" else None,
+        "sample_id": plan.get("sample_id"),
+        "sample_path": plan.get("sample_path"),
+        "batch_plan_id": plan.get("batch_plan_id"),
+        "batch_manifest_path": str(plan["manifest_path"]),
+        "batch_ids": [item["batch_id"] for item in selected],
+        "batch_files": [item["batch_file"] for item in selected],
+        "overlap_item_ids": list(plan["manifest"].get("overlap_item_ids") or []),
+        "selected_overlap_item_ids": selected_overlap_ids,
+        "batch_plan_overlap_item_ids": list(plan["manifest"].get("overlap_item_ids") or []),
+        "rows": len(rows),
+        "_rows": rows,
+    }
+
+
+def _materialize_argilla_dispatch(dispatch: dict[str, Any], annotation_dir: Path) -> str:
+    if dispatch["dispatch_mode"] == "batch_plan":
+        dispatch_path = annotation_dir / "dispatch.jsonl"
+        write_jsonl(dispatch.pop("_rows"), dispatch_path)
+        dispatch["dispatch_path"] = str(dispatch_path)
+        return str(dispatch_path)
+    dispatch.pop("_rows", None)
+    return str(dispatch["dispatch_path"])
+
+
+def _argilla_push_params(params: dict[str, Any], dispatch: dict[str, Any]) -> dict[str, Any]:
+    out = dict(params.get("argilla") or {})
+    if dispatch.get("dispatch_mode") == "sample":
+        return out
+    if dispatch.get("dispatch_mode") == "batch_plan":
+        out.setdefault("record_id_strategy", "batch_scoped")
+    for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path"):
+        value = dispatch.get(key)
+        if value not in (None, "", [], {}):
+            out.setdefault(key, value)
+    return out
+
+
+def _argilla_lineage_for_pull(runs_root: str | Path, task_id: str, params: dict[str, Any], dataset: str) -> dict[str, Any]:
+    annotation_manifest: dict[str, Any] = {}
+    annotation_id = str(params.get("annotation_id") or params.get("job_id") or "").strip()
+    if annotation_id and _safe_segment(annotation_id):
+        manifest_path = Path(runs_root) / task_id / "annotation_jobs" / annotation_id / "manifest.json"
+        if manifest_path.exists():
+            annotation_manifest = read_json(manifest_path)
+    if not annotation_manifest:
+        for item in list_annotation_jobs(Path(runs_root), task_id):
+            if item.get("argilla_dataset") == dataset or item.get("dataset") == dataset:
+                annotation_manifest = item
+                annotation_id = str(item.get("annotation_id") or annotation_id)
+                break
+
+    lineage: dict[str, Any] = {}
+    for key in (
+        "dispatch_mode",
+        "batch_plan_id",
+        "batch_manifest_path",
+        "batch_ids",
+        "batch_files",
+        "overlap_item_ids",
+        "sample_id",
+        "sample_path",
+    ):
+        value = params.get(key)
+        if value in (None, "", [], {}):
+            value = annotation_manifest.get(key)
+        if value not in (None, "", [], {}):
+            lineage[key] = value
+    argilla_dataset = params.get("dataset") or annotation_manifest.get("argilla_dataset") or annotation_manifest.get("dataset")
+    if argilla_dataset not in (None, ""):
+        lineage["argilla_dataset"] = argilla_dataset
+    if annotation_id:
+        lineage["annotation_id"] = annotation_id
+        lineage["source_annotation_id"] = annotation_id
+    return lineage
+
+
 def _has_passing_agreement_audit(task, sample_path: str | Path, decisions_path: str | Path) -> bool:
     base = task.runs_dir / "agreement_audits"
     if not base.is_dir():
@@ -1254,29 +1587,57 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             return {"run": str(run_dir), "run_id": params["run_id"], "kind": "run"}
         if action == "argilla_push":
             from .integrations.argilla import push_sample
-            sample_id = params.get("sample_id") or Path(params["sample"]).parent.name
+            dispatch_mode = _argilla_dispatch_mode(params)
+            dispatch = _resolve_argilla_dispatch(runs_root, task, params, dispatch_mode)
+            sample_id = dispatch.get("sample_id") or params.get("sample_id")
             dataset = params.get("dataset") or _default_argilla_dataset(task.task_id, sample_id)
-            result = push_sample(task, params["sample"], dataset, params.get("argilla", {}))
             annotation_id = params.get("annotation_id") or dataset
             annotation_dir = Path(runs_root) / task.task_id / "annotation_jobs" / annotation_id
+            dispatch_path = _materialize_argilla_dispatch(dispatch, annotation_dir)
+            argilla_params = _argilla_push_params(params, dispatch)
+            result = push_sample(task, dispatch_path, dataset, argilla_params)
             manifest = {
                 "task_id": task.task_id,
                 "annotation_id": annotation_id,
                 "source": "argilla",
                 "argilla_dataset": dataset,
+                "dispatch_mode": dispatch_mode,
+                "dispatch_path": dispatch_path,
                 "sample_id": sample_id,
-                "sample_path": params["sample"],
+                "sample_path": dispatch.get("sample_path"),
+                "batch_plan_id": dispatch.get("batch_plan_id"),
+                "batch_manifest_path": dispatch.get("batch_manifest_path"),
+                "batch_ids": dispatch.get("batch_ids") or [],
+                "batch_files": dispatch.get("batch_files") or [],
+                "overlap_item_ids": dispatch.get("overlap_item_ids") or [],
+                "selected_overlap_item_ids": dispatch.get("selected_overlap_item_ids") or [],
                 "rows": result.get("records", 0),
+                "record_id_policy": result.get("record_id_policy"),
+                "duplicate_record_ids": result.get("duplicate_record_ids"),
                 "status": "已分发",
                 "created_at": _now(),
                 "result": result,
             }
             write_json(manifest, annotation_dir / "manifest.json")
-            return {"kind": "annotation_job", "annotation_id": annotation_id, "result": result}
+            return {
+                "kind": "annotation_job",
+                "annotation_id": annotation_id,
+                "dispatch_mode": dispatch_mode,
+                "dispatch_path": dispatch_path,
+                "result": result,
+            }
         if action == "argilla_pull":
             from .integrations.argilla import pull_responses
-            sample_id = params.get("sample_id") or (Path(params["sample"]).parent.name if params.get("sample") else None)
-            dataset = params.get("dataset") or _default_argilla_dataset(task.task_id, sample_id)
+            dataset_param = params.get("dataset") or ""
+            lineage = _argilla_lineage_for_pull(runs_root, task.task_id, params, dataset_param)
+            sample_id = (
+                params.get("sample_id")
+                or lineage.get("sample_id")
+                or (Path(params["sample"]).parent.name if params.get("sample") else None)
+            )
+            dataset = params.get("dataset") or lineage.get("argilla_dataset") or _default_argilla_dataset(task.task_id, sample_id)
+            if not lineage or lineage.get("argilla_dataset") != dataset:
+                lineage = _argilla_lineage_for_pull(runs_root, task.task_id, params, dataset)
             decision_id = params.get("decision_id") or dataset
             decision_dir = Path(runs_root) / task.task_id / "decisions" / decision_id
             output = Path(params.get("output") or decision_dir / "decisions.jsonl")
@@ -1287,12 +1648,15 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                 "source": "argilla",
                 "argilla_dataset": dataset,
                 "sample_id": sample_id,
-                "sample_path": params.get("sample"),
+                "sample_path": lineage.get("sample_path") or params.get("sample"),
                 "path": str(output),
                 "rows": result.get("responses", 0),
                 "created_at": _now(),
                 "result": result,
             }
+            for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path", "batch_ids", "batch_files", "overlap_item_ids", "annotation_id", "source_annotation_id"):
+                if lineage.get(key) not in (None, "", [], {}):
+                    manifest[key] = lineage[key]
             write_json(manifest, decision_dir / "manifest.json")
             return {"kind": "decision_artifact", "artifact": str(output), "decision_id": decision_id, "result": result}
         if action == "audit":
@@ -1990,7 +2354,10 @@ def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
     for dd in sorted(p for p in base.iterdir() if p.is_dir()):
         manifest = dd / "manifest.json"
         if manifest.exists():
-            out.append(read_json(manifest))
+            item = read_json(manifest)
+            item.setdefault("annotation_id", dd.name)
+            item["manifest_path"] = str(manifest)
+            out.append(item)
         else:
             out.append({
                 "task_id": task_id,

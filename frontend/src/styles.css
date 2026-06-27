@@ -176,7 +176,16 @@ tr:last-child td { border-bottom: 0; }
 .policy-preview div { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--muted-bg); min-width: 0; }
 .policy-preview span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; }
 .policy-preview strong { display: block; font-weight: 500; overflow-wrap: anywhere; }
+.plan-summary-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: -2px 0 16px; }
+.plan-summary-grid div { padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--muted-bg); min-width: 0; }
+.plan-summary-grid span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 2px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.plan-summary-grid strong { display: block; font-weight: 500; overflow-wrap: anywhere; }
 .stage-tip { margin-top: 10px; padding: 10px 12px; border: 1px dashed hsl(0 72% 51% / .35); border-radius: var(--radius); color: var(--red); background: hsl(0 86% 97%); font-size: 13px; }
+.stage-tip a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.advanced-panel { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.advanced-panel summary { cursor: pointer; font-weight: 600; }
+.advanced-panel p { margin: 8px 0 10px; }
+.dispatch-cell span { display: block; }
 .log-box { white-space: pre-wrap; font-size: 12px; background: var(--muted-bg); padding: 12px; border-radius: var(--radius); overflow-x: auto; }
 .canvas-page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .canvas-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }

@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 
@@ -10,8 +10,108 @@ function slug(value) {
     .replace(/^[_.-]+|[_.-]+$/g, "") || "item";
 }
 
-function defaultDatasetName(taskId, sampleId) {
-  return `${slug(taskId)}_${slug(sampleId || "sample")}_v001`;
+function defaultDatasetName(taskId, sampleId, planId) {
+  return `${slug(taskId)}_${slug(sampleId || "sample")}_${slug(planId || "batch_plan")}_v001`;
+}
+
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== "");
+}
+
+function planIdFromPath(value) {
+  const parts = String(value || "").split(/[\\/]+/).filter(Boolean);
+  if (!parts.length) return "";
+  const last = parts[parts.length - 1];
+  if (last === "manifest.json" && parts.length > 1) return parts[parts.length - 2];
+  return last;
+}
+
+function countLike(value) {
+  return Array.isArray(value) ? value.length : value;
+}
+
+function batchPlanFromManifest(manifest, index) {
+  const consistency = manifest.consistency || manifest.quality_controls || manifest.policy || {};
+  const manifestPath = firstDefined(manifest.manifest_path, manifest.batch_manifest_path, manifest.path);
+  const planDir = firstDefined(manifest.plan_dir, manifest.batch_plan_dir);
+  const planId = firstDefined(
+    manifest.plan_id,
+    manifest.batch_plan_id,
+    manifest.id,
+    manifest.name,
+    planIdFromPath(planDir),
+    planIdFromPath(manifestPath),
+    `plan_${index + 1}`,
+  );
+  const batchCount = firstDefined(
+    manifest.batch_count,
+    manifest.batches_count,
+    Array.isArray(manifest.batches) ? manifest.batches.length : undefined,
+  );
+  const overlapItemCount = firstDefined(
+    manifest.overlap_item_count,
+    countLike(manifest.overlap_item_ids),
+    countLike(manifest.overlap_items),
+    manifest.overlap_count,
+    consistency.overlap_item_count,
+    countLike(consistency.overlap_item_ids),
+    countLike(consistency.overlap_items),
+    consistency.overlap_count,
+  );
+
+  return {
+    key: String(firstDefined(manifest.plan_id, manifest.batch_plan_id, manifestPath, planDir, planId)),
+    manifest,
+    manifest_path: manifestPath,
+    plan_id: planId,
+    strategy_id: firstDefined(manifest.strategy_id, consistency.strategy_id, manifest.strategy),
+    batch_count: batchCount,
+    batch_size: firstDefined(manifest.batch_size, manifest.rows_per_batch),
+    overlap_rate: firstDefined(manifest.overlap_rate, consistency.overlap_rate),
+    overlap_item_count: overlapItemCount,
+    min_annotators_per_overlap_item: firstDefined(
+      manifest.min_annotators_per_overlap_item,
+      manifest.min_annotators,
+      consistency.min_annotators_per_overlap_item,
+      consistency.min_annotators,
+    ),
+  };
+}
+
+function getBatchPlans(sample) {
+  const plans = [];
+  const seen = new Set();
+  const pushManifest = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(pushManifest);
+      return;
+    }
+    if (typeof value !== "object") return;
+    const plan = batchPlanFromManifest(value, plans.length);
+    if (seen.has(plan.key)) return;
+    seen.add(plan.key);
+    plans.push(plan);
+  };
+
+  pushManifest(sample?.latest_batch_manifest);
+  pushManifest(Array.isArray(sample?.batch_manifests) ? [...sample.batch_manifests].reverse() : sample?.batch_manifests);
+  pushManifest(sample?.batch_manifest);
+  pushManifest(sample?.batch);
+  pushManifest(Array.isArray(sample?.batches) ? [...sample.batches].reverse() : sample?.batches);
+  pushManifest(sample?.manifest?.batch_manifest);
+  pushManifest(sample?.manifest?.batch);
+  if (sample?.manifest?.batch_count || sample?.manifest?.batch_size || sample?.manifest?.batches) {
+    pushManifest(sample.manifest);
+  }
+  return plans;
+}
+
+function displayPlanValue(value) {
+  if (value === undefined || value === null || value === "") return "-";
+  if (Array.isArray(value)) return String(value.length);
+  if (typeof value === "object") return JSON.stringify(value);
+  return String(value);
 }
 
 export default function RunsPage({ task, taskId, onError }) {
@@ -21,6 +121,7 @@ export default function RunsPage({ task, taskId, onError }) {
   const [decisions, setDecisions] = useState([]);
   const [agreementAudits, setAgreementAudits] = useState([]);
   const [sample, setSample] = useState("");
+  const [batchPlanKey, setBatchPlanKey] = useState("");
   const [decisionPath, setDecisionPath] = useState("");
   const [agreementAuditId, setAgreementAuditId] = useState("");
   const [annotationId, setAnnotationId] = useState("");
@@ -55,12 +156,31 @@ export default function RunsPage({ task, taskId, onError }) {
   useEffect(() => { reload(); }, [reload]);
 
   const selectedSample = samples.find((item) => item.path === sample);
+  const batchPlans = useMemo(() => getBatchPlans(selectedSample), [selectedSample]);
+  const selectedBatchPlan = batchPlans.find((item) => item.key === batchPlanKey) || null;
   const selectedDecision = decisions.find((item) => item.path === decisionPath);
-  const generatedDataset = defaultDatasetName(taskId, selectedSample?.sample_id);
+  const generatedDataset = defaultDatasetName(taskId, selectedSample?.sample_id, selectedBatchPlan?.plan_id);
+  const pushDisabledReason = !sample
+    ? "请选择样本集。"
+    : !batchPlans.length
+      ? "该样本集还没有批次计划，请回样本管理生成批次计划。"
+      : !selectedBatchPlan
+        ? "请选择批次计划。"
+        : "";
 
   useEffect(() => {
     if (datasetAuto) setArgillaDataset(generatedDataset);
   }, [datasetAuto, generatedDataset]);
+
+  useEffect(() => {
+    if (!selectedSample || !batchPlans.length) {
+      if (batchPlanKey) setBatchPlanKey("");
+      return;
+    }
+    if (!batchPlans.some((item) => item.key === batchPlanKey)) {
+      setBatchPlanKey(batchPlans[0].key);
+    }
+  }, [selectedSample, batchPlans, batchPlanKey]);
 
   async function action(name, params, label) {
     if (!task) return false;
@@ -87,24 +207,46 @@ export default function RunsPage({ task, taskId, onError }) {
 
   async function pushArgilla() {
     const dataset = argillaDataset.trim() || generatedDataset;
-    if (!sample || !dataset) { onError("请选择样本"); return; }
+    if (!sample || !dataset) { onError("请选择样本集"); return; }
+    if (!selectedBatchPlan) { onError("请先选择批次计划；没有计划时请回样本管理生成批次计划"); return; }
+    await action("argilla_push", {
+      dispatch_mode: "batch_plan",
+      batch_plan_id: selectedBatchPlan.plan_id,
+      batch_manifest_path: selectedBatchPlan.manifest_path,
+      sample,
+      dataset,
+      annotation_id: annotationId || dataset,
+      sample_id: selectedSample?.sample_id,
+      argilla: {
+        min_submitted: Number(argillaMinSubmitted),
+        if_exists: argillaIfExists,
+        record_id_strategy: "batch_scoped",
+      },
+    }, "推送 Argilla");
+  }
+
+  async function pushArgillaDirect() {
+    const dataset = argillaDataset.trim() || generatedDataset;
+    if (!sample || !dataset) { onError("请选择样本集"); return; }
     await action("argilla_push", {
       sample,
       dataset,
       annotation_id: annotationId || dataset,
       sample_id: selectedSample?.sample_id,
       argilla: { min_submitted: Number(argillaMinSubmitted), if_exists: argillaIfExists },
-    }, "推送 Argilla");
+    }, "直接推送 Argilla");
   }
 
   async function pullArgilla() {
     const dataset = argillaDataset.trim() || generatedDataset;
     if (!sample || !dataset) { onError("请选择样本"); return; }
+    const annotation = annotationId.trim();
     await action("argilla_pull", {
       sample,
       sample_id: selectedSample?.sample_id,
       dataset,
-      decision_id: annotationId || dataset,
+      annotation_id: annotation || undefined,
+      decision_id: annotation || dataset,
     }, "拉回标注结果");
   }
 
@@ -127,6 +269,7 @@ export default function RunsPage({ task, taskId, onError }) {
     if (!job) return;
     const samplePath = job.sample_path || samples.find((item) => item.sample_id === job.sample_id)?.path || "";
     if (samplePath) setSample(samplePath);
+    setBatchPlanKey(String(firstDefined(job.batch_plan_id, job.batch_plan?.plan_id, job.batch_manifest_path, "")));
     setAnnotationId(job.annotation_id || job.argilla_dataset || "");
     setArgillaDataset(job.argilla_dataset || "");
     setDatasetAuto(false);
@@ -164,11 +307,34 @@ export default function RunsPage({ task, taskId, onError }) {
         <h3>Argilla 标注任务</h3>
         <div className="form-grid">
           <div className="field">
-            <label>样本</label>
-            <select value={sample} onChange={(e) => setSample(e.target.value)}>
-              <option value="">选择样本</option>
-              {samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}
+            <label>样本集</label>
+            <select value={sample} onChange={(e) => { setSample(e.target.value); setBatchPlanKey(""); }}>
+              <option value="">选择样本集</option>
+              {samples.map((s) => {
+                const planCount = getBatchPlans(s).length;
+                return (
+                  <option key={s.sample_id} value={s.path}>
+                    {s.sample_id}{planCount ? ` · ${planCount} 个批次计划` : " · 无批次计划"}
+                  </option>
+                );
+              })}
             </select>
+          </div>
+          <div className="field">
+            <label>批次计划</label>
+            <select
+              value={batchPlanKey}
+              disabled={!selectedSample || !batchPlans.length}
+              onChange={(e) => setBatchPlanKey(e.target.value)}
+            >
+              <option value="">{selectedSample ? "选择批次计划" : "请先选择样本集"}</option>
+              {batchPlans.map((plan, index) => (
+                <option key={plan.key} value={plan.key}>
+                  {index === 0 ? "最新 · " : ""}{plan.plan_id} · {displayPlanValue(plan.batch_count)} 批
+                </option>
+              ))}
+            </select>
+            <span className="hint">有批次计划时默认选择最新计划。</span>
           </div>
           <div className="field">
             <label>标注任务编号</label>
@@ -197,12 +363,29 @@ export default function RunsPage({ task, taskId, onError }) {
             </select>
           </div>
         </div>
+        {selectedBatchPlan && (
+          <div className="plan-summary-grid">
+            <div><span>plan_id</span><strong>{displayPlanValue(selectedBatchPlan.plan_id)}</strong></div>
+            <div><span>strategy_id</span><strong>{displayPlanValue(selectedBatchPlan.strategy_id)}</strong></div>
+            <div><span>batch_count</span><strong>{displayPlanValue(selectedBatchPlan.batch_count)}</strong></div>
+            <div><span>batch_size</span><strong>{displayPlanValue(selectedBatchPlan.batch_size)}</strong></div>
+            <div><span>overlap_rate</span><strong>{displayPlanValue(selectedBatchPlan.overlap_rate)}</strong></div>
+            <div><span>overlap_item_count</span><strong>{displayPlanValue(selectedBatchPlan.overlap_item_count)}</strong></div>
+            <div><span>min_annotators_per_overlap_item</span><strong>{displayPlanValue(selectedBatchPlan.min_annotators_per_overlap_item)}</strong></div>
+          </div>
+        )}
+        {selectedSample && !selectedBatchPlan && (
+          <div className="stage-tip">
+            该样本集还没有批次计划，请先<Link to={`/task/${encodeURIComponent(taskId)}/samples`}>回样本管理</Link>生成批次计划。
+          </div>
+        )}
         <div className="action-row">
-          <button className="btn btn-primary" disabled={busy} onClick={pushArgilla}>推送到 Argilla</button>
+          <button className="btn btn-primary" disabled={busy || !selectedBatchPlan} onClick={pushArgilla}>推送到 Argilla</button>
           <button className="btn" disabled={busy} onClick={pullArgilla}>拉回标注结果</button>
           <button className="btn" disabled={busy} onClick={testArgilla}>测试连接</button>
           <button className="btn" disabled={busy} onClick={() => { setDatasetAuto(true); setArgillaDataset(generatedDataset); }}>恢复自动命名</button>
         </div>
+        {pushDisabledReason && <div className="status-line danger-line">{pushDisabledReason}</div>}
         {argillaStatus && (
           <div className="status-line">
             Argilla 连接正常：用户 {argillaStatus.user?.username || "-"}，workspace {argillaStatus.workspace}
@@ -210,6 +393,11 @@ export default function RunsPage({ task, taskId, onError }) {
             {(argillaStatus.workspaces || []).join(", ") || "-"}
           </div>
         )}
+        <details className="advanced-panel">
+          <summary>高级选项：直接推送整个样本集</summary>
+          <p className="muted">默认推送批次计划；仅在需要兼容旧流程时使用整样本直推。</p>
+          <button className="btn" disabled={busy || !sample} onClick={pushArgillaDirect}>直接推送整个样本集</button>
+        </details>
       </div>
       <div className="card section-card">
         <div className="toolbar"><h3>已推送标注任务（{annotationJobs.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
@@ -217,13 +405,17 @@ export default function RunsPage({ task, taskId, onError }) {
         {annotationJobs.length > 0 && (
           <div className="table-wrap">
             <table>
-              <thead><tr><th>标注任务编号</th><th>Argilla 数据集</th><th>样本</th><th>行数</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
+              <thead><tr><th>标注任务编号</th><th>Argilla 数据集</th><th>样本</th><th>批次计划</th><th>行数</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
               <tbody>
                 {annotationJobs.map((job) => (
                   <tr key={job.annotation_id || job.argilla_dataset}>
                     <td><span className="badge badge-blue">{job.annotation_id || "-"}</span></td>
                     <td>{job.argilla_dataset || "-"}</td>
                     <td>{job.sample_id || "-"}</td>
+                    <td className="text-cell dispatch-cell">
+                      <span>dispatch_mode: {job.dispatch_mode || "-"}</span>
+                      <span className="muted mono-cell">batch_plan_id: {job.batch_plan_id || "-"}</span>
+                    </td>
                     <td>{job.rows ?? job.result?.records ?? "-"}</td>
                     <td>{job.status || "-"}</td>
                     <td className="muted">{(job.created_at || "").slice(0, 19)}</td>
