@@ -2747,7 +2747,121 @@ def archive_sample(runs_root: str | Path, task_id: str, sample_id: str, *, reaso
         raise
 
 
-def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
+def _asset_path_status(value: Any, fallback: Path | None = None) -> tuple[str | None, bool]:
+    if value not in (None, "", [], {}):
+        text = str(value)
+        path = Path(text)
+        if path.exists():
+            return str(path), True
+        if fallback is not None and not path.is_absolute():
+            alt = fallback.parent / path
+            if alt.exists():
+                return str(alt), True
+        return text, False
+    if fallback is not None:
+        return str(fallback), fallback.exists()
+    return None, False
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _manifest_file_exists(item: dict[str, Any]) -> bool:
+    manifest_path = item.get("manifest_path")
+    return bool(manifest_path) and Path(str(manifest_path)).exists()
+
+
+def _annotation_dispatch_status(task_dir: Path, item: dict[str, Any]) -> tuple[str | None, bool]:
+    annotation_id = str(item.get("annotation_id") or item.get("job_id") or item.get("id") or "")
+    fallback = task_dir / "annotation_jobs" / annotation_id / "dispatch.jsonl" if annotation_id else None
+    return _asset_path_status(item.get("local_dispatch_file") or item.get("dispatch_path"), fallback)
+
+
+def _decision_file_status(task_dir: Path, item: dict[str, Any]) -> tuple[str | None, bool]:
+    decision_id = str(item.get("decision_id") or item.get("id") or "")
+    fallback = task_dir / "decisions" / decision_id / "decisions.jsonl" if decision_id else None
+    return _asset_path_status(item.get("path") or item.get("decisions_path"), fallback)
+
+
+def _gold_file_status(task_dir: Path, item: dict[str, Any]) -> tuple[str | None, bool]:
+    version = str(item.get("version") or item.get("gold_id") or "")
+    fallback = task_dir / "gold" / f"gold_{version}.jsonl" if version else None
+    return _asset_path_status(item.get("path") or item.get("gold_path"), fallback)
+
+
+def _decision_pulled(task_dir: Path, item: dict[str, Any]) -> bool:
+    _, file_exists = _decision_file_status(task_dir, item)
+    return file_exists or _manifest_file_exists(item) or item.get("rows") is not None
+
+
+def _gold_generated(task_dir: Path, item: dict[str, Any]) -> bool:
+    _, file_exists = _gold_file_status(task_dir, item)
+    return file_exists or _manifest_file_exists(item) or item.get("rows") is not None
+
+
+def _annotation_argilla_published(item: dict[str, Any]) -> bool:
+    explicit = item.get("argilla_published")
+    if isinstance(explicit, bool):
+        return explicit
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    if result:
+        status = str(result.get("status") or "").strip().lower()
+        if result.get("ok") is False or status in {"failed", "failure", "error"}:
+            return False
+        if result.get("records") is not None or result.get("dataset") or result.get("record_id_policy") is not None:
+            return True
+    status_text = str(item.get("status") or item.get("state") or "").strip().lower()
+    if status_text in {"published", "succeeded", "success", "done", "已分发"}:
+        return True
+    return bool(
+        item.get("created_at")
+        and (item.get("argilla_dataset") or item.get("dataset"))
+        and item.get("source") == "argilla"
+    )
+
+
+def _annotation_matches_decision(annotation: dict[str, Any], decision: dict[str, Any]) -> bool:
+    annotation_id = str(annotation.get("annotation_id") or annotation.get("job_id") or annotation.get("id") or "")
+    decision_ids = {
+        str(value)
+        for value in (
+            decision.get("annotation_id"),
+            decision.get("source_annotation_id"),
+            decision.get("job_id"),
+        )
+        if value not in (None, "")
+    }
+    if annotation_id and (annotation_id in decision_ids or str(decision.get("decision_id") or "") == annotation_id):
+        return True
+    dataset = annotation.get("argilla_dataset") or annotation.get("dataset")
+    return bool(dataset and dataset in {decision.get("argilla_dataset"), decision.get("dataset")})
+
+
+def _gold_matches_decision(gold: dict[str, Any], decision: dict[str, Any]) -> bool:
+    decision_path = decision.get("path") or decision.get("decisions_path")
+    gold_decisions = gold.get("decisions") or gold.get("decisions_path")
+    if decision_path and gold_decisions and _same_path(gold_decisions, decision_path):
+        return True
+    decision_id = decision.get("decision_id")
+    return bool(decision_id and decision_id in {gold.get("decision_id"), gold.get("source_decision_id")})
+
+
+def _gold_version_from_manifest_path(path: Path) -> str:
+    name = path.name
+    suffix = ".manifest.json"
+    if name.startswith("gold_") and name.endswith(suffix):
+        return name[len("gold_"):-len(suffix)]
+    return path.stem
+
+
+def _raw_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
     out: list[dict] = []
     base = Path(runs_root) / task_id / "annotation_jobs"
     if not base.is_dir():
@@ -2766,6 +2880,232 @@ def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
                 "source": "unknown",
             })
     return out
+
+
+def _raw_decision_artifacts(runs_root: Path, task_id: str) -> list[dict]:
+    out: list[dict] = []
+    base = Path(runs_root) / task_id / "decisions"
+    if not base.is_dir():
+        return out
+    for dd in sorted(p for p in base.iterdir() if p.is_dir()):
+        manifest = dd / "manifest.json"
+        if manifest.exists():
+            item = read_json(manifest)
+            item.setdefault("decision_id", dd.name)
+            item["manifest_path"] = str(manifest)
+            out.append(item)
+        else:
+            out.append({
+                "task_id": task_id,
+                "decision_id": dd.name,
+                "path": str(dd / "decisions.jsonl"),
+                "source": "unknown",
+            })
+    return out
+
+
+def _raw_gold_versions(runs_root: Path, task_id: str) -> list[dict]:
+    out: list[dict] = []
+    base = Path(runs_root) / task_id / "gold"
+    if not base.is_dir():
+        return out
+    seen: set[str] = set()
+    for mp in sorted(base.glob("gold_*.manifest.json")):
+        item = read_json(mp)
+        version = str(item.get("version") or item.get("gold_id") or _gold_version_from_manifest_path(mp))
+        item.setdefault("version", version)
+        item["manifest_path"] = str(mp)
+        out.append(item)
+        seen.add(version)
+    for data_path in sorted(base.glob("gold_*.jsonl")):
+        version = data_path.stem[len("gold_"):] if data_path.stem.startswith("gold_") else data_path.stem
+        if version in seen:
+            continue
+        out.append({
+            "task_id": task_id,
+            "version": version,
+            "path": str(data_path),
+            "source": "unknown",
+        })
+    return out
+
+
+def _enrich_annotation_job_status(
+    task_dir: Path,
+    item: dict[str, Any],
+    decisions: list[dict],
+    gold_versions: list[dict],
+) -> dict[str, Any]:
+    local_dispatch_file, local_dispatch_file_exists = _annotation_dispatch_status(task_dir, item)
+    linked_decisions = [
+        decision
+        for decision in decisions
+        if _annotation_matches_decision(item, decision) and _decision_pulled(task_dir, decision)
+    ]
+    linked_decision_ids = _ordered_unique([
+        str(decision.get("decision_id") or "")
+        for decision in linked_decisions
+    ])
+    linked_gold_versions = _ordered_unique([
+        str(gold.get("version") or "")
+        for decision in linked_decisions
+        for gold in gold_versions
+        if _gold_matches_decision(gold, decision) and _gold_generated(task_dir, gold)
+    ])
+    argilla_published = _annotation_argilla_published(item)
+    decisions_pulled = bool(linked_decision_ids)
+    gold_generated = bool(linked_gold_versions)
+    state = str(item.get("state") or "")
+    if not state or state == "active":
+        if gold_generated:
+            state = "gold_generated"
+        elif decisions_pulled:
+            state = "decisions_pulled"
+        elif argilla_published:
+            state = "argilla_published"
+        elif local_dispatch_file_exists:
+            state = "dispatch_ready"
+        else:
+            state = "incomplete" if _manifest_file_exists(item) else "empty"
+    return {
+        **item,
+        "local_dispatch_file": local_dispatch_file,
+        "local_dispatch_file_exists": local_dispatch_file_exists,
+        "argilla_published": argilla_published,
+        "decisions_pulled": decisions_pulled,
+        "gold_generated": gold_generated,
+        "state": state,
+        "linked_decision_ids": linked_decision_ids,
+        "linked_gold_versions": linked_gold_versions,
+    }
+
+
+def _enrich_decision_artifact_status(
+    task_dir: Path,
+    item: dict[str, Any],
+    annotations: list[dict],
+    gold_versions: list[dict],
+) -> dict[str, Any]:
+    linked_annotations = [annotation for annotation in annotations if _annotation_matches_decision(annotation, item)]
+    linked_annotation_ids = _ordered_unique([
+        str(annotation.get("annotation_id") or "")
+        for annotation in linked_annotations
+    ])
+    local_dispatch_file = None
+    local_dispatch_file_exists = False
+    for annotation in linked_annotations:
+        local_dispatch_file, local_dispatch_file_exists = _annotation_dispatch_status(task_dir, annotation)
+        if local_dispatch_file:
+            break
+    decision_id = str(item.get("decision_id") or "")
+    linked_gold_versions = _ordered_unique([
+        str(gold.get("version") or "")
+        for gold in gold_versions
+        if _gold_matches_decision(gold, item) and _gold_generated(task_dir, gold)
+    ])
+    decisions_pulled = _decision_pulled(task_dir, item)
+    gold_generated = bool(linked_gold_versions)
+    argilla_published = any(_annotation_argilla_published(annotation) for annotation in linked_annotations)
+    state = str(item.get("state") or "")
+    if not state or state == "active":
+        if gold_generated:
+            state = "gold_generated"
+        elif decisions_pulled:
+            state = "decisions_pulled"
+        else:
+            state = "incomplete" if _manifest_file_exists(item) else "empty"
+    return {
+        **item,
+        "local_dispatch_file": local_dispatch_file,
+        "local_dispatch_file_exists": local_dispatch_file_exists,
+        "argilla_published": argilla_published,
+        "decisions_pulled": decisions_pulled,
+        "gold_generated": gold_generated,
+        "state": state,
+        "linked_annotation_ids": linked_annotation_ids,
+        "linked_decision_ids": [decision_id] if decision_id and decisions_pulled else [],
+        "linked_gold_versions": linked_gold_versions,
+    }
+
+
+def _enrich_gold_version_status(
+    task_dir: Path,
+    item: dict[str, Any],
+    annotations: list[dict],
+    decisions: list[dict],
+) -> dict[str, Any]:
+    linked_decisions = [
+        decision
+        for decision in decisions
+        if _gold_matches_decision(item, decision) and _decision_pulled(task_dir, decision)
+    ]
+    linked_decision_ids = _ordered_unique([
+        str(decision.get("decision_id") or "")
+        for decision in linked_decisions
+    ])
+    linked_annotations = [
+        annotation
+        for annotation in annotations
+        if any(_annotation_matches_decision(annotation, decision) for decision in linked_decisions)
+    ]
+    linked_annotation_ids = _ordered_unique([
+        str(annotation.get("annotation_id") or "")
+        for annotation in linked_annotations
+    ])
+    local_dispatch_file = None
+    local_dispatch_file_exists = False
+    for annotation in linked_annotations:
+        local_dispatch_file, local_dispatch_file_exists = _annotation_dispatch_status(task_dir, annotation)
+        if local_dispatch_file:
+            break
+    decisions_path = item.get("decisions") or item.get("decisions_path")
+    decisions_pulled = bool(linked_decision_ids)
+    if not decisions_pulled and decisions_path:
+        _, decisions_file_exists = _asset_path_status(decisions_path)
+        decisions_pulled = decisions_file_exists
+    argilla_published = any(_annotation_argilla_published(annotation) for annotation in linked_annotations)
+    gold_generated = _gold_generated(task_dir, item)
+    version = str(item.get("version") or item.get("gold_id") or "")
+    state = str(item.get("state") or "")
+    if not state or state == "active":
+        state = "gold_generated" if gold_generated else "incomplete"
+    gold_file, gold_file_exists = _gold_file_status(task_dir, item)
+    return {
+        **item,
+        "gold_file": gold_file,
+        "gold_file_exists": gold_file_exists,
+        "local_dispatch_file": local_dispatch_file,
+        "local_dispatch_file_exists": local_dispatch_file_exists,
+        "argilla_published": argilla_published,
+        "decisions_pulled": decisions_pulled,
+        "gold_generated": gold_generated,
+        "state": state,
+        "linked_annotation_ids": linked_annotation_ids,
+        "linked_decision_ids": linked_decision_ids,
+        "linked_gold_versions": [version] if version and gold_generated else [],
+    }
+
+
+def _asset_status_inputs(runs_root: Path, task_id: str) -> tuple[Path, list[dict], list[dict], list[dict]]:
+    task_dir = Path(runs_root) / task_id
+    annotations = _raw_annotation_jobs(runs_root, task_id)
+    decisions = _raw_decision_artifacts(runs_root, task_id)
+    gold_versions = _raw_gold_versions(runs_root, task_id)
+    return task_dir, annotations, decisions, gold_versions
+
+
+def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
+    task_dir, annotations, decisions, gold_versions = _asset_status_inputs(Path(runs_root), task_id)
+    return [_enrich_annotation_job_status(task_dir, item, decisions, gold_versions) for item in annotations]
+
+
+def annotation_job_detail(runs_root: str | Path, task_id: str, annotation_id: str) -> dict:
+    if not _safe_segment(task_id) or not _safe_segment(annotation_id):
+        raise ValueError("非法任务或标注任务编号")
+    for item in list_annotation_jobs(Path(runs_root), task_id):
+        if str(item.get("annotation_id") or "") == annotation_id:
+            return item
+    raise ValueError(f"标注任务不存在: {annotation_id}")
 
 
 def list_agreement_audits(runs_root: Path, task_id: str) -> list[dict]:
@@ -2917,32 +3257,31 @@ def list_models(runs_root: Path, task_id: str) -> list[dict]:
 
 
 def list_gold_versions(runs_root: Path, task_id: str) -> list[dict]:
-    out: list[dict] = []
-    base = Path(runs_root) / task_id / "gold"
-    if not base.is_dir():
-        return out
-    for mp in sorted(base.glob("gold_*.manifest.json")):
-        out.append(read_json(mp))
-    return out
+    task_dir, annotations, decisions, gold_versions = _asset_status_inputs(Path(runs_root), task_id)
+    return [_enrich_gold_version_status(task_dir, item, annotations, decisions) for item in gold_versions]
 
 
 def list_decision_artifacts(runs_root: Path, task_id: str) -> list[dict]:
-    out: list[dict] = []
-    base = Path(runs_root) / task_id / "decisions"
-    if not base.is_dir():
-        return out
-    for dd in sorted(p for p in base.iterdir() if p.is_dir()):
-        manifest = dd / "manifest.json"
-        if manifest.exists():
-            out.append(read_json(manifest))
-        else:
-            out.append({
-                "task_id": task_id,
-                "decision_id": dd.name,
-                "path": str(dd / "decisions.jsonl"),
-                "source": "unknown",
-            })
-    return out
+    task_dir, annotations, decisions, gold_versions = _asset_status_inputs(Path(runs_root), task_id)
+    return [_enrich_decision_artifact_status(task_dir, item, annotations, gold_versions) for item in decisions]
+
+
+def decision_artifact_detail(runs_root: str | Path, task_id: str, decision_id: str) -> dict:
+    if not _safe_segment(task_id) or not _safe_segment(decision_id):
+        raise ValueError("非法任务或标注结果编号")
+    for item in list_decision_artifacts(Path(runs_root), task_id):
+        if str(item.get("decision_id") or "") == decision_id:
+            return item
+    raise ValueError(f"标注结果不存在: {decision_id}")
+
+
+def gold_version_detail(runs_root: str | Path, task_id: str, version: str) -> dict:
+    if not _safe_segment(task_id) or not _safe_segment(version):
+        raise ValueError("非法任务或训练集版本编号")
+    for item in list_gold_versions(Path(runs_root), task_id):
+        if str(item.get("version") or "") == version:
+            return item
+    raise ValueError(f"训练集版本不存在: {version}")
 
 
 def list_decisions(runs_root: Path, task_id: str, run_id: str) -> list[dict]:

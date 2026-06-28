@@ -19,7 +19,7 @@ from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
 
-API_CONTRACT_VERSION = "2026-06-27"
+API_CONTRACT_VERSION = "2026-06-28"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -192,6 +192,80 @@ def _contract_capabilities() -> dict[str, Any]:
                 "response_schema": {
                     "type": "object",
                     "required": ["ok", "task_id", "checks", "warnings", "errors"],
+                },
+            },
+            {
+                "method": "GET",
+                "path": "/api/task/annotation_jobs",
+                "action": "annotation_jobs_list",
+                "side_effects": False,
+                "query_params": {"task_id": {"type": "string", "required": True}},
+                "response_schema": {"type": "object", "required": ["annotation_jobs"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/annotation_job/detail",
+                "action": "annotation_job_detail",
+                "side_effects": False,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "annotation_id": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["annotation_job"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/task/decision_artifacts",
+                "action": "decision_artifacts_list",
+                "side_effects": False,
+                "query_params": {"task_id": {"type": "string", "required": True}},
+                "response_schema": {"type": "object", "required": ["decision_artifacts"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/decision_artifact/detail",
+                "action": "decision_artifact_detail",
+                "side_effects": False,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "decision_id": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["decision_artifact"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/task/gold_versions",
+                "action": "gold_versions_list",
+                "side_effects": False,
+                "query_params": {"task_id": {"type": "string", "required": True}},
+                "response_schema": {"type": "object", "required": ["gold_versions"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/gold_version/detail",
+                "action": "gold_version_detail",
+                "side_effects": False,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "version": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["gold_version"]},
+            },
+            {
+                "method": "POST",
+                "path": "/api/action",
+                "action": "operator_action",
+                "side_effects": True,
+                "operator_gated": True,
+                "allowed_actions": ["argilla_push", "argilla_pull", "gold"],
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task", "action"],
+                    "properties": {
+                        "task": {"type": "string"},
+                        "action": {"type": "string", "enum": ["argilla_push", "argilla_pull", "gold"]},
+                        "params": {"type": "object"},
+                    },
                 },
             },
         ],
@@ -748,6 +822,16 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"annotation_jobs": pipeline.list_annotation_jobs(self.runs_root, task)})
+        elif path == "/api/annotation_job/detail":
+            task = params.get("task_id", [""])[0]
+            annotation_id = params.get("annotation_id", [""])[0]
+            if not _safe_segment(task) or not _safe_segment(annotation_id):
+                self._json({"error": "bad task/annotation_id"}, status=400)
+                return
+            try:
+                self._json({"annotation_job": pipeline.annotation_job_detail(self.runs_root, task, annotation_id)})
+            except ValueError as exc:
+                self._json({"error": str(exc), "found": False}, status=404)
         elif path == "/api/task/agreement_audits":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
@@ -766,12 +850,32 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"gold_versions": pipeline.list_gold_versions(self.runs_root, task)})
+        elif path == "/api/gold_version/detail":
+            task = params.get("task_id", [""])[0]
+            version = params.get("version", [""])[0]
+            if not _safe_segment(task) or not _safe_segment(version):
+                self._json({"error": "bad task/version"}, status=400)
+                return
+            try:
+                self._json({"gold_version": pipeline.gold_version_detail(self.runs_root, task, version)})
+            except ValueError as exc:
+                self._json({"error": str(exc), "found": False}, status=404)
         elif path == "/api/task/decision_artifacts":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
             self._json({"decision_artifacts": pipeline.list_decision_artifacts(self.runs_root, task)})
+        elif path == "/api/decision_artifact/detail":
+            task = params.get("task_id", [""])[0]
+            decision_id = params.get("decision_id", [""])[0]
+            if not _safe_segment(task) or not _safe_segment(decision_id):
+                self._json({"error": "bad task/decision_id"}, status=400)
+                return
+            try:
+                self._json({"decision_artifact": pipeline.decision_artifact_detail(self.runs_root, task, decision_id)})
+            except ValueError as exc:
+                self._json({"error": str(exc), "found": False}, status=404)
         elif path == "/api/task/decisions":
             task = params.get("task_id", [""])[0]
             run = params.get("run", [""])[0]
