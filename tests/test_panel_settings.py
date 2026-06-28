@@ -156,6 +156,18 @@ def _request(base_url: str, path: str, *, method: str = "GET", payload=None) -> 
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def _raw_request(base_url: str, path: str, *, method: str = "GET") -> tuple[int, bytes, dict]:
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii"),
+    }
+    request = urllib.request.Request(base_url + path, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read(), dict(response.headers)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read(), dict(exc.headers)
+
+
 def test_settings_api_saves_and_reads_runtime_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _clear_settings_env(monkeypatch)
     runs_root = tmp_path / "runs"
@@ -262,6 +274,7 @@ def test_contract_metadata_and_public_settings_do_not_leak_secrets(
         assert ("GET", "/api/task/gold_versions", "gold_versions_list") in advertised
         assert ("GET", "/api/gold_version/detail", "gold_version_detail") in advertised
         assert ("POST", "/api/suggestions/import", "suggestions_import") in advertised
+        assert ("GET", "/api/suggestions/download", "suggestions_download") in advertised
         action_contract = next(item for item in capabilities["endpoints"] if item["path"] == "/api/action")
         assert "prelabel_export" in action_contract["allowed_actions"]
         assert "prelabel_suggest" not in action_contract["allowed_actions"]
@@ -329,6 +342,27 @@ def test_suggestions_import_api_registers_uploaded_file(tmp_path: Path, monkeypa
     rows = read_jsonl(runs_root / task.task_id / "suggestions" / "round_1" / "codex_v001" / "suggestions.jsonl")
     assert rows[0]["agent"] == "external_codex:v001"
     assert rows[0]["suggestions"] == {"label": "yes"}
+
+
+def test_suggestions_download_api_serves_exported_template(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    template_dir = runs_root / "panel_suggestion_task" / "suggestions" / "round_1" / "codex_v001"
+    template_dir.mkdir(parents=True)
+    template = template_dir / "suggestions_template.jsonl"
+    template.write_text('{"record_id":"r1","suggestions":{"label":null}}\n', encoding="utf-8")
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, body, headers = _raw_request(
+            base_url,
+            "/api/suggestions/download?task_id=panel_suggestion_task&annotation_id=round_1&suggestion_id=codex_v001&kind=template",
+        )
+
+    assert status == 200
+    assert body == template.read_bytes()
+    assert headers["Content-Type"].startswith("application/x-ndjson")
+    assert 'filename="codex_v001_suggestions_template.jsonl"' in headers["Content-Disposition"]
 
 
 def test_contract_task_detail_and_check_preview_data_lake(
