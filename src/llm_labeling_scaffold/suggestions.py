@@ -296,6 +296,7 @@ def _publish_existing(
         manifest["publish"] = push_suggestions(task, dispatch_path, dataset, suggestions_path, publish_params)
         manifest["status"] = "published"
         manifest["published_at"] = _now()
+        manifest.pop("error", None)
     except Exception as exc:
         manifest["status"] = "publish_failed"
         manifest["error"] = str(exc)
@@ -439,7 +440,9 @@ def generate_suggestions_for_annotation_job(
                     write_json(failed, manifest_path)
                     raise
                 result["publish"] = push_result
-                write_json({**existing, "status": "published", "publish": push_result}, manifest_path)
+                published = {**existing, "status": "published", "publish": push_result, "published_at": _now()}
+                published.pop("error", None)
+                write_json(published, manifest_path)
             return result
         raise ValueError(f"suggestion_id 已存在且输入或参数不同: {suggestion_id}")
 
@@ -487,6 +490,8 @@ def generate_suggestions_for_annotation_job(
         try:
             manifest["publish"] = push_suggestions(task, dispatch_path, dataset, suggestions_path, publish_params)
             manifest["status"] = "published"
+            manifest["published_at"] = _now()
+            manifest.pop("error", None)
         except Exception as exc:
             manifest["status"] = "publish_failed"
             manifest["error"] = str(exc)
