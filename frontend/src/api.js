@@ -139,5 +139,10 @@ export const archiveSample = (taskId, sampleId, reason = "") =>
     method: "DELETE",
   }).then((data) => data.sample || data);
 
+export const archiveAnnotationJob = (taskId, annotationId, reason = "") =>
+  req(`/api/annotation_job?${q({ task_id: taskId, annotation_id: annotationId, reason })}`, {
+    method: "DELETE",
+  }).then((data) => data.annotation_job || data);
+
 export const importDownloadUrl = (taskId, importId) =>
   `/api/import/download?${q({ task_id: taskId, import_id: importId })}`;

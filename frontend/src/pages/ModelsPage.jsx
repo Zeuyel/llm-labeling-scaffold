@@ -213,7 +213,7 @@ export default function ModelsPage({ task, taskId, onError }) {
                 {models.map((item) => {
                   const summary = modelSummary(item);
                   return (
-                    <tr key={summary.key}>
+                    <tr key={summary.key} className="clickable-row" onClick={() => openModelDetail(item)}>
                       <td><span className="badge badge-blue">{summary.modelId}</span></td>
                       <td><span className={`badge ${statusBadgeClass(summary.status)}`}>{summary.status}</span></td>
                       <td>{summary.trainer}</td>
@@ -224,7 +224,16 @@ export default function ModelsPage({ task, taskId, onError }) {
                       <td className="muted">{summary.createdAt}</td>
                       <td className="muted path-cell">
                         <div>{summary.path}</div>
-                        <button className="btn btn-sm" type="button" onClick={() => openModelDetail(item)}>详情</button>
+                        <button
+                          className="btn btn-sm"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openModelDetail(item);
+                          }}
+                        >
+                          详情
+                        </button>
                       </td>
                     </tr>
                   );

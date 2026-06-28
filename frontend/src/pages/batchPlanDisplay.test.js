@@ -133,6 +133,7 @@ test("annotation job list uses business labels and readable statuses", () => {
   assert.equal(annotationJobStatusLabel({ state: "running" }), "执行中");
   assert.equal(annotationJobStatusLabel({ status: "failed" }), "失败");
   assert.equal(annotationJobStatusLabel({ state: "incomplete" }), "记录不完整");
+  assert.equal(annotationJobStatusLabel({ state: "archived" }), "已归档");
   assert.equal(annotationJobStatusLabel({ annotation_id: "round_2" }), "已记录");
 });
 

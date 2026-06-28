@@ -1417,6 +1417,230 @@ def test_sample_archive_blocks_dependencies_and_prevents_id_reuse(tmp_path: Path
         raise AssertionError("archived sample id should not be reused")
 
 
+def test_annotation_job_archive_blocks_decisions_and_prevents_id_reuse(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "annotation_archive_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    sample_path = sample_records(task, 1, "sample_a", "head", source_path=source)
+    annotation_manifest = {
+        "task_id": task.task_id,
+        "annotation_id": "job_a",
+        "source": "argilla",
+        "argilla_dataset": "dataset_a",
+        "sample_id": "sample_a",
+        "sample_path": str(sample_path),
+    }
+    write_json(
+        annotation_manifest,
+        tmp_path / "runs" / task.task_id / "annotation_jobs" / "job_a" / "manifest.json",
+    )
+    write_json(
+        {
+            "task_id": task.task_id,
+            "decision_id": "decision_a",
+            "annotation_id": "job_a",
+            "argilla_dataset": "dataset_a",
+        },
+        tmp_path / "runs" / task.task_id / "decisions" / "decision_a" / "manifest.json",
+    )
+
+    with pytest.raises(ValueError, match="下游资产"):
+        pipeline.archive_annotation_job(tmp_path / "runs", task.task_id, "job_a")
+
+    (tmp_path / "runs" / task.task_id / "decisions" / "decision_a" / "manifest.json").unlink()
+    write_json(
+        {
+            "task_id": task.task_id,
+            "decision_id": "decision_source",
+            "annotation_id": "job_other",
+            "source_annotation_id": "job_a",
+        },
+        tmp_path / "runs" / task.task_id / "decisions" / "decision_source" / "manifest.json",
+    )
+
+    with pytest.raises(ValueError, match="下游资产"):
+        pipeline.archive_annotation_job(tmp_path / "runs", task.task_id, "job_a")
+
+    (tmp_path / "runs" / task.task_id / "decisions" / "decision_source" / "manifest.json").unlink()
+    archived = pipeline.archive_annotation_job(tmp_path / "runs", task.task_id, "job_a", reason="done")
+
+    archive_path = Path(archived["archive_path"])
+    assert archived["archived"] is True
+    assert not (tmp_path / "runs" / task.task_id / "annotation_jobs" / "job_a").exists()
+    assert (archive_path / "manifest.json").exists()
+    assert read_json(archive_path / "manifest.json")["state"] == "archived"
+    events = read_jsonl(tmp_path / "runs" / task.task_id / "_audit" / "events.jsonl")
+    assert any(event["event"] == "annotation_job.archive" and event["status"] == "succeeded" for event in events)
+    assert any(event["event"] == "annotation_job.archive" and event["status"] == "failed" for event in events)
+
+    job = pipeline.start_action(
+        tmp_path / "runs",
+        created["path"],
+        "argilla_push",
+        {
+            "sample": str(sample_path),
+            "annotation_id": "job_a",
+            "dataset": "dataset_a",
+        },
+    )
+    current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+    assert current["status"] == "failed"
+    assert "已归档" in current["error"]
+
+
+def test_argilla_push_uses_annotation_job_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "annotation_push_lock_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    sample_path = sample_records(task, 1, "sample_a", "head", source_path=source)
+    locked_assets: list[str] = []
+
+    class RecordingLock:
+        def __init__(self, asset_name: str):
+            self.asset_name = asset_name
+
+        def __enter__(self):
+            locked_assets.append(self.asset_name)
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_asset_lock(runs_root: Path, task_id: str, asset_name: str) -> RecordingLock:
+        return RecordingLock(asset_name)
+
+    def fake_push_sample(task, dispatch_path: str, dataset: str, params: dict) -> dict:
+        return {"records": 1}
+
+    from llm_labeling_scaffold.integrations import argilla as argilla_module
+
+    monkeypatch.setattr(pipeline, "_asset_lock", fake_asset_lock)
+    monkeypatch.setattr(argilla_module, "push_sample", fake_push_sample)
+
+    job = pipeline.start_action(
+        tmp_path / "runs",
+        created["path"],
+        "argilla_push",
+        {
+            "sample": str(sample_path),
+            "annotation_id": "job_a",
+            "dataset": "dataset_a",
+        },
+    )
+    current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+
+    assert current["status"] == "succeeded"
+    assert "annotation-job-job_a" in locked_assets
+
+
+def test_annotation_job_archive_does_not_mark_active_manifest_when_move_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task_id = "annotation_archive_failure_task"
+    annotation_dir = tmp_path / "runs" / task_id / "annotation_jobs" / "job_a"
+    write_json(
+        {
+            "task_id": task_id,
+            "annotation_id": "job_a",
+            "source": "argilla",
+            "argilla_dataset": "dataset_a",
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    def fail_move(source: Path, target: Path) -> None:
+        raise RuntimeError("move failed")
+
+    monkeypatch.setattr(pipeline, "_move_directory", fail_move)
+
+    with pytest.raises(RuntimeError, match="move failed"):
+        pipeline.archive_annotation_job(tmp_path / "runs", task_id, "job_a", reason="done")
+
+    manifest = read_json(annotation_dir / "manifest.json")
+    assert manifest.get("state") != "archived"
+    assert manifest.get("archived_at") is None
+    assert annotation_dir.exists()
+    events = read_jsonl(tmp_path / "runs" / task_id / "_audit" / "events.jsonl")
+    assert any(
+        event["event"] == "annotation_job.archive"
+        and event["status"] == "failed"
+        and event["details"]["error"] == "move failed"
+        for event in events
+    )
+
+
+def test_annotation_job_archive_rolls_back_when_archived_manifest_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    task_id = "annotation_archive_manifest_failure_task"
+    annotation_dir = tmp_path / "runs" / task_id / "annotation_jobs" / "job_a"
+    write_json(
+        {
+            "task_id": task_id,
+            "annotation_id": "job_a",
+            "source": "argilla",
+            "argilla_dataset": "dataset_a",
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    original_write_json = pipeline.write_json
+
+    def fail_archived_manifest(payload: dict, path: Path) -> None:
+        target = Path(path)
+        if (
+            target.name == "manifest.json"
+            and "_archive" in target.parts
+            and "annotation_jobs" in target.parts
+        ):
+            raise RuntimeError("manifest write failed")
+        original_write_json(payload, target)
+
+    monkeypatch.setattr(pipeline, "write_json", fail_archived_manifest)
+
+    with pytest.raises(RuntimeError, match="manifest write failed"):
+        pipeline.archive_annotation_job(tmp_path / "runs", task_id, "job_a", reason="done")
+
+    manifest = read_json(annotation_dir / "manifest.json")
+    assert manifest.get("state") != "archived"
+    assert manifest.get("archived_at") is None
+    assert annotation_dir.exists()
+    archive_root = tmp_path / "runs" / task_id / "_archive" / "annotation_jobs"
+    assert not archive_root.exists() or not any(archive_root.iterdir())
+    events = read_jsonl(tmp_path / "runs" / task_id / "_audit" / "events.jsonl")
+    assert any(
+        event["event"] == "annotation_job.archive"
+        and event["status"] == "failed"
+        and event["details"]["error"] == "manifest write failed"
+        for event in events
+    )
+
+
 def test_batch_action_does_not_overwrite_sample_manifest(tmp_path: Path):
     created = pipeline.create_task(
         tmp_path / "tasks",

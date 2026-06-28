@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
+import { annotationJobDetailActions, annotationJobGoldAction, annotationPageSections } from "./annotationPageState.js";
 import {
   agreementAuditCoverageLabel,
   agreementAuditDebugFields,
@@ -176,9 +177,26 @@ export default function RunsPage({ task, taskId, onError }) {
     () => annotationJobActionAvailability(selectedAnnotationJob, selectedJobDecisions, selectedJobSamplePath),
     [selectedAnnotationJob, selectedJobDecisions, selectedJobSamplePath],
   );
+  const selectedJobDetailActions = useMemo(
+    () => annotationJobDetailActions({ busy, job: selectedAnnotationJob, decisions: selectedJobDecisions }),
+    [busy, selectedAnnotationJob, selectedJobDecisions],
+  );
   const selectedJobAudits = useMemo(
     () => agreementAuditsForAnnotationJob(selectedAnnotationJob, selectedJobDecisions, agreementAudits),
     [selectedAnnotationJob, selectedJobDecisions, agreementAudits],
+  );
+  const selectedJobGoldAction = useMemo(
+    () => annotationJobGoldAction({ audits: selectedJobAudits }),
+    [selectedJobAudits],
+  );
+  const sections = useMemo(
+    () => annotationPageSections({
+      annotationJobs,
+      decisionArtifacts: decisions,
+      agreementAudits,
+      debugRuns: runs,
+    }),
+    [annotationJobs, decisions, agreementAudits, runs],
   );
   const selectedDecisionSamplePath = useMemo(
     () => selectedDecision?.sample_path || findSamplePathForJob(selectedDecisionJob, samples),
@@ -335,6 +353,26 @@ export default function RunsPage({ task, taskId, onError }) {
     }, "拉回标注结果");
   }
 
+  async function archiveAnnotationJob(job) {
+    const annotationId = annotationJobKey(job);
+    if (!annotationId) {
+      onError("该标注任务缺少编号，不能归档");
+      return;
+    }
+    const ok = window.confirm(`归档标注任务 ${annotationId}？\n\n只会归档本地 annotation_jobs 记录，不会删除 Argilla 数据集或 R2 对象。`);
+    if (!ok) return;
+    setBusy(true);
+    try {
+      await api.archiveAnnotationJob(taskId, annotationId, "panel archive");
+      setSelectedJobKey("");
+      await reload();
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runAgreementAuditForDecision(decision, job = selectedAnnotationJob) {
     const samplePath = decision?.sample_path || findSamplePathForJob(job, samples);
     const decisionPath = decision?.path;
@@ -375,7 +413,7 @@ export default function RunsPage({ task, taskId, onError }) {
       <div className="card section-card">
         <div className="toolbar">
           <div className="toolbar-stack">
-            <h3>标注任务（{annotationJobs.length}）</h3>
+            <h3>{sections.primary.title}（{sections.primary.count}）</h3>
             <div className="status-line">每一行是一条 Argilla 标注任务；点击行查看推送状态、批次血缘和后续动作。</div>
           </div>
           <div className="action-row">
@@ -442,8 +480,9 @@ export default function RunsPage({ task, taskId, onError }) {
         )}
       </div>
 
-      <div className="card section-card">
-        <div className="toolbar"><h3>标注结果产物（{decisions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+      <details className="card secondary-panel" defaultOpen={sections.decisionArtifacts.defaultOpen}>
+        <summary>{sections.decisionArtifacts.title}（{sections.decisionArtifacts.count}）</summary>
+        <div className="toolbar"><div className="status-line">从标注任务详情拉回后生成；点击行查看来源血缘、一致性检查和 Gold 入口。</div><button className="btn btn-sm" onClick={reload}>刷新</button></div>
         {!decisions.length && <div className="empty">暂无标注结果产物</div>}
         {decisions.length > 0 && (
           <div className="table-wrap">
@@ -487,10 +526,11 @@ export default function RunsPage({ task, taskId, onError }) {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
-      <div className="card section-card">
-        <div className="toolbar debug-toolbar"><h3>检查记录（{agreementAudits.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+      <details className="card secondary-panel" defaultOpen={sections.agreementAudits.defaultOpen}>
+        <summary>{sections.agreementAudits.title}（{sections.agreementAudits.count}）</summary>
+        <div className="toolbar debug-toolbar"><div className="status-line">从标注任务或结果详情运行一致性检查后生成。</div><button className="btn btn-sm" onClick={reload}>刷新</button></div>
         {!agreementAudits.length && <div className="empty">暂无一致性检查记录</div>}
         {agreementAudits.length > 0 && (
           <div className="table-wrap">
@@ -532,10 +572,10 @@ export default function RunsPage({ task, taskId, onError }) {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
-      <details className="card secondary-panel">
-        <summary>本地模型标注调试</summary>
+      <details className="card secondary-panel" defaultOpen={sections.debugRuns.defaultOpen}>
+        <summary>{sections.debugRuns.title}（{sections.debugRuns.count}）</summary>
         <p className="muted">这里仅用于快速检查模型输出，不作为正式人工标注入口。</p>
         <div className="form-grid">
           <div className="field"><label>样本</label><select value={sample} onChange={(e) => setSample(e.target.value)}><option value="">选择样本</option>{samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}</select></div>
@@ -692,10 +732,12 @@ export default function RunsPage({ task, taskId, onError }) {
             </div>
             <div className="drawer-detail-grid">
               <DetailField label="状态" value={annotationJobStatusLabel(selectedAnnotationJob)} />
+              <DetailField label="来源" value={selectedAnnotationJob.source || "Argilla"} />
               <DetailField label="分发方式" value={annotationJobDispatchLabel(selectedAnnotationJob)} />
               <DetailField label="Argilla 数据集" value={selectedAnnotationJob.argilla_dataset} />
               <DetailField label="样本集" value={selectedAnnotationJob.sample_id} />
               <DetailField label="记录数" value={selectedAnnotationJob.rows ?? selectedAnnotationJob.result?.records} />
+              <DetailField label="创建时间" value={(selectedAnnotationJob.created_at || "").slice(0, 19)} />
               <DetailField label="样本路径" value={selectedJobSamplePath} />
               <DetailField label="批次摘要" value={annotationJobBatchSummary(selectedAnnotationJob)} />
             </div>
@@ -716,12 +758,36 @@ export default function RunsPage({ task, taskId, onError }) {
               >
                 运行一致性检查
               </button>
+              {selectedJobGoldAction.enabled ? (
+                <Link className="btn btn-accent" to={`/task/${encodeURIComponent(taskId)}/gold`}>进入 Gold 构建</Link>
+              ) : (
+                <button className="btn" type="button" disabled>{selectedJobGoldAction.disabledReason}</button>
+              )}
             </div>
             {(selectedJobActionAvailability.pull.reason || selectedJobActionAvailability.agreement.reason) && (
               <div className="status-line">
                 {selectedJobActionAvailability.pull.reason || selectedJobActionAvailability.agreement.reason}
               </div>
             )}
+            <div className="drawer-actions">
+              <button className="btn" type="button" disabled title={selectedJobDetailActions.edit.disabledReason}>编辑</button>
+              <button className="btn btn-danger" type="button" disabled title={selectedJobDetailActions.delete.disabledReason}>删除</button>
+              <button
+                className="btn btn-danger"
+                type="button"
+                disabled={!selectedJobDetailActions.archive.enabled}
+                title={selectedJobDetailActions.archive.disabledReason}
+                onClick={() => archiveAnnotationJob(selectedAnnotationJob)}
+              >
+                归档本地记录
+              </button>
+            </div>
+            {selectedJobDetailActions.archive.disabledReason && (
+              <div className="status-line danger-line">{selectedJobDetailActions.archive.disabledReason}</div>
+            )}
+            <div className="status-line">
+              编辑不可用：{selectedJobDetailActions.edit.disabledReason} 删除不可用：{selectedJobDetailActions.delete.disabledReason}
+            </div>
             <div className="info-callout drawer-section">
               <strong>批次血缘</strong>
               <p>{annotationJobBatchSummary(selectedAnnotationJob)}</p>
