@@ -339,7 +339,8 @@ def import_external_suggestions(
         if has_suggestions and same_input and same_provider and same_prompt and same_source:
             result = {"kind": "suggestions", "action": "reused", "idempotent": True, **existing}
             if publish:
-                result = {**result, **_publish_existing(task, annotation_manifest, dispatch_path, dataset, suggestions_path, manifest_path, argilla)}
+                published = _publish_existing(task, annotation_manifest, dispatch_path, dataset, suggestions_path, manifest_path, argilla)
+                result = {"kind": "suggestions", "action": "reused", "idempotent": True, **published}
             return result
         if has_suggestions:
             raise ValueError(f"suggestion_id 已存在且输入或参数不同: {suggestion_id}")

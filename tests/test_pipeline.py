@@ -2216,6 +2216,28 @@ def test_external_suggestions_export_import_and_publish(tmp_path: Path, monkeypa
         "push_suggestions",
         lambda *args, **kwargs: {"status": "published", "records": 1},
     )
+    reused_publish = suggestions_module.import_external_suggestions(
+        tmp_path / "runs",
+        task,
+        "argilla_round_1",
+        "codex_file_v001",
+        [
+            {
+                "argilla_record_id": "r1__batch_00001.jsonl",
+                "suggestions": {"label": "yes"},
+                "scores": {"label": 0.91},
+            }
+        ],
+        provider="external_codex",
+        prompt_version="v001",
+        publish=True,
+    )
+    assert reused_publish["action"] == "reused"
+    assert reused_publish["status"] == "published"
+    assert reused_publish["publish"]["records"] == 1
+    assert "published_at" in reused_publish
+    assert "error" not in reused_publish
+
     publish_job = pipeline.start_action(
         tmp_path / "runs",
         created["path"],
