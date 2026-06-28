@@ -12,6 +12,8 @@ PYTHONPATH=src python3 -m llm_labeling_scaffold.cli <command>
 
 CLI 适合无 UI 的 MCP tool。面板 HTTP API 也能提供同等只读信息，但需要面板进程和 Basic Auth；若生产面板已常驻运行，可以复用 API。
 
+#14 的 SaaS/MCP mutating submit 验收路径使用面板 HTTP API：先 dry-run，再带 `confirm: true` 和 `idempotency_key` submit。CLI `data-lake import` 只作为本地 operator direct import 命令。
+
 部署验收时可使用 `smoke` runner 读取本地环境变量，不要把真实 URL、token、Basic Auth 密码、rclone config、Argilla key、数据库密码或 secret path 写入仓库：
 
 ```bash
@@ -26,7 +28,7 @@ PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format markdown
 ## 允许动作
 
 - 检查数据湖来源：只读取 registry、dataset manifest 和选中的对象元数据。
-- 从数据湖导入：只把 `task.yaml` 指定的任务级 JSONL materialize 到 `runs/<task_id>/imports/<import_id>/`。通过面板 API 发起时应创建异步 job，并通过 job 状态查询进度。
+- 从数据湖导入：先 dry-run 检查将要读取的 task/source/manifest 和 import id；真实提交只把 `task.yaml` 指定的任务级 JSONL materialize 到 `runs/<task_id>/imports/<import_id>/`。通过面板 API 发起 mutating submit 时必须携带 `confirm: true` 和 `idempotency_key`，返回异步 job，并通过 job 状态查询进度。
 - 查询任务列表和任务阶段状态。
 - 查询导入列表和导入详情。
 - 读取面板 API 的等价只读端点。
@@ -44,7 +46,7 @@ PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format markdown
 | MCP tool | scaffold command | 说明 |
 | --- | --- | --- |
 | `scaffold_data_lake_check` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake check --task tasks/<task_id>/task.yaml` | 只读检查 R2 registry、manifest 和对象选择。 |
-| `scaffold_data_lake_import` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake import --task tasks/<task_id>/task.yaml --runs-root runs [--import-id <id>]` | 写入本地 import 缓存；同 ID 同内容幂等复用，不同内容拒绝。 |
+| `operator_data_lake_import` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake import --task tasks/<task_id>/task.yaml --runs-root runs [--import-id <id>]` | 本地 operator 命令，直接写入本地 import 缓存；不作为 #14 SaaS/MCP mutating submit 验收路径。 |
 | `scaffold_task_list` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli task list --tasks-root tasks` | 读取本地任务缓存，输出稳定 JSON。 |
 | `scaffold_task_status` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli task status --task tasks/<task_id>/task.yaml --runs-root runs` | 输出 profile 阶段状态。也可用 `--task-id <task_id> --tasks-root tasks`。 |
 | `scaffold_import_list` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli import list --task tasks/<task_id>/task.yaml --runs-root runs` | 输出该任务所有本地 import manifest 摘要。 |
@@ -88,13 +90,14 @@ MCP 在生产调用 `data-lake import` 时不应传 `--source-object-path`。该
 | `scaffold_import_list` | `GET /api/task/imports?task_id=<task_id>` |
 | `scaffold_import_detail` | `GET /api/import/detail?task_id=<task_id>&import_id=<id>` |
 | `scaffold_data_lake_check` | `GET /api/task/data_lake?task_id=<task_id>` |
-| `scaffold_data_lake_import` | `POST /api/import/data_lake` with `{"task_id":"<task_id>","import_id":"<optional>"}`，返回 job |
+| `scaffold_data_lake_import` dry-run | `POST /api/import/data_lake` with `{"task_id":"<task_id>","import_id":"<optional>","dry_run":true}`，返回 `{"ok":true/false,"dry_run":true,"result":{...}}`，其中 `result` 包含 task/source/manifest 摘要、import id 和 validation |
+| `scaffold_data_lake_import` submit | `POST /api/import/data_lake` with `{"task_id":"<task_id>","import_id":"<optional>","confirm":true,"idempotency_key":"<stable-key>"}`，返回 job；同 key 同请求返回同一 job，同 key 不同请求拒绝 |
 | `scaffold_job_status` | `GET /api/jobs?task_id=<task_id>` |
 
 当 `LLS_TASK_SOURCE=r2` 时，面板 API 会先从 `LLS_TASK_REGISTRY_URI` 指向的数据湖治理登记表同步启用任务到本地 `tasks/` 缓存。CLI 不隐式同步 registry，只读取当前本地任务文件；因此 MCP 使用 CLI 前应确保任务缓存已存在并来自受控同步。
 
 ## 返回值和错误处理
 
-所有推荐 CLI 命令成功时都在 stdout 输出 JSON。MCP 应把非零退出码视为调用失败，并把 stderr/stdout 摘要返回给操作者，不应自动重试会写入本地资产的导入命令，除非 import ID 和数据湖血缘完全相同。通过面板 API 发起 R2 导入时，MCP 应记录返回的 job，并轮询 job 状态；导入成功后再触发 profile 的样本抽取阶段。
+所有推荐 CLI 命令成功时都在 stdout 输出 JSON。MCP 应把非零退出码视为调用失败，并把 stderr/stdout 摘要返回给操作者。CLI `data-lake import` 是本地 operator direct import 命令，不带 SaaS/API 的 submit gate，不作为 #14 的 MCP mutating submit 验收路径。通过面板 API 发起 R2 导入时，MCP 应先调用 dry-run；真实 submit 必须携带 `confirm: true` 和稳定 `idempotency_key`。MCP 应记录返回的 job，并轮询 job 状态；导入成功后再触发 profile 的样本抽取阶段。
 
 `data-lake check` 和 `data-lake import` 需要运行环境可执行 `rclone` 且配置了 `r2` remote。生产环境应按“系统设置”或 `LLS_DATA_LAKE_R2_PREFIX` 配置允许访问的 R2 前缀，例如 `r2:YOUR_BUCKET/...`；本地路径和 `file://` 只允许在测试中显式设置 `LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1`。

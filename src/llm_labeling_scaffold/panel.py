@@ -19,7 +19,7 @@ from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
 
-API_CONTRACT_VERSION = "2026-06-27"
+API_CONTRACT_VERSION = "2026-06-28"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -39,6 +39,16 @@ def _safe_segment(value: str) -> bool:
 
 def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _truthy_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _valid_idempotency_key(value: str) -> bool:
+    return bool(value) and len(value) <= 200 and not any(ord(ch) < 32 for ch in value)
 
 
 def _allow_data_lake_overrides() -> bool:
@@ -192,6 +202,52 @@ def _contract_capabilities() -> dict[str, Any]:
                 "response_schema": {
                     "type": "object",
                     "required": ["ok", "task_id", "checks", "warnings", "errors"],
+                },
+            },
+            {
+                "method": "POST",
+                "path": "/api/import/data_lake",
+                "action": "data_lake_import_dry_run",
+                "side_effects": False,
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id", "dry_run"],
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "import_id": {"type": "string"},
+                        "dry_run": {"const": True},
+                    },
+                    "additionalProperties": True,
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["ok", "dry_run", "result"],
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "dry_run": {"const": True},
+                        "result": {"type": "object"},
+                    },
+                },
+            },
+            {
+                "method": "POST",
+                "path": "/api/import/data_lake",
+                "action": "data_lake_import_submit",
+                "side_effects": True,
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id", "confirm", "idempotency_key"],
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "import_id": {"type": "string"},
+                        "confirm": {"const": True},
+                        "idempotency_key": {"type": "string"},
+                    },
+                    "additionalProperties": True,
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["ok", "job"],
                 },
             },
         ],
@@ -1028,11 +1084,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _import_data_lake(self, params) -> None:
         body = self._read_body()
+        if not isinstance(body, dict):
+            body = {}
         task_id = str(body.get("task_id") or params.get("task_id", [""])[0])
         if not _safe_segment(task_id):
             self._json({"error": "bad task"}, status=400)
             return
         import_id = str(body.get("import_id") or params.get("import_id", [""])[0] or "").strip()
+        dry_run_value = body.get("dry_run", body.get("dryRun", params.get("dry_run", [""])[0]))
+        dry_run = _truthy_value(dry_run_value)
         override_keys = (
             "lake_registry_uri",
             "source_dataset_id",
@@ -1044,16 +1104,35 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "生产模式不允许覆盖数据湖来源；请在 task.yaml 中使用治理登记表配置"}, status=400)
             return
         overrides = provided_overrides if _allow_data_lake_overrides() else {}
+        idempotency_key = str(body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "").strip()
+        if not dry_run:
+            if not _truthy_value(body.get("confirm")):
+                self._json({"error": "数据湖导入提交必须显式设置 confirm=true"}, status=400)
+                return
+            if not _valid_idempotency_key(idempotency_key):
+                self._json({"error": "数据湖导入提交必须提供有效的 idempotency_key 或 Idempotency-Key header"}, status=400)
+                return
         max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
         try:
             _apply_runtime_settings(self.runs_root)
             task_cfg = self._load_task_by_id(task_id)
+            if dry_run:
+                dry_run_result = pipeline.dry_run_data_lake_import(
+                    self.runs_root,
+                    task_cfg,
+                    import_id=import_id or None,
+                    overrides=overrides,
+                    max_bytes=max_bytes,
+                )
+                self._json({"ok": bool(dry_run_result["validation"]["ok"]), "dry_run": True, "result": dry_run_result})
+                return
             job = pipeline.start_data_lake_import(
                 self.runs_root,
                 task_cfg,
                 import_id=import_id or None,
                 overrides=overrides,
                 max_bytes=max_bytes,
+                idempotency_key=idempotency_key,
             )
             self._json({"ok": True, "job": job})
         except Exception as exc:

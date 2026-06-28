@@ -15,7 +15,7 @@ import yaml
 
 from .config import load_task, resolve_profile_id, with_runs_root
 from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
-from .jobs import Job, create_job, run_job
+from .jobs import Job, create_job, get_job, run_job
 from .profiles import DEFAULT_PROFILE, list_profile_presets, profile_definition, status_label
 
 try:
@@ -239,6 +239,11 @@ def _jsonl_content_hash(path: Path) -> str:
         digest.update(_canonical_row(row).encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _stable_json_hash(value: dict[str, Any]) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 DATA_LAKE_LINEAGE_KEYS = (
@@ -2400,6 +2405,184 @@ def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *
         raise
 
 
+def _data_lake_manifest_summary(source) -> dict[str, Any]:
+    manifest = source.manifest
+    selected = {
+        "path": source.source_object_path,
+        "storage_uri": source.source_object_uri,
+        "bytes": source.source_object_bytes,
+        "sha256": source.source_object_sha256,
+        "rows": source.source_object_rows,
+        "asset_type": source.source_asset_type,
+        "id_field": source.source_id_field,
+        "unique_ids": source.source_unique_ids,
+        "created_by": source.source_created_by,
+        "upstream_uri": source.source_upstream_uri,
+        "sampling_strategy": source.source_sampling_strategy,
+    }
+    return {
+        "dataset_id": manifest.get("dataset_id"),
+        "layer": manifest.get("layer"),
+        "domain": manifest.get("domain"),
+        "object_count": manifest.get("object_count"),
+        "total_bytes": manifest.get("total_bytes"),
+        "selected_object": {key: value for key, value in selected.items() if value not in (None, "")},
+    }
+
+
+def _import_resolution(runs_root: str | Path, task, import_id: str,
+                       incoming_hash: str, lineage: dict[str, Any]) -> dict[str, Any]:
+    item = _import_dir(runs_root, task.task_id, import_id)
+    if not item.exists():
+        if _archived_import_exists(runs_root, task.task_id, import_id):
+            return {
+                "action": "blocked",
+                "idempotent": False,
+                "existing": False,
+                "can_submit": False,
+                "reason": "archived_import_id",
+                "message": f"导入编号已归档，不能复用: {import_id}",
+            }
+        return {
+            "action": "create",
+            "idempotent": False,
+            "existing": False,
+            "can_submit": True,
+        }
+
+    raw_path = item / "raw.jsonl"
+    manifest_path = item / "manifest.json"
+    if not raw_path.exists():
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "missing_raw",
+            "message": f"导入编号已存在但缺少 raw.jsonl: {import_id}",
+        }
+    manifest = read_json(manifest_path) if manifest_path.exists() else {}
+    if manifest.get("state") == "archived":
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "archived_import_id",
+            "message": f"导入编号已归档，不能复用: {import_id}",
+        }
+    existing_hash = manifest.get("content_sha256") or _jsonl_content_hash(raw_path)
+    if existing_hash != incoming_hash:
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "content_mismatch",
+            "message": f"导入编号已存在且内容不同: {import_id}",
+            "existing_content_sha256": existing_hash,
+            "incoming_content_sha256": incoming_hash,
+        }
+    mismatches = _metadata_mismatches(manifest, lineage)
+    if mismatches:
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "lineage_mismatch",
+            "message": f"导入编号已存在且内容相同，但数据湖血缘不同: {', '.join(mismatches)}",
+            "lineage_mismatches": mismatches,
+        }
+    return {
+        "action": "reuse",
+        "idempotent": True,
+        "existing": True,
+        "can_submit": True,
+        "existing_import": _import_summary(runs_root, task.task_id, item, id_field=task.id_field),
+    }
+
+
+def dry_run_data_lake_import(runs_root: str | Path, task, import_id: str | None = None,
+                             overrides: dict[str, Any] | None = None,
+                             max_bytes: int | None = None) -> dict:
+    from .data_lake import default_import_id, materialize_source, read_source_rows
+
+    source = materialize_source(task, overrides=overrides, max_bytes=max_bytes)
+    try:
+        rows = read_source_rows(source)
+        profile = _profile_jsonl_from_rows(rows, id_field=task.id_field)
+        incoming_hash = _content_hash(rows)
+        lineage = source.lineage(content_sha256=incoming_hash)
+        target_import_id = str(import_id or default_import_id(task, source)).strip()
+        checks: list[dict[str, Any]] = []
+
+        def add_check(name: str, ok: bool, message: str, **details: Any) -> None:
+            check = {"name": name, "status": "ok" if ok else "error", "message": message}
+            if details:
+                check["details"] = details
+            checks.append(check)
+
+        add_check(
+            "source_rows",
+            profile["rows"] == source.source_object_rows,
+            "数据湖对象行数与 manifest 一致" if profile["rows"] == source.source_object_rows else "数据湖对象行数与 manifest 不一致",
+            expected=source.source_object_rows,
+            actual=profile["rows"],
+        )
+        add_check(
+            "source_unique_ids",
+            profile["unique_ids"] == source.source_unique_ids,
+            "数据湖对象唯一 ID 数与 manifest 一致"
+            if profile["unique_ids"] == source.source_unique_ids
+            else "数据湖对象唯一 ID 数与 manifest 不一致",
+            expected=source.source_unique_ids,
+            actual=profile["unique_ids"],
+        )
+        try:
+            _validate_import_rows(task, rows)
+            add_check("task_schema", True, "导入数据满足任务字段约束")
+        except ValueError as exc:
+            add_check("task_schema", False, str(exc))
+
+        resolution = _import_resolution(runs_root, task, target_import_id, incoming_hash, lineage)
+        add_check(
+            "import_id",
+            bool(resolution.get("can_submit")),
+            "导入编号可创建或幂等复用" if resolution.get("can_submit") else str(resolution.get("message") or "导入编号不可复用"),
+            action=resolution.get("action"),
+            reason=resolution.get("reason"),
+        )
+        validation_ok = all(check["status"] == "ok" for check in checks)
+        return {
+            "kind": "data_lake_import",
+            "dry_run": True,
+            "task": {
+                "task_id": task.task_id,
+                "id_field": task.id_field,
+                "text_fields": list(task.text_fields),
+            },
+            "import_id": target_import_id,
+            "source": lineage,
+            "manifest": _data_lake_manifest_summary(source),
+            "validation": {
+                "ok": validation_ok,
+                "checks": checks,
+                "errors": [check for check in checks if check["status"] != "ok"],
+                "rows": profile["rows"],
+                "fields": profile["fields"],
+                "unique_ids": profile["unique_ids"],
+                "duplicate_ids": profile["duplicate_ids"],
+                "missing_ids": profile["missing_ids"],
+                "content_sha256": incoming_hash,
+            },
+            "plan": resolution,
+        }
+    finally:
+        if source.local_path.exists():
+            source.local_path.unlink()
+
+
 def import_from_data_lake(runs_root: str | Path, task, import_id: str | None = None,
                           overrides: dict[str, Any] | None = None,
                           max_bytes: int | None = None) -> dict:
@@ -2432,17 +2615,41 @@ def import_from_data_lake(runs_root: str | Path, task, import_id: str | None = N
             source.local_path.unlink()
 
 
+def _idempotency_key_digest(idempotency_key: str) -> str:
+    return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+
+
+def _idempotency_record_path(jobs_dir: Path, idempotency_key: str) -> Path:
+    return jobs_dir / "idempotency" / f"{_idempotency_key_digest(idempotency_key)}.json"
+
+
+def _data_lake_import_request_fingerprint(task_id: str, import_id: str | None,
+                                          overrides: dict[str, Any],
+                                          max_bytes: int | None) -> str:
+    return _stable_json_hash({
+        "kind": "data_lake_import",
+        "task_id": task_id,
+        "import_id": import_id,
+        "overrides": overrides,
+        "max_bytes": max_bytes,
+    })
+
+
 def start_data_lake_import(runs_root: str | Path, task, import_id: str | None = None,
                            overrides: dict[str, Any] | None = None,
-                           max_bytes: int | None = None) -> dict:
+                           max_bytes: int | None = None,
+                           idempotency_key: str | None = None) -> dict:
     overrides = dict(overrides or {})
+    idempotency_key = str(idempotency_key or "").strip()
+    jobs_dir = _jobs_dir(Path(runs_root), task.task_id)
     params = {
         "task_id": task.task_id,
         "import_id": import_id,
         "overrides": overrides,
         "max_bytes": max_bytes,
     }
-    job = create_job("data_lake_import", params, _jobs_dir(Path(runs_root), task.task_id))
+    if idempotency_key:
+        params["idempotency_key_sha256"] = _idempotency_key_digest(idempotency_key)
 
     def target(j: Job) -> dict:
         j.log(f"data_lake_import task={task.task_id}")
@@ -2470,6 +2677,37 @@ def start_data_lake_import(runs_root: str | Path, task, import_id: str | None = 
             "rows": result.get("rows"),
             "import": result,
         }
+
+    fingerprint = _data_lake_import_request_fingerprint(task.task_id, import_id, overrides, max_bytes)
+    if idempotency_key:
+        digest = _idempotency_key_digest(idempotency_key)
+        with _asset_lock(runs_root, task.task_id, f"data-lake-import-idempotency-{digest}"):
+            record_path = _idempotency_record_path(jobs_dir, idempotency_key)
+            if record_path.exists():
+                record = read_json(record_path)
+                if record.get("request_fingerprint") != fingerprint:
+                    raise ValueError("幂等 key 已用于不同的数据湖导入请求，请使用新的 idempotency_key")
+                existing = get_job(str(record.get("job_id") or ""), jobs_dir)
+                if existing is None:
+                    raise ValueError("幂等提交记录缺少对应 job，请使用新的 idempotency_key")
+                reused = dict(existing)
+                reused["idempotent_submit"] = True
+                return reused
+            job = create_job("data_lake_import", params, jobs_dir)
+            write_json(
+                {
+                    "kind": "data_lake_import",
+                    "job_id": job.id,
+                    "task_id": task.task_id,
+                    "import_id": import_id,
+                    "idempotency_key_sha256": digest,
+                    "request_fingerprint": fingerprint,
+                    "created_at": _now(),
+                },
+                record_path,
+            )
+    else:
+        job = create_job("data_lake_import", params, jobs_dir)
 
     run_job(job, target)
     return job.to_dict()
