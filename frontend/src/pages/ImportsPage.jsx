@@ -1,22 +1,19 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
-
-function shortHash(value) {
-  return value ? `${String(value).slice(0, 12)}...` : "-";
-}
-
-function cellText(value) {
-  if (value === null || value === undefined || value === "") return "-";
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
-}
-
-function stateLabel(value) {
-  if (value === "active") return "可用";
-  if (value === "archived") return "已归档";
-  return value || "-";
-}
+import {
+  backendAllowsManualImports,
+  createImportActions,
+  displayValue,
+  filterImportAuditEvents,
+  hasEffectiveDataLakeConfig,
+  importActionState,
+  shortHash,
+  stateLabel,
+  summarizeImportAsset,
+  usesLocalTaskSource,
+  usesR2TaskSource,
+} from "./importsPageState.js";
 
 const JOB_STATUS_LABEL = {
   pending: "等待中",
@@ -39,19 +36,6 @@ const JOB_STATUS_LABEL = {
 const JOB_ACTIVE_STATUSES = new Set(["pending", "queued", "running", "in_progress", "started"]);
 const JOB_SUCCESS_STATUSES = new Set(["succeeded", "success", "completed", "complete", "done", "finished"]);
 const JOB_FAILED_STATUSES = new Set(["failed", "error", "cancelled", "canceled"]);
-
-const DATA_LAKE_SOURCE_FIELDS = [
-  "source_dataset_id",
-  "source_object_path",
-  "source_manifest_uri",
-  "source_object_uri",
-  "lake_registry_uri",
-];
-
-function hasEffectiveDataLakeConfig(dataLake) {
-  if (!dataLake || typeof dataLake !== "object" || Array.isArray(dataLake)) return false;
-  return DATA_LAKE_SOURCE_FIELDS.some((field) => typeof dataLake[field] === "string" && dataLake[field].trim() !== "");
-}
 
 function normalizeStatus(value) {
   return String(value || "pending").toLowerCase();
@@ -109,36 +93,20 @@ function completionNotice(imported, savedText) {
   return `${savedText}下一步：样本抽取。`;
 }
 
-function truthyFlag(value) {
-  if (value === true) return true;
-  if (typeof value === "number") return value === 1;
-  if (typeof value === "string") return ["1", "true", "yes", "on", "enabled"].includes(value.trim().toLowerCase());
-  return false;
-}
+const EVENT_LABEL = {
+  "import.create": "创建导入",
+  "import.reuse": "复用导入",
+  "import.save": "保存导入",
+  "import.archive": "归档导入",
+};
 
-function usesR2TaskSource(taskSource, task) {
-  const sources = [taskSource, task?.task_source, task?.source_type, task?.source];
-  return sources.some((value) => {
-    const normalized = String(value || "").trim().toLowerCase();
-    return normalized === "r2" || normalized.startsWith("r2:");
-  });
-}
-
-function usesLocalTaskSource(taskSource) {
-  const normalized = String(taskSource || "").trim().toLowerCase();
-  return normalized === "local" || normalized.startsWith("local:");
-}
-
-function backendAllowsManualImports(task, allowManualImports) {
-  return [
-    allowManualImports,
-    task?.allow_manual_imports,
-    task?.allow_manual_import,
-    task?.manual_imports_enabled,
-    task?.features?.allow_manual_imports,
-    task?.capabilities?.allow_manual_imports,
-    task?.permissions?.allow_manual_imports,
-  ].some(truthyFlag);
+function DetailField({ label, value, className = "" }) {
+  return (
+    <div>
+      <span>{label}</span>
+      <strong className={className}>{displayValue(value)}</strong>
+    </div>
+  );
 }
 
 export default function ImportsPage({
@@ -151,6 +119,8 @@ export default function ImportsPage({
   onError,
 }) {
   const [items, setItems] = useState([]);
+  const [auditEvents, setAuditEvents] = useState([]);
+  const [assetsLoading, setAssetsLoading] = useState(false);
   const [name, setName] = useState("");
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
@@ -165,6 +135,7 @@ export default function ImportsPage({
   const [notice, setNotice] = useState("");
   const [lakeJob, setLakeJob] = useState(null);
   const [completedImport, setCompletedImport] = useState(null);
+  const [createPanel, setCreatePanel] = useState("");
 
   const selected = useMemo(
     () => items.find((item) => item.import_id === selectedId) || null,
@@ -173,21 +144,37 @@ export default function ImportsPage({
   const dataLake = task?.data_lake || null;
   const hasDataLakeConfig = hasEffectiveDataLakeConfig(dataLake);
   const r2TaskSource = usesR2TaskSource(taskSource, task);
-  const localTaskSource = usesLocalTaskSource(taskSource);
+  const localTaskSource = usesLocalTaskSource(taskSource, task);
   const settingsAvailable = settingsReady && !settingsError;
   const manualAllowed = backendAllowsManualImports(task, allowManualImports);
   const showManualImports = settingsAvailable && localTaskSource && !r2TaskSource && manualAllowed;
   const lakeWorking = lakeBusy || isActiveJob(lakeJob);
+  const createActions = createImportActions({ hasDataLakeConfig, showManualImports });
+  const loadedDetail = detail?.import_id === selectedId ? detail : null;
+  const selectedDetail = loadedDetail || selected;
+  const selectedAuditEvents = filterImportAuditEvents(auditEvents, selectedId);
+  const selectedIdRef = useRef("");
+
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
 
   const reload = useCallback(async () => {
     if (!taskId) return;
+    setAssetsLoading(true);
     try {
-      const data = await api.getImports(taskId);
+      const [data, audit] = await Promise.all([
+        api.getImports(taskId),
+        api.getAuditEvents(taskId).catch(() => ({ events: [] })),
+      ]);
       const next = data.imports || [];
       setItems(next);
-      setSelectedId((current) => current || next[0]?.import_id || "");
+      setAuditEvents(audit.events || []);
+      setSelectedId((current) => (current && next.some((item) => item.import_id === current) ? current : ""));
     } catch (error) {
       onError(String(error));
+    } finally {
+      setAssetsLoading(false);
     }
   }, [taskId, onError]);
 
@@ -199,7 +186,7 @@ export default function ImportsPage({
         limit: rowsData.limit || 25,
         query: opts.query ?? query,
       });
-      setRowsData(data);
+      setRowsData((current) => (selectedIdRef.current === importId ? data : current));
     } catch (error) {
       onError(String(error));
     }
@@ -223,10 +210,18 @@ export default function ImportsPage({
       setRowsData({ rows: [], fields: [], total: 0, offset: 0, limit: 25 });
       return;
     }
+    let cancelled = false;
+    setDetail(null);
+    setRowsData({ rows: [], fields: [], total: 0, offset: 0, limit: 25 });
     api.getImportDetail(taskId, selectedId)
-      .then((data) => setDetail(data.import || null))
+      .then((data) => {
+        if (!cancelled && selectedIdRef.current === selectedId) setDetail(data.import || null);
+      })
       .catch((error) => onError(String(error)));
     loadRows(selectedId, { offset: 0 });
+    return () => {
+      cancelled = true;
+    };
   }, [taskId, selectedId, loadRows, onError]);
 
   async function submit() {
@@ -247,6 +242,7 @@ export default function ImportsPage({
       setFileLabel("");
       await reload();
       setSelectedId(nextImportId);
+      setCreatePanel("");
     } catch (error) {
       onError(String(error));
     } finally {
@@ -281,6 +277,8 @@ export default function ImportsPage({
       await api.archiveImport(taskId, item.import_id, "panel archive");
       setNotice(`已归档：${item.import_id}`);
       setSelectedId("");
+      setDetail(null);
+      setRowsData({ rows: [], fields: [], total: 0, offset: 0, limit: 25 });
       await reload();
     } catch (error) {
       onError(String(error));
@@ -335,6 +333,7 @@ export default function ImportsPage({
       setCompletedImport({ import_id: nextImportId, source: "data_lake" });
       await reload();
       if (nextImportId) setSelectedId(nextImportId);
+      setCreatePanel("");
     } catch (error) {
       onError(String(error));
     } finally {
@@ -351,6 +350,7 @@ export default function ImportsPage({
       setCompletedImport({ import_id: nextImportId, source: "data_lake" });
       await reload();
       if (nextImportId) setSelectedId(nextImportId);
+      setCreatePanel("");
     } else if (JOB_FAILED_STATUSES.has(status)) {
       setNotice("数据湖导入未完成，请查看任务状态和错误信息。");
       onError(`数据湖导入失败：${jobErrorText(job)}`);
@@ -398,16 +398,35 @@ export default function ImportsPage({
     loadRows(selectedId, { offset: next });
   }
 
-  const fields = rowsData.fields?.length ? rowsData.fields : detail?.fields || [];
+  const fields = rowsData.fields?.length ? rowsData.fields : selectedDetail?.fields || [];
+  const selectedActions = importActionState(selectedDetail, { busy });
+  const openDefaultCreatePanel = () => setCreatePanel(createActions[0]?.key || "unavailable");
 
   return (
     <div>
       <div className="crumbs">
         <Link to="/">全部任务</Link> / <Link to={`/task/${encodeURIComponent(taskId)}`}>{taskId}</Link> / 数据导入
       </div>
-      <div className="page-header">
-        <h2>数据导入</h2>
-        <p>生产路径优先从 R2 数据湖读取；导入数据按不可覆盖资产管理，同名同内容幂等复用。</p>
+      <div className="page-header imports-page-header">
+        <div>
+          <h2>数据导入</h2>
+          <p>生产路径优先从 R2 数据湖读取；导入数据按不可覆盖资产管理，同名同内容幂等复用。</p>
+        </div>
+        <div className="action-row">
+          {createActions.length > 0 ? (
+            createActions.map((action) => (
+              <button
+                className={`btn ${action.primary ? "btn-primary" : ""}`}
+                key={action.key}
+                onClick={() => setCreatePanel(action.key)}
+              >
+                {action.label}
+              </button>
+            ))
+          ) : (
+            <button className="btn" disabled>暂无可用导入入口</button>
+          )}
+        </div>
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
@@ -427,124 +446,42 @@ export default function ImportsPage({
         </div>
       )}
 
-      <div className={hasDataLakeConfig ? "card section-card primary-import-card" : "card section-card primary-import-card muted-import-card"}>
-        <div className="toolbar">
-          <div>
-            <h3>从数据湖导入</h3>
-            <div className="status-line">
-              {hasDataLakeConfig
-                ? "按任务配置读取 R2 数据湖清单文件，并生成当前任务的本地导入缓存"
-                : "当前任务没有 data_lake 来源。需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。"}
-            </div>
-          </div>
-          {!hasDataLakeConfig && <Link to="/" className="btn btn-sm">去任务列表同步</Link>}
-        </div>
-        {hasDataLakeConfig ? (
-          <>
-          <div className="form-grid">
-            <div className="field">
-              <label>目标导入编号</label>
-              <input value={lakeImportId} onChange={(event) => setLakeImportId(event.target.value)} placeholder={dataLake.default_import_id || "留空则自动生成"} />
-              <span className="hint">同名同内容会幂等复用，同名不同内容会拒绝写入。</span>
-            </div>
-            <div className="field">
-              <label>源数据集</label>
-              <input value={dataLake.source_dataset_id || "-"} readOnly />
-            </div>
-            <div className="field field-wide">
-              <label>源对象</label>
-              <input value={lakeStatus?.selected_object?.path || dataLake.source_object_path || "-"} readOnly />
-            </div>
-          </div>
-          {lakeStatus && (
-            <div className="data-profile">
-              <div><span>数据层</span><strong>{lakeStatus.dataset?.layer || "-"}</strong></div>
-              <div><span>领域</span><strong>{lakeStatus.dataset?.domain || "-"}</strong></div>
-              <div><span>清单对象数</span><strong>{lakeStatus.manifest?.object_count ?? "-"}</strong></div>
-              <div><span>选中对象大小</span><strong>{lakeStatus.selected_object?.bytes ?? "-"}</strong></div>
-            </div>
-          )}
-          {lakeJob && (
-            <div className="job-panel">
-              <div className="toolbar">
-                <div>
-                  <h3>导入任务状态</h3>
-                  <div className="status-line">执行编号：<span className="mono-cell">{lakeJob.id}</span></div>
-                </div>
-                <span className={`badge ${jobBadgeClass(lakeJob.status)}`}>{jobStatusLabel(lakeJob.status)}</span>
-              </div>
-              <div className="job-grid">
-                <div><span>轮询状态</span><strong>{isActiveJob(lakeJob) ? "每 2 秒刷新" : "已停止"}</strong></div>
-                <div><span>创建时间</span><strong>{(lakeJob.created_at || "").slice(0, 19) || "-"}</strong></div>
-                <div><span>最近更新</span><strong>{(lakeJob.updated_at || lakeJob.finished_at || "").slice(0, 19) || "-"}</strong></div>
-              </div>
-              {JOB_FAILED_STATUSES.has(normalizeStatus(lakeJob.status)) && (
-                <div className="status-line danger-line">错误：{jobErrorText(lakeJob)}</div>
-              )}
-            </div>
-          )}
-          <div className="action-row">
-            <button className="btn btn-primary" disabled={lakeWorking} onClick={importLake}>
-              {lakeWorking ? "导入任务执行中..." : "从数据湖导入"}
-            </button>
-            <button className="btn" disabled={lakeWorking} onClick={checkDataLake}>检查配置</button>
-          </div>
-          </>
-        ) : (
-          <div className="info-callout">
-            <strong>当前任务没有 data_lake 来源</strong>
-            <p>需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。</p>
-          </div>
-        )}
-      </div>
-
-      {showManualImports && (
-      <div className="card section-card manual-import-card">
-        <div className="toolbar">
-          <div>
-            <h3>手动新增导入</h3>
-          </div>
-        </div>
-        <div className="form-grid">
-          <div className="field">
-            <label>导入编号</label>
-            <input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 manual_seed_20260627" />
-            <span className="hint">同一编号不能覆盖不同内容；修正数据请使用新的导入编号。</span>
-          </div>
-          <div className="field">
-            <label>上传文件</label>
-            <input type="file" accept=".jsonl,.ndjson,.json,.txt,application/json,application/x-ndjson,text/plain" onChange={selectFile} />
-            {fileLabel && <span className="hint">{fileLabel}</span>}
-          </div>
-          <div className="field field-wide">
-            <label>数据内容</label>
-            <textarea
-              rows={8}
-              value={text}
-              onChange={(event) => setText(event.target.value)}
-              placeholder='每行一个 JSON 对象，例如 {"record_id":"r001","title":"标题","body":"正文"}'
-            />
-          </div>
-        </div>
-        <button className="btn" disabled={busy} onClick={submit}>保存手动导入</button>
-      </div>
-      )}
-
       <div className="card section-card">
         <div className="toolbar">
-          <h3>已导入数据（{items.length}）</h3>
-          <button className="btn btn-sm" onClick={reload}>刷新</button>
+          <div>
+            <h3>导入资产（{items.length}）</h3>
+            <div className="status-line">
+              {hasDataLakeConfig
+                ? "当前任务已配置数据湖来源；新增导入会按 task.yaml 中的数据湖配置执行。"
+                : "当前任务未配置 data_lake 来源；生产环境不会展示手动覆盖 R2 来源的主动作。"}
+            </div>
+          </div>
+          <button className="btn btn-sm" disabled={assetsLoading} onClick={reload}>
+            {assetsLoading ? "刷新中..." : "刷新"}
+          </button>
         </div>
-        {!items.length && <div className="empty">暂无导入数据</div>}
+        {assetsLoading && !items.length && <div className="empty">正在读取导入资产...</div>}
+        {!assetsLoading && !items.length && (
+          <div className="empty action-empty">
+            <span>暂无导入数据</span>
+            {createActions.length > 0 ? (
+              <button className="btn btn-primary" onClick={openDefaultCreatePanel}>新增导入</button>
+            ) : (
+              <Link className="btn" to="/">去任务列表同步</Link>
+            )}
+          </div>
+        )}
         {items.length > 0 && (
           <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>导入编号</th>
+                  <th>来源</th>
+                  <th>状态</th>
                   <th>行数</th>
                   <th>记录编号唯一数</th>
-                  <th>缺失/重复记录编号</th>
+                  <th>质量摘要</th>
                   <th>关联样本</th>
                   <th>内容哈希</th>
                   <th>保存路径</th>
@@ -552,86 +489,278 @@ export default function ImportsPage({
                 </tr>
               </thead>
               <tbody>
-                {items.map((item) => (
-                  <tr key={item.import_id} className={selectedId === item.import_id ? "row-selected" : ""}>
-                    <td>{item.import_id}</td>
-                    <td>{item.rows}</td>
-                    <td>{item.unique_ids ?? "-"}</td>
-                    <td>{item.missing_ids ?? "-"} / {item.duplicate_ids ?? "-"}</td>
-                    <td>{(item.linked_samples || []).map((sample) => sample.sample_id).join(", ") || "-"}</td>
-                    <td className="mono-cell">{shortHash(item.content_sha256)}</td>
-                    <td className="muted path-cell">{item.path}</td>
-                    <td>
-                      <div className="action-row">
-                        <button className="btn btn-sm" onClick={() => setSelectedId(item.import_id)}>查看</button>
-                        <a className="btn btn-sm" href={api.importDownloadUrl(taskId, item.import_id)}>下载</a>
-                        <button className="btn btn-sm btn-danger" disabled={busy || (item.linked_samples || []).length > 0} onClick={() => archive(item)}>归档</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                {items.map((item) => {
+                  const summary = summarizeImportAsset(item);
+                  return (
+                    <tr
+                      key={item.import_id}
+                      className={`clickable-row ${selectedId === item.import_id ? "row-selected" : ""}`}
+                      onClick={() => setSelectedId(item.import_id)}
+                    >
+                      <td><strong>{summary.importId}</strong></td>
+                      <td>{summary.source}</td>
+                      <td>{summary.state}</td>
+                      <td>{summary.rows}</td>
+                      <td>{summary.uniqueIds}</td>
+                      <td>{summary.idQuality}</td>
+                      <td>{summary.linkedSamples}</td>
+                      <td className="mono-cell">{summary.contentHash}</td>
+                      <td className="muted path-cell">{summary.storagePath}</td>
+                      <td>
+                        <button
+                          className="btn btn-sm"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setSelectedId(item.import_id);
+                          }}
+                        >
+                          详情
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>
         )}
       </div>
 
-      {selected && (
-        <div className="card section-card">
-          <div className="toolbar">
-            <h3>导入详情：{selected.import_id}</h3>
-            <div className="action-row">
-              <input className="toolbar-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前导入数据" />
-              <button className="btn btn-sm" onClick={searchRows}>搜索</button>
-              <button className="btn btn-sm" onClick={() => { setQuery(""); loadRows(selected.import_id, { offset: 0, query: "" }); }}>清空</button>
+      {createPanel && (
+        <div className="drawer-backdrop" onClick={() => setCreatePanel("")}>
+          <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <h3>新增导入</h3>
+                <p>新增和执行动作在这里完成，完成后回到导入资产列表。</p>
+              </div>
+              <button className="btn btn-sm" type="button" onClick={() => setCreatePanel("")}>关闭</button>
             </div>
-          </div>
-          <div className="data-profile">
-            <div><span>状态</span><strong>{stateLabel(detail?.state || selected.state || "active")}</strong></div>
-            <div><span>行数</span><strong>{detail?.rows ?? selected.rows}</strong></div>
-            <div><span>记录编号字段</span><strong>{detail?.id_field || "-"}</strong></div>
-            <div><span>记录编号唯一数</span><strong>{detail?.unique_ids ?? "-"}</strong></div>
-            <div><span>缺失记录编号</span><strong>{detail?.missing_ids ?? "-"}</strong></div>
-            <div><span>重复记录编号</span><strong>{detail?.duplicate_ids ?? "-"}</strong></div>
-            <div><span>字段数</span><strong>{(detail?.fields || selected.fields || []).length}</strong></div>
-            <div><span>内容哈希</span><strong className="mono-cell">{shortHash(detail?.content_sha256 || selected.content_sha256)}</strong></div>
-          </div>
-          {detail?.declared_path && (
-            <div className="status-line">历史清单文件中记录的原路径：{detail.declared_path}；当前面板读取的是保存路径：{detail.path}</div>
-          )}
-          {(detail?.linked_samples || []).length > 0 && (
-            <div className="status-line">关联样本：{detail.linked_samples.map((sample) => sample.sample_id).join(", ")}</div>
-          )}
-          <details className="secondary-panel">
-            <summary>字段清单</summary>
-            <div className="field-list">{(detail?.fields || selected.fields || []).map((field) => <span key={field}>{field}</span>)}</div>
-          </details>
 
-          <div className="toolbar data-toolbar">
-            <span className="muted">匹配 {rowsData.total || 0} 行，当前显示第 {(rowsData.offset || 0) + 1} - {Math.min((rowsData.offset || 0) + (rowsData.rows || []).length, rowsData.total || 0)} 行</span>
-            <div className="action-row">
-              <button className="btn btn-sm" disabled={(rowsData.offset || 0) <= 0} onClick={() => pageRows(-1)}>上一页</button>
-              <button className="btn btn-sm" disabled={(rowsData.offset || 0) + (rowsData.limit || 25) >= (rowsData.total || 0)} onClick={() => pageRows(1)}>下一页</button>
-            </div>
-          </div>
-          <div className="table-wrap data-table">
-            <table>
-              <thead>
-                <tr>
-                  <th>#</th>
-                  {fields.map((field) => <th key={field}>{field}</th>)}
-                </tr>
-              </thead>
-              <tbody>
-                {(rowsData.rows || []).map((row, index) => (
-                  <tr key={`${rowsData.offset || 0}-${index}`}>
-                    <td>{(rowsData.offset || 0) + index + 1}</td>
-                    {fields.map((field) => <td key={field} className="text-cell">{cellText(row[field])}</td>)}
-                  </tr>
+            {createActions.length > 1 && (
+              <div className="tabs import-create-tabs">
+                {createActions.map((action) => (
+                  <button
+                    className={`tab ${createPanel === action.key ? "active" : ""}`}
+                    key={action.key}
+                    onClick={() => setCreatePanel(action.key)}
+                  >
+                    {action.label}
+                  </button>
                 ))}
-              </tbody>
-            </table>
-          </div>
+              </div>
+            )}
+
+            {createPanel === "data_lake" && (
+              <div>
+                <div className="info-callout import-drawer-callout">
+                  <strong>从数据湖导入</strong>
+                  <p>按任务配置读取 R2 数据湖清单文件，并生成当前任务的本地导入缓存。</p>
+                </div>
+                <div className="form-grid drawer-form-grid">
+                  <div className="field field-half">
+                    <label>目标导入编号</label>
+                    <input value={lakeImportId} onChange={(event) => setLakeImportId(event.target.value)} placeholder={dataLake.default_import_id || "留空则自动生成"} />
+                    <span className="hint">同名同内容会幂等复用，同名不同内容会拒绝写入。</span>
+                  </div>
+                  <div className="field field-half">
+                    <label>源数据集</label>
+                    <input value={dataLake.source_dataset_id || "-"} readOnly />
+                  </div>
+                  <div className="field field-wide">
+                    <label>源对象</label>
+                    <input value={lakeStatus?.selected_object?.path || dataLake.source_object_path || "-"} readOnly />
+                  </div>
+                </div>
+                {lakeStatus && (
+                  <div className="drawer-detail-grid">
+                    <DetailField label="数据层" value={lakeStatus.dataset?.layer} />
+                    <DetailField label="领域" value={lakeStatus.dataset?.domain} />
+                    <DetailField label="清单对象数" value={lakeStatus.manifest?.object_count} />
+                    <DetailField label="选中对象大小" value={lakeStatus.selected_object?.bytes} />
+                  </div>
+                )}
+                {lakeJob && (
+                  <div className="job-panel">
+                    <div className="toolbar">
+                      <div>
+                        <h3>导入任务状态</h3>
+                        <div className="status-line">执行编号：<span className="mono-cell">{lakeJob.id}</span></div>
+                      </div>
+                      <span className={`badge ${jobBadgeClass(lakeJob.status)}`}>{jobStatusLabel(lakeJob.status)}</span>
+                    </div>
+                    <div className="job-grid">
+                      <div><span>轮询状态</span><strong>{isActiveJob(lakeJob) ? "每 2 秒刷新" : "已停止"}</strong></div>
+                      <div><span>创建时间</span><strong>{(lakeJob.created_at || "").slice(0, 19) || "-"}</strong></div>
+                      <div><span>最近更新</span><strong>{(lakeJob.updated_at || lakeJob.finished_at || "").slice(0, 19) || "-"}</strong></div>
+                    </div>
+                    {JOB_FAILED_STATUSES.has(normalizeStatus(lakeJob.status)) && (
+                      <div className="status-line danger-line">错误：{jobErrorText(lakeJob)}</div>
+                    )}
+                  </div>
+                )}
+                <div className="drawer-actions">
+                  <button className="btn btn-primary" disabled={lakeWorking} onClick={importLake}>
+                    {lakeWorking ? "导入任务执行中..." : "从数据湖导入"}
+                  </button>
+                  <button className="btn" disabled={lakeWorking} onClick={checkDataLake}>检查配置</button>
+                </div>
+              </div>
+            )}
+
+            {createPanel === "manual" && (
+              <div>
+                <div className="info-callout import-drawer-callout">
+                  <strong>手动上传</strong>
+                  <p>仅在本地/开发任务且后端允许手动导入时可用；生产 R2 任务请使用数据湖导入。</p>
+                </div>
+                <div className="form-grid drawer-form-grid">
+                  <div className="field field-half">
+                    <label>导入编号</label>
+                    <input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如 manual_seed_20260627" />
+                    <span className="hint">同一编号不能覆盖不同内容；修正数据请使用新的导入编号。</span>
+                  </div>
+                  <div className="field field-half">
+                    <label>上传文件</label>
+                    <input type="file" accept=".jsonl,.ndjson,.json,.txt,application/json,application/x-ndjson,text/plain" onChange={selectFile} />
+                    {fileLabel && <span className="hint">{fileLabel}</span>}
+                  </div>
+                  <div className="field field-wide">
+                    <label>数据内容</label>
+                    <textarea
+                      rows={10}
+                      value={text}
+                      onChange={(event) => setText(event.target.value)}
+                      placeholder='每行一个 JSON 对象，例如 {"record_id":"r001","title":"标题","body":"正文"}'
+                    />
+                  </div>
+                </div>
+                <div className="drawer-actions">
+                  <button className="btn btn-primary" disabled={busy} onClick={submit}>
+                    {busy ? "保存中..." : "保存手动导入"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {createPanel === "unavailable" && (
+              <div className="info-callout">
+                <strong>暂无可用导入入口</strong>
+                <p>当前任务没有可执行的数据湖导入配置，且当前模式不允许手动上传。</p>
+              </div>
+            )}
+          </aside>
+        </div>
+      )}
+
+      {selected && (
+        <div className="drawer-backdrop" onClick={() => setSelectedId("")}>
+          <aside className="drawer-panel drawer-panel-wide" onClick={(event) => event.stopPropagation()}>
+            <div className="drawer-head">
+              <div>
+                <h3>导入详情：{selected.import_id}</h3>
+                <p>manifest、数据行预览、存储路径和资产审计信息。</p>
+              </div>
+              <button className="btn btn-sm" type="button" onClick={() => setSelectedId("")}>关闭</button>
+            </div>
+
+            <div className="drawer-detail-grid">
+              <DetailField label="状态" value={stateLabel(selectedDetail?.state || "active")} />
+              <DetailField label="来源" value={summarizeImportAsset(selectedDetail).source} />
+              <DetailField label="行数" value={selectedDetail?.rows} />
+              <DetailField label="记录编号字段" value={selectedDetail?.id_field} />
+              <DetailField label="记录编号唯一数" value={selectedDetail?.unique_ids} />
+              <DetailField label="缺失记录编号" value={selectedDetail?.missing_ids} />
+              <DetailField label="重复记录编号" value={selectedDetail?.duplicate_ids} />
+              <DetailField label="内容哈希" value={shortHash(selectedDetail?.content_sha256)} className="mono-cell" />
+            </div>
+
+            <div className="drawer-actions">
+              <button className="btn btn-primary" disabled={!selectedActions.canViewRows} onClick={() => loadRows(selected.import_id, { offset: 0 })}>查看行</button>
+              <a className="btn" href={api.importDownloadUrl(taskId, selected.import_id)}>下载</a>
+              <button
+                className="btn btn-danger"
+                disabled={!selectedActions.canArchive}
+                title={selectedActions.archiveDisabledReason}
+                onClick={() => archive(selectedDetail)}
+              >
+                归档
+              </button>
+            </div>
+
+            <div className="info-callout import-manifest-panel">
+              <strong>Manifest 与存储</strong>
+              <p>manifest：{selectedDetail?.manifest_path || "-"}</p>
+              <p>保存路径：{selectedDetail?.path || "-"}</p>
+              {selectedDetail?.declared_path && <p>历史清单原路径：{selectedDetail.declared_path}</p>}
+              {selectedDetail?.source_dataset_id && <p>源数据集：{selectedDetail.source_dataset_id}</p>}
+              {selectedDetail?.source_object_path && <p>源对象：{selectedDetail.source_object_path}</p>}
+              {selectedDetail?.source_manifest_uri && <p>源 manifest：{selectedDetail.source_manifest_uri}</p>}
+            </div>
+
+            {(selectedDetail?.linked_samples || []).length > 0 && (
+              <div className="status-line">关联样本：{selectedDetail.linked_samples.map((sample) => sample.sample_id).join(", ")}</div>
+            )}
+
+            <details className="secondary-panel" open>
+              <summary>字段清单</summary>
+              <div className="field-list">{(selectedDetail?.fields || []).map((field) => <span key={field}>{field}</span>)}</div>
+            </details>
+
+            <div className="toolbar data-toolbar">
+              <div>
+                <h3>数据行</h3>
+                <div className="status-line">匹配 {rowsData.total || 0} 行，当前显示第 {(rowsData.offset || 0) + 1} - {Math.min((rowsData.offset || 0) + (rowsData.rows || []).length, rowsData.total || 0)} 行</div>
+              </div>
+              <div className="action-row">
+                <input className="toolbar-input" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索当前导入数据" />
+                <button className="btn btn-sm" onClick={searchRows}>搜索</button>
+                <button className="btn btn-sm" onClick={() => { setQuery(""); loadRows(selected.import_id, { offset: 0, query: "" }); }}>清空</button>
+                <button className="btn btn-sm" disabled={(rowsData.offset || 0) <= 0} onClick={() => pageRows(-1)}>上一页</button>
+                <button className="btn btn-sm" disabled={(rowsData.offset || 0) + (rowsData.limit || 25) >= (rowsData.total || 0)} onClick={() => pageRows(1)}>下一页</button>
+              </div>
+            </div>
+            <div className="table-wrap data-table">
+              <table>
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    {fields.map((field) => <th key={field}>{field}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {(rowsData.rows || []).map((row, index) => (
+                    <tr key={`${rowsData.offset || 0}-${index}`}>
+                      <td>{(rowsData.offset || 0) + index + 1}</td>
+                      {fields.map((field) => <td key={field} className="text-cell">{displayValue(row[field])}</td>)}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <details className="secondary-panel" open>
+              <summary>资产审计</summary>
+              {!selectedAuditEvents.length && <div className="empty">暂无该导入的审计事件</div>}
+              {selectedAuditEvents.length > 0 && (
+                <div className="table-wrap">
+                  <table>
+                    <thead><tr><th>时间</th><th>事件</th><th>状态</th><th>详情</th></tr></thead>
+                    <tbody>
+                      {selectedAuditEvents.map((event, index) => (
+                        <tr key={`${event.created_at}-${index}`}>
+                          <td className="muted">{(event.created_at || "").slice(0, 19)}</td>
+                          <td>{EVENT_LABEL[event.event] || event.event}</td>
+                          <td><span className={`badge ${event.status === "failed" ? "badge-red" : "badge-green"}`}>{event.status === "failed" ? "失败" : "成功"}</span></td>
+                          <td className="muted path-cell">{JSON.stringify(event.details || {}).slice(0, 180)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </details>
+          </aside>
         </div>
       )}
     </div>

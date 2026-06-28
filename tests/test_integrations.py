@@ -11,6 +11,7 @@ from llm_labeling_scaffold.integrations.argilla import (
     _argilla_text_fields,
     _guidelines_for_task,
     _human_label_from_values,
+    _make_suggestion,
     _prepare_dataset,
     _prepare_records_for_push,
     _questions_for_task,
@@ -132,6 +133,32 @@ def test_argilla_questions_cover_all_task_label_fields():
     assert titles["service_solution_digital_type"] == "数字化服务类型"
 
 
+def test_argilla_questions_use_value_labels_for_display_text():
+    base = load_task(Path("examples/toy_text_classification/task.yaml"))
+    task = TaskConfig(
+        path=base.path,
+        raw={
+            **base.raw,
+            "labels": {
+                "primary": {
+                    "name": "label",
+                    "type": "categorical",
+                    "values": ["yes", "no"],
+                    "value_labels": {
+                        "yes": {"label": "是", "description": "属于目标类"},
+                        "no": {"label": "否", "description": "不属于目标类"},
+                    },
+                },
+            },
+        },
+    )
+    fake_rg = types.SimpleNamespace(LabelQuestion=_Question)
+
+    question = _questions_for_task(fake_rg, task)[0]
+
+    assert question.kwargs["labels"] == {"yes": "是", "no": "否"}
+
+
 def test_argilla_pull_expands_all_response_fields():
     base = load_task(Path("examples/toy_text_classification/task.yaml"))
     task = TaskConfig(
@@ -202,6 +229,12 @@ class _Record:
         self.id = kwargs["id"]
         self.fields = kwargs["fields"]
         self.metadata = kwargs["metadata"]
+        self.suggestions = kwargs.get("suggestions", [])
+
+
+class _Suggestion:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
 
 
 def _argilla_push_task() -> TaskConfig:
@@ -349,6 +382,103 @@ def test_argilla_push_batch_scoped_record_ids_keep_original_metadata_id(tmp_path
     assert [record.metadata["record_id"] for record in records] == ["r1", "r1"]
     assert [record.metadata["batch_id"] for record in records] == ["batch_00001.jsonl", "batch_00002.jsonl"]
     assert [record.metadata["batch_plan_id"] for record in records] == ["plan_1", "plan_1"]
+
+
+def test_argilla_push_attaches_suggestions_without_responses(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "merged_batches.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "regular", "__lls_batch_id": "batch_00001.jsonl", "__lls_argilla_record_id": "r1__batch_00001.jsonl"},
+            {"record_id": "r1", "title": "overlap", "__lls_batch_id": "batch_00002.jsonl", "__lls_argilla_record_id": "r1__batch_00002.jsonl"},
+        ],
+        sample,
+    )
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl(
+        [
+            {
+                "argilla_record_id": "r1__batch_00002.jsonl",
+                "suggestions": {"label": "yes"},
+                "scores": {"label": 0.82},
+                "agent": "codex_exec:v001",
+            }
+        ],
+        suggestions,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion)
+
+    records, _, _ = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {
+            "record_id_strategy": "batch_scoped",
+            "suggestions_path": str(suggestions),
+        },
+    )
+
+    assert records[0].suggestions == []
+    assert len(records[1].suggestions) == 1
+    assert records[1].suggestions[0].kwargs == {
+        "question_name": "label",
+        "value": "yes",
+        "score": 0.82,
+        "agent": "codex_exec:v001",
+    }
+    assert not hasattr(records[1], "responses")
+
+
+def test_argilla_push_ignores_non_numeric_suggestion_scores(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl(
+        [{"record_id": "r1", "title": "regular"}],
+        sample,
+    )
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "suggestions": {"label": "yes"},
+                "scores": {"label": "not-a-number"},
+                "agent": "codex_exec:v001",
+            }
+        ],
+        suggestions,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion)
+
+    records, _, _ = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+
+    assert len(records[0].suggestions) == 1
+    assert records[0].suggestions[0].kwargs == {
+        "question_name": "label",
+        "value": "yes",
+        "agent": "codex_exec:v001",
+    }
+
+
+def test_argilla_suggestion_fallback_drops_agent_before_score():
+    class ScoreOnlySuggestion:
+        def __init__(self, **kwargs):
+            if "agent" in kwargs:
+                raise TypeError("agent not supported")
+            self.kwargs = kwargs
+
+    fake_rg = types.SimpleNamespace(Suggestion=ScoreOnlySuggestion)
+
+    suggestion = _make_suggestion(fake_rg, question_name="label", value="yes", score=0.7, agent="local_stub:v001")
+
+    assert suggestion.kwargs == {"question_name": "label", "value": "yes", "score": 0.7}
 
 
 def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp_path: Path):

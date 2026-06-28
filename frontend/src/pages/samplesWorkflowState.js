@@ -33,6 +33,26 @@ export function hasBatchPlan(sample) {
   return getBatchManifests(sample).length > 0;
 }
 
+export function sampleStateLabel(sample) {
+  const state = String(sample?.state || sample?.manifest?.state || "active").trim().toLowerCase();
+  if (state === "active") return "可用";
+  if (state === "archived") return "已归档";
+  if (state === "incomplete") return "记录不完整";
+  if (state === "failed") return "失败";
+  return state || "-";
+}
+
+export function sampleCreatedAt(sample) {
+  const value = sample?.created_at || sample?.manifest?.created_at || "";
+  return value ? String(value).slice(0, 19) : "-";
+}
+
+export function filterSampleAuditEvents(events = [], sampleId = "") {
+  const target = String(sampleId || "");
+  if (!target) return [];
+  return events.filter((event) => event?.asset_type === "sample" && String(event.asset_id || "") === target);
+}
+
 export function newestSample(samples = []) {
   if (!samples.length) return null;
   return [...samples].sort((a, b) => {
@@ -55,6 +75,51 @@ export function sampleCompletionNotice({ existedBefore = false, result = null } 
     return "样本集已创建。下一步：配置批次与一致性策略。";
   }
   return "样本任务已完成，可能为新建或幂等复用。下一步：配置批次与一致性策略。";
+}
+
+export function computeSamplesListView({
+  assetsLoading = false,
+  imports = [],
+  samples = [],
+} = {}) {
+  const samplesCount = samples.length;
+  const importsCount = imports.length;
+
+  return {
+    defaultSurface: "list",
+    status: assetsLoading ? STAGE_STATUS.LOADING : samplesCount ? STAGE_STATUS.READY : STAGE_STATUS.BLOCKED,
+    showList: samplesCount > 0,
+    showEmpty: !assetsLoading && samplesCount === 0,
+    canCreate: !assetsLoading && importsCount > 0,
+    emptyReason: importsCount > 0 ? "暂无样本集。" : "当前任务没有导入资产，请先完成数据导入。",
+  };
+}
+
+export function computeSampleDetailActions({
+  assetsLoading = false,
+  busy = false,
+  sample = null,
+} = {}) {
+  const hasSample = Boolean(sample);
+  const hasPlan = hasBatchPlan(sample);
+  const dependencies = sample?.dependencies || [];
+  const archived = sampleStateLabel(sample) === "已归档";
+  const disabledByState = assetsLoading || busy || !hasSample;
+
+  return {
+    generateBatch: {
+      enabled: !disabledByState,
+      disabledReason: !hasSample ? "请选择样本集。" : assetsLoading ? "正在读取导入资产/样本集。" : busy ? "已有动作正在执行。" : "",
+    },
+    pushArgilla: {
+      enabled: !disabledByState && hasPlan,
+      disabledReason: !hasSample ? "请选择样本集。" : !hasPlan ? "请先生成批次计划。" : assetsLoading ? "正在读取导入资产/样本集。" : busy ? "已有动作正在执行。" : "",
+    },
+    archive: {
+      enabled: !disabledByState && !archived && dependencies.length === 0,
+      disabledReason: !hasSample ? "请选择样本集。" : archived ? "样本集已归档。" : dependencies.length ? "样本已被下游资产使用，不能归档。" : assetsLoading ? "正在读取导入资产/样本集。" : busy ? "已有动作正在执行。" : "",
+    },
+  };
 }
 
 export function computeSampleWorkflow({
