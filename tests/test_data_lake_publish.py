@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from llm_labeling_scaffold import data_lake
+from llm_labeling_scaffold.cli import build_parser
 from llm_labeling_scaffold.cli import main as cli_main
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.io import read_json, write_json, write_jsonl
@@ -115,6 +116,28 @@ def test_publish_submit_requires_confirm_and_idempotency_key_before_writes(
     assert writes == []
 
 
+def test_cli_publish_submit_requires_idempotency_key_at_parse_time(tmp_path: Path):
+    task, runs_root = _write_task(tmp_path)
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args([
+            "data-lake",
+            "publish",
+            "submit",
+            "--task",
+            str(task.path),
+            "--runs-root",
+            str(runs_root),
+            "--kind",
+            "decisions",
+            "--artifact-id",
+            "round_1",
+            "--confirm",
+        ])
+
+    assert exc.value.code == 2
+
+
 def test_publish_submit_uploads_manifest_and_verifies_hashes_to_local_uri(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -144,6 +167,28 @@ def test_publish_submit_uploads_manifest_and_verifies_hashes_to_local_uri(
     assert artifact["verification"]["artifact"]["sha256"] == _sha256(source)
     assert not (tmp_path / "lake" / "registry").exists()
     assert not (tmp_path / "lake" / "current").exists()
+
+
+def test_publish_hash_mismatch_error_includes_expected_and_actual(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("LLS_ALLOW_LOCAL_DATA_LAKE_URIS", "1")
+    uploaded = tmp_path / "uploaded.jsonl"
+    uploaded.write_text('{"record_id":"r1"}\n', encoding="utf-8")
+    expected = "0" * 64
+    actual = _sha256(uploaded)
+
+    with pytest.raises(data_lake.DataLakeError) as exc:
+        data_lake._verify_published_object(
+            str(uploaded),
+            expected_bytes=uploaded.stat().st_size,
+            expected_sha256=expected,
+        )
+
+    message = str(exc.value)
+    assert f"expected={expected}" in message
+    assert f"actual={actual}" in message
 
 
 def test_publish_plan_rejects_r2_targets_outside_allowed_prefix(

@@ -780,7 +780,7 @@ def _verify_published_object(uri: str, *, expected_bytes: int, expected_sha256: 
     if actual_bytes != expected_bytes:
         raise DataLakeError(f"发布对象字节数校验失败: uri={uri} expected={expected_bytes} actual={actual_bytes}")
     if actual_sha256 != expected_sha256:
-        raise DataLakeError(f"发布对象 sha256 校验失败: uri={uri}")
+        raise DataLakeError(f"发布对象 sha256 校验失败: uri={uri} expected={expected_sha256} actual={actual_sha256}")
     return {"bytes": actual_bytes, "sha256": actual_sha256}
 
 

@@ -131,7 +131,7 @@ def build_parser() -> argparse.ArgumentParser:
     lake_publish_submit.add_argument("--kind", required=True, choices=["decisions", "gold", "predictions", "model_metadata"])
     lake_publish_submit.add_argument("--artifact-id", required=True)
     lake_publish_submit.add_argument("--confirm", action="store_true")
-    lake_publish_submit.add_argument("--idempotency-key")
+    lake_publish_submit.add_argument("--idempotency-key", required=True)
 
     task_cmd = sub.add_parser("task")
     task_sub = task_cmd.add_subparsers(dest="task_cmd", required=True)
