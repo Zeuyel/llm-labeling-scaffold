@@ -33,6 +33,19 @@ def _task_roots(tasks_root: str | Path) -> list[Path]:
     return [Path(item) for item in parts if item]
 
 
+def _active_task_yaml_paths(root: Path):
+    candidates: list[Path] = []
+    for current, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not name.startswith(".") and name != "_archive"
+        )
+        if "task.yaml" in filenames:
+            candidates.append(Path(current) / "task.yaml")
+    yield from sorted(candidates, key=lambda path: (len(path.relative_to(root).parts), str(path)))
+
+
+
 def _safe_segment(value: str) -> bool:
     return bool(value) and ".." not in value and "/" not in value and "\\" not in value
 
@@ -145,9 +158,7 @@ def load_task_by_id(tasks_root: str | Path, task_id: str):
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
             except Exception:
@@ -161,9 +172,7 @@ def _active_task_exists(roots: list[Path], task_id: str) -> bool:
     for root in roots:
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 if load_task(yml).task_id == task_id:
                     return True
@@ -917,9 +926,7 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
                 key = task.task_id
@@ -957,9 +964,7 @@ def _task_config_archive_info(tasks_root: str | Path, task_id: str) -> dict[str,
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
             except Exception:
@@ -983,9 +988,7 @@ def archive_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path 
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
             except Exception:

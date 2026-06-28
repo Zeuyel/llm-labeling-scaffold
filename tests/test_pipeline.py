@@ -162,6 +162,44 @@ def test_list_tasks_reads_multiple_roots_and_deduplicates(tmp_path: Path):
     assert tasks[0]["profile"] == DEFAULT_PROFILE
 
 
+def test_task_discovery_ignores_hidden_backup_directories(tmp_path: Path):
+    tasks_root = tmp_path / "tasks"
+    created = pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": "shadowed_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "current_label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    hidden_backup = tasks_root / ".shadowed_task.old.1" / "task.yaml"
+    hidden_backup.parent.mkdir(parents=True)
+    hidden_backup.write_text(
+        yaml.safe_dump(
+            {
+                "task_id": "shadowed_task",
+                "id_field": "old_record_id",
+                "input": {"path": "raw.jsonl", "text_fields": ["old_title"]},
+                "labels": {"primary": {"name": "old_label", "values": ["old", "new"]}},
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    listed = pipeline.list_tasks(tasks_root)
+    loaded = pipeline.load_task_by_id(tasks_root, "shadowed_task")
+
+    assert [task["task_id"] for task in listed] == ["shadowed_task"]
+    assert listed[0]["path"] == created["path"]
+    assert loaded.path == Path(created["path"])
+    assert loaded.id_field == "record_id"
+    assert loaded.primary_label["name"] == "current_label"
+
+
 def test_task_profile_accepts_preset_mapping(tmp_path: Path):
     task = pipeline.create_task(
         tmp_path / "tasks",
