@@ -1,33 +1,19 @@
 import React, { useEffect, useState, useCallback } from "react";
 import * as api from "./api.js";
-import { RouterProvider, useRouter, matchRoute } from "./router.jsx";
+import { matchAppRoute } from "./appRoutes.js";
+import { RouterProvider, useRouter } from "./router.jsx";
 import Sidebar from "./components/Sidebar.jsx";
 import TasksPage from "./pages/TasksPage.jsx";
 import TaskOverviewPage from "./pages/TaskOverviewPage.jsx";
 import TaskCanvasPage from "./pages/TaskCanvasPage.jsx";
 import ImportsPage from "./pages/ImportsPage.jsx";
-import SamplesPage from "./pages/SamplesPage.jsx";
+import SamplesPage, { SampleDetailPage } from "./pages/SamplesPage.jsx";
 import RunsPage from "./pages/RunsPage.jsx";
 import JobsPage from "./pages/JobsPage.jsx";
 import GoldPage from "./pages/GoldPage.jsx";
 import ModelsPage from "./pages/ModelsPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
 import TaskArchivePage from "./pages/TaskArchivePage.jsx";
-
-const ROUTES = [
-  { pattern: "/", page: "tasks" },
-  { pattern: "/settings", page: "settings" },
-  { pattern: "/task/:id", page: "overview" },
-  { pattern: "/task/:id/canvas", page: "canvas" },
-  { pattern: "/task/:id/imports", page: "imports" },
-  { pattern: "/task/:id/samples", page: "samples" },
-  { pattern: "/task/:id/annotations", page: "annotations" },
-  { pattern: "/task/:id/runs", page: "annotations" },
-  { pattern: "/task/:id/jobs", page: "jobs" },
-  { pattern: "/task/:id/gold", page: "gold" },
-  { pattern: "/task/:id/models", page: "models" },
-  { pattern: "/task/:id/archive", page: "archive" },
-];
 
 const DEFAULT_SETTINGS = {
   allow_data_lake_overrides: false,
@@ -75,11 +61,7 @@ function Shell() {
     loadSettings();
   }, [loadSettings]);
 
-  let matched = { page: "tasks", params: {} };
-  for (const r of ROUTES) {
-    const params = matchRoute(r.pattern, path);
-    if (params) { matched = { page: r.page, params }; break; }
-  }
+  const matched = matchAppRoute(path);
   const activeTaskId = matched.params.id || null;
   const taskOf = (id) => tasks.find((t) => t.task_id === id) || null;
 
@@ -126,6 +108,14 @@ function Shell() {
     />
   );
   else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "sampleDetail") page = (
+    <SampleDetailPage
+      task={taskOf(activeTaskId)}
+      taskId={activeTaskId}
+      sampleId={matched.params.sampleId}
+      {...common}
+    />
+  );
   else if (matched.page === "annotations") page = <RunsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "jobs") page = <JobsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "gold") page = <GoldPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
@@ -145,7 +135,7 @@ function Shell() {
       <Sidebar
         tasks={tasks}
         activeTaskId={activeTaskId}
-        activePage={matched.page}
+        activePage={matched.activePage}
         collapsed={sidebarCollapsed}
         onToggle={toggleSidebar}
       />
