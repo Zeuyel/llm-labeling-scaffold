@@ -155,7 +155,7 @@ export default function GoldPage({ task, taskId, onError }) {
                 {versions.map((g) => {
                   const summary = goldSummary(g, taskId);
                   return (
-                    <tr key={summary.key}>
+                    <tr key={summary.key} className="clickable-row" onClick={() => openGoldDetail(g)}>
                       <td><span className="badge badge-blue">{summary.version}</span></td>
                       <td><span className={`badge ${statusBadgeClass(summary.status)}`}>{summary.status}</span></td>
                       <td>{summary.rows}</td>
@@ -165,7 +165,16 @@ export default function GoldPage({ task, taskId, onError }) {
                       <td className="muted">{summary.createdAt}</td>
                       <td className="muted path-cell">{summary.path}</td>
                       <td>
-                        <button className="btn btn-sm" type="button" onClick={() => openGoldDetail(g)}>查看</button>
+                        <button
+                          className="btn btn-sm"
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            openGoldDetail(g);
+                          }}
+                        >
+                          详情
+                        </button>
                       </td>
                     </tr>
                   );

@@ -282,6 +282,36 @@ def test_task_archive_plan_api_returns_active_assets(panel_workspace):
     assert body["cleanup"]["r2_protected"] is True
 
 
+def test_annotation_job_archive_api_moves_local_record_only(panel_workspace):
+    task = panel_workspace["task"]
+    annotation_dir = panel_workspace["runs_root"] / task.task_id / "annotation_jobs" / "archive_me"
+    write_json(
+        {
+            "task_id": task.task_id,
+            "annotation_id": "archive_me",
+            "source": "argilla",
+            "argilla_dataset": "archive_me_dataset",
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/annotation_job?task_id=toy_multiclass_v1&annotation_id=archive_me&reason=done",
+            method="DELETE",
+        )
+
+    assert status == 200
+    assert body["annotation_job"]["archived"] is True
+    assert not annotation_dir.exists()
+    archived_path = Path(body["annotation_job"]["archive_path"])
+    assert (archived_path / "manifest.json").exists()
+    assert read_json(archived_path / "manifest.json")["state"] == "archived"
+    events = read_jsonl(panel_workspace["runs_root"] / task.task_id / "_audit" / "events.jsonl")
+    assert any(event["event"] == "annotation_job.archive" and event["details"]["remote_affected"] is False for event in events)
+
+
 def test_build_gold_from_sample_and_decisions(panel_workspace):
     task = panel_workspace["task"]
     gold_path = build_gold_from_decisions(
