@@ -118,6 +118,20 @@ def build_parser() -> argparse.ArgumentParser:
     lake_export.add_argument("--local", required=True)
     lake_export.add_argument("--target-uri")
     lake_export.add_argument("--target-path")
+    lake_publish = lake_sub.add_parser("publish")
+    lake_publish_sub = lake_publish.add_subparsers(dest="publish_cmd", required=True)
+    lake_publish_plan = lake_publish_sub.add_parser("plan")
+    lake_publish_plan.add_argument("--task", required=True)
+    lake_publish_plan.add_argument("--runs-root", default="runs")
+    lake_publish_plan.add_argument("--kind", required=True, choices=["decisions", "gold", "predictions", "model_metadata"])
+    lake_publish_plan.add_argument("--artifact-id", required=True)
+    lake_publish_submit = lake_publish_sub.add_parser("submit")
+    lake_publish_submit.add_argument("--task", required=True)
+    lake_publish_submit.add_argument("--runs-root", default="runs")
+    lake_publish_submit.add_argument("--kind", required=True, choices=["decisions", "gold", "predictions", "model_metadata"])
+    lake_publish_submit.add_argument("--artifact-id", required=True)
+    lake_publish_submit.add_argument("--confirm", action="store_true")
+    lake_publish_submit.add_argument("--idempotency-key")
 
     task_cmd = sub.add_parser("task")
     task_sub = task_cmd.add_subparsers(dest="task_cmd", required=True)
@@ -218,6 +232,26 @@ def main(argv: list[str] | None = None) -> None:
             _print_json(
                 export_artifact(task, args.local, target_uri=args.target_uri, target_path=args.target_path),
             )
+        elif args.lake_cmd == "publish":
+            if args.publish_cmd == "plan":
+                from .data_lake import plan_artifact_publish
+
+                _print_json(
+                    plan_artifact_publish(task, args.runs_root, args.kind, args.artifact_id),
+                )
+            elif args.publish_cmd == "submit":
+                from .data_lake import submit_artifact_publish
+
+                _print_json(
+                    submit_artifact_publish(
+                        task,
+                        args.runs_root,
+                        args.kind,
+                        args.artifact_id,
+                        confirm=args.confirm,
+                        idempotency_key=args.idempotency_key,
+                    ),
+                )
 
     elif args.cmd == "task":
         if args.task_cmd == "list":

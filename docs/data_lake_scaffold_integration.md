@@ -199,3 +199,27 @@ LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1
 - 训练集、预测结果和模型产物
 
 这些本地产物仍要按数据操作规范管理，不覆盖、可追溯、可归档。回写 R2 时必须先生成本地 manifest，再上传产物和 manifest。
+
+## 本地产物发布边界
+
+生产发布不使用 `data-lake export` 作为验收闭环。发布 decisions、gold、predictions 和 model metadata 时，应使用 artifact-aware 的 plan/submit 边界：
+
+```bash
+PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake publish plan \
+  --task tasks/<task_id>/task.yaml \
+  --runs-root runs \
+  --kind decisions \
+  --artifact-id <decision_id>
+
+PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake publish submit \
+  --task tasks/<task_id>/task.yaml \
+  --runs-root runs \
+  --kind decisions \
+  --artifact-id <decision_id> \
+  --confirm \
+  --idempotency-key <operator-issued-key>
+```
+
+`plan` 默认是 dry-run，只读取本地产物并返回本地路径、目标 R2 URI、publish manifest URI、bytes 和 sha256，不写 R2，也不调用 R2 写操作。`submit` 必须显式传入 `--confirm` 和 `--idempotency-key`，会上传本地产物和生成的 publish manifest，并在上传后回读校验 bytes 与 sha256。
+
+发布目标只能位于任务 `data_lake.output_base_uri` 下，并且生产 R2 URI 必须位于当前 `data_lake_r2_prefix` / `LLS_DATA_LAKE_R2_PREFIX` 允许前缀内。发布过程不写 registry，不更新 `current`，不做自动 promotion；如需把版本提升为权威对象，应由数据湖治理流程另行完成。
