@@ -245,6 +245,128 @@ def test_data_lake_import_rejects_source_override_by_default(tmp_path: Path, mon
     assert "生产模式不允许覆盖数据湖来源" in payload["error"]
 
 
+def test_data_lake_import_dry_run_returns_summary_without_writing_asset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clear_import_env(monkeypatch)
+    monkeypatch.setenv("LLS_ALLOW_LOCAL_DATA_LAKE_URIS", "1")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    task_id, source = _create_data_lake_task(tmp_path, tasks_root)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, payload = _request(
+            base_url,
+            "/api/import/data_lake",
+            method="POST",
+            payload={"task_id": task_id, "dry_run": True, "import_id": "lake_import"},
+        )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["dry_run"] is True
+    dry_run = payload["result"]
+    assert dry_run["import_id"] == "lake_import"
+    assert dry_run["task"]["task_id"] == task_id
+    assert dry_run["source"]["source_object_sha256"] == _file_sha256(source)
+    assert dry_run["manifest"]["selected_object"]["rows"] == 2
+    assert dry_run["validation"]["ok"] is True
+    assert dry_run["plan"]["action"] == "create"
+    assert not (runs_root / task_id / "imports" / "lake_import").exists()
+
+
+def test_data_lake_import_submit_requires_confirm_and_idempotency_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clear_import_env(monkeypatch)
+    monkeypatch.setenv("LLS_ALLOW_LOCAL_DATA_LAKE_URIS", "1")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    task_id, _source = _create_data_lake_task(tmp_path, tasks_root)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, payload = _request(
+            base_url,
+            "/api/import/data_lake",
+            method="POST",
+            payload={"task_id": task_id, "idempotency_key": "lake-submit-1"},
+        )
+        assert status == 400
+        assert "confirm=true" in payload["error"]
+
+        status, payload = _request(
+            base_url,
+            "/api/import/data_lake",
+            method="POST",
+            payload={"task_id": task_id, "confirm": True},
+        )
+
+    assert status == 400
+    assert "idempotency_key" in payload["error"]
+
+
+def test_data_lake_import_idempotency_key_reuses_existing_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clear_import_env(monkeypatch)
+    monkeypatch.setenv("LLS_ALLOW_LOCAL_DATA_LAKE_URIS", "1")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    task_id, _source = _create_data_lake_task(tmp_path, tasks_root)
+
+    payload = {"task_id": task_id, "confirm": True, "idempotency_key": "lake-submit-1"}
+    with _panel_server(runs_root, tasks_root) as base_url:
+        first_status, first = _request(base_url, "/api/import/data_lake", method="POST", payload=payload)
+        second_status, second = _request(base_url, "/api/import/data_lake", method="POST", payload=payload)
+        assert first_status == 200
+        assert second_status == 200
+        assert second["job"]["id"] == first["job"]["id"]
+        assert second["job"]["idempotent_submit"] is True
+        job = _wait_for_job(base_url, task_id, first["job"]["id"])
+
+    assert job["status"] == "succeeded"
+    assert job["result"]["import_id"] == "lake_import"
+
+
+def test_data_lake_import_idempotency_key_rejects_different_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    _clear_import_env(monkeypatch)
+    monkeypatch.setenv("LLS_ALLOW_LOCAL_DATA_LAKE_URIS", "1")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    task_id, _source = _create_data_lake_task(tmp_path, tasks_root)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, _payload = _request(
+            base_url,
+            "/api/import/data_lake",
+            method="POST",
+            payload={
+                "task_id": task_id,
+                "confirm": True,
+                "idempotency_key": "lake-submit-1",
+                "import_id": "first_import",
+            },
+        )
+        assert status == 200
+
+        status, payload = _request(
+            base_url,
+            "/api/import/data_lake",
+            method="POST",
+            payload={
+                "task_id": task_id,
+                "confirm": True,
+                "idempotency_key": "lake-submit-1",
+                "import_id": "second_import",
+            },
+        )
+
+    assert status == 400
+    assert "幂等 key" in payload["error"]
+
+
 def test_data_lake_import_api_returns_job_and_writes_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     _clear_import_env(monkeypatch)
     monkeypatch.setenv("LLS_ALLOW_LOCAL_DATA_LAKE_URIS", "1")
@@ -257,16 +379,26 @@ def test_data_lake_import_api_returns_job_and_writes_manifest(tmp_path: Path, mo
             base_url,
             "/api/import/data_lake",
             method="POST",
-            payload={"task_id": task_id},
+            payload={"task_id": task_id, "confirm": True, "idempotency_key": "lake-submit-1"},
         )
         assert status == 200
         assert payload["job"]["kind"] == "data_lake_import"
         assert payload["job"]["status"] in {"pending", "running", "succeeded"}
 
         job = _wait_for_job(base_url, task_id, payload["job"]["id"])
+        status, payload = _request(
+            base_url,
+            "/api/import/data_lake",
+            method="POST",
+            payload={"task_id": task_id, "confirm": True, "idempotency_key": "lake-submit-2"},
+        )
+        assert status == 200
+        reused_job = _wait_for_job(base_url, task_id, payload["job"]["id"])
 
     assert job["status"] == "succeeded"
     assert job["result"]["import_id"] == "lake_import"
+    assert reused_job["status"] == "succeeded"
+    assert reused_job["result"]["action"] == "reused"
     manifest = read_json(runs_root / task_id / "imports" / "lake_import" / "manifest.json")
     assert manifest["source"] == "data_lake"
     assert manifest["source_object_sha256"] == _file_sha256(source)
