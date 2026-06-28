@@ -15,7 +15,7 @@ import pytest
 import yaml
 
 from llm_labeling_scaffold import data_lake, panel, panel_settings, pipeline, task_registry
-from llm_labeling_scaffold.io import read_json, write_json
+from llm_labeling_scaffold.io import read_json, read_jsonl, write_json, write_jsonl
 from llm_labeling_scaffold.profiles import DEFAULT_PROFILE, QUALITY_CONTROL_PROFILE
 
 
@@ -261,6 +261,11 @@ def test_contract_metadata_and_public_settings_do_not_leak_secrets(
         assert ("GET", "/api/decision_artifact/detail", "decision_artifact_detail") in advertised
         assert ("GET", "/api/task/gold_versions", "gold_versions_list") in advertised
         assert ("GET", "/api/gold_version/detail", "gold_version_detail") in advertised
+        assert ("POST", "/api/suggestions/import", "suggestions_import") in advertised
+        action_contract = next(item for item in capabilities["endpoints"] if item["path"] == "/api/action")
+        assert "prelabel_export" in action_contract["allowed_actions"]
+        assert "prelabel_suggest" not in action_contract["allowed_actions"]
+        assert "prelabel_publish" in action_contract["allowed_actions"]
 
         status, public = _request(base_url, "/api/settings/public")
 
@@ -278,6 +283,52 @@ def test_contract_metadata_and_public_settings_do_not_leak_secrets(
     assert "/very/secret" not in serialized
     assert "argilla-secret-value" not in serialized
     assert "rclone_config_path" not in serialized
+
+
+def test_suggestions_import_api_registers_uploaded_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    created = pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": "panel_suggestion_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.load_task_by_id(tasks_root, "panel_suggestion_task")
+    annotation_dir = runs_root / task.task_id / "annotation_jobs" / "round_1"
+    dispatch_path = annotation_dir / "dispatch.jsonl"
+    write_jsonl(
+        [{"record_id": "r1", "title": "remote service", "__lls_argilla_record_id": "r1__batch_1"}],
+        dispatch_path,
+    )
+    write_json(
+        {
+            "annotation_id": "round_1",
+            "argilla_dataset": "dataset_round_1",
+            "dispatch_path": str(dispatch_path),
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, payload = _request(
+            base_url,
+            "/api/suggestions/import?task_id=panel_suggestion_task&annotation_id=round_1&suggestion_id=codex_v001&provider=external_codex&prompt_version=v001",
+            method="POST",
+            payload=[{"argilla_record_id": "r1__batch_1", "suggestions": {"label": "yes"}}],
+        )
+
+    assert status == 200
+    assert payload["ok"] is True
+    assert payload["suggestions"]["records"] == 1
+    rows = read_jsonl(runs_root / task.task_id / "suggestions" / "round_1" / "codex_v001" / "suggestions.jsonl")
+    assert rows[0]["agent"] == "external_codex:v001"
+    assert rows[0]["suggestions"] == {"label": "yes"}
 
 
 def test_contract_task_detail_and_check_preview_data_lake(

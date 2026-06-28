@@ -2129,6 +2129,105 @@ def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: 
     assert pipeline.list_runs(tmp_path / "runs", task.task_id) == []
 
 
+def test_external_suggestions_export_import_and_publish(tmp_path: Path, monkeypatch):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "external_suggest_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    annotation_dir = tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_round_1"
+    dispatch_path = annotation_dir / "dispatch.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "title": "remote service platform",
+                "__lls_batch_id": "batch_00001.jsonl",
+                "__lls_argilla_record_id": "r1__batch_00001.jsonl",
+                "__lls_batch_plan_id": "plan_1",
+            }
+        ],
+        dispatch_path,
+    )
+    write_json(
+        {
+            "annotation_id": "argilla_round_1",
+            "argilla_dataset": "argilla_dataset_1",
+            "dispatch_path": str(dispatch_path),
+            "dispatch_mode": "batch_plan",
+            "batch_plan_id": "plan_1",
+            "batch_ids": ["batch_00001.jsonl"],
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    export_job = pipeline.start_action(
+        tmp_path / "runs",
+        created["path"],
+        "prelabel_export",
+        {
+            "annotation_id": "argilla_round_1",
+            "suggestion_id": "codex_file_v001",
+            "provider": "external_codex",
+            "prompt_version": "v001",
+        },
+    )
+    export_result = _wait_for_job(tmp_path / "runs", task.task_id, export_job["id"])
+    assert export_result["status"] == "succeeded"
+    export_manifest = export_result["result"]
+    template_rows = read_jsonl(export_manifest["template_path"])
+    assert template_rows[0]["argilla_record_id"] == "r1__batch_00001.jsonl"
+    assert template_rows[0]["suggestions"] == {"label": None}
+
+    imported = suggestions_module.import_external_suggestions(
+        tmp_path / "runs",
+        task,
+        "argilla_round_1",
+        "codex_file_v001",
+        [
+            {
+                "argilla_record_id": "r1__batch_00001.jsonl",
+                "suggestions": {"label": "yes"},
+                "scores": {"label": 0.91},
+            }
+        ],
+        provider="external_codex",
+        prompt_version="v001",
+    )
+    rows = read_jsonl(imported["suggestions_path"])
+    assert imported["status"] == "generated"
+    assert imported["records"] == 1
+    assert rows[0]["agent"] == "external_codex:v001"
+    assert rows[0]["suggestions"] == {"label": "yes"}
+    assert rows[0]["scores"] == {"label": 0.91}
+
+    monkeypatch.setattr(
+        suggestions_module,
+        "push_suggestions",
+        lambda *args, **kwargs: {"status": "published", "records": 1},
+    )
+    publish_job = pipeline.start_action(
+        tmp_path / "runs",
+        created["path"],
+        "prelabel_publish",
+        {
+            "annotation_id": "argilla_round_1",
+            "suggestion_id": "codex_file_v001",
+        },
+    )
+    publish_result = _wait_for_job(tmp_path / "runs", task.task_id, publish_job["id"])
+    assert publish_result["status"] == "succeeded"
+    manifest = read_json(imported["manifest_path"])
+    assert manifest["status"] == "published"
+    assert manifest["publish"]["records"] == 1
+
+
 def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
     created = pipeline.create_task(
         tmp_path / "tasks",

@@ -16,6 +16,8 @@ test("job display helpers normalize status and action labels", () => {
   assert.equal(jobBadgeClass("running"), "badge-blue");
   assert.equal(jobBadgeClass("unknown"), "badge-gray");
   assert.equal(jobKindLabel("argilla_pull"), "拉回标注结果");
+  assert.equal(jobKindLabel("prelabel_export"), "导出预标注模板");
+  assert.equal(jobKindLabel("prelabel_publish"), "写入机器建议");
   assert.equal(jobKindLabel("prelabel_suggest"), "生成预标注建议");
 });
 
