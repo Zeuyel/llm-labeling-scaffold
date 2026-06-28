@@ -177,8 +177,23 @@ def _suggestion_values(task: TaskConfig, entry: dict[str, Any]) -> dict[str, Any
         value = source.get(name)
         if value in (None, ""):
             continue
-        out[name] = _cast_value(label, _response_value(value))
+        converted = _argilla_suggestion_value(label, _response_value(value))
+        if converted in (None, ""):
+            continue
+        out[name] = converted
     return out
+
+
+def _argilla_suggestion_value(label: dict[str, Any], value: Any) -> Any:
+    if value in (None, ""):
+        return None
+    casted = _cast_value(label, value)
+    label_type = label.get("type", "string")
+    if label_type == "integer" and "values" in label:
+        return str(casted)
+    if label_type == "boolean":
+        return "true" if casted else "false"
+    return casted
 
 
 def _suggestion_score(value: Any) -> float | None:

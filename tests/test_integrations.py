@@ -467,6 +467,94 @@ def test_argilla_push_ignores_non_numeric_suggestion_scores(tmp_path: Path):
     }
 
 
+def test_argilla_suggestions_encode_integer_label_values_as_strings(tmp_path: Path):
+    task = TaskConfig(
+        path=Path("task.yaml"),
+        raw={
+            "task_id": "argilla_suggestion_value_task",
+            "id_field": "record_id",
+            "input": {"path": "input.jsonl", "text_fields": ["title"]},
+            "labels": {
+                "primary": {"name": "label", "type": "categorical", "values": ["yes", "no"]},
+                "auxiliary": [
+                    {"name": "flag", "type": "integer", "values": [0, 1]},
+                    {"name": "bool_flag", "type": "boolean"},
+                ],
+            },
+        },
+    )
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "suggestions": {"label": "yes", "flag": 0, "bool_flag": False},
+            }
+        ],
+        suggestions,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion)
+
+    records, _, _ = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+
+    values = {item.kwargs["question_name"]: item.kwargs["value"] for item in records[0].suggestions}
+    assert values == {"label": "yes", "flag": "0", "bool_flag": "false"}
+
+
+def test_argilla_suggestions_skip_wrapped_null_values(tmp_path: Path):
+    task = TaskConfig(
+        path=Path("task.yaml"),
+        raw={
+            "task_id": "argilla_suggestion_null_value_task",
+            "id_field": "record_id",
+            "input": {"path": "input.jsonl", "text_fields": ["title"]},
+            "labels": {
+                "primary": {"name": "label", "type": "categorical", "values": ["yes", "no"]},
+                "auxiliary": [
+                    {"name": "flag", "type": "integer", "values": [0, 1]},
+                    {"name": "bool_flag", "type": "boolean"},
+                ],
+            },
+        },
+    )
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "suggestions": {
+                    "label": "yes",
+                    "flag": {"value": None},
+                    "bool_flag": {"value": None},
+                },
+            }
+        ],
+        suggestions,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion)
+
+    records, _, _ = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+
+    values = {item.kwargs["question_name"]: item.kwargs["value"] for item in records[0].suggestions}
+    assert values == {"label": "yes"}
+
+
 def test_argilla_suggestion_fallback_drops_agent_before_score():
     class ScoreOnlySuggestion:
         def __init__(self, **kwargs):
