@@ -11,6 +11,10 @@ from .providers.local_stub import LocalStubProvider
 def get_provider(name: str):
     if name == "local_stub":
         return LocalStubProvider()
+    if name == "codex_exec":
+        from .providers.codex_exec import CodexExecProvider
+
+        return CodexExecProvider()
     raise ValueError(f"provider not implemented in MVP: {name}")
 
 

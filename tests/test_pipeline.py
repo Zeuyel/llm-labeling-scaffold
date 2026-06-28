@@ -504,6 +504,16 @@ def test_task_asset_graph_returns_stage_fallback_and_asset_lineage(tmp_path: Pat
         },
         runs_root / task.task_id / "annotation_jobs" / "argilla_qc_round" / "manifest.json",
     )
+    write_json(
+        {
+            "task_id": task.task_id,
+            "annotation_id": "argilla_qc_round",
+            "suggestion_id": "codex_v001",
+            "status": "generated",
+            "provider": "codex_exec",
+        },
+        runs_root / task.task_id / "suggestions" / "argilla_qc_round" / "codex_v001" / "manifest.json",
+    )
     decisions_dir = runs_root / task.task_id / "decisions" / "round_1"
     write_json(
         {
@@ -523,9 +533,11 @@ def test_task_asset_graph_returns_stage_fallback_and_asset_lineage(tmp_path: Pat
     nodes = {node["id"]: node for node in graph["nodes"]}
     assert nodes["import:seed_1"]["type"] == "import"
     assert nodes["sample:sample_a"]["status"] == "completed"
+    assert nodes["suggestions:argilla_qc_round:codex_v001"]["summary"] == "codex_exec"
     assert nodes["decision:round_1"]["route"].endswith("/annotations")
     assert {"source": "import:seed_1", "target": "sample:sample_a", "reason": "抽样来源"} in graph["edges"]
     assert {"source": "batch:sample_a:qc_round_1", "target": "annotation_job:argilla_qc_round", "reason": "批次分发"} in graph["edges"]
+    assert {"source": "annotation_job:argilla_qc_round", "target": "suggestions:argilla_qc_round:codex_v001", "reason": "生成机器建议"} in graph["edges"]
     assert {"source": "sample:sample_a", "target": "decision:round_1", "reason": "结果来源样本"} in graph["edges"]
 
 
@@ -2108,6 +2120,14 @@ def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: 
     assert rows[0]["batch_plan_id"] == "plan_1"
     assert rows[0]["agent"] == "local_stub:v001"
     assert rows[0]["suggestions"]["label"] in {"yes", "no"}
+    suggestions = pipeline.list_suggestions(tmp_path / "runs", task.task_id, annotation_id="argilla_round_1")
+    jobs = pipeline.list_annotation_jobs(tmp_path / "runs", task.task_id)
+    assert suggestions[0]["suggestion_id"] == "local_stub_v001"
+    assert suggestions[0]["records"] == 1
+    assert jobs[0]["suggestion_summary"]["records"] == 1
+    assert jobs[0]["suggestion_summary"]["latest_suggestion_id"] == "local_stub_v001"
+    assert pipeline.list_runs(tmp_path / "runs", task.task_id) == []
+
 
 def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
     created = pipeline.create_task(
