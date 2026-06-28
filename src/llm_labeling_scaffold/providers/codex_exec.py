@@ -81,8 +81,9 @@ def _prompt(task: TaskConfig, rows: list[dict]) -> str:
 def _parse_json_object(text: str) -> dict[str, Any]:
     stripped = text.strip()
     if stripped.startswith("```"):
-        lines = [line for line in stripped.splitlines() if not line.strip().startswith("```")]
-        stripped = "\n".join(lines).strip()
+        lines = stripped.splitlines()
+        if len(lines) >= 2 and lines[0].strip().startswith("```") and lines[-1].strip().startswith("```"):
+            stripped = "\n".join(lines[1:-1]).strip()
     try:
         payload = json.loads(stripped)
     except json.JSONDecodeError as exc:

@@ -8,7 +8,7 @@ import pytest
 
 from llm_labeling_scaffold import pipeline
 from llm_labeling_scaffold.config import load_task
-from llm_labeling_scaffold.providers.codex_exec import CodexExecProvider
+from llm_labeling_scaffold.providers.codex_exec import CodexExecProvider, _parse_json_object
 
 
 def _task(tmp_path: Path):
@@ -44,6 +44,22 @@ def test_codex_exec_provider_parses_results_from_output_file(tmp_path: Path):
     payload = provider.annotate_batch([{"record_id": "r1", "title": "remote platform"}], task)
 
     assert payload == {"results": [{"record_id": "r1", "label": "yes"}]}
+
+
+def test_codex_exec_parser_strips_only_outer_markdown_fence():
+    payload = {
+        "results": [
+            {
+                "record_id": "r1",
+                "label": "yes",
+                "reason": "```text\nkeep this evidence\n```",
+            }
+        ]
+    }
+
+    parsed = _parse_json_object("```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```")
+
+    assert parsed == payload
 
 
 def test_codex_exec_provider_requires_codex_cli(tmp_path: Path):

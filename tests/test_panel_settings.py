@@ -255,6 +255,12 @@ def test_contract_metadata_and_public_settings_do_not_leak_secrets(
         advertised = {(item["method"], item["path"], item["action"]) for item in capabilities["endpoints"]}
         assert ("GET", "/api/settings/public", "settings_public") in advertised
         assert ("POST", "/api/tasks/{task_id}/check", "task_check") in advertised
+        assert ("GET", "/api/task/annotation_jobs", "annotation_jobs_list") in advertised
+        assert ("GET", "/api/annotation_job/detail", "annotation_job_detail") in advertised
+        assert ("GET", "/api/task/decision_artifacts", "decision_artifacts_list") in advertised
+        assert ("GET", "/api/decision_artifact/detail", "decision_artifact_detail") in advertised
+        assert ("GET", "/api/task/gold_versions", "gold_versions_list") in advertised
+        assert ("GET", "/api/gold_version/detail", "gold_version_detail") in advertised
 
         status, public = _request(base_url, "/api/settings/public")
 

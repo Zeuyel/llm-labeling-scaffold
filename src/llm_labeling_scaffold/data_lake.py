@@ -21,6 +21,13 @@ from .io import read_jsonl
 DEFAULT_REGISTRY_URI = "r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml"
 JSONL_SUFFIXES = (".jsonl", ".ndjson")
 DEFAULT_R2_PREFIX = "r2:ai-innovation-data-lake/"
+PUBLISH_ARTIFACT_KINDS = ("decisions", "gold", "predictions", "model_metadata")
+_PUBLISH_ASSET_TYPES = {
+    "decisions": "scaffold_decisions",
+    "gold": "scaffold_gold",
+    "predictions": "scaffold_predictions",
+    "model_metadata": "scaffold_model_metadata",
+}
 _DEFAULT_REGISTRY_URI_OVERRIDE: str | None = None
 _ALLOWED_R2_PREFIX_OVERRIDE: str | None = None
 
@@ -188,6 +195,13 @@ def _validate_output_path(path: str) -> str:
     return value
 
 
+def _validate_publish_segment(value: str, label: str) -> str:
+    text = str(value or "").strip()
+    if not text or "/" in text or "\\" in text or ".." in text or text in {".", ".."}:
+        raise DataLakeError(f"{label} 必须是安全单段名称: {value}")
+    return text
+
+
 def _validate_storage_uri(uri: str) -> str:
     value = str(uri or "").strip()
     if not value:
@@ -199,6 +213,44 @@ def _validate_storage_uri(uri: str) -> str:
             raise DataLakeError("生产模式不允许本地数据湖 URI；如需单测请设置 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1")
     else:
         raise DataLakeError(f"不支持的数据湖对象 URI: {uri}")
+    return value
+
+
+def _rclone_path_parts(uri: str) -> list[str]:
+    if not _is_rclone_uri(uri):
+        return []
+    path = uri.partition(":")[2]
+    return [part for part in path.strip("/").split("/") if part]
+
+
+def _reject_registry_or_current_target(uri: str) -> None:
+    parts = _rclone_path_parts(uri)
+    if not parts:
+        return
+    lowered = {part.lower() for part in parts}
+    if lowered.intersection({"governance", "registry", "current"}) or parts[-1].lower() == "data_lake.yaml":
+        raise DataLakeError(f"发布目标不能写 registry/governance/current 路径: {uri}")
+
+
+def _publish_output_base_uri(task: TaskConfig) -> str:
+    base = str(task.data_lake.get("output_base_uri") or "").strip()
+    if not base:
+        raise DataLakeError("任务 data_lake 缺少 output_base_uri，无法发布产物")
+    normalized = base.rstrip("/") + "/"
+    _validate_storage_uri(normalized)
+    _reject_registry_or_current_target(normalized)
+    return normalized
+
+
+def _join_uri(base_uri: str, relative_path: str) -> str:
+    return base_uri.rstrip("/") + "/" + _validate_output_path(relative_path)
+
+
+def _validate_publish_uri(uri: str, base_uri: str) -> str:
+    value = _validate_storage_uri(uri)
+    if not value.startswith(base_uri):
+        raise DataLakeError(f"发布目标必须位于任务 output_base_uri 内: base={base_uri}, target={uri}")
+    _reject_registry_or_current_target(value)
     return value
 
 
@@ -600,6 +652,197 @@ def _artifact_manifest_uri(target_uri: str) -> str:
         if target_uri.endswith(suffix):
             return target_uri[: -len(suffix)] + ".manifest.json"
     return target_uri.rstrip("/") + ".manifest.json"
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    return next((path for path in paths if path.is_file()), None)
+
+
+def _publish_artifact_location(task: TaskConfig, runs_root: str | Path, kind: str, artifact_id: str) -> dict[str, Any]:
+    if kind not in PUBLISH_ARTIFACT_KINDS:
+        raise DataLakeError(f"不支持的发布产物类型: {kind}")
+    task_dir = Path(runs_root) / task.task_id
+    artifact_id = str(artifact_id or "").strip()
+    if kind == "decisions":
+        decision_id = _validate_publish_segment(artifact_id, "decision_id")
+        local = task_dir / "decisions" / decision_id / "decisions.jsonl"
+        source_manifest = task_dir / "decisions" / decision_id / "manifest.json"
+        relative = f"decisions/{decision_id}/decisions.jsonl"
+        identity = {"decision_id": decision_id}
+        required_manifest = source_manifest
+    elif kind == "gold":
+        version = artifact_id[5:] if artifact_id.startswith("gold_") else artifact_id
+        version = _validate_publish_segment(version, "gold version")
+        local = task_dir / "gold" / f"gold_{version}.jsonl"
+        source_manifest = task_dir / "gold" / f"gold_{version}.manifest.json"
+        relative = f"gold/{version}/gold_{version}.jsonl"
+        identity = {"version": version}
+        required_manifest = source_manifest
+    elif kind == "predictions":
+        run_id = _validate_publish_segment(artifact_id, "prediction run_id")
+        local = task_dir / "inference" / run_id / "predictions.jsonl"
+        source_manifest = _first_existing([
+            task_dir / "inference" / run_id / "manifest.json",
+            task_dir / "inference" / run_id / "inference_summary.json",
+        ])
+        relative = f"predictions/{run_id}/predictions.jsonl"
+        identity = {"run_id": run_id}
+        required_manifest = None
+    else:
+        model_id = _validate_publish_segment(artifact_id, "model_id")
+        local = task_dir / "models" / model_id / "manifest.json"
+        source_manifest = local
+        relative = f"model_metadata/{model_id}/manifest.json"
+        identity = {"model_id": model_id}
+        required_manifest = local
+
+    if not local.is_file():
+        raise DataLakeError(f"本地产物不存在: {local}")
+    if required_manifest is not None and not required_manifest.is_file():
+        raise DataLakeError(f"本地产物缺少 manifest: {required_manifest}")
+
+    base_uri = _publish_output_base_uri(task)
+    target_uri = _validate_publish_uri(_join_uri(base_uri, relative), base_uri)
+    manifest_uri = _validate_publish_uri(_artifact_manifest_uri(target_uri), base_uri)
+    bytes_value = local.stat().st_size
+    sha256 = _file_sha256(local)
+    return {
+        "artifact_type": kind,
+        "asset_type": _PUBLISH_ASSET_TYPES[kind],
+        "artifact_id": artifact_id,
+        **identity,
+        "local_path": str(local),
+        "source_manifest_path": str(source_manifest) if source_manifest is not None else None,
+        "target_path": relative,
+        "target_uri": target_uri,
+        "manifest_uri": manifest_uri,
+        "bytes": bytes_value,
+        "sha256": sha256,
+        "rows": _jsonl_rows_if_supported(local),
+    }
+
+
+def _publish_manifest(task: TaskConfig, artifact: dict[str, Any], *, dry_run: bool,
+                      idempotency_key_sha256: str | None = None) -> dict[str, Any]:
+    manifest = {
+        "manifest_version": "1.0",
+        "task_id": task.task_id,
+        "artifact_type": artifact["artifact_type"],
+        "asset_type": artifact["asset_type"],
+        "artifact_id": artifact["artifact_id"],
+        "path": artifact["target_path"],
+        "storage_uri": artifact["target_uri"],
+        "manifest_uri": artifact["manifest_uri"],
+        "bytes": artifact["bytes"],
+        "sha256": artifact["sha256"],
+        "rows": artifact["rows"],
+        "source_manifest_path": artifact.get("source_manifest_path"),
+        "created_at": _now(),
+        "created_by": "llm_labeling_scaffold",
+        "dry_run": dry_run,
+    }
+    for key in ("decision_id", "version", "run_id", "model_id"):
+        if artifact.get(key):
+            manifest[key] = artifact[key]
+    if idempotency_key_sha256:
+        manifest["idempotency_key_sha256"] = idempotency_key_sha256
+    return {key: value for key, value in manifest.items() if value is not None}
+
+
+def plan_artifact_publish(task: TaskConfig, runs_root: str | Path, kind: str, artifact_id: str) -> dict[str, Any]:
+    artifact = _publish_artifact_location(task, runs_root, kind, artifact_id)
+    artifact["manifest"] = _publish_manifest(task, artifact, dry_run=True)
+    return {
+        "task_id": task.task_id,
+        "action": "publish_plan",
+        "dry_run": True,
+        "output_base_uri": _publish_output_base_uri(task),
+        "artifacts": [artifact],
+    }
+
+
+def _validate_idempotency_key(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise DataLakeError("submit 必须提供 idempotency key")
+    if len(text) > 128 or any(ch.isspace() for ch in text) or "/" in text or "\\" in text or ".." in text:
+        raise DataLakeError("idempotency key 必须是安全短字符串，不能包含空白、路径分隔符或路径穿越")
+    return text
+
+
+def _idempotency_key_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _verify_published_object(uri: str, *, expected_bytes: int, expected_sha256: str) -> dict[str, Any]:
+    suffix = Path(uri).suffix or ".artifact"
+    with tempfile.TemporaryDirectory(prefix="lls-lake-publish-verify-") as td:
+        target = Path(td) / f"object{suffix}"
+        copy_uri_to_path(uri, target)
+        actual_bytes = target.stat().st_size
+        actual_sha256 = _file_sha256(target)
+    if actual_bytes != expected_bytes:
+        raise DataLakeError(f"发布对象字节数校验失败: uri={uri} expected={expected_bytes} actual={actual_bytes}")
+    if actual_sha256 != expected_sha256:
+        raise DataLakeError(f"发布对象 sha256 校验失败: uri={uri} expected={expected_sha256} actual={actual_sha256}")
+    return {"bytes": actual_bytes, "sha256": actual_sha256}
+
+
+def submit_artifact_publish(
+    task: TaskConfig,
+    runs_root: str | Path,
+    kind: str,
+    artifact_id: str,
+    *,
+    confirm: bool = False,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    if not confirm:
+        raise DataLakeError("submit 必须显式 confirm")
+    key = _validate_idempotency_key(idempotency_key)
+    key_sha256 = _idempotency_key_sha256(key)
+    plan = plan_artifact_publish(task, runs_root, kind, artifact_id)
+    submitted: list[dict[str, Any]] = []
+    for artifact in plan["artifacts"]:
+        manifest = _publish_manifest(task, artifact, dry_run=False, idempotency_key_sha256=key_sha256)
+        with tempfile.TemporaryDirectory(prefix="lls-lake-publish-") as td:
+            manifest_path = Path(td) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            manifest_bytes = manifest_path.stat().st_size
+            manifest_sha256 = _file_sha256(manifest_path)
+
+            written_artifact = copy_path_to_uri(artifact["local_path"], artifact["target_uri"])
+            written_manifest = copy_path_to_uri(manifest_path, artifact["manifest_uri"])
+            artifact_verification = _verify_published_object(
+                artifact["target_uri"],
+                expected_bytes=artifact["bytes"],
+                expected_sha256=artifact["sha256"],
+            )
+            manifest_verification = _verify_published_object(
+                artifact["manifest_uri"],
+                expected_bytes=manifest_bytes,
+                expected_sha256=manifest_sha256,
+            )
+        submitted.append({
+            **artifact,
+            "manifest": manifest,
+            "target_uri": written_artifact,
+            "manifest_uri": written_manifest,
+            "verified": True,
+            "verification": {
+                "artifact": artifact_verification,
+                "manifest": manifest_verification,
+            },
+        })
+    return {
+        "task_id": task.task_id,
+        "action": "publish_submit",
+        "dry_run": False,
+        "confirmed": True,
+        "idempotency_key_sha256": key_sha256,
+        "output_base_uri": plan["output_base_uri"],
+        "artifacts": submitted,
+    }
 
 
 def export_artifact(task: TaskConfig, local_path: str | Path,
