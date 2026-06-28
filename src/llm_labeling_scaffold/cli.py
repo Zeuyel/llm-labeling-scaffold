@@ -143,6 +143,18 @@ def build_parser() -> argparse.ArgumentParser:
     import_detail.add_argument("--runs-root", default="runs")
     import_detail.add_argument("--import-id", required=True)
 
+    smoke = sub.add_parser("smoke")
+    smoke.add_argument("--server-url")
+    smoke.add_argument("--token")
+    smoke.add_argument("--token-env", default="LLS_SMOKE_TOKEN")
+    smoke.add_argument("--basic-user")
+    smoke.add_argument("--basic-password")
+    smoke.add_argument("--basic-password-env", default="LLS_SMOKE_BASIC_PASSWORD")
+    smoke.add_argument("--task-id", default="patent_boundary_v0_1")
+    smoke.add_argument("--import-id", default="patent_boundary_manual_seed_500_2026_06_27")
+    smoke.add_argument("--timeout", type=float, default=10.0)
+    smoke.add_argument("--format", choices=["json", "markdown"], default="json")
+
     panel = sub.add_parser("panel")
     panel.add_argument("--runs-root", default="runs")
     panel.add_argument("--host", default="127.0.0.1")
@@ -238,6 +250,25 @@ def main(argv: list[str] | None = None) -> None:
             _print_json({"imports": list_imports(args.runs_root, task.task_id, id_field=task.id_field)})
         elif args.import_cmd == "detail":
             _print_json({"import": import_detail(args.runs_root, task.task_id, args.import_id, id_field=task.id_field)})
+
+    elif args.cmd == "smoke":
+        from .smoke import config_from_env, render_summary, run_smoke
+
+        config = config_from_env(
+            server_url=args.server_url,
+            token=args.token,
+            token_env=args.token_env,
+            basic_user=args.basic_user,
+            basic_password=args.basic_password,
+            basic_password_env=args.basic_password_env,
+            task_id=args.task_id,
+            import_id=args.import_id,
+            timeout=args.timeout,
+        )
+        summary = run_smoke(config)
+        print(render_summary(summary, args.format))
+        if not summary.get("ok"):
+            raise SystemExit(1)
 
     elif args.cmd == "panel":
         from .panel import serve_panel
