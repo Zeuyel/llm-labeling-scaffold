@@ -715,6 +715,30 @@ def test_import_from_data_lake_manifest_records_lineage(tmp_path: Path):
         raise AssertionError("same import id with different lake lineage should fail")
 
 
+def test_dry_run_data_lake_import_returns_plan_without_final_import_asset(tmp_path: Path):
+    task, source = _create_local_data_lake_task(tmp_path)
+    runs_root = tmp_path / "runs"
+
+    with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
+        dry_run = pipeline.dry_run_data_lake_import(runs_root, task)
+
+    assert dry_run["dry_run"] is True
+    assert dry_run["import_id"] == "lake_import"
+    assert dry_run["task"]["task_id"] == task.task_id
+    assert dry_run["source"]["source_object_sha256"] == _file_sha256(source)
+    assert dry_run["manifest"]["selected_object"]["rows"] == 2
+    assert dry_run["validation"]["ok"] is True
+    assert dry_run["plan"]["action"] == "create"
+    assert not (runs_root / task.task_id / "imports" / "lake_import").exists()
+
+    with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
+        pipeline.import_from_data_lake(runs_root, task)
+        reused = pipeline.dry_run_data_lake_import(runs_root, task)
+
+    assert reused["plan"]["action"] == "reuse"
+    assert reused["plan"]["idempotent"] is True
+
+
 def test_start_data_lake_import_job_writes_import_manifest(tmp_path: Path):
     task, source = _create_local_data_lake_task(tmp_path)
 
@@ -738,6 +762,28 @@ def test_start_data_lake_import_job_writes_import_manifest(tmp_path: Path):
     manifest = read_json(manifest_path)
     assert manifest["source"] == "data_lake"
     assert manifest["source_object_sha256"] == _file_sha256(source)
+
+
+def test_start_data_lake_import_reuses_idempotency_key(tmp_path: Path):
+    task, _source = _create_local_data_lake_task(tmp_path)
+    runs_root = tmp_path / "runs"
+
+    with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
+        first = pipeline.start_data_lake_import(runs_root, task, idempotency_key="lake-submit-1")
+        second = pipeline.start_data_lake_import(runs_root, task, idempotency_key="lake-submit-1")
+        current = _wait_for_job(runs_root, task.task_id, first["id"])
+
+    assert second["id"] == first["id"]
+    assert second["idempotent_submit"] is True
+    assert current["status"] == "succeeded"
+    assert current["result"]["import_id"] == "lake_import"
+
+    try:
+        pipeline.start_data_lake_import(runs_root, task, import_id="other_import", idempotency_key="lake-submit-1")
+    except ValueError as exc:
+        assert "幂等 key" in str(exc)
+    else:
+        raise AssertionError("same idempotency key with different request should fail")
 
 
 def test_data_lake_import_accepts_source_path_relative_to_canonical_uri(tmp_path: Path):
