@@ -194,6 +194,7 @@ export function annotationJobStatusLabel(job) {
   if (["failed", "error"].includes(status)) return "失败";
   if (["incomplete", "partial"].includes(status)) return "记录不完整";
   if (["cancelled", "canceled"].includes(status)) return "已取消";
+  if (["archived", "已归档"].includes(status)) return "已归档";
   if (!status && job) return "已记录";
   return status || "-";
 }

@@ -40,3 +40,49 @@ export function annotationPageSections({
     },
   };
 }
+
+export function annotationJobDetailActions({
+  busy = false,
+  job = null,
+  decisions = [],
+} = {}) {
+  const hasJob = Boolean(job);
+  const archived = String(job?.state || "").trim().toLowerCase() === "archived";
+  const downstreamCount = Array.isArray(decisions) ? decisions.length : 0;
+  const disabledByState = busy || !hasJob;
+
+  return {
+    edit: {
+      enabled: false,
+      disabledReason: hasJob
+        ? "已推送的标注任务不能在本地编辑；需要变更样本、批次或数据集策略时请新建标注任务。"
+        : "请选择标注任务。",
+    },
+    delete: {
+      enabled: false,
+      disabledReason: hasJob
+        ? "不支持从面板删除本地记录或远端 Argilla 数据集；无下游结果时可归档本地标注任务。"
+        : "请选择标注任务。",
+    },
+    archive: {
+      enabled: !disabledByState && !archived && downstreamCount === 0,
+      disabledReason: !hasJob
+        ? "请选择标注任务。"
+        : archived
+          ? "标注任务已归档。"
+          : downstreamCount > 0
+            ? "标注任务已有下游标注结果，不能归档。"
+            : busy
+              ? "当前有操作正在执行。"
+              : "",
+    },
+  };
+}
+
+export function annotationJobGoldAction({ audits = [] } = {}) {
+  const hasPassingAudit = (audits || []).some((audit) => audit?.passed === true);
+  return {
+    enabled: hasPassingAudit,
+    disabledReason: hasPassingAudit ? "" : "通过一致性检查后构建 Gold",
+  };
+}

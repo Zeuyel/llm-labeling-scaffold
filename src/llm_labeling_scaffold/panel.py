@@ -993,6 +993,17 @@ class _Handler(BaseHTTPRequestHandler):
                 })
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/annotation_job":
+            task_id = params.get("task_id", [""])[0]
+            annotation_id = params.get("annotation_id", [""])[0]
+            reason = params.get("reason", [""])[0]
+            try:
+                self._json({
+                    "ok": True,
+                    "annotation_job": pipeline.archive_annotation_job(self.runs_root, task_id, annotation_id, reason=reason),
+                })
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         else:
             self._json({"error": "not found"}, status=404)
 

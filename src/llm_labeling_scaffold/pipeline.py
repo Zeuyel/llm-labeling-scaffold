@@ -1973,6 +1973,8 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             dataset = params.get("dataset") or _default_argilla_dataset(task.task_id, sample_id)
             annotation_id = params.get("annotation_id") or dataset
             annotation_dir = Path(runs_root) / task.task_id / "annotation_jobs" / annotation_id
+            if not annotation_dir.exists() and _archived_annotation_job_exists(runs_root, task.task_id, annotation_id):
+                raise ValueError(f"标注任务编号已归档，不能复用: {annotation_id}。请使用新的标注任务编号。")
             dispatch_path = _materialize_argilla_dispatch(dispatch, annotation_dir)
             argilla_params = _argilla_push_params(params, dispatch)
             result = push_sample(task, dispatch_path, dataset, argilla_params)
@@ -2203,9 +2205,41 @@ def _sample_dir(runs_root: str | Path, task_id: str, sample_id: str) -> Path:
     return Path(runs_root) / task_id / "samples" / sample_id
 
 
+def _annotation_job_dir(runs_root: str | Path, task_id: str, annotation_id: str) -> Path:
+    if not _safe_segment(task_id) or not _safe_segment(annotation_id):
+        raise ValueError("非法任务或标注任务编号")
+    return Path(runs_root) / task_id / "annotation_jobs" / annotation_id
+
+
 def _archived_sample_exists(runs_root: str | Path, task_id: str, sample_id: str) -> bool:
     archive = _archive_dir(runs_root, task_id, "samples")
     return archive.is_dir() and any(path.name.startswith(f"{sample_id}__") for path in archive.iterdir())
+
+
+def _archived_annotation_job_exists(runs_root: str | Path, task_id: str, annotation_id: str) -> bool:
+    archive = _archive_dir(runs_root, task_id, "annotation_jobs")
+    return archive.is_dir() and any(path.name.startswith(f"{annotation_id}__") for path in archive.iterdir())
+
+
+def dependencies_for_annotation_job(runs_root: str | Path, task_id: str, annotation_id: str) -> list[dict[str, str]]:
+    base = Path(runs_root) / task_id / "decisions"
+    if not base.is_dir():
+        return []
+    deps: list[dict[str, str]] = []
+    annotation_manifest_path = _annotation_job_dir(runs_root, task_id, annotation_id) / "manifest.json"
+    annotation_manifest = read_json(annotation_manifest_path) if annotation_manifest_path.exists() else {}
+    dataset = str(annotation_manifest.get("argilla_dataset") or annotation_manifest.get("dataset") or "")
+    for child in sorted(path for path in base.iterdir() if path.is_dir()):
+        manifest_path = child / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        manifest = read_json(manifest_path)
+        decision_id = str(manifest.get("decision_id") or child.name)
+        decision_annotation = str(manifest.get("annotation_id") or manifest.get("source_annotation_id") or "")
+        decision_dataset = str(manifest.get("argilla_dataset") or manifest.get("dataset") or "")
+        if decision_annotation == annotation_id or (dataset and decision_dataset == dataset):
+            deps.append({"kind": "标注结果", "id": decision_id})
+    return deps
 
 
 def dependencies_for_sample(runs_root: str | Path, task_id: str, sample_id: str) -> list[dict[str, str]]:
@@ -2740,6 +2774,61 @@ def archive_sample(runs_root: str | Path, task_id: str, sample_id: str, *, reaso
             asset_id=sample_id or "-",
             status="failed",
             details={"error": str(exc), "reason": reason},
+        )
+        raise
+
+
+def archive_annotation_job(runs_root: str | Path, task_id: str, annotation_id: str, *, reason: str = "") -> dict:
+    try:
+        with _asset_lock(runs_root, task_id, f"annotation-job-{annotation_id}"):
+            item = _annotation_job_dir(runs_root, task_id, annotation_id)
+            if not item.is_dir():
+                raise ValueError(f"标注任务不存在: {annotation_id}")
+            deps = dependencies_for_annotation_job(runs_root, task_id, annotation_id)
+            if deps:
+                names = ", ".join(f"{dep['kind']}:{dep['id']}" for dep in deps)
+                raise ValueError(f"标注任务已被下游资产使用，不能归档。关联资产: {names}")
+            manifest_path = item / "manifest.json"
+            manifest = read_json(manifest_path) if manifest_path.exists() else {
+                "task_id": task_id,
+                "annotation_id": annotation_id,
+            }
+            archived_at = _now()
+            manifest.update({
+                "state": "archived",
+                "archived_at": archived_at,
+                "archive_reason": reason,
+                "archived_from": str(item),
+            })
+            write_json(manifest, manifest_path)
+            stamp = _archive_stamp(archived_at)
+            target = _archive_dir(runs_root, task_id, "annotation_jobs") / f"{annotation_id}__{stamp}"
+            _move_directory(item, target)
+            result = {
+                "task_id": task_id,
+                "annotation_id": annotation_id,
+                "archived": True,
+                "archive_path": str(target),
+                "archived_at": archived_at,
+            }
+            record_audit_event(
+                runs_root,
+                task_id,
+                "annotation_job.archive",
+                asset_type="annotation_job",
+                asset_id=annotation_id,
+                details={"archive_path": str(target), "reason": reason, "remote_affected": False},
+            )
+            return result
+    except Exception as exc:
+        record_audit_event(
+            runs_root,
+            task_id,
+            "annotation_job.archive",
+            asset_type="annotation_job",
+            asset_id=annotation_id or "-",
+            status="failed",
+            details={"error": str(exc), "reason": reason, "remote_affected": False},
         )
         raise
 
