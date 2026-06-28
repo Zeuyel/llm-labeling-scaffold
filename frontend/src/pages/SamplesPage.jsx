@@ -9,6 +9,7 @@ import {
   getBatchManifests,
   hasBatchPlan,
   newestSample,
+  sampleBatchSummary,
   sampleCreatedAt,
   sampleCompletionNotice,
   sampleStateLabel,
@@ -36,59 +37,6 @@ function formatPercent(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return "-";
   return `${Math.round(numeric * 1000) / 10}%`;
-}
-
-function firstDefined(...values) {
-  return values.find((value) => value !== undefined && value !== null && value !== "");
-}
-
-function batchSummary(sample) {
-  const manifests = getBatchManifests(sample);
-  if (!manifests.length) {
-    return {
-      hasBatchInfo: false,
-      batchText: "未记录",
-      overlapText: "未记录",
-      policyText: "未记录",
-    };
-  }
-
-  const manifest = manifests[0];
-  const consistency = manifest.consistency || manifest.quality_controls || manifest.policy || {};
-  const batchCount = firstDefined(
-    manifest.batch_count,
-    manifest.batches_count,
-    Array.isArray(manifest.batches) ? manifest.batches.length : undefined,
-  );
-  const batchSize = firstDefined(manifest.batch_size, manifest.rows_per_batch);
-  const overlapCount = firstDefined(
-    manifest.overlap_count,
-    manifest.overlap_items,
-    manifest.overlap_item_count,
-    consistency.overlap_count,
-    consistency.overlap_items,
-    consistency.overlap_item_count,
-  );
-  const overlapRate = firstDefined(manifest.overlap_rate, consistency.overlap_rate);
-  const minAnnotators = firstDefined(
-    manifest.min_annotators_per_overlap_item,
-    manifest.min_annotators,
-    consistency.min_annotators_per_overlap_item,
-    consistency.min_annotators,
-  );
-  const goldRate = firstDefined(manifest.gold_rate, consistency.gold_rate);
-
-  const policyParts = [];
-  if (overlapRate !== undefined) policyParts.push(`重叠 ${formatPercent(overlapRate)}`);
-  if (minAnnotators !== undefined) policyParts.push(`重叠样本至少 ${minAnnotators} 人标注`);
-  if (goldRate !== undefined) policyParts.push(`控制样本 ${formatPercent(goldRate)}`);
-
-  return {
-    hasBatchInfo: true,
-    batchText: batchCount ? `${batchCount} 批${batchSize ? ` · 每批 ${batchSize} 行` : ""}` : "已记录批次",
-    overlapText: overlapCount !== undefined ? `${overlapCount} 条` : "未记录",
-    policyText: policyParts.length ? policyParts.join("；") : "未记录",
-  };
 }
 
 function DetailField({ label, value, className = "" }) {
@@ -187,11 +135,11 @@ export default function SamplesPage({ task, taskId, onError }) {
   );
 
   const selectedBatchSummary = useMemo(
-    () => batchSummary(selectedBatchSample),
+    () => sampleBatchSummary(selectedBatchSample),
     [selectedBatchSample],
   );
   const selectedDetailSummary = useMemo(
-    () => batchSummary(selectedDetailSample),
+    () => sampleBatchSummary(selectedDetailSample),
     [selectedDetailSample],
   );
   const detailBatchPlans = useMemo(
@@ -449,7 +397,7 @@ export default function SamplesPage({ task, taskId, onError }) {
               </thead>
               <tbody>
                 {samples.map((s) => {
-                  const summary = batchSummary(s);
+                  const summary = sampleBatchSummary(s);
                   return (
                     <tr className="clickable-row" key={s.sample_id} onClick={() => openSampleDetail(s)}>
                       <td>
