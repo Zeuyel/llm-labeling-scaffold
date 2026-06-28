@@ -1,3 +1,5 @@
+import { countLike, firstDefined } from "./batchPlanDisplay.js";
+
 export const STAGE_STATUS = {
   LOADING: "loading",
   READY: "ready",
@@ -31,6 +33,67 @@ export function getBatchManifests(sample) {
 
 export function hasBatchPlan(sample) {
   return getBatchManifests(sample).length > 0;
+}
+
+function formatPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "-";
+  return `${Math.round(numeric * 1000) / 10}%`;
+}
+
+export function sampleBatchSummary(sample) {
+  const manifests = getBatchManifests(sample);
+  if (!manifests.length) {
+    return {
+      hasBatchInfo: false,
+      batchText: "未记录",
+      overlapText: "未记录",
+      policyText: "未记录",
+    };
+  }
+
+  const manifest = manifests[0];
+  const consistency = manifest.consistency || manifest.quality_controls || manifest.policy || {};
+  const batchCount = firstDefined(
+    manifest.batch_count,
+    manifest.batches_count,
+    Array.isArray(manifest.batches) ? manifest.batches.length : undefined,
+  );
+  const batchSize = firstDefined(manifest.batch_size, manifest.rows_per_batch);
+  const overlapCount = firstDefined(
+    manifest.overlap_item_count,
+    countLike(manifest.overlap_item_ids),
+    countLike(manifest.selected_overlap_item_ids),
+    countLike(manifest.overlap_items),
+    countLike(manifest.selected_overlap_items),
+    manifest.overlap_count,
+    consistency.overlap_item_count,
+    countLike(consistency.overlap_item_ids),
+    countLike(consistency.selected_overlap_item_ids),
+    countLike(consistency.overlap_items),
+    countLike(consistency.selected_overlap_items),
+    consistency.overlap_count,
+  );
+  const overlapRate = firstDefined(manifest.overlap_rate, consistency.overlap_rate);
+  const minAnnotators = firstDefined(
+    manifest.min_annotators_per_overlap_item,
+    manifest.min_annotators,
+    consistency.min_annotators_per_overlap_item,
+    consistency.min_annotators,
+  );
+  const goldRate = firstDefined(manifest.gold_rate, consistency.gold_rate);
+
+  const policyParts = [];
+  if (overlapRate !== undefined) policyParts.push(`重叠 ${formatPercent(overlapRate)}`);
+  if (minAnnotators !== undefined) policyParts.push(`重叠样本至少 ${minAnnotators} 人标注`);
+  if (goldRate !== undefined) policyParts.push(`控制样本 ${formatPercent(goldRate)}`);
+
+  return {
+    hasBatchInfo: true,
+    batchText: batchCount ? `${batchCount} 批${batchSize ? ` · 每批 ${batchSize} 行` : ""}` : "已记录批次",
+    overlapText: overlapCount !== undefined ? `${overlapCount} 条` : "未记录",
+    policyText: policyParts.length ? policyParts.join("；") : "未记录",
+  };
 }
 
 export function sampleStateLabel(sample) {
