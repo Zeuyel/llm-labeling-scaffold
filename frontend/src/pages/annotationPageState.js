@@ -47,8 +47,11 @@ export function annotationJobDetailActions({
   decisions = [],
 } = {}) {
   const hasJob = Boolean(job);
-  const state = String(job?.state || "").trim().toLowerCase();
-  const archived = state === "archived" || state === "已归档";
+  const statusValue = job?.status === undefined || job?.status === null || job?.status === ""
+    ? job?.state
+    : job?.status;
+  const status = String(statusValue || "").trim().toLowerCase();
+  const archived = status === "archived" || status === "已归档";
   const downstreamCount = Array.isArray(decisions) ? decisions.length : 0;
   const disabledByState = busy || !hasJob;
 

@@ -85,6 +85,26 @@ test("annotation job archive is blocked for archived states in either locale", (
   }
 });
 
+test("annotation job archive reads archived status even when state is stale", () => {
+  const actions = annotationJobDetailActions({
+    job: { annotation_id: "round_1", status: "archived", state: "active" },
+    decisions: [],
+  });
+
+  assert.equal(actions.archive.enabled, false);
+  assert.equal(actions.archive.disabledReason, "标注任务已归档。");
+});
+
+test("annotation job archive falls back from empty status to state", () => {
+  const actions = annotationJobDetailActions({
+    job: { annotation_id: "round_1", status: "", state: "archived" },
+    decisions: [],
+  });
+
+  assert.equal(actions.archive.enabled, false);
+  assert.equal(actions.archive.disabledReason, "标注任务已归档。");
+});
+
 test("annotation job gold action requires a passing agreement audit", () => {
   assert.deepEqual(annotationJobGoldAction({ audits: [] }), {
     enabled: false,

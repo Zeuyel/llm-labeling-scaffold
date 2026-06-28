@@ -1980,35 +1980,36 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             sample_id = dispatch.get("sample_id") or params.get("sample_id")
             dataset = params.get("dataset") or _default_argilla_dataset(task.task_id, sample_id)
             annotation_id = params.get("annotation_id") or dataset
-            annotation_dir = Path(runs_root) / task.task_id / "annotation_jobs" / annotation_id
-            if not annotation_dir.exists() and _archived_annotation_job_exists(runs_root, task.task_id, annotation_id):
-                raise ValueError(f"标注任务编号已归档，不能复用: {annotation_id}。请使用新的标注任务编号。")
-            dispatch_path = _materialize_argilla_dispatch(dispatch, annotation_dir)
-            argilla_params = _argilla_push_params(params, dispatch)
-            result = push_sample(task, dispatch_path, dataset, argilla_params)
-            manifest = {
-                "task_id": task.task_id,
-                "annotation_id": annotation_id,
-                "source": "argilla",
-                "argilla_dataset": dataset,
-                "dispatch_mode": dispatch_mode,
-                "dispatch_path": dispatch_path,
-                "sample_id": sample_id,
-                "sample_path": dispatch.get("sample_path"),
-                "batch_plan_id": dispatch.get("batch_plan_id"),
-                "batch_manifest_path": dispatch.get("batch_manifest_path"),
-                "batch_ids": dispatch.get("batch_ids") or [],
-                "batch_files": dispatch.get("batch_files") or [],
-                "overlap_item_ids": dispatch.get("overlap_item_ids") or [],
-                "selected_overlap_item_ids": dispatch.get("selected_overlap_item_ids") or [],
-                "rows": result.get("records", 0),
-                "record_id_policy": result.get("record_id_policy"),
-                "duplicate_record_ids": result.get("duplicate_record_ids"),
-                "status": "已分发",
-                "created_at": _now(),
-                "result": result,
-            }
-            write_json(manifest, annotation_dir / "manifest.json")
+            with _asset_lock(runs_root, task.task_id, f"annotation-job-{annotation_id}"):
+                annotation_dir = _annotation_job_dir(runs_root, task.task_id, annotation_id)
+                if not annotation_dir.exists() and _archived_annotation_job_exists(runs_root, task.task_id, annotation_id):
+                    raise ValueError(f"标注任务编号已归档，不能复用: {annotation_id}。请使用新的标注任务编号。")
+                dispatch_path = _materialize_argilla_dispatch(dispatch, annotation_dir)
+                argilla_params = _argilla_push_params(params, dispatch)
+                result = push_sample(task, dispatch_path, dataset, argilla_params)
+                manifest = {
+                    "task_id": task.task_id,
+                    "annotation_id": annotation_id,
+                    "source": "argilla",
+                    "argilla_dataset": dataset,
+                    "dispatch_mode": dispatch_mode,
+                    "dispatch_path": dispatch_path,
+                    "sample_id": sample_id,
+                    "sample_path": dispatch.get("sample_path"),
+                    "batch_plan_id": dispatch.get("batch_plan_id"),
+                    "batch_manifest_path": dispatch.get("batch_manifest_path"),
+                    "batch_ids": dispatch.get("batch_ids") or [],
+                    "batch_files": dispatch.get("batch_files") or [],
+                    "overlap_item_ids": dispatch.get("overlap_item_ids") or [],
+                    "selected_overlap_item_ids": dispatch.get("selected_overlap_item_ids") or [],
+                    "rows": result.get("records", 0),
+                    "record_id_policy": result.get("record_id_policy"),
+                    "duplicate_record_ids": result.get("duplicate_record_ids"),
+                    "status": "已分发",
+                    "created_at": _now(),
+                    "result": result,
+                }
+                write_json(manifest, annotation_dir / "manifest.json")
             return {
                 "kind": "annotation_job",
                 "annotation_id": annotation_id,
@@ -2243,9 +2244,14 @@ def dependencies_for_annotation_job(runs_root: str | Path, task_id: str, annotat
             continue
         manifest = read_json(manifest_path)
         decision_id = str(manifest.get("decision_id") or child.name)
-        decision_annotation = str(manifest.get("annotation_id") or manifest.get("source_annotation_id") or "")
+        decision_annotation = str(manifest.get("annotation_id") or "")
+        source_annotation_id = str(manifest.get("source_annotation_id") or "")
         decision_dataset = str(manifest.get("argilla_dataset") or manifest.get("dataset") or "")
-        if decision_annotation == annotation_id or (dataset and decision_dataset == dataset):
+        if (
+            decision_annotation == annotation_id
+            or source_annotation_id == annotation_id
+            or (dataset and decision_dataset == dataset)
+        ):
             deps.append({"kind": "标注结果", "id": decision_id})
     return deps
 
@@ -3044,7 +3050,12 @@ def archive_annotation_job(runs_root: str | Path, task_id: str, annotation_id: s
             stamp = _archive_stamp(archived_at)
             target = _archive_dir(runs_root, task_id, "annotation_jobs") / f"{annotation_id}__{stamp}"
             _move_directory(item, target)
-            write_json(manifest, target / "manifest.json")
+            try:
+                write_json(manifest, target / "manifest.json")
+            except Exception:
+                if target.exists() and not item.exists():
+                    _move_directory(target, item)
+                raise
             result = {
                 "task_id": task_id,
                 "annotation_id": annotation_id,
