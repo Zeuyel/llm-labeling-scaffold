@@ -29,6 +29,8 @@ PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format markdown
 
 - 检查数据湖来源：只读取 registry、dataset manifest 和选中的对象元数据。
 - 从数据湖导入：先 dry-run 检查将要读取的 task/source/manifest 和 import id；真实提交只把 `task.yaml` 指定的任务级 JSONL materialize 到 `runs/<task_id>/imports/<import_id>/`。通过面板 API 发起 mutating submit 时必须携带 `confirm: true` 和 `idempotency_key`，返回异步 job，并通过 job 状态查询进度。
+- 规划本地产物发布：对 decisions、gold、predictions、model metadata 执行 `data-lake publish plan`，只读本地产物并返回目标 R2 URI、publish manifest URI、bytes 和 sha256。
+- 提交本地产物发布：只有在操作者显式提供 confirm 和 idempotency key 时，才可执行 `data-lake publish submit`。submit 只写入任务 `data_lake.output_base_uri` 下的 artifact 与 publish manifest，并在上传后回读校验 hash。
 - 查询任务列表和任务阶段状态。
 - 查询导入列表和导入详情。
 - 查询 annotation job、decision artifact、gold version 的只读 list/detail/status，用于 smoke contract 检查。
@@ -36,7 +38,8 @@ PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format markdown
 
 ## 禁止动作
 
-- 不允许 MCP 修改 `task.yaml`、R2 registry、R2 manifest 或任务快照。
+- 不允许 MCP 修改 `task.yaml`、R2 registry、源数据集 R2 manifest 或任务快照。
+- 不允许 MCP 写 registry/governance/current 路径，不允许自动 promotion。
 - 生产模式下不允许覆盖 `lake_registry_uri`、`source_dataset_id`、`source_manifest_uri`、`source_object_path`。
 - 不允许调用删除、归档、任务新建、样本新建、Argilla 分发/拉回、训练、推理或 Docker 管理动作。
 - 不允许把只读 status smoke 自动升级为 `POST /api/action`。`argilla_push`、`argilla_pull`、`gold` 都是操作者授权后的写入动作。
@@ -49,6 +52,8 @@ PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format markdown
 | --- | --- | --- |
 | `scaffold_data_lake_check` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake check --task tasks/<task_id>/task.yaml` | 只读检查 R2 registry、manifest 和对象选择。 |
 | `operator_data_lake_import` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake import --task tasks/<task_id>/task.yaml --runs-root runs [--import-id <id>]` | 本地 operator 命令，直接写入本地 import 缓存；不作为 #14 SaaS/MCP mutating submit 验收路径。 |
+| `scaffold_data_lake_publish_plan` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake publish plan --task tasks/<task_id>/task.yaml --runs-root runs --kind <decisions\|gold\|predictions\|model_metadata> --artifact-id <id>` | dry-run；不写 R2；返回本地 artifact、目标 R2 URI、publish manifest URI、bytes 和 sha256。 |
+| `scaffold_data_lake_publish_submit` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake publish submit --task tasks/<task_id>/task.yaml --runs-root runs --kind <kind> --artifact-id <id> --confirm --idempotency-key <key>` | 受控写入 artifact 和 publish manifest；缺少 confirm 或 idempotency key 必须拒绝；上传后校验 hash；manifest 和返回值只记录 key digest。 |
 | `scaffold_task_list` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli task list --tasks-root tasks` | 读取本地任务缓存，输出稳定 JSON。 |
 | `scaffold_task_status` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli task status --task tasks/<task_id>/task.yaml --runs-root runs` | 输出 profile 阶段状态。也可用 `--task-id <task_id> --tasks-root tasks`。 |
 | `scaffold_import_list` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli import list --task tasks/<task_id>/task.yaml --runs-root runs` | 输出该任务所有本地 import manifest 摘要。 |
@@ -118,6 +123,6 @@ annotation / decisions / gold 的 list/detail 端点只读取本地 manifest 和
 
 ## 返回值和错误处理
 
-所有推荐 CLI 命令成功时都在 stdout 输出 JSON。MCP 应把非零退出码视为调用失败，并把 stderr/stdout 摘要返回给操作者。CLI `data-lake import` 是本地 operator direct import 命令，不带 SaaS/API 的 submit gate，不作为 #14 的 MCP mutating submit 验收路径。通过面板 API 发起 R2 导入时，MCP 应先调用 dry-run；真实 submit 必须携带 `confirm: true` 和稳定 `idempotency_key`。MCP 应记录返回的 job，并轮询 job 状态；导入成功后再触发 profile 的样本抽取阶段。
+所有推荐 CLI 命令成功时都在 stdout 输出 JSON。MCP 应把非零退出码视为调用失败，并把 stderr/stdout 摘要返回给操作者。CLI `data-lake import` 是本地 operator direct import 命令，不带 SaaS/API 的 submit gate，不作为 #14 的 MCP mutating submit 验收路径。通过面板 API 发起 R2 导入时，MCP 应先调用 dry-run；真实 submit 必须携带 `confirm: true` 和稳定 `idempotency_key`。MCP 应记录返回的 job，并轮询 job 状态；导入成功后再触发 profile 的样本抽取阶段。`data-lake publish submit` 不应自动重试，除非操作者确认使用同一个 idempotency key 继续同一发布动作。
 
 `data-lake check` 和 `data-lake import` 需要运行环境可执行 `rclone` 且配置了 `r2` remote。生产环境应按“系统设置”或 `LLS_DATA_LAKE_R2_PREFIX` 配置允许访问的 R2 前缀，例如 `r2:YOUR_BUCKET/...`；本地路径和 `file://` 只允许在测试中显式设置 `LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1`。
