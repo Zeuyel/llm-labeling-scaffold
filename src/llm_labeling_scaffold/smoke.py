@@ -248,8 +248,9 @@ def _run_json_check(
         return {**check, "status": "not_supported", "message": _message_from_body(response.body)}
     if not 200 <= response.status < 300:
         return {**check, "status": "failed", "message": _message_from_body(response.body)}
-    if expect_ok_field and isinstance(response.body, dict) and response.body.get("ok") is False:
-        return {**check, "status": "failed", "message": _message_from_body(response.body)}
+    if expect_ok_field and (not isinstance(response.body, dict) or response.body.get("ok") is not True):
+        message = _message_from_body(response.body) or "response must include ok: true"
+        return {**check, "status": "failed", "message": message}
     return {**check, "status": "ok"}
 
 
@@ -295,7 +296,8 @@ def _find_import_dry_run_endpoint(capabilities: dict[str, Any] | None) -> dict[s
         path = str(endpoint.get("path") or "")
         action = str(endpoint.get("action") or "")
         schema = endpoint.get("request_schema") if isinstance(endpoint.get("request_schema"), dict) else {}
-        properties = schema.get("properties") if isinstance(schema, dict) else {}
+        raw_properties = schema.get("properties") if isinstance(schema, dict) else {}
+        properties = raw_properties if isinstance(raw_properties, dict) else {}
         dry_run_declared = (
             "dry_run" in properties
             or "dry-run" in path
@@ -321,12 +323,30 @@ def _message_from_body(body: Any) -> str:
         for key in ("message", "error", "detail"):
             value = body.get(key)
             if isinstance(value, str) and value:
-                return value
-        if body.get("errors"):
-            return json.dumps(body["errors"], ensure_ascii=False)[:500]
+                return _short_message(value)
+            if value not in (None, "", [], {}):
+                return _short_message(value)
+        if body.get("errors") not in (None, "", [], {}):
+            return _short_message(body["errors"])
+        if body.get("raw") not in (None, ""):
+            return _short_message(body["raw"])
+        return _short_message(body) if body else ""
     if isinstance(body, str):
-        return body[:500]
+        return _short_message(body)
+    if body not in (None, "", [], {}):
+        return _short_message(body)
     return ""
+
+
+def _short_message(value: Any, limit: int = 500) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = json.dumps(redact_secrets(value), ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            text = str(redact_secrets(value))
+    return redact_text(text)[:limit]
 
 
 def _compact_check(check: dict[str, Any]) -> dict[str, Any]:

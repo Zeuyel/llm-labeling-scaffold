@@ -4,7 +4,7 @@ import base64
 import json
 from urllib.parse import urlparse
 
-from llm_labeling_scaffold.smoke import SmokeConfig, SmokeResponse, render_summary, run_smoke
+from llm_labeling_scaffold.smoke import SmokeConfig, SmokeResponse, _message_from_body, render_summary, run_smoke
 
 
 def test_smoke_summary_redacts_sensitive_values():
@@ -158,6 +158,90 @@ def test_smoke_runner_marks_import_dry_run_not_supported_without_safe_contract()
     assert import_check["status"] == "not_supported"
     assert calls[0][2]["Authorization"] == basic_header
     assert all(path != "/api/import/data_lake" for _, path, _ in calls)
+
+
+def test_smoke_runner_requires_ok_true_for_ok_checked_endpoints():
+    for response_body in ({}, {"ok": "yes"}):
+        def fake_transport(method, url, headers, body, timeout):
+            path = urlparse(url).path
+            if path == "/api/health":
+                return SmokeResponse(200, {"ok": True, "status": "ok", "service": "llm-labeling-scaffold"})
+            if path == "/api/version":
+                return SmokeResponse(200, {"service": "llm-labeling-scaffold", "version": "0.1.0"})
+            if path == "/api/capabilities":
+                return SmokeResponse(200, {"endpoints": []})
+            if path == "/api/settings/public":
+                return SmokeResponse(200, {"settings": {}})
+            if path == "/api/tasks/patent_boundary_v0_1/check":
+                return SmokeResponse(200, response_body)
+            raise AssertionError(f"unexpected request: {method} {path}")
+
+        summary = run_smoke(SmokeConfig(server_url="http://127.0.0.1:8765"), transport=fake_transport)
+        task_check = next(item for item in summary["checks"] if item["name"] == "task_check")
+
+        assert summary["ok"] is False
+        assert task_check["status"] == "failed"
+
+
+def test_smoke_runner_ignores_none_capability_properties_without_calling_import():
+    calls = []
+
+    def fake_transport(method, url, headers, body, timeout):
+        path = urlparse(url).path
+        calls.append(path)
+        if path == "/api/health":
+            return SmokeResponse(200, {"ok": True, "status": "ok", "service": "llm-labeling-scaffold"})
+        if path == "/api/version":
+            return SmokeResponse(200, {"service": "llm-labeling-scaffold", "version": "0.1.0"})
+        if path == "/api/capabilities":
+            return SmokeResponse(
+                200,
+                {
+                    "endpoints": [
+                        {
+                            "method": "POST",
+                            "path": "/api/import/data_lake",
+                            "action": "data_lake_import",
+                            "side_effects": False,
+                            "request_schema": {"type": "object", "properties": None},
+                        }
+                    ]
+                },
+            )
+        if path == "/api/settings/public":
+            return SmokeResponse(200, {"settings": {}})
+        if path == "/api/tasks/patent_boundary_v0_1/check":
+            return SmokeResponse(200, {"ok": True, "checks": [], "warnings": [], "errors": []})
+        raise AssertionError(f"properties=None should not advertise import dry-run: {method} {path}")
+
+    summary = run_smoke(SmokeConfig(server_url="http://127.0.0.1:8765"), transport=fake_transport)
+    import_check = next(item for item in summary["checks"] if item["name"] == "import_dry_run")
+
+    assert import_check["status"] == "not_supported"
+    assert calls.count("/api/import/data_lake") == 0
+
+
+def test_message_from_body_summarizes_structured_detail_and_redacts():
+    list_message = _message_from_body({
+        "detail": [
+            {"loc": ["query", "token"], "msg": "token=list-token api_key=list-key"},
+        ]
+    })
+    dict_message = _message_from_body({
+        "detail": {
+            "message": "password=dict-password",
+            "secret_path": "/run/secrets/panel_password",
+        }
+    })
+    raw_message = _message_from_body({"raw": "upstream failed secret=raw-secret"})
+
+    combined = "\n".join([list_message, dict_message, raw_message])
+    assert "list-token" not in combined
+    assert "list-key" not in combined
+    assert "dict-password" not in combined
+    assert "/run/secrets/panel_password" not in combined
+    assert "raw-secret" not in combined
+    assert "<redacted>" in combined
 
 
 def test_smoke_runner_compacts_legacy_import_dry_run_object():
