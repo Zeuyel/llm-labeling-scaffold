@@ -2206,6 +2206,10 @@ def test_external_suggestions_export_import_and_publish(tmp_path: Path, monkeypa
     assert rows[0]["agent"] == "external_codex:v001"
     assert rows[0]["suggestions"] == {"label": "yes"}
     assert rows[0]["scores"] == {"label": 0.91}
+    write_json(
+        {**read_json(imported["manifest_path"]), "status": "publish_failed", "error": "previous failure"},
+        imported["manifest_path"],
+    )
 
     monkeypatch.setattr(
         suggestions_module,
@@ -2226,6 +2230,8 @@ def test_external_suggestions_export_import_and_publish(tmp_path: Path, monkeypa
     manifest = read_json(imported["manifest_path"])
     assert manifest["status"] == "published"
     assert manifest["publish"]["records"] == 1
+    assert "published_at" in manifest
+    assert "error" not in manifest
 
 
 def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
@@ -2259,6 +2265,11 @@ def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
         provider="local_stub",
         prompt_version="v001",
     )
+    manifest_path = tmp_path / "runs" / task.task_id / "suggestions" / "argilla_round_1" / "local_stub_v001" / "manifest.json"
+    write_json(
+        {**read_json(manifest_path), "status": "publish_failed", "error": "previous failure"},
+        manifest_path,
+    )
     monkeypatch.setattr(
         suggestions_module,
         "push_suggestions",
@@ -2275,11 +2286,13 @@ def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
         publish=True,
     )
 
-    manifest = read_json(tmp_path / "runs" / task.task_id / "suggestions" / "argilla_round_1" / "local_stub_v001" / "manifest.json")
+    manifest = read_json(manifest_path)
     assert result["action"] == "reused"
     assert result["publish"]["status"] == "published"
     assert manifest["status"] == "published"
     assert manifest["publish"]["records"] == 1
+    assert "published_at" in manifest
+    assert "error" not in manifest
 
 
 def test_prelabel_provider_payload_must_be_dict(tmp_path: Path, monkeypatch):
