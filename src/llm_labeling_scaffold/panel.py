@@ -310,6 +310,18 @@ def _contract_capabilities() -> dict[str, Any]:
                 "response_schema": {"type": "object", "required": ["ok", "suggestions"]},
             },
             {
+                "method": "GET",
+                "path": "/api/suggestions/download",
+                "action": "suggestions_download",
+                "side_effects": False,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "annotation_id": {"type": "string", "required": True},
+                    "suggestion_id": {"type": "string", "required": True},
+                    "kind": {"type": "string", "required": False, "enum": ["template", "suggestions", "schema"]},
+                },
+            },
+            {
                 "method": "POST",
                 "path": "/api/import/data_lake",
                 "action": "data_lake_import_dry_run",
@@ -923,6 +935,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/import/download":
             self._download_import(params)
+        elif path == "/api/suggestions/download":
+            self._download_suggestions(params)
         elif path == "/api/task/annotation_jobs":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
@@ -1364,6 +1378,35 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{import_id}.jsonl"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _download_suggestions(self, params) -> None:
+        task = params.get("task_id", [""])[0]
+        annotation_id = params.get("annotation_id", [""])[0]
+        suggestion_id = params.get("suggestion_id", [""])[0]
+        kind = params.get("kind", ["template"])[0] or "template"
+        if not _safe_segment(task) or not _safe_segment(annotation_id) or not _safe_segment(suggestion_id):
+            self._json({"error": "bad task/annotation/suggestion"}, status=400)
+            return
+        files = {
+            "template": ("suggestions_template.jsonl", "application/x-ndjson; charset=utf-8"),
+            "suggestions": ("suggestions.jsonl", "application/x-ndjson; charset=utf-8"),
+            "schema": ("schema.json", "application/json; charset=utf-8"),
+        }
+        if kind not in files:
+            self._json({"error": "unknown suggestions download kind"}, status=400)
+            return
+        filename, content_type = files[kind]
+        path = self.runs_root / task / "suggestions" / annotation_id / suggestion_id / filename
+        if not path.is_file():
+            self._json({"error": "no data"}, status=404)
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{suggestion_id}_{filename}"')
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

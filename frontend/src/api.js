@@ -161,3 +161,6 @@ export const archiveAnnotationJob = (taskId, annotationId, reason = "") =>
 
 export const importDownloadUrl = (taskId, importId) =>
   `/api/import/download?${q({ task_id: taskId, import_id: importId })}`;
+
+export const suggestionDownloadUrl = (taskId, annotationId, suggestionId, kind = "template") =>
+  `/api/suggestions/download?${q({ task_id: taskId, annotation_id: annotationId, suggestion_id: suggestionId, kind })}`;

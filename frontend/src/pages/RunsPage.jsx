@@ -195,6 +195,12 @@ export default function RunsPage({ task, taskId, onError }) {
     () => annotationJobDetailActions({ busy, job: selectedAnnotationJob, decisions: selectedJobDecisions }),
     [busy, selectedAnnotationJob, selectedJobDecisions],
   );
+  const suggestionUploadDisabledReason = !suggestionFileText.trim()
+    ? "请先下载模板，交给 Codex 或其他 LLM 填写 suggestions 后，在这里选择填好的 JSONL 文件。"
+    : selectedJobSuggestionAvailability.generate.reason;
+  const suggestionPublishUploadDisabledReason = !suggestionFileText.trim()
+    ? "请先下载模板，交给 Codex 或其他 LLM 填写 suggestions 后，在这里选择填好的 JSONL 文件。"
+    : selectedJobSuggestionAvailability.publish.reason;
   const selectedJobAudits = useMemo(
     () => agreementAuditsForAnnotationJob(selectedAnnotationJob, selectedJobDecisions, agreementAudits),
     [selectedAnnotationJob, selectedJobDecisions, agreementAudits],
@@ -862,7 +868,7 @@ export default function RunsPage({ task, taskId, onError }) {
             )}
             <div className="secondary-panel drawer-section">
               <div className="toolbar"><h3>机器建议 Suggestions</h3></div>
-              <p className="muted">先导出待预标注文件，在外部用 Codex 或其他 LLM 填写 suggestions 后上传；机器建议仅供人工 review，不是正式标注。</p>
+              <p className="muted">先导出并下载 suggestions_template.jsonl，交给 Codex 或其他 LLM 填写 suggestions；再在这里选择填好的 JSONL 上传，最后写入 Argilla 供人工 review。</p>
               <div className="form-grid drawer-form-grid">
                 <div className="field field-half">
                   <label>建议编号</label>
@@ -879,7 +885,7 @@ export default function RunsPage({ task, taskId, onError }) {
                 <div className="field field-half">
                   <label>上传建议文件</label>
                   <input type="file" accept=".jsonl,.json,application/json" onChange={selectSuggestionFile} />
-                  <span className="hint">{suggestionFileName || "选择填好 suggestions 的 JSONL 文件"}</span>
+                  <span className="hint">{suggestionFileName || "先下载模板，外部填写后再选择填好的 suggestions.jsonl"}</span>
                 </div>
               </div>
               <div className="drawer-actions">
@@ -895,7 +901,7 @@ export default function RunsPage({ task, taskId, onError }) {
                 <button
                   className="btn"
                   disabled={busy || !selectedJobSuggestionAvailability.generate.enabled || !suggestionFileText.trim()}
-                  title={selectedJobSuggestionAvailability.generate.reason}
+                  title={suggestionUploadDisabledReason}
                   type="button"
                   onClick={() => importSuggestionsForJob(selectedAnnotationJob, false)}
                 >
@@ -904,7 +910,7 @@ export default function RunsPage({ task, taskId, onError }) {
                 <button
                   className="btn btn-primary"
                   disabled={busy || !selectedJobSuggestionAvailability.publish.enabled || !suggestionFileText.trim()}
-                  title={selectedJobSuggestionAvailability.publish.reason}
+                  title={suggestionPublishUploadDisabledReason}
                   type="button"
                   onClick={() => importSuggestionsForJob(selectedAnnotationJob, true)}
                 >
@@ -937,10 +943,35 @@ export default function RunsPage({ task, taskId, onError }) {
                       {" · "}
                       {suggestion.provider || "-"}:{suggestion.prompt_version || "-"}
                     </span>
+                    {suggestion.template_path && (
+                      <span className="status-line">
+                        模板文件：suggestions_template.jsonl。下载后让 Codex/LLM 填写 suggestions，再回到这里上传。
+                      </span>
+                    )}
                   </div>
-                  <span className={`badge ${statusBadgeClass(suggestionStatusLabel(suggestion))}`}>
-                    {suggestionStatusLabel(suggestion)}
-                  </span>
+                  <div className="action-row">
+                    {suggestion.template_path && (
+                      <a
+                        className="btn btn-sm"
+                        href={api.suggestionDownloadUrl(taskId, selectedAnnotationJob.annotation_id, suggestion.suggestion_id, "template")}
+                        download
+                      >
+                        下载模板
+                      </a>
+                    )}
+                    {suggestion.records > 0 && (
+                      <a
+                        className="btn btn-sm"
+                        href={api.suggestionDownloadUrl(taskId, selectedAnnotationJob.annotation_id, suggestion.suggestion_id, "suggestions")}
+                        download
+                      >
+                        下载已上传建议
+                      </a>
+                    )}
+                    <span className={`badge ${statusBadgeClass(suggestionStatusLabel(suggestion))}`}>
+                      {suggestionStatusLabel(suggestion)}
+                    </span>
+                  </div>
                 </div>
               ))}
             </div>
