@@ -2089,6 +2089,22 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                     manifest[key] = lineage[key]
             write_json(manifest, decision_dir / "manifest.json")
             return {"kind": "decision_artifact", "artifact": str(output), "decision_id": decision_id, "result": result}
+        if action == "prelabel_export":
+            from .suggestions import export_suggestion_template
+
+            annotation_id = str(params.get("annotation_id") or params.get("job_id") or "").strip()
+            suggestion_id = str(params.get("suggestion_id") or "suggestions_v001").strip()
+            if not annotation_id:
+                raise ValueError("缺少标注任务编号 annotation_id")
+            with _asset_lock(runs_root, task.task_id, f"suggestions-{annotation_id}-{suggestion_id}"):
+                return export_suggestion_template(
+                    runs_root,
+                    task,
+                    annotation_id,
+                    suggestion_id,
+                    provider=str(params.get("provider") or "external"),
+                    prompt_version=str(params.get("prompt_version") or "v001"),
+                )
         if action == "prelabel_suggest":
             from .suggestions import generate_suggestions_for_annotation_job
 
@@ -2105,6 +2121,21 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                     provider=str(params.get("provider") or "local_stub"),
                     prompt_version=str(params.get("prompt_version") or "v001"),
                     publish=_truthy_param(params.get("publish")),
+                    argilla=params.get("argilla") or {},
+                )
+        if action == "prelabel_publish":
+            from .suggestions import publish_suggestions_for_annotation_job
+
+            annotation_id = str(params.get("annotation_id") or params.get("job_id") or "").strip()
+            suggestion_id = str(params.get("suggestion_id") or "suggestions_v001").strip()
+            if not annotation_id:
+                raise ValueError("缺少标注任务编号 annotation_id")
+            with _asset_lock(runs_root, task.task_id, f"suggestions-{annotation_id}-{suggestion_id}"):
+                return publish_suggestions_for_annotation_job(
+                    runs_root,
+                    task,
+                    annotation_id,
+                    suggestion_id,
                     argilla=params.get("argilla") or {},
                 )
         if action == "audit":

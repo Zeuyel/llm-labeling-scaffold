@@ -250,6 +250,7 @@ export function annotationJobActionAvailability(job, decisions = [], samplePath 
 export function suggestionStatusLabel(suggestion) {
   const status = String(firstDefined(suggestion?.status, suggestion?.state) || "").trim().toLowerCase();
   if (["published", "pushed"].includes(status)) return "已写入 Argilla";
+  if (["template_exported", "exported"].includes(status)) return "已导出模板";
   if (["generated", "created", "reused"].includes(status)) return "已生成";
   if (["publish_failed", "failed", "error"].includes(status)) return "写入失败";
   if (["running", "pending", "queued", "in_progress"].includes(status)) return "执行中";
@@ -302,6 +303,8 @@ export function suggestionLineageFields(suggestion) {
     ["prompt_version", suggestion.prompt_version],
     ["批次计划", suggestion.batch_plan_id],
     ["批次数", countLike(suggestion.batch_ids)],
+    ["模板路径", suggestion.template_path],
+    ["字段规则", suggestion.schema_path],
     ["产物路径", suggestion.suggestions_path],
     ["manifest", suggestion.manifest_path],
   ];

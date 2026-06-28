@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 from .batching import batch_records
@@ -8,10 +9,16 @@ from .io import read_jsonl, write_json
 from .providers.local_stub import LocalStubProvider
 
 
+def _direct_codex_exec_enabled() -> bool:
+    return str(os.environ.get("LLS_ENABLE_DIRECT_CODEX_EXEC") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def get_provider(name: str):
     if name == "local_stub":
         return LocalStubProvider()
     if name == "codex_exec":
+        if not _direct_codex_exec_enabled():
+            raise ValueError("codex_exec 直接执行默认关闭；请使用预标注模板导出、外部填写、上传建议的文件交接流程")
         from .providers.codex_exec import CodexExecProvider
 
         return CodexExecProvider()

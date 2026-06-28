@@ -7,6 +7,7 @@ import subprocess
 import pytest
 
 from llm_labeling_scaffold import pipeline
+from llm_labeling_scaffold.annotation import get_provider
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.providers.codex_exec import CodexExecProvider, _parse_json_object
 
@@ -44,6 +45,19 @@ def test_codex_exec_provider_parses_results_from_output_file(tmp_path: Path):
     payload = provider.annotate_batch([{"record_id": "r1", "title": "remote platform"}], task)
 
     assert payload == {"results": [{"record_id": "r1", "label": "yes"}]}
+
+
+def test_codex_exec_provider_is_not_registered_by_default(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("LLS_ENABLE_DIRECT_CODEX_EXEC", raising=False)
+
+    with pytest.raises(ValueError, match="文件交接"):
+        get_provider("codex_exec")
+
+
+def test_codex_exec_provider_registration_requires_opt_in(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LLS_ENABLE_DIRECT_CODEX_EXEC", "1")
+
+    assert isinstance(get_provider("codex_exec"), CodexExecProvider)
 
 
 def test_codex_exec_parser_strips_only_outer_markdown_fence():

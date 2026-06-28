@@ -106,6 +106,20 @@ export const startAction = (taskPath, action, params) =>
     body: JSON.stringify({ task: taskPath, action, params }),
   }).then((data) => data.job || data);
 
+export const importSuggestions = (taskId, annotationId, suggestionId, text, opts = {}) =>
+  req(`/api/suggestions/import?${q({
+    task_id: taskId,
+    annotation_id: annotationId,
+    suggestion_id: suggestionId,
+    provider: opts.provider,
+    prompt_version: opts.promptVersion,
+    publish: opts.publish ? 1 : undefined,
+  })}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-ndjson" },
+    body: text,
+  }).then((data) => data.suggestions || data);
+
 export async function waitForJob(taskId, jobId, attempts = 30) {
   for (let i = 0; i < attempts; i += 1) {
     const data = await getJobs(taskId);

@@ -126,8 +126,10 @@ export default function RunsPage({ task, taskId, onError }) {
   const [argillaIfExists, setArgillaIfExists] = useState("fail");
   const [argillaStatus, setArgillaStatus] = useState(null);
   const [suggestionId, setSuggestionId] = useState("");
-  const [suggestionProvider, setSuggestionProvider] = useState("local_stub");
+  const [suggestionProvider, setSuggestionProvider] = useState("external_codex");
   const [suggestionPromptVersion, setSuggestionPromptVersion] = useState("v001");
+  const [suggestionFileText, setSuggestionFileText] = useState("");
+  const [suggestionFileName, setSuggestionFileName] = useState("");
   const [datasetAuto, setDatasetAuto] = useState(true);
   const [busy, setBusy] = useState(false);
   const [showCreatePanel, setShowCreatePanel] = useState(false);
@@ -366,25 +368,77 @@ export default function RunsPage({ task, taskId, onError }) {
     }, "拉回标注结果");
   }
 
-  async function prelabelForJob(job, publish = false) {
+  function suggestionParams(job) {
     const annotation = String(job?.annotation_id || "").trim();
-    const dataset = String(job?.argilla_dataset || job?.dataset || "").trim();
     const currentSuggestionId = suggestionId.trim() || generatedSuggestionId;
+    return { annotation, currentSuggestionId };
+  }
+
+  async function exportPrelabelForJob(job) {
+    const { annotation, currentSuggestionId } = suggestionParams(job);
     if (!annotation || !currentSuggestionId) {
-      onError("该标注任务缺少 annotation_id 或 suggestion_id，不能生成机器建议");
+      onError("该标注任务缺少 annotation_id 或 suggestion_id，不能导出预标注模板");
+      return;
+    }
+    await action("prelabel_export", {
+      annotation_id: annotation,
+      suggestion_id: currentSuggestionId,
+      provider: suggestionProvider.trim() || "external",
+      prompt_version: suggestionPromptVersion.trim() || "v001",
+    }, "导出预标注模板");
+  }
+
+  async function importSuggestionsForJob(job, publish = false) {
+    const { annotation, currentSuggestionId } = suggestionParams(job);
+    const dataset = String(job?.argilla_dataset || job?.dataset || "").trim();
+    if (!annotation || !currentSuggestionId) {
+      onError("该标注任务缺少 annotation_id 或 suggestion_id，不能上传机器建议");
+      return;
+    }
+    if (!suggestionFileText.trim()) {
+      onError("请选择 suggestions.jsonl 文件");
       return;
     }
     if (publish && !dataset) {
       onError("该标注任务缺少 Argilla 数据集名，不能写入 Suggestions");
       return;
     }
-    await action("prelabel_suggest", {
+    setBusy(true);
+    try {
+      await api.importSuggestions(taskId, annotation, currentSuggestionId, suggestionFileText, {
+        provider: suggestionProvider.trim() || "external",
+        promptVersion: suggestionPromptVersion.trim() || "v001",
+        publish,
+      });
+      await reload();
+    } catch (error) {
+      onError(`${publish ? "上传并写入 Argilla Suggestions" : "上传机器建议"}: ${error}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function publishSuggestionsForJob(job) {
+    const { annotation, currentSuggestionId } = suggestionParams(job);
+    const dataset = String(job?.argilla_dataset || job?.dataset || "").trim();
+    if (!annotation || !currentSuggestionId) {
+      onError("该标注任务缺少 annotation_id 或 suggestion_id，不能写入 Suggestions");
+      return;
+    }
+    if (!dataset) {
+      onError("该标注任务缺少 Argilla 数据集名，不能写入 Suggestions");
+      return;
+    }
+    await action("prelabel_publish", {
       annotation_id: annotation,
       suggestion_id: currentSuggestionId,
-      provider: suggestionProvider.trim() || "local_stub",
-      prompt_version: suggestionPromptVersion.trim() || "v001",
-      publish,
-    }, publish ? "写入 Argilla Suggestions" : "生成机器建议");
+    }, "写入已上传 Suggestions");
+  }
+
+  async function selectSuggestionFile(event) {
+    const file = event.target.files?.[0];
+    setSuggestionFileName(file?.name || "");
+    setSuggestionFileText(file ? await file.text() : "");
   }
 
   async function archiveAnnotationJob(job) {
@@ -808,22 +862,24 @@ export default function RunsPage({ task, taskId, onError }) {
             )}
             <div className="secondary-panel drawer-section">
               <div className="toolbar"><h3>机器建议 Suggestions</h3></div>
-              <p className="muted">机器建议仅供人工 review，不是正式标注；回收结果只读取人工提交的 responses。</p>
+              <p className="muted">先导出待预标注文件，在外部用 Codex 或其他 LLM 填写 suggestions 后上传；机器建议仅供人工 review，不是正式标注。</p>
               <div className="form-grid drawer-form-grid">
                 <div className="field field-half">
-                  <label>suggestion_id</label>
+                  <label>建议编号</label>
                   <input value={suggestionId} onChange={(e) => setSuggestionId(e.target.value)} placeholder={generatedSuggestionId} />
                 </div>
                 <div className="field field-half">
-                  <label>provider</label>
-                  <select value={suggestionProvider} onChange={(e) => setSuggestionProvider(e.target.value)}>
-                    <option value="local_stub">local_stub</option>
-                    <option value="codex_exec">codex_exec</option>
-                  </select>
+                  <label>外部来源标识</label>
+                  <input value={suggestionProvider} onChange={(e) => setSuggestionProvider(e.target.value)} placeholder="external_codex" />
                 </div>
                 <div className="field field-half">
-                  <label>prompt_version</label>
+                  <label>提示版本</label>
                   <input value={suggestionPromptVersion} onChange={(e) => setSuggestionPromptVersion(e.target.value)} placeholder="v001" />
+                </div>
+                <div className="field field-half">
+                  <label>上传建议文件</label>
+                  <input type="file" accept=".jsonl,.json,application/json" onChange={selectSuggestionFile} />
+                  <span className="hint">{suggestionFileName || "选择填好 suggestions 的 JSONL 文件"}</span>
                 </div>
               </div>
               <div className="drawer-actions">
@@ -832,18 +888,36 @@ export default function RunsPage({ task, taskId, onError }) {
                   disabled={busy || !selectedJobSuggestionAvailability.generate.enabled}
                   title={selectedJobSuggestionAvailability.generate.reason}
                   type="button"
-                  onClick={() => prelabelForJob(selectedAnnotationJob, false)}
+                  onClick={() => exportPrelabelForJob(selectedAnnotationJob)}
                 >
-                  生成机器建议
+                  导出预标注模板
+                </button>
+                <button
+                  className="btn"
+                  disabled={busy || !selectedJobSuggestionAvailability.generate.enabled || !suggestionFileText.trim()}
+                  title={selectedJobSuggestionAvailability.generate.reason}
+                  type="button"
+                  onClick={() => importSuggestionsForJob(selectedAnnotationJob, false)}
+                >
+                  上传机器建议
                 </button>
                 <button
                   className="btn btn-primary"
+                  disabled={busy || !selectedJobSuggestionAvailability.publish.enabled || !suggestionFileText.trim()}
+                  title={selectedJobSuggestionAvailability.publish.reason}
+                  type="button"
+                  onClick={() => importSuggestionsForJob(selectedAnnotationJob, true)}
+                >
+                  上传并写入 Argilla
+                </button>
+                <button
+                  className="btn"
                   disabled={busy || !selectedJobSuggestionAvailability.publish.enabled}
                   title={selectedJobSuggestionAvailability.publish.reason}
                   type="button"
-                  onClick={() => prelabelForJob(selectedAnnotationJob, true)}
+                  onClick={() => publishSuggestionsForJob(selectedAnnotationJob)}
                 >
-                  写入 Argilla Suggestions
+                  写入已上传建议
                 </button>
               </div>
               {(selectedJobSuggestionAvailability.generate.reason || selectedJobSuggestionAvailability.publish.reason) && (

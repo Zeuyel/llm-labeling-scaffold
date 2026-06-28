@@ -184,6 +184,7 @@ test("annotation job detail exposes suggestion status and actions", () => {
   };
 
   assert.equal(defaultSuggestionId("codex_exec", "prompt/v1"), "codex_exec_prompt_v1");
+  assert.equal(suggestionStatusLabel({ status: "template_exported" }), "已导出模板");
   assert.equal(suggestionStatusLabel({ status: "generated" }), "已生成");
   assert.equal(suggestionStatusLabel({ status: "published" }), "已写入 Argilla");
   assert.equal(suggestionStatusLabel({ status: "publish_failed" }), "写入失败");

@@ -266,16 +266,48 @@ def _contract_capabilities() -> dict[str, Any]:
                 "action": "operator_action",
                 "side_effects": True,
                 "operator_gated": True,
-                "allowed_actions": ["argilla_push", "argilla_pull", "gold"],
+                "allowed_actions": [
+                    "argilla_push",
+                    "argilla_pull",
+                    "gold",
+                    "prelabel_export",
+                    "prelabel_publish",
+                ],
                 "request_schema": {
                     "type": "object",
                     "required": ["task", "action"],
                     "properties": {
                         "task": {"type": "string"},
-                        "action": {"type": "string", "enum": ["argilla_push", "argilla_pull", "gold"]},
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "argilla_push",
+                                "argilla_pull",
+                                "gold",
+                                "prelabel_export",
+                                "prelabel_publish",
+                            ],
+                        },
                         "params": {"type": "object"},
                     },
                 },
+            },
+            {
+                "method": "POST",
+                "path": "/api/suggestions/import",
+                "action": "suggestions_import",
+                "side_effects": True,
+                "operator_gated": True,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "annotation_id": {"type": "string", "required": True},
+                    "suggestion_id": {"type": "string", "required": True},
+                    "provider": {"type": "string", "required": False},
+                    "prompt_version": {"type": "string", "required": False},
+                    "publish": {"type": "boolean", "required": False},
+                },
+                "request_schema": {"content_type": "application/x-ndjson"},
+                "response_schema": {"type": "object", "required": ["ok", "suggestions"]},
             },
             {
                 "method": "POST",
@@ -1066,6 +1098,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "job": job})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/suggestions/import":
+            self._import_suggestions(params)
         elif path == "/api/tasks":
             body = self._read_body()
             try:
@@ -1271,6 +1305,48 @@ class _Handler(BaseHTTPRequestHandler):
                 idempotency_key=idempotency_key,
             )
             self._json({"ok": True, "job": job})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
+    def _import_suggestions(self, params) -> None:
+        task_id = params.get("task_id", [""])[0]
+        annotation_id = params.get("annotation_id", [""])[0]
+        suggestion_id = params.get("suggestion_id", [""])[0]
+        provider = params.get("provider", ["external"])[0] or "external"
+        prompt_version = params.get("prompt_version", ["v001"])[0] or "v001"
+        publish = _truthy_value(params.get("publish", [""])[0])
+        if not _safe_segment(task_id) or not _safe_segment(annotation_id) or not _safe_segment(suggestion_id):
+            self._json({"error": "bad task/annotation/suggestion"}, status=400)
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        max_bytes = int(os.environ.get("LLS_MAX_SUGGESTIONS_BYTES", str(50 * 1024 * 1024)))
+        if length <= 0:
+            self._json({"error": "上传内容为空"}, status=400)
+            return
+        if length > max_bytes:
+            self._json({"error": f"上传内容过大，当前上限为 {max_bytes} bytes"}, status=HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+            return
+        raw = self.rfile.read(length)
+        try:
+            rows = parse_import_rows(raw.decode("utf-8", "replace"))
+        except ValueError as exc:
+            self._json({"error": str(exc)}, status=400)
+            return
+        try:
+            from .suggestions import import_external_suggestions
+
+            task_cfg = self._load_task_by_id(task_id)
+            result = import_external_suggestions(
+                self.runs_root,
+                task_cfg,
+                annotation_id,
+                suggestion_id,
+                rows,
+                provider=provider,
+                prompt_version=prompt_version,
+                publish=publish,
+            )
+            self._json({"ok": True, "suggestions": result})
         except Exception as exc:
             self._json({"error": str(exc)}, status=400)
 
