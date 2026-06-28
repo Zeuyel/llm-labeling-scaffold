@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
+import { annotationPageSections } from "./annotationPageState.js";
 import {
   agreementAuditCoverageLabel,
   agreementAuditDebugFields,
@@ -179,6 +180,15 @@ export default function RunsPage({ task, taskId, onError }) {
   const selectedJobAudits = useMemo(
     () => agreementAuditsForAnnotationJob(selectedAnnotationJob, selectedJobDecisions, agreementAudits),
     [selectedAnnotationJob, selectedJobDecisions, agreementAudits],
+  );
+  const sections = useMemo(
+    () => annotationPageSections({
+      annotationJobs,
+      decisionArtifacts: decisions,
+      agreementAudits,
+      debugRuns: runs,
+    }),
+    [annotationJobs, decisions, agreementAudits, runs],
   );
   const selectedDecisionSamplePath = useMemo(
     () => selectedDecision?.sample_path || findSamplePathForJob(selectedDecisionJob, samples),
@@ -375,7 +385,7 @@ export default function RunsPage({ task, taskId, onError }) {
       <div className="card section-card">
         <div className="toolbar">
           <div className="toolbar-stack">
-            <h3>标注任务（{annotationJobs.length}）</h3>
+            <h3>{sections.primary.title}（{sections.primary.count}）</h3>
             <div className="status-line">每一行是一条 Argilla 标注任务；点击行查看推送状态、批次血缘和后续动作。</div>
           </div>
           <div className="action-row">
@@ -442,8 +452,9 @@ export default function RunsPage({ task, taskId, onError }) {
         )}
       </div>
 
-      <div className="card section-card">
-        <div className="toolbar"><h3>标注结果产物（{decisions.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+      <details className="card secondary-panel" defaultOpen={sections.decisionArtifacts.defaultOpen}>
+        <summary>{sections.decisionArtifacts.title}（{sections.decisionArtifacts.count}）</summary>
+        <div className="toolbar"><div className="status-line">从标注任务详情拉回后生成；点击行查看来源血缘、一致性检查和 Gold 入口。</div><button className="btn btn-sm" onClick={reload}>刷新</button></div>
         {!decisions.length && <div className="empty">暂无标注结果产物</div>}
         {decisions.length > 0 && (
           <div className="table-wrap">
@@ -487,10 +498,11 @@ export default function RunsPage({ task, taskId, onError }) {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
-      <div className="card section-card">
-        <div className="toolbar debug-toolbar"><h3>检查记录（{agreementAudits.length}）</h3><button className="btn btn-sm" onClick={reload}>刷新</button></div>
+      <details className="card secondary-panel" defaultOpen={sections.agreementAudits.defaultOpen}>
+        <summary>{sections.agreementAudits.title}（{sections.agreementAudits.count}）</summary>
+        <div className="toolbar debug-toolbar"><div className="status-line">从标注任务或结果详情运行一致性检查后生成。</div><button className="btn btn-sm" onClick={reload}>刷新</button></div>
         {!agreementAudits.length && <div className="empty">暂无一致性检查记录</div>}
         {agreementAudits.length > 0 && (
           <div className="table-wrap">
@@ -532,10 +544,10 @@ export default function RunsPage({ task, taskId, onError }) {
             </table>
           </div>
         )}
-      </div>
+      </details>
 
-      <details className="card secondary-panel">
-        <summary>本地模型标注调试</summary>
+      <details className="card secondary-panel" defaultOpen={sections.debugRuns.defaultOpen}>
+        <summary>{sections.debugRuns.title}（{sections.debugRuns.count}）</summary>
         <p className="muted">这里仅用于快速检查模型输出，不作为正式人工标注入口。</p>
         <div className="form-grid">
           <div className="field"><label>样本</label><select value={sample} onChange={(e) => setSample(e.target.value)}><option value="">选择样本</option>{samples.map((s) => <option key={s.sample_id} value={s.path}>{s.sample_id}</option>)}</select></div>
