@@ -264,7 +264,8 @@ def test_data_lake_import_dry_run_returns_summary_without_writing_asset(
 
     assert status == 200
     assert payload["ok"] is True
-    dry_run = payload["dry_run"]
+    assert payload["dry_run"] is True
+    dry_run = payload["result"]
     assert dry_run["import_id"] == "lake_import"
     assert dry_run["task"]["task_id"] == task_id
     assert dry_run["source"]["source_object_sha256"] == _file_sha256(source)

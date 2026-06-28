@@ -221,7 +221,12 @@ def _contract_capabilities() -> dict[str, Any]:
                 },
                 "response_schema": {
                     "type": "object",
-                    "required": ["ok", "dry_run"],
+                    "required": ["ok", "dry_run", "result"],
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "dry_run": {"const": True},
+                        "result": {"type": "object"},
+                    },
                 },
             },
             {
@@ -1119,7 +1124,7 @@ class _Handler(BaseHTTPRequestHandler):
                     overrides=overrides,
                     max_bytes=max_bytes,
                 )
-                self._json({"ok": bool(dry_run_result["validation"]["ok"]), "dry_run": dry_run_result})
+                self._json({"ok": bool(dry_run_result["validation"]["ok"]), "dry_run": True, "result": dry_run_result})
                 return
             job = pipeline.start_data_lake_import(
                 self.runs_root,
