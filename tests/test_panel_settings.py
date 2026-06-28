@@ -483,28 +483,64 @@ def test_settings_update_invalidates_r2_task_sync_cache(tmp_path: Path, monkeypa
         status, payload = _request(base_url, "/api/tasks")
         assert status == 200
         assert payload == {"tasks": []}
+        assert calls == []
 
-        status, payload = _request(base_url, "/api/tasks")
+        status, payload = _request(base_url, "/api/tasks/sync", method="POST")
         assert status == 200
-        assert payload == {"tasks": []}
+        assert payload["ok"] is True
+        assert payload["tasks"] == []
 
         status, payload = _request(
             base_url,
             "/api/settings",
             method="POST",
-            payload={"task_registry_uri": "r2:settings/governance/data_lake.yaml"},
+            payload={"task_registry_uri": "r2:settings-next/governance/data_lake.yaml"},
         )
         assert status == 200
         assert payload["ok"] is True
 
-        status, payload = _request(base_url, "/api/tasks")
+        status, payload = _request(base_url, "/api/tasks/sync", method="POST")
 
     assert status == 200
-    assert payload == {"tasks": []}
+    assert payload["ok"] is True
     assert calls == [
         "r2:settings/governance/data_lake.yaml",
-        "r2:settings/governance/data_lake.yaml",
+        "r2:settings-next/governance/data_lake.yaml",
     ]
+
+
+def test_r2_task_status_reads_local_cache_without_registry_sync(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _clear_settings_env(monkeypatch)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": "cached_task",
+            "id_field": "record_id",
+            "text_fields": ["text"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+
+    def fail_sync(*args, **kwargs):
+        raise AssertionError("status endpoints must not sync task registry")
+
+    monkeypatch.setattr(task_registry, "sync_tasks_from_registry", fail_sync)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, payload = _request(base_url, "/api/tasks")
+        assert status == 200
+        assert [item["task_id"] for item in payload["tasks"]] == ["cached_task"]
+        assert payload["tasks"][0]["source"] == "R2 数据湖"
+        assert payload["tasks"][0]["deletable"] is False
+
+        status, payload = _request(base_url, "/api/task/imports?task_id=cached_task")
+
+    assert status == 200
+    assert payload == {"imports": []}
 
 
 def test_profile_preset_api_lists_and_switches_task_profile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

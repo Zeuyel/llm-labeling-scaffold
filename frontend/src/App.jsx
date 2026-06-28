@@ -50,6 +50,9 @@ function Shell() {
   const loadTasks = useCallback(() =>
     api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
   []);
+  const syncTasks = useCallback(() =>
+    api.syncTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
+  []);
   useEffect(() => { loadTasks(); }, [loadTasks]);
   const handleSettingsLoadError = useCallback((error) => {
     const message = `设置读取失败：${String(error)}`;
@@ -94,6 +97,7 @@ function Shell() {
     <TasksPage
       tasks={tasks}
       onReload={loadTasks}
+      onSync={syncTasks}
       allowDataLakeOverrides={Boolean(settings.allow_data_lake_overrides)}
       taskSource={settings.task_source || "local"}
       taskRegistryUri={settings.task_registry_uri || ""}

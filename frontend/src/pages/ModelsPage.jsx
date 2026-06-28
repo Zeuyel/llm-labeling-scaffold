@@ -283,7 +283,6 @@ export default function ModelsPage({ task, taskId, onError }) {
                   onChange={(event) => setTrainer(event.target.value)}
                   placeholder="tfidf_sgd 或 package.module:function"
                 />
-                <span className="hint">内置 tfidf_sgd 是轻量基线；自定义训练器可填模块函数路径。</span>
               </div>
               <div className="field field-half">
                 <label>外部模型记录服务（可选）</label>

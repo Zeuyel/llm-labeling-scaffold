@@ -14,7 +14,6 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs
 
 from . import __version__
-from .config import load_task
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
@@ -553,7 +552,7 @@ class _Handler(BaseHTTPRequestHandler):
         run_dir = self.runs_root / task / run
         return run_dir if run_dir.is_dir() else None
 
-    def _sync_tasks_if_needed(self):
+    def _sync_tasks_if_needed(self, *, force: bool = False):
         if not _r2_task_source_enabled():
             return None
         from .task_registry import sync_tasks_from_registry
@@ -565,7 +564,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         with _TASK_REGISTRY_SYNC_CACHE_LOCK:
             cached = _TASK_REGISTRY_SYNC_CACHE.get(cache_key)
-            if cached is not None and ttl_seconds > 0 and now - cached[0] < ttl_seconds:
+            if not force and cached is not None and ttl_seconds > 0 and now - cached[0] < ttl_seconds:
                 return cached[1]
 
             synced = sync_tasks_from_registry(self.tasks_root, registry_uri=settings["task_registry_uri"])
@@ -574,39 +573,59 @@ class _Handler(BaseHTTPRequestHandler):
             return synced
 
     def _list_tasks(self) -> list[dict]:
-        synced = self._sync_tasks_if_needed()
         tasks = pipeline.list_tasks(self.tasks_root)
-        if synced is None:
+        if not _r2_task_source_enabled():
             return tasks
-        active = synced.tasks
         out: list[dict] = []
         for task in tasks:
             task_id = task.get("task_id")
-            if task_id not in active:
+            if not task_id:
                 continue
             item = dict(task)
             item["source"] = "R2 数据湖"
             item["deletable"] = False
-            item["task_uri"] = active[task_id]["task_uri"]
-            item["registry_uri"] = synced.registry_uri
             out.append(item)
         return out
 
     def _load_task_by_id(self, task_id: str):
-        synced = self._sync_tasks_if_needed()
-        if synced is not None and task_id not in synced.tasks:
-            raise ValueError(f"任务未在 R2 数据湖登记表中登记为启用状态: {task_id}")
         return pipeline.load_task_by_id(self.tasks_root, task_id)
 
     def _resolve_action_task_path(self, task_path: str) -> str:
-        synced = self._sync_tasks_if_needed()
-        if synced is None:
+        if not _r2_task_source_enabled():
             return task_path
-        task = load_task(task_path)
-        meta = synced.tasks.get(task.task_id)
-        if not meta:
-            raise ValueError(f"任务未在 R2 数据湖登记表中登记为启用状态: {task.task_id}")
-        return str(meta["path"])
+        try:
+            submitted = Path(task_path).expanduser().resolve()
+        except Exception as exc:
+            raise ValueError(f"任务路径无效: {task_path}") from exc
+        for task in pipeline.list_tasks(self.tasks_root):
+            local_path = task.get("path")
+            if not local_path:
+                continue
+            try:
+                resolved = Path(local_path).expanduser().resolve()
+            except Exception:
+                continue
+            if submitted == resolved:
+                return str(resolved)
+        raise ValueError("生产模式只能执行已同步到本地缓存的 R2 任务配置；请先同步任务配置")
+
+    def _sync_tasks_from_registry(self) -> None:
+        if not _r2_task_source_enabled():
+            self._json({"error": "当前不是 R2 任务来源模式，不需要同步任务配置"}, status=400)
+            return
+        try:
+            synced = self._sync_tasks_if_needed(force=True)
+            tasks = self._list_tasks()
+            self._json({
+                "ok": True,
+                "sync": {
+                    "registry_uri": synced.registry_uri if synced is not None else None,
+                    "tasks": synced.tasks if synced is not None else {},
+                },
+                "tasks": tasks,
+            })
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
 
     def _task_detail(self, task_id: str) -> None:
         if not _safe_segment(task_id):
@@ -1013,6 +1032,8 @@ class _Handler(BaseHTTPRequestHandler):
         contract_check_task_id = _contract_task_path(path, suffix="check")
         if contract_check_task_id is not None:
             self._task_check(contract_check_task_id)
+        elif path == "/api/tasks/sync":
+            self._sync_tasks_from_registry()
         elif path.startswith("/api/tasks/"):
             self._json({"error": "not found"}, status=404)
         elif path == "/api/adjudicate":
