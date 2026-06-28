@@ -9,7 +9,10 @@ from llm_labeling_scaffold.smoke import SmokeConfig, SmokeResponse, render_summa
 
 def test_smoke_summary_redacts_sensitive_values():
     summary = {
-        "server_url": "https://user:db-pass@example.test",
+        "server_url": (
+            "https://user:db-pass@example.test/path?"
+            "token=query-token&api_key=query-api-key&password=query-password&secret=query-secret&safe=ok"
+        ),
         "token": "super-secret-token",
         "rclone_config_path": "/home/app/.config/rclone/rclone.conf",
         "argilla_api_key": "argilla-secret-key",
@@ -28,11 +31,23 @@ def test_smoke_summary_redacts_sensitive_values():
                 ),
             }
         ],
+        "errors": [
+            "token=inline-token api_key=inline-api-key password=inline-password secret=inline-secret"
+        ],
     }
 
     rendered = render_summary(summary, "json")
 
+    assert "db-pass" not in rendered
     assert "super-secret-token" not in rendered
+    assert "query-token" not in rendered
+    assert "query-api-key" not in rendered
+    assert "query-password" not in rendered
+    assert "query-secret" not in rendered
+    assert "inline-token" not in rendered
+    assert "inline-api-key" not in rendered
+    assert "inline-password" not in rendered
+    assert "inline-secret" not in rendered
     assert "argilla-secret-key" not in rendered
     assert "postgres-secret-password" not in rendered
     assert "rclone.conf" not in rendered
@@ -89,6 +104,7 @@ def test_smoke_runner_organizes_discovery_task_and_import_dry_run_requests():
     )
 
     assert summary["ok"] is True
+    import_check = next(item for item in summary["checks"] if item["name"] == "import_dry_run")
     assert [(method, path) for method, path, *_ in calls] == [
         ("GET", "/api/health"),
         ("GET", "/api/version"),
@@ -104,6 +120,9 @@ def test_smoke_runner_organizes_discovery_task_and_import_dry_run_requests():
         "dry_run": True,
     }
     assert calls[-1][4] == 3.0
+    assert import_check["dry_run"] is True
+    assert import_check["result_keys"] == ["would_import"]
+    assert import_check["result_would_import"] is True
 
 
 def test_smoke_runner_marks_import_dry_run_not_supported_without_safe_contract():
@@ -139,3 +158,56 @@ def test_smoke_runner_marks_import_dry_run_not_supported_without_safe_contract()
     assert import_check["status"] == "not_supported"
     assert calls[0][2]["Authorization"] == basic_header
     assert all(path != "/api/import/data_lake" for _, path, _ in calls)
+
+
+def test_smoke_runner_compacts_legacy_import_dry_run_object():
+    def fake_transport(method, url, headers, body, timeout):
+        path = urlparse(url).path
+        if path == "/api/health":
+            return SmokeResponse(200, {"ok": True, "status": "ok", "service": "llm-labeling-scaffold"})
+        if path == "/api/version":
+            return SmokeResponse(200, {"service": "llm-labeling-scaffold", "version": "0.1.0"})
+        if path == "/api/capabilities":
+            return SmokeResponse(
+                200,
+                {
+                    "endpoints": [
+                        {
+                            "method": "POST",
+                            "path": "/api/import/data_lake",
+                            "action": "import_dry_run",
+                            "side_effects": False,
+                            "request_schema": {"properties": {"dry_run": {}}},
+                        }
+                    ]
+                },
+            )
+        if path == "/api/settings/public":
+            return SmokeResponse(200, {"settings": {}})
+        if path == "/api/tasks/patent_boundary_v0_1/check":
+            return SmokeResponse(200, {"ok": True, "checks": [], "warnings": [], "errors": []})
+        if path == "/api/import/data_lake":
+            return SmokeResponse(
+                200,
+                {
+                    "ok": True,
+                    "dry_run": {
+                        "import_id": "patent_boundary_manual_seed_500_2026_06_27",
+                        "validation_ok": True,
+                        "source_manifest_uri": "r2://private-bucket/secret/manifest.json",
+                        "manifest": {"source_object_path": "private/raw.jsonl"},
+                    },
+                },
+            )
+        raise AssertionError(f"unexpected request: {method} {path}")
+
+    summary = run_smoke(SmokeConfig(server_url="http://127.0.0.1:8765"), transport=fake_transport)
+    import_check = next(item for item in summary["checks"] if item["name"] == "import_dry_run")
+    rendered = render_summary(summary, "json")
+
+    assert summary["ok"] is True
+    assert import_check["dry_run"] is True
+    assert import_check["dry_run_import_id"] == "patent_boundary_manual_seed_500_2026_06_27"
+    assert import_check["dry_run_validation_ok"] is True
+    assert "r2://private-bucket" not in rendered
+    assert "private/raw.jsonl" not in rendered

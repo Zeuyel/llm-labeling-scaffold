@@ -29,6 +29,11 @@ SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"|RCLONE_CONFIG(?:_PATH)?|ARGILLA_API_KEY|SECRET_PATH"
     r")\s*=\s*([^\s,;]+)"
 )
+SENSITIVE_PARAM_RE = re.compile(
+    r"(?i)(^|[?&\s,;])"
+    r"([A-Z0-9_.-]*(?:token|secret|password|passwd|pwd|api[_-]?key|apikey)[A-Z0-9_.-]*)"
+    r"(=)([^&#\s,;]+)"
+)
 AUTH_RE = re.compile(r"(?i)\b(authorization:\s*(?:bearer|basic)\s+)[^\s,;]+")
 URL_PASSWORD_RE = re.compile(r"([a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@\s/]+(@)", re.IGNORECASE)
 RCLONE_PATH_RE = re.compile(r"(?i)(?:[A-Za-z]:)?[^\s,;]*rclone[^\s,;]*\.conf")
@@ -123,6 +128,7 @@ def redact_text(value: str) -> str:
     out = URL_PASSWORD_RE.sub(r"\1<redacted>\2", value)
     out = AUTH_RE.sub(r"\1<redacted>", out)
     out = SENSITIVE_ASSIGNMENT_RE.sub(lambda match: f"{match.group(1)}=<redacted>", out)
+    out = SENSITIVE_PARAM_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{match.group(3)}<redacted>", out)
     out = RCLONE_PATH_RE.sub("<redacted-rclone-config>", out)
     out = SECRET_PATH_RE.sub("<redacted-secret-path>", out)
     return out
@@ -353,9 +359,14 @@ def _compact_check(check: dict[str, Any]) -> dict[str, Any]:
             if isinstance(response.get("errors"), list):
                 out["error_count"] = len(response["errors"])
         elif check.get("name") == "import_dry_run":
-            for key in ("ok", "dry_run"):
-                if key in response:
-                    out[key] = response[key]
+            if "ok" in response:
+                out["ok"] = response["ok"]
+            if "dry_run" in response:
+                dry_run = response["dry_run"]
+                out["dry_run"] = True if isinstance(dry_run, dict) else bool(dry_run)
+                if isinstance(dry_run, dict):
+                    out["dry_run_keys"] = sorted(str(key) for key in dry_run.keys())
+                    _copy_summary_fields(dry_run, out, prefix="dry_run")
             if isinstance(response.get("job"), dict):
                 out["job"] = {
                     key: response["job"].get(key)
@@ -364,7 +375,15 @@ def _compact_check(check: dict[str, Any]) -> dict[str, Any]:
                 }
             if isinstance(response.get("result"), dict):
                 out["result_keys"] = sorted(str(key) for key in response["result"].keys())
+                _copy_summary_fields(response["result"], out, prefix="result")
     return redact_secrets(out)
+
+
+def _copy_summary_fields(source: dict[str, Any], target: dict[str, Any], *, prefix: str) -> None:
+    for key in ("import_id", "validation_ok", "valid", "ok", "would_import"):
+        value = source.get(key)
+        if value not in (None, "") and isinstance(value, (str, int, float, bool)):
+            target[f"{prefix}_{key}"] = value
 
 
 def render_summary(summary: dict[str, Any], output_format: str = "json") -> str:
