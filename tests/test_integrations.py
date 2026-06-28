@@ -17,7 +17,7 @@ from llm_labeling_scaffold.integrations.argilla import (
     _questions_for_task,
 )
 from llm_labeling_scaffold.integrations.mlflow import log_training_result
-from llm_labeling_scaffold.io import read_json, write_json, write_jsonl
+from llm_labeling_scaffold.io import read_json, read_jsonl, write_json, write_jsonl
 
 
 class _RunInfo:
@@ -479,6 +479,25 @@ def test_argilla_suggestion_fallback_drops_agent_before_score():
     suggestion = _make_suggestion(fake_rg, question_name="label", value="yes", score=0.7, agent="local_stub:v001")
 
     assert suggestion.kwargs == {"question_name": "label", "value": "yes", "score": 0.7}
+
+
+def test_argilla_pull_ignores_suggestions_without_human_responses(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    output = tmp_path / "decisions.jsonl"
+    record = types.SimpleNamespace(
+        id="r1",
+        metadata={"record_id": "r1"},
+        suggestions=[types.SimpleNamespace(values={"label": "yes"})],
+        responses=[],
+    )
+    dataset = types.SimpleNamespace(records=[record])
+    client = types.SimpleNamespace(datasets=lambda name, workspace=None: dataset)
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+
+    result = argilla.pull_responses(task, "dataset", output, {"workspace": "argilla"})
+
+    assert result["responses"] == 0
+    assert read_jsonl(output) == []
 
 
 def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp_path: Path):

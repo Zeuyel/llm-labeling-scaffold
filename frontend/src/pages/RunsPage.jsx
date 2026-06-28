@@ -21,6 +21,7 @@ import {
   batchPlanDebugFields,
   batchPlanOptionLabel,
   defaultDatasetName,
+  defaultSuggestionId,
   decisionArtifactDebugFields,
   decisionArtifactKey,
   decisionArtifactLabel,
@@ -32,12 +33,16 @@ import {
   firstDefinedString,
   formatBatchPlanSummary,
   getBatchPlans,
+  suggestionActionAvailability,
+  suggestionLineageFields,
+  suggestionStatusLabel,
+  suggestionSummaryLabel,
 } from "./batchPlanDisplay.js";
 
 function statusBadgeClass(label) {
-  if (label === "已推送" || label === "已记录" || label === "已回收" || label === "通过") return "badge-green";
+  if (label === "已推送" || label === "已记录" || label === "已回收" || label === "通过" || label === "已生成" || label === "已写入 Argilla") return "badge-green";
   if (label === "执行中") return "badge-blue";
-  if (label === "失败" || label === "未通过") return "badge-red";
+  if (label === "失败" || label === "未通过" || label === "写入失败") return "badge-red";
   return "badge-gray";
 }
 
@@ -119,6 +124,9 @@ export default function RunsPage({ task, taskId, onError }) {
   const [argillaMinSubmitted, setArgillaMinSubmitted] = useState(1);
   const [argillaIfExists, setArgillaIfExists] = useState("fail");
   const [argillaStatus, setArgillaStatus] = useState(null);
+  const [suggestionId, setSuggestionId] = useState("");
+  const [suggestionProvider, setSuggestionProvider] = useState("local_stub");
+  const [suggestionPromptVersion, setSuggestionPromptVersion] = useState("v001");
   const [datasetAuto, setDatasetAuto] = useState(true);
   const [busy, setBusy] = useState(false);
   const [showCreatePanel, setShowCreatePanel] = useState(false);
@@ -176,6 +184,10 @@ export default function RunsPage({ task, taskId, onError }) {
     () => annotationJobActionAvailability(selectedAnnotationJob, selectedJobDecisions, selectedJobSamplePath),
     [selectedAnnotationJob, selectedJobDecisions, selectedJobSamplePath],
   );
+  const selectedJobSuggestionAvailability = useMemo(
+    () => suggestionActionAvailability(selectedAnnotationJob),
+    [selectedAnnotationJob],
+  );
   const selectedJobAudits = useMemo(
     () => agreementAuditsForAnnotationJob(selectedAnnotationJob, selectedJobDecisions, agreementAudits),
     [selectedAnnotationJob, selectedJobDecisions, agreementAudits],
@@ -190,6 +202,7 @@ export default function RunsPage({ task, taskId, onError }) {
   );
   const selectedDecisionAgreementReason = agreementDisabledReason(selectedDecision, selectedDecisionSamplePath);
   const generatedDataset = defaultDatasetName(taskId, selectedSample?.sample_id, selectedBatchPlan?.plan_id);
+  const generatedSuggestionId = defaultSuggestionId(suggestionProvider, suggestionPromptVersion);
   const pushDisabledReason = !sample
     ? "请选择样本集。"
     : !batchPlans.length
@@ -335,6 +348,27 @@ export default function RunsPage({ task, taskId, onError }) {
     }, "拉回标注结果");
   }
 
+  async function prelabelForJob(job, publish = false) {
+    const annotation = String(job?.annotation_id || "").trim();
+    const dataset = String(job?.argilla_dataset || job?.dataset || "").trim();
+    const currentSuggestionId = suggestionId.trim() || generatedSuggestionId;
+    if (!annotation || !currentSuggestionId) {
+      onError("该标注任务缺少 annotation_id 或 suggestion_id，不能生成机器建议");
+      return;
+    }
+    if (publish && !dataset) {
+      onError("该标注任务缺少 Argilla 数据集名，不能写入 Suggestions");
+      return;
+    }
+    await action("prelabel_suggest", {
+      annotation_id: annotation,
+      suggestion_id: currentSuggestionId,
+      provider: suggestionProvider.trim() || "local_stub",
+      prompt_version: suggestionPromptVersion.trim() || "v001",
+      publish,
+    }, publish ? "写入 Argilla Suggestions" : "生成机器建议");
+  }
+
   async function runAgreementAuditForDecision(decision, job = selectedAnnotationJob) {
     const samplePath = decision?.sample_path || findSamplePathForJob(job, samples);
     const decisionPath = decision?.path;
@@ -399,6 +433,7 @@ export default function RunsPage({ task, taskId, onError }) {
                   <th>样本</th>
                   <th>批次方案</th>
                   <th>行数</th>
+                  <th>机器建议</th>
                   <th>状态</th>
                   <th>创建时间</th>
                   <th>操作</th>
@@ -419,6 +454,7 @@ export default function RunsPage({ task, taskId, onError }) {
                       <td>{job.sample_id || "-"}</td>
                       <td className="text-cell dispatch-cell">{annotationJobBatchSummary(job)}</td>
                       <td>{job.rows ?? job.result?.records ?? "-"}</td>
+                      <td className="text-cell">{suggestionSummaryLabel(job)}</td>
                       <td><span className={`badge ${statusBadgeClass(status)}`}>{status}</span></td>
                       <td className="muted">{(job.created_at || "").slice(0, 19)}</td>
                       <td>
@@ -696,6 +732,7 @@ export default function RunsPage({ task, taskId, onError }) {
               <DetailField label="Argilla 数据集" value={selectedAnnotationJob.argilla_dataset} />
               <DetailField label="样本集" value={selectedAnnotationJob.sample_id} />
               <DetailField label="记录数" value={selectedAnnotationJob.rows ?? selectedAnnotationJob.result?.records} />
+              <DetailField label="机器建议" value={suggestionSummaryLabel(selectedAnnotationJob)} />
               <DetailField label="样本路径" value={selectedJobSamplePath} />
               <DetailField label="批次摘要" value={annotationJobBatchSummary(selectedAnnotationJob)} />
             </div>
@@ -722,6 +759,70 @@ export default function RunsPage({ task, taskId, onError }) {
                 {selectedJobActionAvailability.pull.reason || selectedJobActionAvailability.agreement.reason}
               </div>
             )}
+            <div className="secondary-panel drawer-section">
+              <div className="toolbar"><h3>机器建议 Suggestions</h3></div>
+              <p className="muted">机器建议仅供人工 review，不是正式标注；回收结果只读取人工提交的 responses。</p>
+              <div className="form-grid drawer-form-grid">
+                <div className="field field-half">
+                  <label>suggestion_id</label>
+                  <input value={suggestionId} onChange={(e) => setSuggestionId(e.target.value)} placeholder={generatedSuggestionId} />
+                </div>
+                <div className="field field-half">
+                  <label>provider</label>
+                  <select value={suggestionProvider} onChange={(e) => setSuggestionProvider(e.target.value)}>
+                    <option value="local_stub">local_stub</option>
+                    <option value="codex_exec">codex_exec</option>
+                  </select>
+                </div>
+                <div className="field field-half">
+                  <label>prompt_version</label>
+                  <input value={suggestionPromptVersion} onChange={(e) => setSuggestionPromptVersion(e.target.value)} placeholder="v001" />
+                </div>
+              </div>
+              <div className="drawer-actions">
+                <button
+                  className="btn"
+                  disabled={busy || !selectedJobSuggestionAvailability.generate.enabled}
+                  title={selectedJobSuggestionAvailability.generate.reason}
+                  type="button"
+                  onClick={() => prelabelForJob(selectedAnnotationJob, false)}
+                >
+                  生成机器建议
+                </button>
+                <button
+                  className="btn btn-primary"
+                  disabled={busy || !selectedJobSuggestionAvailability.publish.enabled}
+                  title={selectedJobSuggestionAvailability.publish.reason}
+                  type="button"
+                  onClick={() => prelabelForJob(selectedAnnotationJob, true)}
+                >
+                  写入 Argilla Suggestions
+                </button>
+              </div>
+              {(selectedJobSuggestionAvailability.generate.reason || selectedJobSuggestionAvailability.publish.reason) && (
+                <div className="status-line">
+                  {selectedJobSuggestionAvailability.generate.reason || selectedJobSuggestionAvailability.publish.reason}
+                </div>
+              )}
+              {!(selectedAnnotationJob.suggestions || []).length && <div className="empty">暂无机器建议记录</div>}
+              {(selectedAnnotationJob.suggestions || []).map((suggestion) => (
+                <div className="resource-mini-row" key={suggestion.suggestion_id || suggestion.manifest_path}>
+                  <div>
+                    <strong>{suggestion.suggestion_id || "未命名建议"}</strong>
+                    <span>
+                      {suggestionStatusLabel(suggestion)}
+                      {" · "}
+                      {suggestion.records ?? "-"} 条覆盖
+                      {" · "}
+                      {suggestion.provider || "-"}:{suggestion.prompt_version || "-"}
+                    </span>
+                  </div>
+                  <span className={`badge ${statusBadgeClass(suggestionStatusLabel(suggestion))}`}>
+                    {suggestionStatusLabel(suggestion)}
+                  </span>
+                </div>
+              ))}
+            </div>
             <div className="info-callout drawer-section">
               <strong>批次血缘</strong>
               <p>{annotationJobBatchSummary(selectedAnnotationJob)}</p>
@@ -766,6 +867,11 @@ export default function RunsPage({ task, taskId, onError }) {
               <div className="debug-field-list">
                 {annotationJobDebugFields(selectedAnnotationJob).map(([key, value]) => (
                   <div key={key}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                ))}
+                {(selectedAnnotationJob.suggestions || []).flatMap((suggestion) => (
+                  suggestionLineageFields(suggestion).map(([key, value]) => (
+                    <div key={`${suggestion.suggestion_id || suggestion.manifest_path}-${key}`}><span>{key}</span><strong>{displayPlanValue(value)}</strong></div>
+                  ))
                 ))}
               </div>
             </details>

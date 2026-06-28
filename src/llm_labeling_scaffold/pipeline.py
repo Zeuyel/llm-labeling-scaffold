@@ -337,6 +337,7 @@ def _agreement_audit_artifact_state(task_dir: Path) -> dict[str, Any]:
         "inference",
         "decisions",
         "annotation_jobs",
+        "suggestions",
         "agreement_audits",
         "_jobs",
     }
@@ -466,6 +467,7 @@ def _graph_route(task_id: str, key: str) -> str:
         "sample": "/samples",
         "batch": "/samples",
         "annotation_job": "/annotations",
+        "suggestions": "/annotations",
         "agreement_audit": "/annotations",
         "run": "/annotations",
         "decision": "/annotations",
@@ -503,7 +505,7 @@ def _graph_status(value: Any, *, exists: bool = True) -> str:
         return "completed"
     if status in {"ready", "available", "runnable", "running", "in_progress", "pending"}:
         return "ready"
-    if status in {"blocked", "failed", "error", "incomplete"}:
+    if status in {"blocked", "failed", "error", "incomplete", "publish_failed"}:
         return "blocked"
     if not exists:
         return "not_started"
@@ -652,6 +654,7 @@ def task_asset_graph(runs_root: str | Path, task, profile_id: str | None = None)
     samples = list_samples(Path(runs_root), task_id)
     batches = _graph_list_batches(runs_root, task_id, samples)
     annotation_jobs = list_annotation_jobs(Path(runs_root), task_id)
+    suggestions = list_suggestions(Path(runs_root), task_id)
     agreement_audits = list_agreement_audits(Path(runs_root), task_id)
     runs = list_runs(Path(runs_root), task_id)
     decisions = list_decision_artifacts(Path(runs_root), task_id)
@@ -756,6 +759,28 @@ def task_asset_graph(runs_root: str | Path, task, profile_id: str | None = None)
             _graph_add_edge(edges, seen_edges, batch_node_id, node_id, "批次分发")
         elif f"sample:{sample_id}" in seen_nodes:
             _graph_add_edge(edges, seen_edges, f"sample:{sample_id}", node_id, "标注输入")
+
+    for item in suggestions:
+        annotation_id = str(item.get("annotation_id") or "")
+        suggestion_id = str(item.get("suggestion_id") or "")
+        if not annotation_id or not suggestion_id:
+            continue
+        node_id = f"suggestions:{annotation_id}:{suggestion_id}"
+        _graph_file_node(
+            nodes,
+            seen_nodes,
+            task_id=task_id,
+            node_id=node_id,
+            node_type="suggestions",
+            title=suggestion_id,
+            status=_graph_status(item.get("status")),
+            summary=_graph_summary([f"{item.get('records', 0)} 条建议", item.get("provider"), item.get("prompt_version")]),
+            path=item.get("manifest_path") or item.get("suggestions_path"),
+            route_kind="suggestions",
+            data={"manifest": item},
+        )
+        if f"annotation_job:{annotation_id}" in seen_nodes:
+            _graph_add_edge(edges, seen_edges, f"annotation_job:{annotation_id}", node_id, "生成机器建议")
 
     for item in agreement_audits:
         audit_id = str(item.get("audit_id") or "")
@@ -1044,6 +1069,7 @@ ARCHIVE_STEP_ORDER: tuple[dict[str, str], ...] = (
     {"asset_type": "gold", "label": "训练集", "group": "gold"},
     {"asset_type": "agreement_audit", "label": "一致性检查", "group": "agreement_audits"},
     {"asset_type": "decision", "label": "标注结果", "group": "decisions"},
+    {"asset_type": "suggestions", "label": "机器建议", "group": "suggestions"},
     {"asset_type": "annotation_job", "label": "标注分发记录", "group": "annotation_jobs"},
     {"asset_type": "run", "label": "本地标注运行", "group": ""},
     {"asset_type": "sample", "label": "样本", "group": "samples"},
@@ -1100,6 +1126,7 @@ def _archive_group_operation(runs_root: str | Path, task_id: str, step: dict[str
         "inference",
         "decisions",
         "annotation_jobs",
+        "suggestions",
         "agreement_audits",
         "_archive",
         "_audit",
@@ -1941,6 +1968,16 @@ def _has_passing_agreement_audit(task, sample_path: str | Path, decisions_path: 
     return False
 
 
+def _truthy_param(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in (None, ""):
+        return False
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # --- core object: run + jobs -------------------------------------------------
 
 def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> dict:
@@ -2054,7 +2091,7 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                     suggestion_id,
                     provider=str(params.get("provider") or "local_stub"),
                     prompt_version=str(params.get("prompt_version") or "v001"),
-                    publish=bool(params.get("publish")),
+                    publish=_truthy_param(params.get("publish")),
                     argilla=params.get("argilla") or {},
                 )
         if action == "audit":
@@ -2249,6 +2286,8 @@ def dependencies_for_sample(runs_root: str | Path, task_id: str, sample_id: str)
         "inference",
         "decisions",
         "annotation_jobs",
+        "suggestions",
+        "agreement_audits",
         "_jobs",
         "_audit",
         "_archive",
@@ -2745,6 +2784,11 @@ def archive_sample(runs_root: str | Path, task_id: str, sample_id: str, *, reaso
 
 
 def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
+    suggestions_by_annotation: dict[str, list[dict[str, Any]]] = {}
+    for suggestion in list_suggestions(runs_root, task_id):
+        annotation_id = str(suggestion.get("annotation_id") or "")
+        if annotation_id:
+            suggestions_by_annotation.setdefault(annotation_id, []).append(suggestion)
     out: list[dict] = []
     base = Path(runs_root) / task_id / "annotation_jobs"
     if not base.is_dir():
@@ -2755,6 +2799,10 @@ def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
             item = read_json(manifest)
             item.setdefault("annotation_id", dd.name)
             item["manifest_path"] = str(manifest)
+            suggestions = suggestions_by_annotation.get(str(item.get("annotation_id") or dd.name), [])
+            if suggestions:
+                item["suggestions"] = suggestions
+                item["suggestion_summary"] = _suggestion_summary(suggestions)
             out.append(item)
         else:
             out.append({
@@ -2763,6 +2811,66 @@ def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
                 "source": "unknown",
             })
     return out
+
+
+def list_suggestions(runs_root: Path, task_id: str, annotation_id: str | None = None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    base = Path(runs_root) / task_id / "suggestions"
+    if not base.is_dir():
+        return out
+    annotation_dirs = [base / annotation_id] if annotation_id else sorted(path for path in base.iterdir() if path.is_dir())
+    for annotation_dir in annotation_dirs:
+        if not annotation_dir.is_dir():
+            continue
+        for suggestion_dir in sorted(path for path in annotation_dir.iterdir() if path.is_dir()):
+            manifest_path = suggestion_dir / "manifest.json"
+            suggestions_path = suggestion_dir / "suggestions.jsonl"
+            if manifest_path.exists():
+                item = read_json(manifest_path)
+            else:
+                item = {
+                    "task_id": task_id,
+                    "annotation_id": annotation_dir.name,
+                    "suggestion_id": suggestion_dir.name,
+                    "status": "incomplete",
+                }
+            item.setdefault("task_id", task_id)
+            item.setdefault("annotation_id", annotation_dir.name)
+            item.setdefault("suggestion_id", suggestion_dir.name)
+            item["manifest_path"] = str(manifest_path)
+            if suggestions_path.exists():
+                item.setdefault("suggestions_path", str(suggestions_path))
+                if item.get("records") is None:
+                    item["records"] = _count_jsonl(suggestions_path)
+            out.append(item)
+    return out
+
+
+def _suggestion_summary(suggestions: list[dict[str, Any]]) -> dict[str, Any]:
+    status_counts: dict[str, int] = {}
+    batch_ids: list[str] = []
+    seen_batches: set[str] = set()
+    latest: dict[str, Any] | None = None
+    for item in suggestions:
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        for batch_id in item.get("batch_ids") or []:
+            text = str(batch_id)
+            if text not in seen_batches:
+                seen_batches.add(text)
+                batch_ids.append(text)
+        if latest is None or str(item.get("created_at") or "") >= str(latest.get("created_at") or ""):
+            latest = item
+    return {
+        "count": len(suggestions),
+        "records": sum(int(item.get("records") or 0) for item in suggestions),
+        "published_records": sum(int(item.get("records") or 0) for item in suggestions if item.get("status") == "published"),
+        "status_counts": status_counts,
+        "batch_ids": batch_ids,
+        "latest_suggestion_id": latest.get("suggestion_id") if latest else None,
+        "latest_status": latest.get("status") if latest else None,
+        "latest_created_at": latest.get("created_at") if latest else None,
+    }
 
 
 def list_agreement_audits(runs_root: Path, task_id: str) -> list[dict]:
@@ -2814,6 +2922,7 @@ def list_runs(runs_root: Path, task_id: str) -> list[dict]:
             "inference",
             "decisions",
             "annotation_jobs",
+            "suggestions",
             "agreement_audits",
             "_jobs",
         ):

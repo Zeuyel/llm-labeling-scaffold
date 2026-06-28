@@ -15,6 +15,7 @@ import {
   batchPlanDebugFields,
   batchPlanFromManifest,
   batchPlanOptionLabel,
+  defaultSuggestionId,
   decisionArtifactKey,
   decisionArtifactLabel,
   decisionArtifactLineageFields,
@@ -22,6 +23,9 @@ import {
   agreementAuditKey,
   firstDefinedString,
   formatBatchPlanSummary,
+  suggestionActionAvailability,
+  suggestionStatusLabel,
+  suggestionSummaryLabel,
 } from "./batchPlanDisplay.js";
 
 const technicalFieldNames = [
@@ -163,6 +167,35 @@ test("annotation job detail action availability explains disabled states", () =>
   const missingDataset = annotationJobActionAvailability({ sample_path: "/tmp/sample.jsonl" }, [], "/tmp/sample.jsonl");
   assert.equal(missingDataset.pull.enabled, false);
   assert.equal(missingDataset.pull.reason, "缺少 Argilla 数据集名，不能拉回结果。");
+});
+
+test("annotation job detail exposes suggestion status and actions", () => {
+  const job = {
+    annotation_id: "round_1",
+    argilla_dataset: "dataset_round_1",
+    dispatch_path: "/tmp/dispatch.jsonl",
+    suggestion_summary: {
+      count: 2,
+      records: 18,
+      published_records: 8,
+      latest_status: "published",
+    },
+  };
+
+  assert.equal(defaultSuggestionId("codex_exec", "prompt/v1"), "codex_exec_prompt_v1");
+  assert.equal(suggestionStatusLabel({ status: "generated" }), "已生成");
+  assert.equal(suggestionStatusLabel({ status: "published" }), "已写入 Argilla");
+  assert.equal(suggestionStatusLabel({ status: "publish_failed" }), "写入失败");
+  assert.equal(suggestionSummaryLabel(job), "2 次生成，18 条覆盖，8 条已写入，最近已写入 Argilla");
+
+  const availability = suggestionActionAvailability(job);
+  assert.equal(availability.generate.enabled, true);
+  assert.equal(availability.publish.enabled, true);
+
+  const missingDataset = suggestionActionAvailability({ annotation_id: "round_1", dispatch_path: "/tmp/dispatch.jsonl" });
+  assert.equal(missingDataset.generate.enabled, true);
+  assert.equal(missingDataset.publish.enabled, false);
+  assert.equal(missingDataset.publish.reason, "缺少 Argilla 数据集名，不能写入 Suggestions。");
 });
 
 test("annotation job detail finds related agreement audits", () => {

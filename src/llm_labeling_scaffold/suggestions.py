@@ -49,8 +49,6 @@ def _suggestion_values(task: TaskConfig, result: dict) -> dict[str, Any]:
 
 
 def _provider_results(task: TaskConfig, rows: list[dict], provider_name: str) -> list[dict]:
-    if provider_name == "codex_exec":
-        raise ValueError("codex_exec provider 尚未实现; 当前先支持本地 suggestions 产物和 Argilla Suggestions 写入边界")
     provider = get_provider(provider_name)
     payload = provider.annotate_batch(rows, task)
     if not isinstance(payload, dict):
@@ -116,7 +114,12 @@ def generate_suggestions_for_annotation_job(
             result = {"kind": "suggestions", "action": "reused", "idempotent": True, **existing}
             if publish:
                 publish_params = _argilla_publish_params(annotation_manifest, argilla)
-                push_result = push_suggestions(task, dispatch_path, dataset, suggestions_path, publish_params)
+                try:
+                    push_result = push_suggestions(task, dispatch_path, dataset, suggestions_path, publish_params)
+                except Exception as exc:
+                    failed = {**existing, "status": "publish_failed", "error": str(exc)}
+                    write_json(failed, manifest_path)
+                    raise
                 result["publish"] = push_result
                 write_json({**existing, "status": "published", "publish": push_result}, manifest_path)
             return result
@@ -158,10 +161,18 @@ def generate_suggestions_for_annotation_job(
         "suggestions_path": str(suggestions_path),
         "records": len(suggestion_rows),
         "created_at": _now(),
-        "status": "published" if publish else "generated",
+        "status": "generated",
     }
+    write_json(manifest, manifest_path)
     if publish:
         publish_params = _argilla_publish_params(annotation_manifest, argilla)
-        manifest["publish"] = push_suggestions(task, dispatch_path, dataset, suggestions_path, publish_params)
+        try:
+            manifest["publish"] = push_suggestions(task, dispatch_path, dataset, suggestions_path, publish_params)
+            manifest["status"] = "published"
+        except Exception as exc:
+            manifest["status"] = "publish_failed"
+            manifest["error"] = str(exc)
+            write_json(manifest, manifest_path)
+            raise
     write_json(manifest, manifest_path)
     return {"kind": "suggestions", "action": "created", "idempotent": False, **manifest}

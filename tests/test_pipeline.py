@@ -1642,6 +1642,14 @@ def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: 
     assert rows[0]["batch_plan_id"] == "plan_1"
     assert rows[0]["agent"] == "local_stub:v001"
     assert rows[0]["suggestions"]["label"] in {"yes", "no"}
+    suggestions = pipeline.list_suggestions(tmp_path / "runs", task.task_id, annotation_id="argilla_round_1")
+    jobs = pipeline.list_annotation_jobs(tmp_path / "runs", task.task_id)
+    assert suggestions[0]["suggestion_id"] == "local_stub_v001"
+    assert suggestions[0]["records"] == 1
+    assert jobs[0]["suggestion_summary"]["records"] == 1
+    assert jobs[0]["suggestion_summary"]["latest_suggestion_id"] == "local_stub_v001"
+    assert pipeline.list_runs(tmp_path / "runs", task.task_id) == []
+
 
 def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
     created = pipeline.create_task(

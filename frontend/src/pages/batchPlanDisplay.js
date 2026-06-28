@@ -10,6 +10,10 @@ export function defaultDatasetName(taskId, sampleId, planId) {
   return `${slug(taskId)}_${slug(sampleId || "sample")}_${slug(planId || "batch_plan")}_v001`;
 }
 
+export function defaultSuggestionId(provider = "local_stub", promptVersion = "v001") {
+  return `${slug(provider || "provider")}_${slug(promptVersion || "v001")}`;
+}
+
 export function firstDefined(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== "");
 }
@@ -240,6 +244,66 @@ export function annotationJobActionAvailability(job, decisions = [], samplePath 
         : { enabled: true, reason: "", decision: usableDecision };
 
   return { pull, agreement };
+}
+
+export function suggestionStatusLabel(suggestion) {
+  const status = String(firstDefined(suggestion?.status, suggestion?.state) || "").trim().toLowerCase();
+  if (["published", "pushed"].includes(status)) return "已写入 Argilla";
+  if (["generated", "created", "reused"].includes(status)) return "已生成";
+  if (["publish_failed", "failed", "error"].includes(status)) return "写入失败";
+  if (["running", "pending", "queued", "in_progress"].includes(status)) return "执行中";
+  if (["incomplete", "partial"].includes(status)) return "记录不完整";
+  return status || "-";
+}
+
+export function suggestionSummaryLabel(job) {
+  const summary = job?.suggestion_summary || {};
+  const count = Number(summary.count || 0);
+  if (!count) return "暂无机器建议";
+  const records = Number(summary.records || 0);
+  const publishedRecords = Number(summary.published_records || 0);
+  const latestStatus = suggestionStatusLabel({ status: summary.latest_status });
+  const parts = [`${count} 次生成`, `${records} 条覆盖`];
+  if (publishedRecords > 0) parts.push(`${publishedRecords} 条已写入`);
+  if (latestStatus !== "-") parts.push(`最近${latestStatus}`);
+  return parts.join("，");
+}
+
+export function suggestionActionAvailability(job) {
+  const annotationId = firstDefinedString(job?.annotation_id, job?.job_id, job?.id).trim();
+  const dataset = firstDefinedString(job?.argilla_dataset, job?.dataset).trim();
+  const dispatchPath = firstDefinedString(job?.dispatch_path).trim();
+
+  const generate = !job
+    ? { enabled: false, reason: "未选择标注任务。" }
+    : !annotationId
+      ? { enabled: false, reason: "缺少标注任务编号，不能生成机器建议。" }
+      : !dispatchPath
+        ? { enabled: false, reason: "缺少分发文件，不能生成机器建议。" }
+        : { enabled: true, reason: "" };
+
+  const publish = !generate.enabled
+    ? { enabled: false, reason: generate.reason }
+    : !dataset
+      ? { enabled: false, reason: "缺少 Argilla 数据集名，不能写入 Suggestions。" }
+      : { enabled: true, reason: "" };
+
+  return { generate, publish };
+}
+
+export function suggestionLineageFields(suggestion) {
+  if (!suggestion) return [];
+  return [
+    ["suggestion_id", suggestion.suggestion_id],
+    ["状态", suggestionStatusLabel(suggestion)],
+    ["覆盖记录", suggestion.records],
+    ["provider", suggestion.provider],
+    ["prompt_version", suggestion.prompt_version],
+    ["批次计划", suggestion.batch_plan_id],
+    ["批次数", countLike(suggestion.batch_ids)],
+    ["产物路径", suggestion.suggestions_path],
+    ["manifest", suggestion.manifest_path],
+  ];
 }
 
 export function agreementAuditsForAnnotationJob(job, decisions = [], audits = []) {
