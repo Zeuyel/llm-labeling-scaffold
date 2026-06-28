@@ -220,6 +220,6 @@ PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake publish submit \
   --idempotency-key <operator-issued-key>
 ```
 
-`plan` 默认是 dry-run，只读取本地产物并返回本地路径、目标 R2 URI、publish manifest URI、bytes 和 sha256，不写 R2，也不调用 R2 写操作。`submit` 必须显式传入 `--confirm` 和 `--idempotency-key`，会上传本地产物和生成的 publish manifest，并在上传后回读校验 bytes 与 sha256。
+`plan` 默认是 dry-run，只读取本地产物并返回本地路径、目标 R2 URI、publish manifest URI、bytes 和 sha256，不写 R2，也不调用 R2 写操作。`submit` 必须显式传入 `--confirm` 和 `--idempotency-key`，会上传本地产物和生成的 publish manifest，并在上传后回读校验 bytes 与 sha256。publish manifest 和 submit 返回值只记录 `idempotency_key_sha256`，不保存或回显原始 idempotency key。
 
 发布目标只能位于任务 `data_lake.output_base_uri` 下，并且生产 R2 URI 必须位于当前 `data_lake_r2_prefix` / `LLS_DATA_LAKE_R2_PREFIX` 允许前缀内。发布过程不写 registry，不更新 `current`，不做自动 promotion；如需把版本提升为权威对象，应由数据湖治理流程另行完成。

@@ -146,6 +146,8 @@ def test_publish_submit_uploads_manifest_and_verifies_hashes_to_local_uri(
     task, runs_root = _write_task(tmp_path, output_base_uri=str(tmp_path / "lake"))
     _write_artifacts(runs_root, task.task_id)
     source = runs_root / task.task_id / "decisions" / "round_1" / "decisions.jsonl"
+    raw_key = "submit-1"
+    key_digest = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
     result = data_lake.submit_artifact_publish(
         task,
@@ -153,7 +155,7 @@ def test_publish_submit_uploads_manifest_and_verifies_hashes_to_local_uri(
         "decisions",
         "round_1",
         confirm=True,
-        idempotency_key="submit-1",
+        idempotency_key=raw_key,
     )
 
     target = tmp_path / "lake" / "decisions" / "round_1" / "decisions.jsonl"
@@ -161,7 +163,12 @@ def test_publish_submit_uploads_manifest_and_verifies_hashes_to_local_uri(
     publish_manifest = read_json(manifest_path)
     artifact = result["artifacts"][0]
     assert target.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
-    assert publish_manifest["idempotency_key"] == "submit-1"
+    assert "idempotency_key" not in publish_manifest
+    assert publish_manifest["idempotency_key_sha256"] == key_digest
+    assert "idempotency_key" not in result
+    assert result["idempotency_key_sha256"] == key_digest
+    assert raw_key not in json.dumps(publish_manifest, ensure_ascii=False)
+    assert raw_key not in json.dumps(result, ensure_ascii=False)
     assert publish_manifest["sha256"] == _sha256(source)
     assert artifact["verified"] is True
     assert artifact["verification"]["artifact"]["sha256"] == _sha256(source)

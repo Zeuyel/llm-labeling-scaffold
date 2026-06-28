@@ -723,7 +723,7 @@ def _publish_artifact_location(task: TaskConfig, runs_root: str | Path, kind: st
 
 
 def _publish_manifest(task: TaskConfig, artifact: dict[str, Any], *, dry_run: bool,
-                      idempotency_key: str | None = None) -> dict[str, Any]:
+                      idempotency_key_sha256: str | None = None) -> dict[str, Any]:
     manifest = {
         "manifest_version": "1.0",
         "task_id": task.task_id,
@@ -744,8 +744,8 @@ def _publish_manifest(task: TaskConfig, artifact: dict[str, Any], *, dry_run: bo
     for key in ("decision_id", "version", "run_id", "model_id"):
         if artifact.get(key):
             manifest[key] = artifact[key]
-    if idempotency_key:
-        manifest["idempotency_key"] = idempotency_key
+    if idempotency_key_sha256:
+        manifest["idempotency_key_sha256"] = idempotency_key_sha256
     return {key: value for key, value in manifest.items() if value is not None}
 
 
@@ -768,6 +768,10 @@ def _validate_idempotency_key(value: str | None) -> str:
     if len(text) > 128 or any(ch.isspace() for ch in text) or "/" in text or "\\" in text or ".." in text:
         raise DataLakeError("idempotency key 必须是安全短字符串，不能包含空白、路径分隔符或路径穿越")
     return text
+
+
+def _idempotency_key_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _verify_published_object(uri: str, *, expected_bytes: int, expected_sha256: str) -> dict[str, Any]:
@@ -796,10 +800,11 @@ def submit_artifact_publish(
     if not confirm:
         raise DataLakeError("submit 必须显式 confirm")
     key = _validate_idempotency_key(idempotency_key)
+    key_sha256 = _idempotency_key_sha256(key)
     plan = plan_artifact_publish(task, runs_root, kind, artifact_id)
     submitted: list[dict[str, Any]] = []
     for artifact in plan["artifacts"]:
-        manifest = _publish_manifest(task, artifact, dry_run=False, idempotency_key=key)
+        manifest = _publish_manifest(task, artifact, dry_run=False, idempotency_key_sha256=key_sha256)
         with tempfile.TemporaryDirectory(prefix="lls-lake-publish-") as td:
             manifest_path = Path(td) / "manifest.json"
             manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -834,7 +839,7 @@ def submit_artifact_publish(
         "action": "publish_submit",
         "dry_run": False,
         "confirmed": True,
-        "idempotency_key": key,
+        "idempotency_key_sha256": key_sha256,
         "output_base_uri": plan["output_base_uri"],
         "artifacts": submitted,
     }
