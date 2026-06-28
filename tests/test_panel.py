@@ -13,7 +13,7 @@ import urllib.request
 from llm_labeling_scaffold import panel
 from llm_labeling_scaffold import pipeline
 from llm_labeling_scaffold.gold import build_gold_from_decisions
-from llm_labeling_scaffold.io import read_json, read_jsonl, write_json
+from llm_labeling_scaffold.io import read_json, read_jsonl, write_json, write_jsonl
 
 
 def _decode_basic(header: str) -> tuple[str, str]:
@@ -150,18 +150,109 @@ def test_parse_import_rows_rejects_bad_lines():
 
 def test_list_decision_artifacts_reads_manifest(panel_workspace):
     artifacts = pipeline.list_decision_artifacts(panel_workspace["runs_root"], "toy_multiclass_v1")
-    assert artifacts == [
+    assert len(artifacts) == 1
+    artifact = artifacts[0]
+    assert artifact["task_id"] == "toy_multiclass_v1"
+    assert artifact["decision_id"] == "argilla_round_1"
+    assert artifact["source"] == "argilla"
+    assert artifact["argilla_dataset"] == "toy_argilla_round_1"
+    assert artifact["sample_id"] == "sample_a"
+    assert artifact["sample_path"] == str(panel_workspace["sample_path"])
+    assert artifact["path"] == str(panel_workspace["decisions_path"])
+    assert artifact["rows"] == 2
+    assert artifact["decisions_pulled"] is True
+    assert artifact["state"] == "decisions_pulled"
+    assert artifact["linked_decision_ids"] == ["argilla_round_1"]
+
+
+def test_asset_status_detail_endpoints_empty_state(tmp_path: Path):
+    with _panel_server(tmp_path / "runs", tmp_path / "tasks") as base_url:
+        status, annotations = _request(base_url, "/api/task/annotation_jobs?task_id=empty_task")
+        assert status == 200
+        assert annotations == {"annotation_jobs": []}
+
+        status, decisions = _request(base_url, "/api/task/decision_artifacts?task_id=empty_task")
+        assert status == 200
+        assert decisions == {"decision_artifacts": []}
+
+        status, gold = _request(base_url, "/api/task/gold_versions?task_id=empty_task")
+        assert status == 200
+        assert gold == {"gold_versions": []}
+
+        status, missing = _request(
+            base_url,
+            "/api/annotation_job/detail?task_id=empty_task&annotation_id=missing_round",
+        )
+        assert status == 404
+        assert missing["found"] is False
+
+        status, bad = _request(
+            base_url,
+            "/api/decision_artifact/detail?task_id=empty_task&decision_id=../bad",
+        )
+        assert status == 400
+        assert "error" in bad
+
+
+def test_asset_status_detail_endpoints_return_smoke_contract(panel_workspace):
+    task_id = "toy_multiclass_v1"
+    runs_root = panel_workspace["runs_root"]
+    annotation_dir = runs_root / task_id / "annotation_jobs" / "argilla_round_1"
+    dispatch_path = annotation_dir / "dispatch.jsonl"
+    write_jsonl([{"record_id": "r001", "title": "General notice"}], dispatch_path)
+    write_json(
         {
-            "task_id": "toy_multiclass_v1",
-            "decision_id": "argilla_round_1",
+            "task_id": task_id,
+            "annotation_id": "argilla_round_1",
             "source": "argilla",
             "argilla_dataset": "toy_argilla_round_1",
-            "sample_id": "sample_a",
-            "sample_path": str(panel_workspace["sample_path"]),
-            "path": str(panel_workspace["decisions_path"]),
+            "dispatch_path": str(dispatch_path),
+            "status": "已分发",
+            "result": {"records": 1, "record_id_policy": {"strategy": "original"}},
+        },
+        annotation_dir / "manifest.json",
+    )
+    gold_dir = runs_root / task_id / "gold"
+    gold_path = gold_dir / "gold_from_decisions_v001.jsonl"
+    write_json(
+        {
+            "task_id": task_id,
+            "version": "from_decisions_v001",
+            "path": str(gold_path),
             "rows": 2,
-        }
-    ]
+            "source": "decision_artifact",
+            "decisions": str(panel_workspace["decisions_path"]),
+        },
+        gold_dir / "gold_from_decisions_v001.manifest.json",
+    )
+
+    with _panel_server(runs_root, Path("examples")) as base_url:
+        status, annotation = _request(
+            base_url,
+            "/api/annotation_job/detail?task_id=toy_multiclass_v1&annotation_id=argilla_round_1",
+        )
+        assert status == 200
+        annotation_job = annotation["annotation_job"]
+        assert annotation_job["local_dispatch_file_exists"] is True
+        assert annotation_job["argilla_published"] is True
+        assert annotation_job["decisions_pulled"] is True
+        assert annotation_job["gold_generated"] is True
+        assert annotation_job["linked_decision_ids"] == ["argilla_round_1"]
+        assert annotation_job["linked_gold_versions"] == ["from_decisions_v001"]
+
+        status, decision = _request(
+            base_url,
+            "/api/decision_artifact/detail?task_id=toy_multiclass_v1&decision_id=argilla_round_1",
+        )
+        assert status == 200
+        assert decision["decision_artifact"]["linked_gold_versions"] == ["from_decisions_v001"]
+
+        status, gold = _request(
+            base_url,
+            "/api/gold_version/detail?task_id=toy_multiclass_v1&version=from_decisions_v001",
+        )
+        assert status == 200
+        assert gold["gold_version"]["linked_decision_ids"] == ["argilla_round_1"]
 
 
 def test_task_graph_api_returns_nodes_and_edges(panel_workspace):

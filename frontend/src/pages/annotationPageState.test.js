@@ -73,6 +73,18 @@ test("annotation job archive is blocked once downstream decisions exist", () => 
   assert.equal(busy.archive.disabledReason, "当前有操作正在执行。");
 });
 
+test("annotation job archive is blocked for archived states in either locale", () => {
+  for (const state of ["archived", "已归档"]) {
+    const actions = annotationJobDetailActions({
+      job: { annotation_id: "round_1", state },
+      decisions: [],
+    });
+
+    assert.equal(actions.archive.enabled, false);
+    assert.equal(actions.archive.disabledReason, "标注任务已归档。");
+  }
+});
+
 test("annotation job gold action requires a passing agreement audit", () => {
   assert.deepEqual(annotationJobGoldAction({ audits: [] }), {
     enabled: false,

@@ -15,7 +15,7 @@ import yaml
 
 from .config import load_task, resolve_profile_id, with_runs_root
 from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
-from .jobs import Job, create_job, run_job
+from .jobs import Job, create_job, get_job, run_job
 from .profiles import DEFAULT_PROFILE, list_profile_presets, profile_definition, status_label
 
 try:
@@ -31,6 +31,19 @@ def _task_roots(tasks_root: str | Path) -> list[Path]:
     for chunk in str(tasks_root).split(os.pathsep):
         parts.extend(item.strip() for item in chunk.split(","))
     return [Path(item) for item in parts if item]
+
+
+def _active_task_yaml_paths(root: Path):
+    candidates: list[Path] = []
+    for current, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            name for name in dirnames
+            if not name.startswith(".") and name != "_archive"
+        )
+        if "task.yaml" in filenames:
+            candidates.append(Path(current) / "task.yaml")
+    yield from sorted(candidates, key=lambda path: (len(path.relative_to(root).parts), str(path)))
+
 
 
 def _safe_segment(value: str) -> bool:
@@ -145,9 +158,7 @@ def load_task_by_id(tasks_root: str | Path, task_id: str):
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
             except Exception:
@@ -161,9 +172,7 @@ def _active_task_exists(roots: list[Path], task_id: str) -> bool:
     for root in roots:
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 if load_task(yml).task_id == task_id:
                     return True
@@ -230,6 +239,11 @@ def _jsonl_content_hash(path: Path) -> str:
         digest.update(_canonical_row(row).encode("utf-8"))
         digest.update(b"\n")
     return digest.hexdigest()
+
+
+def _stable_json_hash(value: dict[str, Any]) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 DATA_LAKE_LINEAGE_KEYS = (
@@ -917,9 +931,7 @@ def list_tasks(tasks_root: str | Path) -> list[dict]:
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
                 key = task.task_id
@@ -957,9 +969,7 @@ def _task_config_archive_info(tasks_root: str | Path, task_id: str) -> dict[str,
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
             except Exception:
@@ -983,9 +993,7 @@ def archive_task(tasks_root: str | Path, task_id: str, *, runs_root: str | Path 
     for root in _task_roots(tasks_root):
         if not root.exists():
             continue
-        for yml in sorted(root.rglob("task.yaml")):
-            if "_archive" in yml.parts:
-                continue
+        for yml in _active_task_yaml_paths(root):
             try:
                 task = load_task(yml)
             except Exception:
@@ -2431,6 +2439,184 @@ def save_import(runs_root: str | Path, task, import_id: str, rows: list[dict], *
         raise
 
 
+def _data_lake_manifest_summary(source) -> dict[str, Any]:
+    manifest = source.manifest
+    selected = {
+        "path": source.source_object_path,
+        "storage_uri": source.source_object_uri,
+        "bytes": source.source_object_bytes,
+        "sha256": source.source_object_sha256,
+        "rows": source.source_object_rows,
+        "asset_type": source.source_asset_type,
+        "id_field": source.source_id_field,
+        "unique_ids": source.source_unique_ids,
+        "created_by": source.source_created_by,
+        "upstream_uri": source.source_upstream_uri,
+        "sampling_strategy": source.source_sampling_strategy,
+    }
+    return {
+        "dataset_id": manifest.get("dataset_id"),
+        "layer": manifest.get("layer"),
+        "domain": manifest.get("domain"),
+        "object_count": manifest.get("object_count"),
+        "total_bytes": manifest.get("total_bytes"),
+        "selected_object": {key: value for key, value in selected.items() if value not in (None, "")},
+    }
+
+
+def _import_resolution(runs_root: str | Path, task, import_id: str,
+                       incoming_hash: str, lineage: dict[str, Any]) -> dict[str, Any]:
+    item = _import_dir(runs_root, task.task_id, import_id)
+    if not item.exists():
+        if _archived_import_exists(runs_root, task.task_id, import_id):
+            return {
+                "action": "blocked",
+                "idempotent": False,
+                "existing": False,
+                "can_submit": False,
+                "reason": "archived_import_id",
+                "message": f"导入编号已归档，不能复用: {import_id}",
+            }
+        return {
+            "action": "create",
+            "idempotent": False,
+            "existing": False,
+            "can_submit": True,
+        }
+
+    raw_path = item / "raw.jsonl"
+    manifest_path = item / "manifest.json"
+    if not raw_path.exists():
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "missing_raw",
+            "message": f"导入编号已存在但缺少 raw.jsonl: {import_id}",
+        }
+    manifest = read_json(manifest_path) if manifest_path.exists() else {}
+    if manifest.get("state") == "archived":
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "archived_import_id",
+            "message": f"导入编号已归档，不能复用: {import_id}",
+        }
+    existing_hash = manifest.get("content_sha256") or _jsonl_content_hash(raw_path)
+    if existing_hash != incoming_hash:
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "content_mismatch",
+            "message": f"导入编号已存在且内容不同: {import_id}",
+            "existing_content_sha256": existing_hash,
+            "incoming_content_sha256": incoming_hash,
+        }
+    mismatches = _metadata_mismatches(manifest, lineage)
+    if mismatches:
+        return {
+            "action": "blocked",
+            "idempotent": False,
+            "existing": True,
+            "can_submit": False,
+            "reason": "lineage_mismatch",
+            "message": f"导入编号已存在且内容相同，但数据湖血缘不同: {', '.join(mismatches)}",
+            "lineage_mismatches": mismatches,
+        }
+    return {
+        "action": "reuse",
+        "idempotent": True,
+        "existing": True,
+        "can_submit": True,
+        "existing_import": _import_summary(runs_root, task.task_id, item, id_field=task.id_field),
+    }
+
+
+def dry_run_data_lake_import(runs_root: str | Path, task, import_id: str | None = None,
+                             overrides: dict[str, Any] | None = None,
+                             max_bytes: int | None = None) -> dict:
+    from .data_lake import default_import_id, materialize_source, read_source_rows
+
+    source = materialize_source(task, overrides=overrides, max_bytes=max_bytes)
+    try:
+        rows = read_source_rows(source)
+        profile = _profile_jsonl_from_rows(rows, id_field=task.id_field)
+        incoming_hash = _content_hash(rows)
+        lineage = source.lineage(content_sha256=incoming_hash)
+        target_import_id = str(import_id or default_import_id(task, source)).strip()
+        checks: list[dict[str, Any]] = []
+
+        def add_check(name: str, ok: bool, message: str, **details: Any) -> None:
+            check = {"name": name, "status": "ok" if ok else "error", "message": message}
+            if details:
+                check["details"] = details
+            checks.append(check)
+
+        add_check(
+            "source_rows",
+            profile["rows"] == source.source_object_rows,
+            "数据湖对象行数与 manifest 一致" if profile["rows"] == source.source_object_rows else "数据湖对象行数与 manifest 不一致",
+            expected=source.source_object_rows,
+            actual=profile["rows"],
+        )
+        add_check(
+            "source_unique_ids",
+            profile["unique_ids"] == source.source_unique_ids,
+            "数据湖对象唯一 ID 数与 manifest 一致"
+            if profile["unique_ids"] == source.source_unique_ids
+            else "数据湖对象唯一 ID 数与 manifest 不一致",
+            expected=source.source_unique_ids,
+            actual=profile["unique_ids"],
+        )
+        try:
+            _validate_import_rows(task, rows)
+            add_check("task_schema", True, "导入数据满足任务字段约束")
+        except ValueError as exc:
+            add_check("task_schema", False, str(exc))
+
+        resolution = _import_resolution(runs_root, task, target_import_id, incoming_hash, lineage)
+        add_check(
+            "import_id",
+            bool(resolution.get("can_submit")),
+            "导入编号可创建或幂等复用" if resolution.get("can_submit") else str(resolution.get("message") or "导入编号不可复用"),
+            action=resolution.get("action"),
+            reason=resolution.get("reason"),
+        )
+        validation_ok = all(check["status"] == "ok" for check in checks)
+        return {
+            "kind": "data_lake_import",
+            "dry_run": True,
+            "task": {
+                "task_id": task.task_id,
+                "id_field": task.id_field,
+                "text_fields": list(task.text_fields),
+            },
+            "import_id": target_import_id,
+            "source": lineage,
+            "manifest": _data_lake_manifest_summary(source),
+            "validation": {
+                "ok": validation_ok,
+                "checks": checks,
+                "errors": [check for check in checks if check["status"] != "ok"],
+                "rows": profile["rows"],
+                "fields": profile["fields"],
+                "unique_ids": profile["unique_ids"],
+                "duplicate_ids": profile["duplicate_ids"],
+                "missing_ids": profile["missing_ids"],
+                "content_sha256": incoming_hash,
+            },
+            "plan": resolution,
+        }
+    finally:
+        if source.local_path.exists():
+            source.local_path.unlink()
+
+
 def import_from_data_lake(runs_root: str | Path, task, import_id: str | None = None,
                           overrides: dict[str, Any] | None = None,
                           max_bytes: int | None = None) -> dict:
@@ -2463,17 +2649,41 @@ def import_from_data_lake(runs_root: str | Path, task, import_id: str | None = N
             source.local_path.unlink()
 
 
+def _idempotency_key_digest(idempotency_key: str) -> str:
+    return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+
+
+def _idempotency_record_path(jobs_dir: Path, idempotency_key: str) -> Path:
+    return jobs_dir / "idempotency" / f"{_idempotency_key_digest(idempotency_key)}.json"
+
+
+def _data_lake_import_request_fingerprint(task_id: str, import_id: str | None,
+                                          overrides: dict[str, Any],
+                                          max_bytes: int | None) -> str:
+    return _stable_json_hash({
+        "kind": "data_lake_import",
+        "task_id": task_id,
+        "import_id": import_id,
+        "overrides": overrides,
+        "max_bytes": max_bytes,
+    })
+
+
 def start_data_lake_import(runs_root: str | Path, task, import_id: str | None = None,
                            overrides: dict[str, Any] | None = None,
-                           max_bytes: int | None = None) -> dict:
+                           max_bytes: int | None = None,
+                           idempotency_key: str | None = None) -> dict:
     overrides = dict(overrides or {})
+    idempotency_key = str(idempotency_key or "").strip()
+    jobs_dir = _jobs_dir(Path(runs_root), task.task_id)
     params = {
         "task_id": task.task_id,
         "import_id": import_id,
         "overrides": overrides,
         "max_bytes": max_bytes,
     }
-    job = create_job("data_lake_import", params, _jobs_dir(Path(runs_root), task.task_id))
+    if idempotency_key:
+        params["idempotency_key_sha256"] = _idempotency_key_digest(idempotency_key)
 
     def target(j: Job) -> dict:
         j.log(f"data_lake_import task={task.task_id}")
@@ -2501,6 +2711,37 @@ def start_data_lake_import(runs_root: str | Path, task, import_id: str | None = 
             "rows": result.get("rows"),
             "import": result,
         }
+
+    fingerprint = _data_lake_import_request_fingerprint(task.task_id, import_id, overrides, max_bytes)
+    if idempotency_key:
+        digest = _idempotency_key_digest(idempotency_key)
+        with _asset_lock(runs_root, task.task_id, f"data-lake-import-idempotency-{digest}"):
+            record_path = _idempotency_record_path(jobs_dir, idempotency_key)
+            if record_path.exists():
+                record = read_json(record_path)
+                if record.get("request_fingerprint") != fingerprint:
+                    raise ValueError("幂等 key 已用于不同的数据湖导入请求，请使用新的 idempotency_key")
+                existing = get_job(str(record.get("job_id") or ""), jobs_dir)
+                if existing is None:
+                    raise ValueError("幂等提交记录缺少对应 job，请使用新的 idempotency_key")
+                reused = dict(existing)
+                reused["idempotent_submit"] = True
+                return reused
+            job = create_job("data_lake_import", params, jobs_dir)
+            write_json(
+                {
+                    "kind": "data_lake_import",
+                    "job_id": job.id,
+                    "task_id": task.task_id,
+                    "import_id": import_id,
+                    "idempotency_key_sha256": digest,
+                    "request_fingerprint": fingerprint,
+                    "created_at": _now(),
+                },
+                record_path,
+            )
+    else:
+        job = create_job("data_lake_import", params, jobs_dir)
 
     run_job(job, target)
     return job.to_dict()
@@ -2800,10 +3041,10 @@ def archive_annotation_job(runs_root: str | Path, task_id: str, annotation_id: s
                 "archive_reason": reason,
                 "archived_from": str(item),
             })
-            write_json(manifest, manifest_path)
             stamp = _archive_stamp(archived_at)
             target = _archive_dir(runs_root, task_id, "annotation_jobs") / f"{annotation_id}__{stamp}"
             _move_directory(item, target)
+            write_json(manifest, target / "manifest.json")
             result = {
                 "task_id": task_id,
                 "annotation_id": annotation_id,
@@ -2833,7 +3074,121 @@ def archive_annotation_job(runs_root: str | Path, task_id: str, annotation_id: s
         raise
 
 
-def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
+def _asset_path_status(value: Any, fallback: Path | None = None) -> tuple[str | None, bool]:
+    if value not in (None, "", [], {}):
+        text = str(value)
+        path = Path(text)
+        if path.exists():
+            return str(path), True
+        if fallback is not None and not path.is_absolute():
+            alt = fallback.parent / path
+            if alt.exists():
+                return str(alt), True
+        return text, False
+    if fallback is not None:
+        return str(fallback), fallback.exists()
+    return None, False
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+    return out
+
+
+def _manifest_file_exists(item: dict[str, Any]) -> bool:
+    manifest_path = item.get("manifest_path")
+    return bool(manifest_path) and Path(str(manifest_path)).exists()
+
+
+def _annotation_dispatch_status(task_dir: Path, item: dict[str, Any]) -> tuple[str | None, bool]:
+    annotation_id = str(item.get("annotation_id") or item.get("job_id") or item.get("id") or "")
+    fallback = task_dir / "annotation_jobs" / annotation_id / "dispatch.jsonl" if annotation_id else None
+    return _asset_path_status(item.get("local_dispatch_file") or item.get("dispatch_path"), fallback)
+
+
+def _decision_file_status(task_dir: Path, item: dict[str, Any]) -> tuple[str | None, bool]:
+    decision_id = str(item.get("decision_id") or item.get("id") or "")
+    fallback = task_dir / "decisions" / decision_id / "decisions.jsonl" if decision_id else None
+    return _asset_path_status(item.get("path") or item.get("decisions_path"), fallback)
+
+
+def _gold_file_status(task_dir: Path, item: dict[str, Any]) -> tuple[str | None, bool]:
+    version = str(item.get("version") or item.get("gold_id") or "")
+    fallback = task_dir / "gold" / f"gold_{version}.jsonl" if version else None
+    return _asset_path_status(item.get("path") or item.get("gold_path"), fallback)
+
+
+def _decision_pulled(task_dir: Path, item: dict[str, Any]) -> bool:
+    _, file_exists = _decision_file_status(task_dir, item)
+    return file_exists or _manifest_file_exists(item) or item.get("rows") is not None
+
+
+def _gold_generated(task_dir: Path, item: dict[str, Any]) -> bool:
+    _, file_exists = _gold_file_status(task_dir, item)
+    return file_exists or _manifest_file_exists(item) or item.get("rows") is not None
+
+
+def _annotation_argilla_published(item: dict[str, Any]) -> bool:
+    explicit = item.get("argilla_published")
+    if isinstance(explicit, bool):
+        return explicit
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    if result:
+        status = str(result.get("status") or "").strip().lower()
+        if result.get("ok") is False or status in {"failed", "failure", "error"}:
+            return False
+        if result.get("records") is not None or result.get("dataset") or result.get("record_id_policy") is not None:
+            return True
+    status_text = str(item.get("status") or item.get("state") or "").strip().lower()
+    if status_text in {"published", "succeeded", "success", "done", "已分发"}:
+        return True
+    return bool(
+        item.get("created_at")
+        and (item.get("argilla_dataset") or item.get("dataset"))
+        and item.get("source") == "argilla"
+    )
+
+
+def _annotation_matches_decision(annotation: dict[str, Any], decision: dict[str, Any]) -> bool:
+    annotation_id = str(annotation.get("annotation_id") or annotation.get("job_id") or annotation.get("id") or "")
+    decision_ids = {
+        str(value)
+        for value in (
+            decision.get("annotation_id"),
+            decision.get("source_annotation_id"),
+            decision.get("job_id"),
+        )
+        if value not in (None, "")
+    }
+    if annotation_id and (annotation_id in decision_ids or str(decision.get("decision_id") or "") == annotation_id):
+        return True
+    dataset = annotation.get("argilla_dataset") or annotation.get("dataset")
+    return bool(dataset and dataset in {decision.get("argilla_dataset"), decision.get("dataset")})
+
+
+def _gold_matches_decision(gold: dict[str, Any], decision: dict[str, Any]) -> bool:
+    decision_path = decision.get("path") or decision.get("decisions_path")
+    gold_decisions = gold.get("decisions") or gold.get("decisions_path")
+    if decision_path and gold_decisions and _same_path(gold_decisions, decision_path):
+        return True
+    decision_id = decision.get("decision_id")
+    return bool(decision_id and decision_id in {gold.get("decision_id"), gold.get("source_decision_id")})
+
+
+def _gold_version_from_manifest_path(path: Path) -> str:
+    name = path.name
+    suffix = ".manifest.json"
+    if name.startswith("gold_") and name.endswith(suffix):
+        return name[len("gold_"):-len(suffix)]
+    return path.stem
+
+
+def _raw_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
     out: list[dict] = []
     base = Path(runs_root) / task_id / "annotation_jobs"
     if not base.is_dir():
@@ -2852,6 +3207,233 @@ def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
                 "source": "unknown",
             })
     return out
+
+
+def _raw_decision_artifacts(runs_root: Path, task_id: str) -> list[dict]:
+    out: list[dict] = []
+    base = Path(runs_root) / task_id / "decisions"
+    if not base.is_dir():
+        return out
+    for dd in sorted(p for p in base.iterdir() if p.is_dir()):
+        manifest = dd / "manifest.json"
+        if manifest.exists():
+            item = read_json(manifest)
+            item.setdefault("decision_id", dd.name)
+            item["manifest_path"] = str(manifest)
+            out.append(item)
+        else:
+            out.append({
+                "task_id": task_id,
+                "decision_id": dd.name,
+                "path": str(dd / "decisions.jsonl"),
+                "source": "unknown",
+            })
+    return out
+
+
+def _raw_gold_versions(runs_root: Path, task_id: str) -> list[dict]:
+    out: list[dict] = []
+    base = Path(runs_root) / task_id / "gold"
+    if not base.is_dir():
+        return out
+    seen: set[str] = set()
+    for mp in sorted(base.glob("gold_*.manifest.json")):
+        item = read_json(mp)
+        version = str(item.get("version") or item.get("gold_id") or _gold_version_from_manifest_path(mp))
+        item.setdefault("version", version)
+        item["manifest_path"] = str(mp)
+        out.append(item)
+        seen.add(version)
+    for data_path in sorted(base.glob("gold_*.jsonl")):
+        version = data_path.stem[len("gold_"):] if data_path.stem.startswith("gold_") else data_path.stem
+        if version in seen:
+            continue
+        out.append({
+            "task_id": task_id,
+            "version": version,
+            "path": str(data_path),
+            "source": "unknown",
+        })
+    return out
+
+
+def _enrich_annotation_job_status(
+    task_dir: Path,
+    item: dict[str, Any],
+    decisions: list[dict],
+    gold_versions: list[dict],
+) -> dict[str, Any]:
+    local_dispatch_file, local_dispatch_file_exists = _annotation_dispatch_status(task_dir, item)
+    linked_decisions = [
+        decision
+        for decision in decisions
+        if _annotation_matches_decision(item, decision) and _decision_pulled(task_dir, decision)
+    ]
+    linked_decision_ids = _ordered_unique([
+        str(decision.get("decision_id") or "")
+        for decision in linked_decisions
+    ])
+    linked_gold_versions = _ordered_unique([
+        str(gold.get("version") or "")
+        for decision in linked_decisions
+        for gold in gold_versions
+        if _gold_matches_decision(gold, decision) and _gold_generated(task_dir, gold)
+    ])
+    argilla_published = _annotation_argilla_published(item)
+    decisions_pulled = bool(linked_decision_ids)
+    gold_generated = bool(linked_gold_versions)
+    state = str(item.get("state") or "")
+    if not state or state == "active":
+        if gold_generated:
+            state = "gold_generated"
+        elif decisions_pulled:
+            state = "decisions_pulled"
+        elif argilla_published:
+            state = "argilla_published"
+        elif local_dispatch_file_exists:
+            state = "dispatch_ready"
+        else:
+            state = "incomplete" if _manifest_file_exists(item) else "empty"
+    return {
+        **item,
+        "local_dispatch_file": local_dispatch_file,
+        "local_dispatch_file_exists": local_dispatch_file_exists,
+        "argilla_published": argilla_published,
+        "decisions_pulled": decisions_pulled,
+        "gold_generated": gold_generated,
+        "state": state,
+        "linked_decision_ids": linked_decision_ids,
+        "linked_gold_versions": linked_gold_versions,
+    }
+
+
+def _linked_annotation_dispatch_status(task_dir: Path, annotations: list[dict]) -> tuple[str | None, bool]:
+    first_candidate: str | None = None
+    for annotation in annotations:
+        candidate, exists = _annotation_dispatch_status(task_dir, annotation)
+        if first_candidate is None and candidate:
+            first_candidate = candidate
+        if exists:
+            return candidate, True
+    return first_candidate, False
+
+
+def _enrich_decision_artifact_status(
+    task_dir: Path,
+    item: dict[str, Any],
+    annotations: list[dict],
+    gold_versions: list[dict],
+) -> dict[str, Any]:
+    linked_annotations = [annotation for annotation in annotations if _annotation_matches_decision(annotation, item)]
+    linked_annotation_ids = _ordered_unique([
+        str(annotation.get("annotation_id") or "")
+        for annotation in linked_annotations
+    ])
+    local_dispatch_file, local_dispatch_file_exists = _linked_annotation_dispatch_status(task_dir, linked_annotations)
+    decision_id = str(item.get("decision_id") or "")
+    linked_gold_versions = _ordered_unique([
+        str(gold.get("version") or "")
+        for gold in gold_versions
+        if _gold_matches_decision(gold, item) and _gold_generated(task_dir, gold)
+    ])
+    decisions_pulled = _decision_pulled(task_dir, item)
+    gold_generated = bool(linked_gold_versions)
+    argilla_published = any(_annotation_argilla_published(annotation) for annotation in linked_annotations)
+    state = str(item.get("state") or "")
+    if not state or state == "active":
+        if gold_generated:
+            state = "gold_generated"
+        elif decisions_pulled:
+            state = "decisions_pulled"
+        else:
+            state = "incomplete" if _manifest_file_exists(item) else "empty"
+    return {
+        **item,
+        "local_dispatch_file": local_dispatch_file,
+        "local_dispatch_file_exists": local_dispatch_file_exists,
+        "argilla_published": argilla_published,
+        "decisions_pulled": decisions_pulled,
+        "gold_generated": gold_generated,
+        "state": state,
+        "linked_annotation_ids": linked_annotation_ids,
+        "linked_decision_ids": [decision_id] if decision_id and decisions_pulled else [],
+        "linked_gold_versions": linked_gold_versions,
+    }
+
+
+def _enrich_gold_version_status(
+    task_dir: Path,
+    item: dict[str, Any],
+    annotations: list[dict],
+    decisions: list[dict],
+) -> dict[str, Any]:
+    linked_decisions = [
+        decision
+        for decision in decisions
+        if _gold_matches_decision(item, decision) and _decision_pulled(task_dir, decision)
+    ]
+    linked_decision_ids = _ordered_unique([
+        str(decision.get("decision_id") or "")
+        for decision in linked_decisions
+    ])
+    linked_annotations = [
+        annotation
+        for annotation in annotations
+        if any(_annotation_matches_decision(annotation, decision) for decision in linked_decisions)
+    ]
+    linked_annotation_ids = _ordered_unique([
+        str(annotation.get("annotation_id") or "")
+        for annotation in linked_annotations
+    ])
+    local_dispatch_file, local_dispatch_file_exists = _linked_annotation_dispatch_status(task_dir, linked_annotations)
+    decisions_path = item.get("decisions") or item.get("decisions_path")
+    decisions_pulled = bool(linked_decision_ids)
+    if not decisions_pulled and decisions_path:
+        _, decisions_file_exists = _asset_path_status(decisions_path)
+        decisions_pulled = decisions_file_exists
+    argilla_published = any(_annotation_argilla_published(annotation) for annotation in linked_annotations)
+    gold_generated = _gold_generated(task_dir, item)
+    version = str(item.get("version") or item.get("gold_id") or "")
+    state = str(item.get("state") or "")
+    if not state or state == "active":
+        state = "gold_generated" if gold_generated else "incomplete"
+    gold_file, gold_file_exists = _gold_file_status(task_dir, item)
+    return {
+        **item,
+        "gold_file": gold_file,
+        "gold_file_exists": gold_file_exists,
+        "local_dispatch_file": local_dispatch_file,
+        "local_dispatch_file_exists": local_dispatch_file_exists,
+        "argilla_published": argilla_published,
+        "decisions_pulled": decisions_pulled,
+        "gold_generated": gold_generated,
+        "state": state,
+        "linked_annotation_ids": linked_annotation_ids,
+        "linked_decision_ids": linked_decision_ids,
+        "linked_gold_versions": [version] if version and gold_generated else [],
+    }
+
+
+def _asset_status_inputs(runs_root: Path, task_id: str) -> tuple[Path, list[dict], list[dict], list[dict]]:
+    task_dir = Path(runs_root) / task_id
+    annotations = _raw_annotation_jobs(runs_root, task_id)
+    decisions = _raw_decision_artifacts(runs_root, task_id)
+    gold_versions = _raw_gold_versions(runs_root, task_id)
+    return task_dir, annotations, decisions, gold_versions
+
+
+def list_annotation_jobs(runs_root: Path, task_id: str) -> list[dict]:
+    task_dir, annotations, decisions, gold_versions = _asset_status_inputs(Path(runs_root), task_id)
+    return [_enrich_annotation_job_status(task_dir, item, decisions, gold_versions) for item in annotations]
+
+
+def annotation_job_detail(runs_root: str | Path, task_id: str, annotation_id: str) -> dict:
+    if not _safe_segment(task_id) or not _safe_segment(annotation_id):
+        raise ValueError("非法任务或标注任务编号")
+    for item in list_annotation_jobs(Path(runs_root), task_id):
+        if str(item.get("annotation_id") or "") == annotation_id:
+            return item
+    raise ValueError(f"标注任务不存在: {annotation_id}")
 
 
 def list_agreement_audits(runs_root: Path, task_id: str) -> list[dict]:
@@ -3003,32 +3585,31 @@ def list_models(runs_root: Path, task_id: str) -> list[dict]:
 
 
 def list_gold_versions(runs_root: Path, task_id: str) -> list[dict]:
-    out: list[dict] = []
-    base = Path(runs_root) / task_id / "gold"
-    if not base.is_dir():
-        return out
-    for mp in sorted(base.glob("gold_*.manifest.json")):
-        out.append(read_json(mp))
-    return out
+    task_dir, annotations, decisions, gold_versions = _asset_status_inputs(Path(runs_root), task_id)
+    return [_enrich_gold_version_status(task_dir, item, annotations, decisions) for item in gold_versions]
 
 
 def list_decision_artifacts(runs_root: Path, task_id: str) -> list[dict]:
-    out: list[dict] = []
-    base = Path(runs_root) / task_id / "decisions"
-    if not base.is_dir():
-        return out
-    for dd in sorted(p for p in base.iterdir() if p.is_dir()):
-        manifest = dd / "manifest.json"
-        if manifest.exists():
-            out.append(read_json(manifest))
-        else:
-            out.append({
-                "task_id": task_id,
-                "decision_id": dd.name,
-                "path": str(dd / "decisions.jsonl"),
-                "source": "unknown",
-            })
-    return out
+    task_dir, annotations, decisions, gold_versions = _asset_status_inputs(Path(runs_root), task_id)
+    return [_enrich_decision_artifact_status(task_dir, item, annotations, gold_versions) for item in decisions]
+
+
+def decision_artifact_detail(runs_root: str | Path, task_id: str, decision_id: str) -> dict:
+    if not _safe_segment(task_id) or not _safe_segment(decision_id):
+        raise ValueError("非法任务或标注结果编号")
+    for item in list_decision_artifacts(Path(runs_root), task_id):
+        if str(item.get("decision_id") or "") == decision_id:
+            return item
+    raise ValueError(f"标注结果不存在: {decision_id}")
+
+
+def gold_version_detail(runs_root: str | Path, task_id: str, version: str) -> dict:
+    if not _safe_segment(task_id) or not _safe_segment(version):
+        raise ValueError("非法任务或训练集版本编号")
+    for item in list_gold_versions(Path(runs_root), task_id):
+        if str(item.get("version") or "") == version:
+            return item
+    raise ValueError(f"训练集版本不存在: {version}")
 
 
 def list_decisions(runs_root: Path, task_id: str, run_id: str) -> list[dict]:

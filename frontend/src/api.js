@@ -13,6 +13,31 @@ const q = (obj) =>
     .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join("&");
 
+const keyPart = (value, fallback) =>
+  String(value || fallback)
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^[_\-.]+|[_\-.]+$/g, "")
+    .slice(0, 64) || fallback;
+
+export const dataLakeImportIdempotencyKey = (taskId, importId = "") => {
+  const random =
+    globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  return `data-lake-import:${keyPart(taskId, "task")}:${keyPart(importId, "default")}:${random}`;
+};
+
+export const dataLakeImportPayload = (taskId, payload = {}) => {
+  const body = { task_id: taskId, ...payload };
+  if (body.dry_run || body.dryRun) return body;
+  return {
+    ...body,
+    confirm: body.confirm ?? true,
+    idempotency_key: body.idempotency_key || dataLakeImportIdempotencyKey(taskId, body.import_id),
+  };
+};
+
 export const getTasks = () => req("/api/tasks");
 const unwrapSettings = (data) => data.settings || data.config || data || {};
 
@@ -101,7 +126,7 @@ export const importFromDataLake = (taskId, payload = {}) =>
   req("/api/import/data_lake", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ task_id: taskId, ...payload }),
+    body: JSON.stringify(dataLakeImportPayload(taskId, payload)),
   });
 
 export const archiveImport = (taskId, importId, reason = "") =>
