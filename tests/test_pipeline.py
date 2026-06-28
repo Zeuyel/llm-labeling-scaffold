@@ -1662,6 +1662,164 @@ def test_argilla_push_batch_plan_dispatch_writes_dispatch_file_and_lineage(tmp_p
     assert manifest["record_id_policy"]["strategy"] == "batch_scoped"
 
 
+def test_annotation_decision_gold_status_contract_links_manifests(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    task_id = "smoke_status_task"
+    annotation_dir = runs_root / task_id / "annotation_jobs" / "argilla_round_1"
+    dispatch_path = annotation_dir / "dispatch.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "A"}], dispatch_path)
+    write_json(
+        {
+            "task_id": task_id,
+            "annotation_id": "argilla_round_1",
+            "source": "argilla",
+            "argilla_dataset": "dataset_round_1",
+            "dispatch_path": str(dispatch_path),
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    dispatched = pipeline.annotation_job_detail(runs_root, task_id, "argilla_round_1")
+    assert dispatched["local_dispatch_file"] == str(dispatch_path)
+    assert dispatched["local_dispatch_file_exists"] is True
+    assert dispatched["argilla_published"] is False
+    assert dispatched["decisions_pulled"] is False
+    assert dispatched["gold_generated"] is False
+    assert dispatched["state"] == "dispatch_ready"
+
+    manifest_path = annotation_dir / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest.update({
+        "status": "已分发",
+        "created_at": "2026-06-28T00:00:00+00:00",
+        "result": {"records": 1, "record_id_policy": {"strategy": "original"}},
+    })
+    write_json(manifest, manifest_path)
+    published = pipeline.annotation_job_detail(runs_root, task_id, "argilla_round_1")
+    assert published["argilla_published"] is True
+    assert published["state"] == "argilla_published"
+
+    decision_dir = runs_root / task_id / "decisions" / "decision_round_1"
+    decisions_path = decision_dir / "decisions.jsonl"
+    write_json(
+        {
+            "task_id": task_id,
+            "decision_id": "decision_round_1",
+            "annotation_id": "argilla_round_1",
+            "source_annotation_id": "argilla_round_1",
+            "source": "argilla",
+            "argilla_dataset": "dataset_round_1",
+            "path": str(decisions_path),
+            "rows": 0,
+        },
+        decision_dir / "manifest.json",
+    )
+    pulled = pipeline.annotation_job_detail(runs_root, task_id, "argilla_round_1")
+    assert pulled["decisions_pulled"] is True
+    assert pulled["linked_decision_ids"] == ["decision_round_1"]
+    assert pulled["state"] == "decisions_pulled"
+
+    gold_dir = runs_root / task_id / "gold"
+    gold_path = gold_dir / "gold_v001.jsonl"
+    write_json(
+        {
+            "task_id": task_id,
+            "version": "v001",
+            "path": str(gold_path),
+            "decisions": str(decisions_path),
+            "rows": 0,
+            "source": "decision_artifact",
+        },
+        gold_dir / "gold_v001.manifest.json",
+    )
+    completed = pipeline.annotation_job_detail(runs_root, task_id, "argilla_round_1")
+    assert completed["gold_generated"] is True
+    assert completed["linked_gold_versions"] == ["v001"]
+    assert completed["state"] == "gold_generated"
+
+    decision = pipeline.decision_artifact_detail(runs_root, task_id, "decision_round_1")
+    assert decision["argilla_published"] is True
+    assert decision["decisions_pulled"] is True
+    assert decision["gold_generated"] is True
+    assert decision["linked_gold_versions"] == ["v001"]
+    assert decision["local_dispatch_file_exists"] is True
+
+    gold = pipeline.gold_version_detail(runs_root, task_id, "v001")
+    assert gold["gold_generated"] is True
+    assert gold["decisions_pulled"] is True
+    assert gold["linked_decision_ids"] == ["decision_round_1"]
+    assert gold["linked_gold_versions"] == ["v001"]
+
+
+def test_decision_and_gold_status_choose_existing_dispatch_from_later_linked_annotation(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    task_id = "dispatch_selection_task"
+    task_dir = runs_root / task_id
+    dataset = "shared_argilla_dataset"
+
+    missing_dir = task_dir / "annotation_jobs" / "round_a_missing"
+    write_json(
+        {
+            "task_id": task_id,
+            "annotation_id": "round_a_missing",
+            "source": "argilla",
+            "argilla_dataset": dataset,
+        },
+        missing_dir / "manifest.json",
+    )
+
+    present_dir = task_dir / "annotation_jobs" / "round_b_present"
+    present_dispatch = present_dir / "dispatch.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "A"}], present_dispatch)
+    write_json(
+        {
+            "task_id": task_id,
+            "annotation_id": "round_b_present",
+            "source": "argilla",
+            "argilla_dataset": dataset,
+            "dispatch_path": str(present_dispatch),
+        },
+        present_dir / "manifest.json",
+    )
+
+    decision_dir = task_dir / "decisions" / "decision_shared"
+    decisions_path = decision_dir / "decisions.jsonl"
+    write_json(
+        {
+            "task_id": task_id,
+            "decision_id": "decision_shared",
+            "source": "argilla",
+            "argilla_dataset": dataset,
+            "path": str(decisions_path),
+            "rows": 0,
+        },
+        decision_dir / "manifest.json",
+    )
+
+    gold_dir = task_dir / "gold"
+    write_json(
+        {
+            "task_id": task_id,
+            "version": "v001",
+            "path": str(gold_dir / "gold_v001.jsonl"),
+            "decisions": str(decisions_path),
+            "rows": 0,
+            "source": "decision_artifact",
+        },
+        gold_dir / "gold_v001.manifest.json",
+    )
+
+    decision = pipeline.decision_artifact_detail(runs_root, task_id, "decision_shared")
+    assert decision["linked_annotation_ids"] == ["round_a_missing", "round_b_present"]
+    assert decision["local_dispatch_file"] == str(present_dispatch)
+    assert decision["local_dispatch_file_exists"] is True
+
+    gold = pipeline.gold_version_detail(runs_root, task_id, "v001")
+    assert gold["linked_annotation_ids"] == ["round_a_missing", "round_b_present"]
+    assert gold["local_dispatch_file"] == str(present_dispatch)
+    assert gold["local_dispatch_file_exists"] is True
+
+
 def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: Path):
     created = pipeline.create_task(
         tmp_path / "tasks",
