@@ -141,6 +141,44 @@ cd llm-labeling-scaffold
 ./scripts/stack up --mlflow
 ```
 
+### SaaS smoke 验收
+
+真实部署启动后，可以在服务器本地运行 scaffold smoke runner。不要把真实 URL、token、Basic Auth 密码、rclone 配置路径或 secret 路径写入仓库文件；使用 shell 环境变量或服务器 secret manager 注入。
+
+Basic Auth 示例：
+
+```bash
+export LLS_SMOKE_SERVER_URL=http://127.0.0.1:8765
+export LLS_SMOKE_BASIC_USER=admin
+export LLS_SMOKE_BASIC_PASSWORD='<read-from-local-secret-manager>'
+PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format markdown
+```
+
+Bearer token 示例：
+
+```bash
+export LLS_SMOKE_SERVER_URL='<deployment-url>'
+export LLS_SMOKE_TOKEN='<read-from-local-secret-manager>'
+PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format json
+```
+
+runner 默认检查：
+
+- discovery：`/api/health`、`/api/version`、`/api/capabilities`、`/api/settings/public`
+- task check：`patent_boundary_v0_1`
+- import dry-run：`patent_boundary_manual_seed_500_2026_06_27`
+
+任务和导入编号可以按部署覆盖：
+
+```bash
+PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke \
+  --task-id patent_boundary_v0_1 \
+  --import-id patent_boundary_manual_seed_500_2026_06_27 \
+  --format markdown
+```
+
+import dry-run 只会在 `/api/capabilities` 声明了 side-effect-free dry-run contract 时发送请求；当前服务若只暴露会启动真实导入的 `POST /api/import/data_lake`，runner 会把该项标记为 `not_supported`，不会伪造通过。输出摘要会对 token、rclone config、Argilla key、数据库密码和 secret path 做脱敏；任何 `not_supported`、`missing` 或失败项都会让命令返回非零退出码。
+
 ## 环境变量
 
 默认配置在 `.env.example`：
