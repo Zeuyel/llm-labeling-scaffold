@@ -30,6 +30,7 @@ function parseList(value) {
 export default function TasksPage({
   tasks,
   onReload,
+  onSync,
   onError,
   allowDataLakeOverrides = false,
   taskSource = "local",
@@ -140,7 +141,11 @@ export default function TasksPage({
   async function reloadTasks() {
     setSyncing(true);
     try {
-      await onReload();
+      if (r2TaskSource) {
+        await (onSync || onReload)();
+      } else {
+        await onReload();
+      }
     } finally {
       setSyncing(false);
     }
