@@ -3218,6 +3218,17 @@ def _enrich_annotation_job_status(
     }
 
 
+def _linked_annotation_dispatch_status(task_dir: Path, annotations: list[dict]) -> tuple[str | None, bool]:
+    first_candidate: str | None = None
+    for annotation in annotations:
+        candidate, exists = _annotation_dispatch_status(task_dir, annotation)
+        if first_candidate is None and candidate:
+            first_candidate = candidate
+        if exists:
+            return candidate, True
+    return first_candidate, False
+
+
 def _enrich_decision_artifact_status(
     task_dir: Path,
     item: dict[str, Any],
@@ -3229,12 +3240,7 @@ def _enrich_decision_artifact_status(
         str(annotation.get("annotation_id") or "")
         for annotation in linked_annotations
     ])
-    local_dispatch_file = None
-    local_dispatch_file_exists = False
-    for annotation in linked_annotations:
-        local_dispatch_file, local_dispatch_file_exists = _annotation_dispatch_status(task_dir, annotation)
-        if local_dispatch_file:
-            break
+    local_dispatch_file, local_dispatch_file_exists = _linked_annotation_dispatch_status(task_dir, linked_annotations)
     decision_id = str(item.get("decision_id") or "")
     linked_gold_versions = _ordered_unique([
         str(gold.get("version") or "")
@@ -3290,12 +3296,7 @@ def _enrich_gold_version_status(
         str(annotation.get("annotation_id") or "")
         for annotation in linked_annotations
     ])
-    local_dispatch_file = None
-    local_dispatch_file_exists = False
-    for annotation in linked_annotations:
-        local_dispatch_file, local_dispatch_file_exists = _annotation_dispatch_status(task_dir, annotation)
-        if local_dispatch_file:
-            break
+    local_dispatch_file, local_dispatch_file_exists = _linked_annotation_dispatch_status(task_dir, linked_annotations)
     decisions_path = item.get("decisions") or item.get("decisions_path")
     decisions_pulled = bool(linked_decision_ids)
     if not decisions_pulled and decisions_path:
