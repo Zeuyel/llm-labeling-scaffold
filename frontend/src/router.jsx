@@ -1,4 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
+export { matchRoute } from "./routeMatching.js";
 
 const RouterCtx = createContext({ path: "/", navigate: () => {} });
 
@@ -22,19 +23,6 @@ export function RouterProvider({ children }) {
 
 export function useRouter() {
   return useContext(RouterCtx);
-}
-
-// matches "/task/:id/sample" against current path, returns params or null
-export function matchRoute(pattern, path) {
-  const pp = pattern.split("/").filter(Boolean);
-  const cp = path.split("/").filter(Boolean);
-  if (pp.length !== cp.length) return null;
-  const params = {};
-  for (let i = 0; i < pp.length; i++) {
-    if (pp[i].startsWith(":")) params[pp[i].slice(1)] = decodeURIComponent(cp[i]);
-    else if (pp[i] !== cp[i]) return null;
-  }
-  return params;
 }
 
 export function Link({ to, className, children, title }) {

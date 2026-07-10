@@ -5,10 +5,12 @@ import {
   computeSampleWorkflow,
   computeSamplesListView,
   filterSampleAuditEvents,
+  findSampleById,
   hasBatchPlan,
   newestSample,
   sampleCreatedAt,
   sampleCompletionNotice,
+  sampleDetailPath,
   sampleStateLabel,
   STAGE_STATUS,
 } from "./samplesWorkflowState.js";
@@ -55,6 +57,18 @@ test("samples page defaults to list-first state", () => {
   assert.equal(loading.defaultSurface, "list");
   assert.equal(loading.status, STAGE_STATUS.LOADING);
   assert.equal(loading.showEmpty, false);
+});
+
+test("sample detail route helpers encode task and sample ids", () => {
+  assert.equal(
+    sampleDetailPath("task a", "sample/one"),
+    "/task/task%20a/samples/sample%2Fone",
+  );
+  assert.deepEqual(
+    findSampleById([{ sample_id: "sample_a" }, { sample_id: "sample_b" }], "sample_b"),
+    { sample_id: "sample_b" },
+  );
+  assert.equal(findSampleById([{ sample_id: "sample_a" }], ""), null);
 });
 
 test("argilla step requires a generated batch plan", () => {

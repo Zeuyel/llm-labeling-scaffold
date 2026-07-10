@@ -33,6 +33,16 @@ export function hasBatchPlan(sample) {
   return getBatchManifests(sample).length > 0;
 }
 
+export function sampleDetailPath(taskId, sampleId) {
+  return `/task/${encodeURIComponent(taskId || "")}/samples/${encodeURIComponent(sampleId || "")}`;
+}
+
+export function findSampleById(samples = [], sampleId = "") {
+  const target = String(sampleId || "");
+  if (!target) return null;
+  return samples.find((item) => String(item?.sample_id || "") === target) || null;
+}
+
 export function sampleStateLabel(sample) {
   const state = String(sample?.state || sample?.manifest?.state || "active").trim().toLowerCase();
   if (state === "active") return "可用";
