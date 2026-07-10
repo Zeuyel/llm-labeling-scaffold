@@ -31,8 +31,11 @@ function planIdFromPath(value) {
   return last;
 }
 
-function countLike(value) {
-  return Array.isArray(value) ? value.length : value;
+export function countLike(value) {
+  if (value === undefined || value === null || value === "") return undefined;
+  if (Array.isArray(value)) return value.length;
+  if (typeof value === "object") return Object.keys(value).length;
+  return value;
 }
 
 export function displayPlanValue(value) {

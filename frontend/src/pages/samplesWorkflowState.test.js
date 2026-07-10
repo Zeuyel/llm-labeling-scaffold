@@ -7,6 +7,7 @@ import {
   filterSampleAuditEvents,
   hasBatchPlan,
   newestSample,
+  sampleBatchSummary,
   sampleCreatedAt,
   sampleCompletionNotice,
   sampleStateLabel,
@@ -82,6 +83,39 @@ test("argilla step requires a generated batch plan", () => {
   assert.equal(hasBatchPlan(sampleWithPlan), true);
   assert.equal(ready.batch.status, STAGE_STATUS.COMPLETED);
   assert.equal(ready.argilla.status, STAGE_STATUS.READY);
+});
+
+test("sample batch summary renders overlap collections as counts", () => {
+  const objectArray = sampleBatchSummary({
+    latest_batch_manifest: {
+      batch_count: 1,
+      overlap_items: [{ id: "r1" }, { id: "r2" }],
+    },
+  });
+  const idArray = sampleBatchSummary({
+    latest_batch_manifest: {
+      overlap_item_ids: ["r1", "r2", "r3"],
+    },
+  });
+  const numeric = sampleBatchSummary({
+    latest_batch_manifest: {
+      overlap_item_count: 50,
+    },
+  });
+  const objectMap = sampleBatchSummary({
+    latest_batch_manifest: {
+      overlap_items: {
+        r1: { id: "r1" },
+        r2: { id: "r2" },
+      },
+    },
+  });
+
+  assert.equal(objectArray.overlapText, "2 条");
+  assert.equal(objectArray.overlapText.includes("[object Object]"), false);
+  assert.equal(idArray.overlapText, "3 条");
+  assert.equal(numeric.overlapText, "50 条");
+  assert.equal(objectMap.overlapText, "2 条");
 });
 
 test("sample detail actions enable argilla only after batch plan exists", () => {
