@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from llm_labeling_scaffold import task_control
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.io import read_json
@@ -86,3 +88,18 @@ def test_publish_writes_revision_snapshots_and_increments_revision(tmp_path: Pat
     assert load_task(first_snapshot / "task.yaml").raw["revision"] == 1
     assert load_task(second_snapshot / "task.yaml").raw["revision"] == 2
     assert [item["revision"] for item in record["revisions"]] == [1, 2]
+
+
+def test_publish_requires_complete_data_lake_configuration(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = _draft_spec()
+    spec["data_lake"].pop("output_base_uri")
+    task_control.create_draft(runs_root, tasks_root, spec)
+
+    with pytest.raises(ValueError, match="output_base_uri"):
+        task_control.publish_task(runs_root, tasks_root, spec["task_id"])
+
+    record = task_control.get_task_record(runs_root, spec["task_id"])
+    assert record["revision"] == 0
+    assert not (tasks_root / spec["task_id"] / "task.yaml").exists()

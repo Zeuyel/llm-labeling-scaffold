@@ -40,6 +40,8 @@ export const dataLakeImportPayload = (taskId, payload = {}) => {
 
 export const getTasks = () => req("/api/tasks");
 export const syncTasks = () => req("/api/tasks/sync", { method: "POST" });
+export const getTaskControl = (taskId) =>
+  req(`/api/task/control?${q({ task_id: taskId })}`).then((data) => data.task || data);
 const unwrapSettings = (data) => data.settings || data.config || data || {};
 
 export const getSettings = () => req("/api/settings").then(unwrapSettings);
@@ -69,6 +71,18 @@ export const createTask = (payload) =>
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
+  }).then((data) => data.task || data);
+
+export const updateTask = (taskId, payload) =>
+  req(`/api/tasks/${encodeURIComponent(taskId)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  }).then((data) => data.task || data);
+
+export const publishTask = (taskId) =>
+  req(`/api/tasks/${encodeURIComponent(taskId)}/publish`, {
+    method: "POST",
   }).then((data) => data.task || data);
 
 export const updateSettings = (payload) =>

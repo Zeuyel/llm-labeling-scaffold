@@ -18,7 +18,7 @@ from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
 
-API_CONTRACT_VERSION = "2026-06-28"
+API_CONTRACT_VERSION = "2026-07-12"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -64,6 +64,10 @@ def _task_source_mode() -> str:
 
 def _r2_task_source_enabled() -> bool:
     return _task_source_mode() == "r2"
+
+
+def _control_task_source_enabled() -> bool:
+    return _task_source_mode() == "control"
 
 
 def _task_registry_sync_ttl_seconds() -> float:
@@ -127,7 +131,7 @@ def _contract_capabilities() -> dict[str, Any]:
     return {
         "service": "llm-labeling-scaffold",
         "api_contract_version": API_CONTRACT_VERSION,
-        "auth": {"type": "basic"},
+        "auth": {"type": "basic", "multi_user": False},
         "endpoints": [
             {
                 "method": "GET",
@@ -190,6 +194,51 @@ def _contract_capabilities() -> dict[str, Any]:
                     "required": ["task"],
                     "properties": {"task": {"type": "object", "required": ["task_id", "profile", "data_lake"]}},
                 },
+            },
+            {
+                "method": "GET",
+                "path": "/api/tasks",
+                "action": "tasks_list",
+                "side_effects": False,
+                "response_schema": {"type": "object", "required": ["tasks"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/task/control",
+                "action": "task_control_detail",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "query_params": {"task_id": {"type": "string", "required": True}},
+                "response_schema": {"type": "object", "required": ["task"]},
+            },
+            {
+                "method": "POST",
+                "path": "/api/tasks",
+                "action": "task_control_create_draft",
+                "side_effects": True,
+                "requires_task_source": "control",
+                "request_schema": {"type": "object", "required": ["task_id", "text_fields", "primary_label_values"]},
+                "response_schema": {"type": "object", "required": ["ok", "task"]},
+            },
+            {
+                "method": "PUT",
+                "path": "/api/tasks/{task_id}",
+                "action": "task_control_update_draft",
+                "side_effects": True,
+                "requires_task_source": "control",
+                "path_params": {"task_id": {"type": "string"}},
+                "request_schema": {"type": "object", "required": ["task_id", "text_fields", "primary_label_values"]},
+                "response_schema": {"type": "object", "required": ["ok", "task"]},
+            },
+            {
+                "method": "POST",
+                "path": "/api/tasks/{task_id}/publish",
+                "action": "task_control_publish",
+                "side_effects": True,
+                "requires_task_source": "control",
+                "path_params": {"task_id": {"type": "string"}},
+                "request_schema": {"type": "object", "additionalProperties": False},
+                "response_schema": {"type": "object", "required": ["ok", "task", "published"]},
             },
             {
                 "method": "POST",
@@ -560,6 +609,18 @@ class _Handler(BaseHTTPRequestHandler):
         user, _, pw = raw.partition(":")
         return hmac.compare_digest(user, self.auth_user) and hmac.compare_digest(pw, self.auth_pass)
 
+    def _actor(self) -> str:
+        header = self.headers.get("Authorization", "")
+        if header.startswith("Basic "):
+            try:
+                raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
+                user, _, _ = raw.partition(":")
+                if user:
+                    return user
+            except Exception:
+                pass
+        return self.auth_user or "panel"
+
     def _require_auth(self) -> bool:
         if self._authed():
             return True
@@ -617,6 +678,10 @@ class _Handler(BaseHTTPRequestHandler):
             return synced
 
     def _list_tasks(self) -> list[dict]:
+        if _control_task_source_enabled():
+            from .task_control import list_control_tasks
+
+            return list_control_tasks(self.runs_root)
         tasks = pipeline.list_tasks(self.tasks_root)
         if not _r2_task_source_enabled():
             return tasks
@@ -632,9 +697,18 @@ class _Handler(BaseHTTPRequestHandler):
         return out
 
     def _load_task_by_id(self, task_id: str):
+        if _control_task_source_enabled():
+            from .task_control import get_task_record
+
+            record = get_task_record(self.runs_root, task_id)
+            if not record.get("published"):
+                raise ValueError(f"任务尚未发布，不能执行: {task_id}")
         return pipeline.load_task_by_id(self.tasks_root, task_id)
 
     def _resolve_action_task_path(self, task_path: str) -> str:
+        if _control_task_source_enabled():
+            task = load_task(task_path)
+            return str(self._load_task_by_id(task.task_id).path)
         if not _r2_task_source_enabled():
             return task_path
         try:
@@ -833,6 +907,20 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"tasks": self._list_tasks()})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/task/control":
+            if not _control_task_source_enabled():
+                self._json({"error": "当前不是 scaffold 控制面任务来源模式"}, status=400)
+                return
+            task = params.get("task_id", [""])[0]
+            if not _safe_segment(task):
+                self._json({"error": "bad task"}, status=400)
+                return
+            try:
+                from .task_control import get_task_record
+
+                self._json({"task": get_task_record(self.runs_root, task)})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=404)
         elif path == "/api/task/profile":
             task = params.get("task_id", [""])[0]
             preset = params.get("preset", [""])[0].strip() or None
@@ -1076,8 +1164,20 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path
         params = parse_qs(parsed.query)
         contract_check_task_id = _contract_task_path(path, suffix="check")
+        publish_task_id = _contract_task_path(path, suffix="publish")
         if contract_check_task_id is not None:
             self._task_check(contract_check_task_id)
+        elif publish_task_id is not None:
+            if not _control_task_source_enabled():
+                self._json({"error": "只有 scaffold 控制面任务来源模式支持发布任务 revision"}, status=400)
+                return
+            try:
+                from .task_control import publish_task
+
+                result = publish_task(self.runs_root, self.tasks_root, publish_task_id, actor=self._actor())
+                self._json({"ok": True, **result})
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
         elif path == "/api/tasks/sync":
             self._sync_tasks_from_registry()
         elif path.startswith("/api/tasks/"):
@@ -1117,6 +1217,12 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/tasks":
             body = self._read_body()
             try:
+                if _control_task_source_enabled():
+                    from .task_control import create_draft
+
+                    result = create_draft(self.runs_root, self.tasks_root, body, actor=self._actor())
+                    self._json({"ok": True, **result})
+                    return
                 if _r2_task_source_enabled():
                     self._json({"error": "生产模式任务必须从 R2 数据湖登记表拉取，不能在面板中新建本地任务"}, status=400)
                     return
@@ -1176,6 +1282,27 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, status=404)
 
+    def do_PUT(self) -> None:
+        if not self._require_auth():
+            return
+        parsed = urlparse(self.path)
+        path = parsed.path
+        task_id = _contract_task_path(path)
+        if task_id is None:
+            self._json({"error": "not found"}, status=404)
+            return
+        if not _control_task_source_enabled():
+            self._json({"error": "只有 scaffold 控制面任务来源模式支持编辑任务草稿"}, status=400)
+            return
+        body = self._read_body()
+        try:
+            from .task_control import update_draft
+
+            result = update_draft(self.runs_root, task_id, body, actor=self._actor())
+            self._json({"ok": True, **result})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
     def do_DELETE(self) -> None:
         if not self._require_auth():
             return
@@ -1186,6 +1313,9 @@ class _Handler(BaseHTTPRequestHandler):
             task_id = params.get("task_id", [""])[0]
             delete_runs = params.get("delete_runs", ["0"])[0] in {"1", "true", "yes"}
             try:
+                if _control_task_source_enabled():
+                    self._json({"error": "控制面任务不能直接删除本地 task.yaml；请通过任务状态停用或归档"}, status=400)
+                    return
                 if _r2_task_source_enabled():
                     self._json({"error": "生产模式任务来自 R2 数据湖登记表，不能在面板中归档本地缓存；请在登记表中标记为非启用状态"}, status=400)
                     return

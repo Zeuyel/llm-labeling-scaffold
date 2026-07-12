@@ -84,6 +84,7 @@ def test_unpublished_control_draft_cannot_load_normal_task_detail(tmp_path: Path
         status, created = _request(base_url, "/api/tasks", method="POST", body=spec)
         assert status == 200
         assert created["task"]["status"] == "draft"
+        assert created["record"]["created_by"] == "admin"
         assert not (tasks_root / spec["task_id"] / "task.yaml").exists()
 
         status, tasks = _request(base_url, "/api/tasks")
@@ -123,6 +124,7 @@ def test_control_api_updates_publishes_revisions_and_rejects_delete(tmp_path: Pa
         assert status == 200
         first_snapshot = Path(first["published"]["snapshot_path"])
         assert first["task"]["revision"] == 1
+        assert first["record"]["published_by"] == "admin"
         assert first_snapshot.exists()
         assert load_task(first_snapshot).raw["revision"] == 1
 

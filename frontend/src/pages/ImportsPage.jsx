@@ -290,7 +290,7 @@ export default function ImportsPage({
   async function checkDataLake() {
     if (!taskId) return;
     if (!hasDataLakeConfig) {
-      onError("当前任务没有 data_lake 来源。需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。");
+      onError("当前任务没有数据湖来源。请返回任务单编辑页，在数据湖字段配置已登记的数据集和对象后发布任务。");
       return;
     }
     setLakeBusy(true);
@@ -310,7 +310,7 @@ export default function ImportsPage({
   async function importLake() {
     if (!taskId) return;
     if (!hasDataLakeConfig) {
-      onError("当前任务没有 data_lake 来源。需要在 R2 任务配置的 data_lake 字段登记来源，然后同步任务配置。");
+      onError("当前任务没有数据湖来源。请返回任务单编辑页，在数据湖字段配置已登记的数据集和对象后发布任务。");
       return;
     }
     setLakeBusy(true);
