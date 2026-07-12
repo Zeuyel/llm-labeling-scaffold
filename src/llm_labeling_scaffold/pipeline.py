@@ -1489,7 +1489,7 @@ def _normalize_label(raw: dict[str, Any], *, primary: bool = False) -> dict[str,
     return label
 
 
-def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
+def build_task_raw_from_spec(spec: dict[str, Any], *, revision: int | None = None) -> dict[str, Any]:
     task_id = str(spec.get("task_id", "")).strip()
     if not task_id or ".." in task_id or "/" in task_id or "\\" in task_id:
         raise ValueError("任务编号只能使用单段目录名")
@@ -1512,15 +1512,6 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
     ]
     if not text_fields:
         raise ValueError("至少需要一个文本字段")
-
-    roots = _task_roots(tasks_root)
-    root = roots[-1] if roots else Path("tasks")
-    task_dir = root / task_id
-    task_path = task_dir / "task.yaml"
-    if task_path.exists() or _active_task_exists(roots, task_id):
-        raise ValueError(f"任务已存在: {task_id}")
-    if _archived_task_exists(roots, task_id):
-        raise ValueError(f"任务编号已归档，不能复用: {task_id}")
 
     raw = {
         "task_id": task_id,
@@ -1546,6 +1537,24 @@ def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
         cleaned = {str(key): value for key, value in data_lake.items() if value not in (None, "")}
         if cleaned:
             raw["data_lake"] = cleaned
+    if revision is not None:
+        raw["revision"] = int(revision)
+    return raw
+
+
+def create_task(tasks_root: str | Path, spec: dict[str, Any]) -> dict:
+    raw = build_task_raw_from_spec(spec)
+    task_id = str(raw["task_id"])
+
+    roots = _task_roots(tasks_root)
+    root = roots[-1] if roots else Path("tasks")
+    task_dir = root / task_id
+    task_path = task_dir / "task.yaml"
+    if task_path.exists() or _active_task_exists(roots, task_id):
+        raise ValueError(f"任务已存在: {task_id}")
+    if _archived_task_exists(roots, task_id):
+        raise ValueError(f"任务编号已归档，不能复用: {task_id}")
+
     task_dir.mkdir(parents=True, exist_ok=False)
     write_text_atomic(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), task_path)
     prompt = str(spec.get("prompt", "")).strip()

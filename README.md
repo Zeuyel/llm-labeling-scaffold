@@ -80,15 +80,34 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 模型训练按“控制面和计算面分离”设计。控制台服务器可以是低配机器，高性能训练服务器作为计算面接入。详细设计见 [远程训练设计](docs/remote_training_design.md)。
 
-## 部署配置分层
+## 任务来源和部署配置
 
-平台部署时按三层管理配置和数据：
+平台按 `LLS_TASK_SOURCE` 区分任务单权威来源，再单独配置 R2 数据湖：
 
-1. **R2 数据湖 / registry 是权威层**：任务列表、任务快照、源数据 manifest、任务级输入对象以及需要回写的数据湖产物，都以 R2 registry 中登记的 URI 为准。`task_registry_uri` 指向数据湖治理登记表，通常是 `governance/data_lake/v1/current/data_lake.yaml`；登记表中的 `tasks.<task_id>.task_uri` 才指向具体 `task.yaml`，`task_registry_uri` 不是 `task.yaml` 本身。
-2. **panel settings 是运行配置层**：当前部署在“系统设置”中保存 `task_registry_uri` 和 `data_lake_r2_prefix`，决定本控制台连接哪一个 R2 registry 和允许访问哪个 R2 前缀。
-3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 只缓存从 registry 同步下来的任务配置；`runs/` 保存导入、样本、标注结果、训练集、模型、推理结果和审计日志。
+1. **`r2`**：R2 registry 管理任务列表和远端 `task.yaml`。`task_registry_uri` 指向数据湖治理登记表，通常是 `governance/data_lake/v1/current/data_lake.yaml`；登记表中的 `tasks.<task_id>.task_uri` 才指向具体 `task.yaml`。
+2. **`control`**：scaffold 控制面管理任务单、草稿和发布 revision。R2 不再作为任务单来源，只提供任务配置中声明的数据湖输入和产物读写。
+3. **`local`**：直接读取本地 `tasks/`，仅适合开发或测试。
+4. **panel settings 和本地执行目录**：`task_registry_uri` 与 `data_lake_r2_prefix` 配置 R2 数据湖连接和允许前缀；`runs/` 保存运行产物，`tasks/` 保存 `r2` 模式的同步缓存或 `control` 模式当前已发布的可执行任务配置。
 
-服务器部署后，第一步是在轻量控制台的“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，保存后同步任务配置。`task_registry_uri` 应填写数据湖治理登记表地址，不要填写某个任务的 `task.yaml`。不要把示例 bucket 当成生产配置；同一套镜像应能连接任意符合约定的 R2 数据湖。
+`r2` 模式首次部署后，应在“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，再同步任务配置。`control` 模式不从 R2 同步任务；其中的 R2 配置只在任务访问数据湖时使用。不要把示例 bucket 当成生产配置；同一套镜像应能连接任意符合约定的 R2 数据湖。
+
+## 控制面任务生命周期
+
+`LLS_TASK_SOURCE=control` 下，任务单先以 draft 保存。创建 draft 时 revision 为 `0`，草稿的最新内容保存在 `runs/_system/task_control/registry.json`，此时不会生成可执行的 `task.yaml`。修改已发布任务会保留当前已发布 revision，并把状态改为 `published_with_draft`。
+
+发布会校验 draft，生成递增的 revision，并把当前可执行配置写到 `tasks/<task_id>/task.yaml`；如果配置包含 prompt，同时写入同目录的 `prompt.revision_<六位编号>.md`。每次发布还会保留不可覆盖快照：
+
+```text
+runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/task.yaml
+runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/prompt.md
+runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/draft_spec.json
+```
+
+`registry.json` 保留 draft、当前发布信息和 revision 历史；流水线只使用当前已发布的 `tasks/<task_id>/task.yaml`。因此 draft 不会直接改变正在执行的已发布任务。
+
+## 认证边界
+
+控制面没有引入完整的多用户登录、团队隔离或 RBAC。面板仍使用一个静态 Basic Auth 账号（Docker 默认用户名为 `admin`，密码由部署的 `LLS_PANEL_PASSWORD` 提供）；任务记录中的操作者只是该已认证账号。部署时应通过环境或 secret manager 注入真实密码，不能将其提交到仓库。
 
 ## 服务器测试
 
@@ -115,7 +134,7 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull p
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
 ```
 
-启动后先访问轻量控制台，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。只要启用 R2/data lake，任何 compose 启动都必须包含 rclone override 或等价 secret 挂载。
+`r2` 模式启动后，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。只要任务需要 R2 数据湖，compose 启动都必须包含 rclone override 或等价 secret 挂载。
 
 如果要同时测试可选模型记录服务：
 
@@ -140,6 +159,16 @@ cd llm-labeling-scaffold
 ```bash
 ./scripts/stack up --mlflow
 ```
+
+### 启用控制面任务来源
+
+默认 compose 使用 `LLS_TASK_SOURCE=control`。如部署文件覆盖了该变量，请在 `.env` 中明确设置：
+
+```text
+LLS_TASK_SOURCE=control
+```
+
+控制面模式不会从 R2 registry 同步任务。草稿和 revision 会写入持久化的 `./runs` 挂载，发布后才写入 `./tasks` 挂载供流水线执行。控制面任务仍可使用 R2 数据湖；此时保留 `LLS_TASK_REGISTRY_URI`、`LLS_DATA_LAKE_R2_PREFIX` 和只读 rclone 配置，但它们不决定任务单列表。
 
 ### SaaS smoke 验收
 
@@ -194,13 +223,13 @@ ARGILLA_API_KEY=argilla.apikey
 ARGILLA_WORKSPACE=argilla
 
 MLFLOW_PORT=5000
-LLS_TASK_SOURCE=r2
+LLS_TASK_SOURCE=control
 LLS_TASK_REGISTRY_URI=r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.yaml
 LLS_DATA_LAKE_R2_PREFIX=r2:YOUR_BUCKET/
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
 
-`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。`LLS_TASK_REGISTRY_URI` 对应 `task_registry_uri`，应指向数据湖治理登记表，通常是 `data_lake.yaml`；具体任务文件由登记表的 `tasks.<task_id>.task_uri` 指向。
+`LLS_TASK_SOURCE` 可设为 `r2`、`control` 或 `local`。`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。在 `r2` 模式中，`LLS_TASK_REGISTRY_URI` 对应 `task_registry_uri`，应指向数据湖治理登记表，通常是 `data_lake.yaml`；具体任务文件由登记表的 `tasks.<task_id>.task_uri` 指向。在 `control` 模式中，它只作为数据湖 registry 的默认配置，不参与任务单同步。
 
 `MLFLOW_TRACKING_URI` 默认不设置。只有需要把训练记录同步到可选模型记录服务时，才设置：
 
@@ -222,13 +251,13 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 
 容器挂载：
 
-- `./runs:/app/runs`：保存样本、标注结果、训练集、模型和推理产物
-- `./tasks:/app/tasks`：R2 任务配置的本地执行缓存
+- `./runs:/app/runs`：保存样本、标注结果、训练集、模型、推理产物，以及控制面的 registry 和 revision 快照
+- `./tasks:/app/tasks`：`r2` 模式的任务配置缓存，或 `control` 模式当前已发布的可执行任务配置
 - `./configs:/app/configs:ro`：配置示例
 
-生产面板默认使用 `LLS_TASK_SOURCE=r2`。当前部署应在“系统设置”保存 `task_registry_uri` 和 `data_lake_r2_prefix`；启动兜底值可由 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 提供。`task_registry_uri` 是数据湖治理登记表地址，通常是 `data_lake.yaml`；刷新或同步任务时，面板会从登记表读取 `tasks.<任务编号>.task_uri`，把远端 `task.yaml` 同步到 `tasks/<任务编号>/task.yaml` 作为本地缓存。面板不允许新建或归档本地任务配置；任务下线应在 R2 registry 中把对应任务标记为非启用状态。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
+生产面板默认使用 `LLS_TASK_SOURCE=control`。任务单由控制面创建、编辑和发布，当前已发布 revision 写入 `tasks/<任务编号>/task.yaml` 供流水线执行；`runs/` 保留草稿和 revision 快照。启动兜底值可由 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 提供，它们只配置 R2 数据湖。需要兼容既有上游任务登记表时，可显式设置 `LLS_TASK_SOURCE=r2`；该模式从登记表读取 `tasks.<任务编号>.task_uri` 并缓存远端 `task.yaml`。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
 
-生产模式下，R2 数据湖是任务输入的权威来源，面板只把登记表和 manifest 指定的任务级 JSONL materialize 到本地 `runs/<task_id>/imports/`。手动上传文件和粘贴导入默认关闭，只能在本地开发或测试模式下开启。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
+无论任务来源，只要任务配置了 `data_lake`，R2 数据湖就是任务输入的权威来源；面板只把登记表和 manifest 指定的任务级 JSONL materialize 到本地 `runs/<task_id>/imports/`。手动上传文件和粘贴导入默认关闭，只能在本地开发或测试模式下开启。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
 
 配置了 `data_lake` 的任务可以从 R2 数据湖 manifest 生成本地导入。R2 导入是下载、校验和原子提交过程，应作为异步 job 执行；页面通过 job 状态反馈排队、运行、成功或失败。导入成功后，profile 的下一步是从该导入中抽取样本。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。生产面板默认不能覆盖数据湖来源，只按 `task.yaml` 中的治理登记表配置导入；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。Docker 部署时需要叠加 `docker-compose.rclone.example.yml`，把 rclone 配置以只读方式映射到面板容器。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
 

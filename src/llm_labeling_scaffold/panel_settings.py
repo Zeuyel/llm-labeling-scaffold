@@ -33,6 +33,8 @@ def task_source_mode() -> str:
     value = str(os.environ.get("LLS_TASK_SOURCE") or "local").strip().lower()
     if value in {"r2", "data_lake", "registry"}:
         return "r2"
+    if value in {"control", "scaffold", "panel"}:
+        return "control"
     return "local"
 
 

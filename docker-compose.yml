@@ -29,8 +29,9 @@ services:
       - MLFLOW_TRACKING_URI
       - RCLONE_CONFIG=${RCLONE_CONFIG:-/run/secrets/rclone/rclone.conf}
       - LLS_RCLONE_TIMEOUT_SECONDS=${LLS_RCLONE_TIMEOUT_SECONDS:-120}
-      - LLS_TASK_SOURCE=${LLS_TASK_SOURCE:-r2}
-      # 必须指向本部署自己的 R2 registry；YOUR_BUCKET 是占位示例。
+      # r2 从 R2 registry 同步任务；control 由 scaffold 控制面管理任务草稿和发布 revision。
+      - LLS_TASK_SOURCE=${LLS_TASK_SOURCE:-control}
+      # r2 模式中这是任务 registry；control 模式中它只配置任务的数据湖 registry。YOUR_BUCKET 是占位示例。
       - LLS_TASK_REGISTRY_URI=${LLS_TASK_REGISTRY_URI:-r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.yaml}
       - LLS_DATA_LAKE_R2_PREFIX=${LLS_DATA_LAKE_R2_PREFIX:-r2:YOUR_BUCKET/}
     volumes:

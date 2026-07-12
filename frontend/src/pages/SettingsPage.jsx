@@ -17,6 +17,7 @@ function mergeSettings(value) {
 
 function sourceLabel(value) {
   if (value === "r2") return "R2 登记表";
+  if (value === "control") return "Scaffold 控制面";
   if (value === "local") return "本地任务目录";
   return value || "-";
 }
@@ -27,6 +28,7 @@ function boolLabel(value) {
 
 export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoadError, onError }) {
   const normalized = useMemo(() => mergeSettings(settings), [settings]);
+  const controlTaskSource = normalized.task_source === "control";
   const [form, setForm] = useState({
     task_registry_uri: normalized.task_registry_uri,
     data_lake_r2_prefix: normalized.data_lake_r2_prefix,
@@ -89,7 +91,7 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
       </div>
       <div className="page-header">
         <h2>系统设置</h2>
-        <p>配置 R2 任务登记表和数据湖导入使用的共享位置，保存后任务列表会按新配置刷新。</p>
+        <p>{controlTaskSource ? "任务单由 Scaffold 控制面管理；这里配置 R2 数据湖的默认登记表和可访问范围。" : "配置 R2 任务登记表和数据湖导入使用的共享位置，保存后任务列表会按新配置刷新。"}</p>
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
@@ -101,13 +103,13 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
         </div>
         <div className="form-grid">
           <div className="field field-wide">
-            <label>任务登记表地址 <span className="field-key">task_registry_uri</span></label>
+            <label>{controlTaskSource ? "数据湖登记表地址" : "任务登记表地址"} <span className="field-key">task_registry_uri</span></label>
             <input
               value={form.task_registry_uri}
               onChange={(event) => update("task_registry_uri", event.target.value)}
               placeholder="r2:bucket/registry/data_lake.yaml"
             />
-            <span className="hint">填写数据湖 registry/data_lake.yaml 的地址。这个文件登记 task_id 到 task_uri 的映射；task_uri 才指向具体任务配置，不能直接填写某个 task.yaml。</span>
+            <span className="hint">{controlTaskSource ? "填写数据湖 registry/data_lake.yaml 的地址。任务单在 Scaffold 中创建和发布，R2 不再登记 task.yaml。" : "填写数据湖 registry/data_lake.yaml 的地址。这个文件登记 task_id 到 task_uri 的映射；task_uri 才指向具体任务配置，不能直接填写某个 task.yaml。"}</span>
           </div>
           <div className="field field-wide">
             <label>数据湖根路径 <span className="field-key">data_lake_r2_prefix</span></label>
@@ -132,7 +134,7 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
             <input value={`${sourceLabel(normalized.task_source)} (${normalized.task_source || "-"})`} readOnly />
           </div>
           <div className="field">
-            <label>允许任务覆盖数据湖来源 <span className="field-key">allow_data_lake_overrides</span></label>
+            <label>允许执行时覆盖数据湖来源 <span className="field-key">allow_data_lake_overrides</span></label>
             <input value={boolLabel(Boolean(normalized.allow_data_lake_overrides))} readOnly />
           </div>
           <div className="field">
