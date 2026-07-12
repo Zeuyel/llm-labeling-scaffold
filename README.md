@@ -95,7 +95,7 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 `LLS_TASK_SOURCE=control` 下，任务单先以 draft 保存。创建 draft 时 revision 为 `0`，草稿的最新内容保存在 `runs/_system/task_control/registry.json`，此时不会生成可执行的 `task.yaml`。修改已发布任务会保留当前已发布 revision，并把状态改为 `published_with_draft`。
 
-发布会校验 draft，生成递增的 revision，并把当前可执行配置写到 `tasks/<task_id>/task.yaml`；如果配置包含 prompt，同时写入同目录的 `prompt.md`。每次发布还会保留不可覆盖快照：
+发布会校验 draft，生成递增的 revision，并把当前可执行配置写到 `tasks/<task_id>/task.yaml`；如果配置包含 prompt，同时写入同目录的 `prompt.revision_<六位编号>.md`。每次发布还会保留不可覆盖快照：
 
 ```text
 runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/task.yaml

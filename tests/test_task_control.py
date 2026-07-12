@@ -90,6 +90,26 @@ def test_publish_writes_revision_snapshots_and_increments_revision(tmp_path: Pat
     assert [item["revision"] for item in record["revisions"]] == [1, 2]
 
 
+def test_publish_keeps_live_prompts_versioned(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = {**_draft_spec(), "prompt": "First prompt"}
+    task_control.create_draft(runs_root, tasks_root, spec)
+    task_control.publish_task(runs_root, tasks_root, spec["task_id"])
+
+    updated_spec = {**spec, "prompt": "Second prompt"}
+    task_control.update_draft(runs_root, spec["task_id"], updated_spec)
+    task_control.publish_task(runs_root, tasks_root, spec["task_id"])
+
+    task_dir = tasks_root / spec["task_id"]
+    live_raw = load_task(task_dir / "task.yaml").raw
+    first_prompt = task_dir / "prompt.revision_000001.md"
+    second_prompt = task_dir / "prompt.revision_000002.md"
+    assert live_raw["prompt"] == second_prompt.name
+    assert first_prompt.read_text(encoding="utf-8") == "First prompt\n"
+    assert second_prompt.read_text(encoding="utf-8") == "Second prompt\n"
+
+
 def test_publish_requires_complete_data_lake_configuration(tmp_path: Path):
     runs_root = tmp_path / "runs"
     tasks_root = tmp_path / "tasks"

@@ -198,23 +198,24 @@ def _write_published_task(
         if revision in recorded_revisions or not snapshot_dir.is_dir():
             raise ValueError(f"任务 revision 快照已存在，拒绝覆盖: {snapshot_dir}")
         shutil.rmtree(snapshot_dir)
-    raw_to_write = dict(raw)
+    snapshot_raw = dict(raw)
+    live_raw = dict(raw)
+    live_prompt_path: Path | None = None
     if prompt:
-        raw_to_write["prompt"] = "prompt.md"
+        snapshot_raw["prompt"] = "prompt.md"
+        live_prompt_path = task_dir / f"prompt.revision_{revision:06d}.md"
+        live_raw["prompt"] = live_prompt_path.name
 
     snapshot_dir.mkdir(parents=True, exist_ok=False)
-    write_text_atomic(yaml.safe_dump(raw_to_write, allow_unicode=True, sort_keys=False), snapshot_task_path)
+    write_text_atomic(yaml.safe_dump(snapshot_raw, allow_unicode=True, sort_keys=False), snapshot_task_path)
     if prompt:
         write_text_atomic(prompt + "\n", snapshot_dir / "prompt.md")
     write_json(record.get("draft_spec", {}), snapshot_dir / "draft_spec.json", indent=2)
 
     task_dir.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(yaml.safe_dump(raw_to_write, allow_unicode=True, sort_keys=False), task_path)
-    prompt_path = task_dir / "prompt.md"
-    if prompt:
-        write_text_atomic(prompt + "\n", prompt_path)
-    elif prompt_path.exists():
-        prompt_path.unlink()
+    if live_prompt_path is not None:
+        write_text_atomic(prompt + "\n", live_prompt_path)
+    write_text_atomic(yaml.safe_dump(live_raw, allow_unicode=True, sort_keys=False), task_path)
 
     loaded = load_task(task_path)
     return {
