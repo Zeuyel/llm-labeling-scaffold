@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+import shutil
 import threading
 from typing import Any
 
@@ -189,10 +190,23 @@ def _write_published_task(
     snapshot_dir = _snapshot_dir(runs_root, task_id, revision)
     snapshot_task_path = snapshot_dir / "task.yaml"
     if snapshot_dir.exists():
-        raise ValueError(f"任务 revision 快照已存在，拒绝覆盖: {snapshot_dir}")
+        recorded_revisions = {
+            int(item.get("revision") or 0)
+            for item in record.get("revisions", [])
+            if isinstance(item, dict)
+        }
+        if revision in recorded_revisions or not snapshot_dir.is_dir():
+            raise ValueError(f"任务 revision 快照已存在，拒绝覆盖: {snapshot_dir}")
+        shutil.rmtree(snapshot_dir)
     raw_to_write = dict(raw)
     if prompt:
         raw_to_write["prompt"] = "prompt.md"
+
+    snapshot_dir.mkdir(parents=True, exist_ok=False)
+    write_text_atomic(yaml.safe_dump(raw_to_write, allow_unicode=True, sort_keys=False), snapshot_task_path)
+    if prompt:
+        write_text_atomic(prompt + "\n", snapshot_dir / "prompt.md")
+    write_json(record.get("draft_spec", {}), snapshot_dir / "draft_spec.json", indent=2)
 
     task_dir.mkdir(parents=True, exist_ok=True)
     write_text_atomic(yaml.safe_dump(raw_to_write, allow_unicode=True, sort_keys=False), task_path)
@@ -201,12 +215,6 @@ def _write_published_task(
         write_text_atomic(prompt + "\n", prompt_path)
     elif prompt_path.exists():
         prompt_path.unlink()
-
-    snapshot_dir.mkdir(parents=True, exist_ok=False)
-    write_text_atomic(yaml.safe_dump(raw_to_write, allow_unicode=True, sort_keys=False), snapshot_task_path)
-    if prompt:
-        write_text_atomic(prompt + "\n", snapshot_dir / "prompt.md")
-    write_json(record.get("draft_spec", {}), snapshot_dir / "draft_spec.json", indent=2)
 
     loaded = load_task(task_path)
     return {

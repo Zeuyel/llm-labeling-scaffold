@@ -103,3 +103,39 @@ def test_publish_requires_complete_data_lake_configuration(tmp_path: Path):
     record = task_control.get_task_record(runs_root, spec["task_id"])
     assert record["revision"] == 0
     assert not (tasks_root / spec["task_id"] / "task.yaml").exists()
+
+
+def test_publish_keeps_live_task_unchanged_when_promotion_fails(tmp_path: Path, monkeypatch):
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = _draft_spec()
+    task_control.create_draft(runs_root, tasks_root, spec)
+    task_path = tasks_root / spec["task_id"] / "task.yaml"
+    original_write = task_control.write_text_atomic
+
+    def fail_live_task_write(text: str, path: str | Path) -> None:
+        if Path(path) == task_path:
+            raise OSError("live task write failed")
+        original_write(text, path)
+
+    monkeypatch.setattr(task_control, "write_text_atomic", fail_live_task_write)
+    with pytest.raises(OSError, match="live task write failed"):
+        task_control.publish_task(runs_root, tasks_root, spec["task_id"])
+
+    snapshot = (
+        runs_root
+        / "_system"
+        / "task_control"
+        / "task_snapshots"
+        / spec["task_id"]
+        / "revision_000001"
+        / "task.yaml"
+    )
+    assert snapshot.exists()
+    assert not task_path.exists()
+    assert task_control.get_task_record(runs_root, spec["task_id"])["revision"] == 0
+
+    monkeypatch.setattr(task_control, "write_text_atomic", original_write)
+    retried = task_control.publish_task(runs_root, tasks_root, spec["task_id"])
+    assert retried["task"]["revision"] == 1
+    assert load_task(task_path).raw["revision"] == 1
