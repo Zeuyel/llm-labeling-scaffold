@@ -40,15 +40,24 @@ def _panel_server(runs_root: Path, tasks_root: Path):
             setattr(panel._Handler, key, value)
 
 
-def _request(base_url: str, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, dict]:
+def _request(
+    base_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
+    request_headers = {
+        "Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii"),
+        "Content-Type": "application/json",
+    }
+    request_headers.update(headers or {})
     request = urllib.request.Request(
         base_url + path,
         data=data,
-        headers={
-            "Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii"),
-            "Content-Type": "application/json",
-        },
+        headers=request_headers,
         method=method,
     )
     try:
@@ -164,3 +173,52 @@ def test_control_actions_resolve_to_the_published_revision(tmp_path: Path, monke
 
     resolved = handler_class._resolve_action_task_path(Resolver(), str(task_path))
     assert resolved == str(task_path)
+
+
+def test_control_publish_endpoint_reuses_an_idempotency_key(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = _draft_spec()
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, _ = _request(base_url, "/api/tasks", method="POST", body=spec)
+        assert status == 200
+
+        status, unconfirmed = _request(
+            base_url,
+            f"/api/tasks/{spec['task_id']}/publish",
+            method="POST",
+            body={"idempotency_key": "publish-001"},
+        )
+        assert status == 400
+        assert "confirm=true" in unconfirmed["error"]
+
+        payload = {"confirm": True, "idempotency_key": "publish-001"}
+        status, first = _request(base_url, f"/api/tasks/{spec['task_id']}/publish", method="POST", body=payload)
+        assert status == 200
+        status, second = _request(base_url, f"/api/tasks/{spec['task_id']}/publish", method="POST", body=payload)
+        assert status == 200
+
+    assert first["published"]["revision"] == 1
+    assert second["published"]["revision"] == 1
+    assert second["idempotent"] is True
+
+
+def test_control_records_the_trusted_mcp_actor(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    monkeypatch.setenv("LLS_MCP_INTERNAL_TOKEN", "mcp-internal-0123456789-abcdef-012")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, created = _request(
+            base_url,
+            "/api/tasks",
+            method="POST",
+            body=_draft_spec(),
+            headers={"X-LLS-MCP-Internal-Token": "mcp-internal-0123456789-abcdef-012"},
+        )
+
+    assert status == 200
+    assert created["record"]["created_by"] == "mcp"

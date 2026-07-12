@@ -238,7 +238,14 @@ def _contract_capabilities() -> dict[str, Any]:
                 "side_effects": True,
                 "requires_task_source": "control",
                 "path_params": {"task_id": {"type": "string"}},
-                "request_schema": {"type": "object", "additionalProperties": False},
+                "request_schema": {
+                    "type": "object",
+                    "properties": {
+                        "confirm": {"type": "boolean"},
+                        "idempotency_key": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
                 "response_schema": {"type": "object", "required": ["ok", "task", "published"]},
             },
             {
@@ -611,6 +618,10 @@ class _Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(user, self.auth_user) and hmac.compare_digest(pw, self.auth_pass)
 
     def _actor(self) -> str:
+        internal_token = str(os.environ.get("LLS_MCP_INTERNAL_TOKEN") or "")
+        submitted_token = self.headers.get("X-LLS-MCP-Internal-Token", "")
+        if internal_token and submitted_token and hmac.compare_digest(submitted_token, internal_token):
+            return "mcp"
         header = self.headers.get("Authorization", "")
         if header.startswith("Basic "):
             try:
@@ -1175,7 +1186,18 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 from .task_control import publish_task
 
-                result = publish_task(self.runs_root, self.tasks_root, publish_task_id, actor=self._actor())
+                body = self._read_body()
+                idempotency_key = str(body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "").strip()
+                if idempotency_key and not _truthy_value(body.get("confirm")):
+                    self._json({"error": "带 idempotency_key 的任务发布必须显式设置 confirm=true"}, status=400)
+                    return
+                result = publish_task(
+                    self.runs_root,
+                    self.tasks_root,
+                    publish_task_id,
+                    actor=self._actor(),
+                    idempotency_key=idempotency_key or None,
+                )
                 self._json({"ok": True, **result})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)

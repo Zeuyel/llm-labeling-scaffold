@@ -110,6 +110,26 @@ def test_publish_keeps_live_prompts_versioned(tmp_path: Path):
     assert second_prompt.read_text(encoding="utf-8") == "Second prompt\n"
 
 
+def test_publish_idempotency_reuses_the_same_revision(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = _draft_spec()
+    task_control.create_draft(runs_root, tasks_root, spec)
+
+    first = task_control.publish_task(runs_root, tasks_root, spec["task_id"], idempotency_key="publish-001")
+    second = task_control.publish_task(runs_root, tasks_root, spec["task_id"], idempotency_key="publish-001")
+
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert second["published"]["revision"] == 1
+    assert task_control.get_task_record(runs_root, spec["task_id"])["revision"] == 1
+
+    updated_spec = {**spec, "annotation_guidelines": "Updated draft"}
+    task_control.update_draft(runs_root, spec["task_id"], updated_spec)
+    with pytest.raises(ValueError, match="不同任务草稿"):
+        task_control.publish_task(runs_root, tasks_root, spec["task_id"], idempotency_key="publish-001")
+
+
 def test_publish_requires_complete_data_lake_configuration(tmp_path: Path):
     runs_root = tmp_path / "runs"
     tasks_root = tmp_path / "tasks"

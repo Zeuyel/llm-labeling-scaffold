@@ -178,6 +178,17 @@ def build_parser() -> argparse.ArgumentParser:
     panel.add_argument("--static-dir")
     panel.add_argument("--tasks-root", default="tasks")
 
+    mcp = sub.add_parser("mcp")
+    mcp.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
+    mcp.add_argument("--host", default="127.0.0.1")
+    mcp.add_argument("--port", type=int, default=8766)
+    mcp.add_argument("--panel-url")
+    mcp.add_argument("--panel-user")
+    mcp.add_argument("--panel-password")
+    mcp.add_argument("--bearer-token")
+    mcp.add_argument("--internal-token")
+    mcp.add_argument("--timeout", type=float)
+
     return p
 
 
@@ -308,6 +319,18 @@ def main(argv: list[str] | None = None) -> None:
         from .panel import serve_panel
 
         serve_panel(args.runs_root, args.host, args.port, args.user, args.password, args.static_dir, args.tasks_root)
+    elif args.cmd == "mcp":
+        from .mcp_server import McpServerConfig, serve_mcp
+
+        config = McpServerConfig.from_env(
+            panel_url=args.panel_url,
+            panel_user=args.panel_user,
+            panel_password=args.panel_password,
+            bearer_token=args.bearer_token,
+            internal_token=args.internal_token,
+            timeout_seconds=args.timeout,
+        )
+        serve_mcp(config, transport=args.transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

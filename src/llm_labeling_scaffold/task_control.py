@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
 from pathlib import Path
 import shutil
 import threading
@@ -23,6 +25,34 @@ def _now() -> str:
 
 def _safe_segment(value: str) -> bool:
     return bool(value) and ".." not in value and "/" not in value and "\\" not in value
+
+
+def _idempotency_key_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _validate_idempotency_key(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if len(text) > 200 or any(ord(char) < 32 for char in text):
+        raise ValueError("idempotency_key 必须是长度不超过 200 的可打印字符串")
+    return text
+
+
+def _draft_fingerprint(record: dict[str, Any]) -> str:
+    try:
+        encoded = json.dumps(record.get("draft_spec") or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("任务草稿无法生成幂等指纹") from exc
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _published_revision(record: dict[str, Any], revision: int) -> dict[str, Any] | None:
+    for item in record.get("revisions", []):
+        if isinstance(item, dict) and int(item.get("revision") or 0) == revision:
+            return dict(item)
+    return None
 
 
 def control_root(runs_root: str | Path) -> Path:
@@ -231,14 +261,44 @@ def _write_published_task(
     }
 
 
-def publish_task(runs_root: str | Path, tasks_root: str | Path, task_id: str, *, actor: str = "panel") -> dict[str, Any]:
+def publish_task(
+    runs_root: str | Path,
+    tasks_root: str | Path,
+    task_id: str,
+    *,
+    actor: str = "panel",
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
     if not _safe_segment(task_id):
         raise ValueError("非法任务编号")
+    key = _validate_idempotency_key(idempotency_key)
     with _LOCK:
         registry = _read_registry(runs_root)
         record = registry["tasks"].get(task_id)
         if not record:
             raise ValueError(f"任务单不存在: {task_id}")
+        draft_fingerprint = _draft_fingerprint(record)
+        idempotency_records = record.get("publish_idempotency")
+        if idempotency_records is None:
+            idempotency_records = {}
+        if not isinstance(idempotency_records, dict):
+            raise ValueError("任务发布幂等记录必须是 JSON 对象")
+        if key:
+            key_digest = _idempotency_key_digest(key)
+            existing = idempotency_records.get(key_digest)
+            if isinstance(existing, dict):
+                if existing.get("draft_fingerprint") != draft_fingerprint:
+                    raise ValueError("幂等 key 已用于不同任务草稿，请使用新的 idempotency_key")
+                published = _published_revision(record, int(existing.get("revision") or 0))
+                if published is None:
+                    raise ValueError("幂等发布记录缺少对应 revision，请使用新的 idempotency_key")
+                return {
+                    "action": "published",
+                    "idempotent": True,
+                    "task": _task_summary_from_record(record),
+                    "record": record,
+                    "published": published,
+                }
         revision = int(record.get("revision") or 0) + 1
         raw = _validate_spec(
             record.get("draft_spec") or {},
@@ -254,6 +314,19 @@ def publish_task(runs_root: str | Path, tasks_root: str | Path, task_id: str, *,
         record["updated_at"] = published["published_at"]
         record["published_by"] = actor
         record.setdefault("revisions", []).append(published)
+        if key:
+            idempotency_records[_idempotency_key_digest(key)] = {
+                "draft_fingerprint": draft_fingerprint,
+                "revision": revision,
+                "published_at": published["published_at"],
+            }
+            record["publish_idempotency"] = idempotency_records
         registry["tasks"][task_id] = record
         _write_registry(runs_root, registry)
-        return {"action": "published", "task": _task_summary_from_record(record), "record": record, "published": published}
+        return {
+            "action": "published",
+            "idempotent": False,
+            "task": _task_summary_from_record(record),
+            "record": record,
+            "published": published,
+        }

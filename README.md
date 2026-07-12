@@ -59,6 +59,14 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 脚本会在 `--mlflow` 模式下临时把 `MLFLOW_TRACKING_URI=http://mlflow:5000` 传给控制台；默认模式不会注入这个地址。
 
+需要让 Codex 或其他 MCP client 调用平台时，先在 `.env` 设置 `LLS_MCP_BEARER_TOKEN`，再启用 MCP profile：
+
+```bash
+./scripts/stack up --mcp
+```
+
+MCP endpoint 为 `http://localhost:8766/mcp`。Docker 默认只绑定本机回环地址，应通过 HTTPS 反向代理对外暴露。它通过 Panel API 执行受控任务草稿、任务发布、数据湖 preview 和导入，不直接操作 R2 或本地数据目录。启用前必须配置彼此不同的 `LLS_MCP_BEARER_TOKEN` 与 `LLS_MCP_INTERNAL_TOKEN`；首版不是多用户 OAuth/RBAC，完整边界见 [MCP 接入说明](docs/mcp_integration.md)。
+
 ## 平台流程
 
 推荐的实验闭环：
@@ -223,6 +231,11 @@ ARGILLA_API_KEY=argilla.apikey
 ARGILLA_WORKSPACE=argilla
 
 MLFLOW_PORT=5000
+MCP_PORT=8766
+MCP_BIND_HOST=127.0.0.1
+LLS_MCP_BEARER_TOKEN=<由服务器 secret manager 生成的随机值>
+LLS_MCP_INTERNAL_TOKEN=<另一条由服务器 secret manager 生成的随机值>
+LLS_MCP_TIMEOUT_SECONDS=15
 LLS_TASK_SOURCE=control
 LLS_TASK_REGISTRY_URI=r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.yaml
 LLS_DATA_LAKE_R2_PREFIX=r2:YOUR_BUCKET/
@@ -245,6 +258,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - Argilla 集成依赖
 - 基线训练依赖：`scikit-learn`、`joblib`
 - MLflow 客户端依赖
+- MCP Streamable HTTP 服务依赖
 - rclone，用于按任务配置读取 R2 数据湖
 
 因此默认部署可以直接运行内置 `tfidf_sgd` 基线训练器。MLflow 客户端只提供可选记录能力；不启用 Docker Compose 的 mlflow profile 时不会启动 MLflow 服务。
@@ -290,6 +304,17 @@ pip install -e ".[baseline,argilla]"
 ```bash
 pip install -e ".[baseline,argilla,mlflow]"
 export MLFLOW_TRACKING_URI=http://localhost:5000
+```
+
+本地调试 MCP：
+
+```bash
+pip install -e ".[mcp]"
+LLS_MCP_PANEL_URL=http://127.0.0.1:8765 \
+LLS_MCP_PANEL_USER=admin \
+LLS_MCP_PANEL_PASSWORD='<从本机 secret manager 读取>' \
+LLS_MCP_INTERNAL_TOKEN='<从本机 secret manager 读取的内部服务凭据>' \
+lls mcp --transport stdio
 ```
 
 前端本地开发：

@@ -23,7 +23,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN pip install -e ".[baseline,argilla,mlflow]"
+RUN pip install -e ".[baseline,argilla,mlflow,mcp]"
 ARG PANEL_UID=1000
 ARG PANEL_GID=1000
 RUN groupadd --gid "${PANEL_GID}" panel \
@@ -31,7 +31,7 @@ RUN groupadd --gid "${PANEL_GID}" panel \
     && mkdir -p /app/runs /app/tasks \
     && chown -R panel:panel /app
 
-EXPOSE 8765
+EXPOSE 8765 8766
 
 USER panel:panel
 CMD ["python", "-m", "llm_labeling_scaffold.cli", "panel", "--host", "0.0.0.0", "--port", "8765", "--static-dir", "frontend/dist", "--tasks-root", "tasks", "--runs-root", "runs"]
