@@ -1,16 +1,18 @@
 # 数据湖接入说明
 
+本说明描述 R2 数据湖接入。`LLS_TASK_SOURCE=r2` 时，R2 registry 同时是任务单来源；`LLS_TASK_SOURCE=control` 时，scaffold 控制面管理任务单和 revision，R2 只提供任务配置中声明的数据湖输入和产物读写。以下涉及任务 registry 同步的步骤只适用于 `r2`。
+
 平台部署按三层理解：
 
-1. **R2 数据湖 / registry 是权威层**：任务列表、远端 `task.yaml`、源数据集 manifest、任务级输入对象和需要回写的数据湖产物，都以 R2 registry 中登记的 URI 为准。`task_registry_uri` 指向数据湖治理登记表，通常是 `governance/data_lake/v1/current/data_lake.yaml`；登记表里的 `tasks.<task_id>.task_uri` 才指向具体 `task.yaml`。
+1. **任务单权威层**：`r2` 模式中，任务列表和远端 `task.yaml` 以 R2 registry 中登记的 URI 为准；`control` 模式中，任务单及其 revision 由 scaffold 控制面本地持久化。
 2. **panel settings 是运行配置层**：每个部署在“系统设置”中保存当前要使用的 `task_registry_uri` 和 `data_lake_r2_prefix`。同一套镜像可以连接不同团队、不同环境或不同 bucket。
-3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 只缓存从 registry 同步下来的任务配置；`runs/` 保存本次部署产生的导入、样本、标注结果、训练集、模型、推理结果和审计日志。
+3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 保存 `r2` 模式的任务配置缓存，或 `control` 模式当前已发布的任务配置；`runs/` 保存控制面元数据、导入、样本、标注结果、训练集、模型、推理结果和审计日志。
 
 不要把某个单一项目、业务域或固定 R2 bucket 写死到部署说明中。生产环境必须按自己的 R2 registry 填写配置。
 
 ## 首次部署
 
-服务器部署后第一步不是新建本地任务，而是进入轻量控制台的“系统设置”：
+`r2` 模式服务器部署后第一步不是新建本地任务，而是进入轻量控制台的“系统设置”：
 
 1. 填写 `task_registry_uri`，例如 `r2:labeling-lake/governance/data_lake/v1/current/data_lake.yaml`。它是数据湖治理登记表地址，不是某个任务的 `task.yaml`。
 2. 填写 `data_lake_r2_prefix`，例如 `r2:labeling-lake/`。
@@ -21,7 +23,7 @@
 
 ## 任务配置来源
 
-生产环境使用 R2 registry 作为任务来源：
+`LLS_TASK_SOURCE=r2` 时，生产环境使用 R2 registry 作为任务来源：
 
 ```text
 LLS_TASK_SOURCE=r2
