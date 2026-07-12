@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import urlparse, parse_qs
 
 from . import __version__
+from .config import load_task
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings

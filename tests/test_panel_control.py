@@ -142,3 +142,25 @@ def test_control_api_updates_publishes_revisions_and_rejects_delete(tmp_path: Pa
         assert status == 400
         assert "控制面任务不能直接删除" in deleted["error"]
         assert (tasks_root / spec["task_id"] / "task.yaml").exists()
+
+
+def test_control_actions_resolve_to_the_published_revision(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = _draft_spec()
+    handler_class = panel._Handler
+
+    from llm_labeling_scaffold import task_control as control
+
+    control.create_draft(runs_root, tasks_root, spec)
+    control.publish_task(runs_root, tasks_root, spec["task_id"])
+    task_path = tasks_root / spec["task_id"] / "task.yaml"
+
+    class Resolver:
+        def _load_task_by_id(self, task_id: str):
+            assert task_id == spec["task_id"]
+            return load_task(task_path)
+
+    resolved = handler_class._resolve_action_task_path(Resolver(), str(task_path))
+    assert resolved == str(task_path)
