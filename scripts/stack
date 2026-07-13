@@ -90,6 +90,28 @@ if [ "$enable_mcp" -eq 1 ] && [ "$cmd" = "up" ]; then
   fi
 fi
 
+panel_auth_mode="$(env_value LLS_PANEL_AUTH_MODE cloudflare_access)"
+if [ "$cmd" = "up" ]; then
+  case "${panel_auth_mode,,}" in
+    basic_dev)
+      if [ -z "$(env_value LLS_PANEL_PASSWORD "")" ]; then
+        echo "basic_dev 模式必须设置 LLS_PANEL_PASSWORD。" >&2
+        exit 2
+      fi
+      ;;
+    cloudflare_access)
+      if [ -z "$(env_value LLS_CF_ACCESS_ISSUER "")" ] || [ -z "$(env_value LLS_CF_ACCESS_AUD "")" ]; then
+        echo "cloudflare_access 模式必须设置 LLS_CF_ACCESS_ISSUER 和 LLS_CF_ACCESS_AUD。" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "LLS_PANEL_AUTH_MODE 只能是 cloudflare_access 或 basic_dev。" >&2
+      exit 2
+      ;;
+  esac
+fi
+
 task_source="$(env_value LLS_TASK_SOURCE control)"
 compose=(docker compose -f docker-compose.yml)
 case "${task_source,,}" in
@@ -123,7 +145,11 @@ print_urls() {
     echo "MCP：         http://localhost:$(env_value MCP_PORT 8766)/mcp"
   fi
   echo
-  echo "panel 登录：admin / $(env_value LLS_PANEL_PASSWORD changeme)"
+  if [ "${panel_auth_mode,,}" = "basic_dev" ]; then
+    echo "panel 本地开发登录：admin / $(env_value LLS_PANEL_PASSWORD changeme)"
+  else
+    echo "panel 登录：Cloudflare Access"
+  fi
   echo "Argilla 登录：$(env_value ARGILLA_USERNAME argilla) / $(env_value ARGILLA_PASSWORD 12345678)"
   if [ "$enable_mlflow" -eq 0 ]; then
     echo

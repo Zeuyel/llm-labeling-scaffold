@@ -173,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     panel.add_argument("--runs-root", default="runs")
     panel.add_argument("--host", default="127.0.0.1")
     panel.add_argument("--port", type=int, default=8765)
+    panel.add_argument("--auth-mode", choices=["cloudflare_access", "basic_dev"])
     panel.add_argument("--user", default="admin")
     panel.add_argument("--password")
     panel.add_argument("--static-dir")
@@ -317,7 +318,16 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "panel":
         from .panel import serve_panel
 
-        serve_panel(args.runs_root, args.host, args.port, args.user, args.password, args.static_dir, args.tasks_root)
+        serve_panel(
+            runs_root=args.runs_root,
+            host=args.host,
+            port=args.port,
+            user=args.user,
+            password=args.password,
+            static_dir=args.static_dir,
+            tasks_root=args.tasks_root,
+            auth_mode=args.auth_mode,
+        )
     elif args.cmd == "mcp":
         from .mcp_server import McpServerConfig, serve_mcp
 

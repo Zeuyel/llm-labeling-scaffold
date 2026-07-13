@@ -9,6 +9,7 @@ description = "Task-agnostic LLM labeling and local-model extrapolation scaffold
 requires-python = ">=3.10"
 dependencies = [
   "PyYAML>=6.0",
+  "PyJWT[crypto]>=2.8,<3",
   "jsonschema>=4.0",
 ]
 

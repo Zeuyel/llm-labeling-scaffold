@@ -17,7 +17,7 @@ MLflow 不再是默认依赖。它只作为可选外部模型记录服务，适�
 
 默认启动：
 
-- 轻量控制台：`http://localhost:8765`，默认账号 `admin` / `changeme`
+- 轻量控制台：`http://localhost:8765`；本地 `.env.example` 显式启用 `basic_dev`，账号 `admin` / `changeme`
 - Argilla：`http://localhost:6900`，默认账号 `argilla` / `12345678`
 - Argilla 依赖服务：PostgreSQL、Elasticsearch、Redis
 
@@ -115,7 +115,9 @@ runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/draft
 
 ## 认证边界
 
-控制面没有引入完整的多用户登录、团队隔离或 RBAC。面板仍使用一个静态 Basic Auth 账号（Docker 默认用户名为 `admin`，密码由部署的 `LLS_PANEL_PASSWORD` 提供）；任务记录中的操作者只是该已认证账号。部署时应通过环境或 secret manager 注入真实密码，不能将其提交到仓库。
+生产 Panel 使用 Cloudflare Access 注入的 `Cf-Access-Jwt-Assertion`，源站验证 RS256 签名、JWKS、issuer、显式 application AUD、时间声明和 `type=app`。稳定用户身份使用 `(issuer, subject)`，邮箱与显示名只作为显示快照；客户端自报 actor 或邮箱头不会建立身份。
+
+当前 #44/RBAC 尚未接入。Access 用户可以读取 `/api/session` 等系统认证态端点，但所有业务 API 都会以 `503 authorization_unavailable` fail closed，不能因为“已登录”而获得原有管理员能力。现有 Basic Auth 只在显式 `LLS_PANEL_AUTH_MODE=basic_dev` 时用于本地开发；生产默认 `cloudflare_access`，配置或验证失败不会回退到 Basic。完整配置与 Tunnel-only 源站要求见 [Cloudflare Access 身份验证](docs/cloudflare_access.md)。
 
 ## 服务器测试
 
@@ -182,7 +184,7 @@ LLS_TASK_SOURCE=control
 
 真实部署启动后，可以在服务器本地运行 scaffold smoke runner。不要把真实 URL、token、Basic Auth 密码、rclone 配置路径或 secret 路径写入仓库文件；使用 shell 环境变量或服务器 secret manager 注入。
 
-Basic Auth 示例：
+Basic Auth 示例（仅 `basic_dev` 本地开发或迁移）：
 
 ```bash
 export LLS_SMOKE_SERVER_URL=http://127.0.0.1:8765
@@ -222,7 +224,13 @@ import dry-run 只会在 `/api/capabilities` 声明了 side-effect-free dry-run 
 
 ```text
 PANEL_PORT=8765
+PANEL_BIND_HOST=127.0.0.1
+LLS_PANEL_AUTH_MODE=basic_dev
 LLS_PANEL_PASSWORD=changeme
+
+# 生产改为 cloudflare_access，并配置：
+# LLS_CF_ACCESS_ISSUER=https://YOUR_TEAM.cloudflareaccess.com
+# LLS_CF_ACCESS_AUD=<Access application Audience Tag>
 
 ARGILLA_PORT=6900
 ARGILLA_USERNAME=argilla
@@ -242,6 +250,8 @@ LLS_TASK_REGISTRY_URI=r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.y
 LLS_DATA_LAKE_R2_PREFIX=r2:YOUR_BUCKET/
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
+
+`.env.example` 的 `basic_dev` 只服务于本地快速启动。生产部署必须设置 `LLS_PANEL_AUTH_MODE=cloudflare_access`，保持源站回环/私网绑定，并通过 Cloudflare Tunnel 暴露 Access 应用；不得开放 Panel 公网端口让请求绕过 Access。
 
 `LLS_TASK_SOURCE` 可设为 `r2`、`control` 或 `local`。`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。在 `r2` 模式中，`LLS_TASK_REGISTRY_URI` 对应 `task_registry_uri`，应指向数据湖治理登记表，通常是 `data_lake.yaml`；具体任务文件由登记表的 `tasks.<task_id>.task_uri` 指向。在 `control` 模式中，它只作为数据湖 registry 的默认配置，不参与任务单同步。
 
