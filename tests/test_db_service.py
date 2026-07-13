@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,8 @@ from llm_labeling_scaffold.db import (
     AuthorizationUnavailable,
     DatabaseService,
     ExternalIdentity,
+    IdempotencyClaimStatus,
+    IdempotencyConflict,
     IdentityTypeConflict,
     Permission,
     PrincipalType,
@@ -24,7 +27,7 @@ from llm_labeling_scaffold.db import (
 from llm_labeling_scaffold.db.base import Base
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
 from llm_labeling_scaffold.db.database import create_database_engine, resolve_database_url
-from llm_labeling_scaffold.db.enums import IdempotencyState, TaskStatus
+from llm_labeling_scaffold.db.enums import AuditActorType, IdempotencyState
 from llm_labeling_scaffold.db.models import (
     AuditEvent,
     IdempotencyRecord,
@@ -84,16 +87,31 @@ def seeded_service(engine):
             subject="mcp-service",
             principal_type=PrincipalType.SERVICE,
         )
+        worker_principal = Principal(
+            issuer="llm-labeling-scaffold",
+            subject="worker-service",
+            principal_type=PrincipalType.SERVICE,
+        )
         workspace_a = Workspace(slug="workspace-a", name="Workspace A")
         workspace_b = Workspace(slug="workspace-b", name="Workspace B")
-        session.add_all([viewer, annotator, experimenter, admin, service_principal, workspace_a, workspace_b])
+        session.add_all(
+            [
+                viewer,
+                annotator,
+                experimenter,
+                admin,
+                service_principal,
+                worker_principal,
+                workspace_a,
+                workspace_b,
+            ]
+        )
         session.flush()
 
         task_a = Task(
             workspace_id=workspace_a.id,
             task_key="shared-key",
             name="Task A",
-            status=TaskStatus.PUBLISHED,
             created_by_principal_id=admin.id,
         )
         task_a_other = Task(
@@ -104,7 +122,7 @@ def seeded_service(engine):
         )
         task_b = Task(
             workspace_id=workspace_b.id,
-            task_key="shared-key",
+            task_key="workspace-b-key",
             name="Task B",
             created_by_principal_id=admin.id,
         )
@@ -149,6 +167,7 @@ def seeded_service(engine):
         "experimenter": ExternalIdentity(identity.issuer, "experimenter-1"),
         "admin": ExternalIdentity(identity.issuer, "admin-1"),
         "mcp": ExternalIdentity("llm-labeling-scaffold", "mcp-service"),
+        "worker": ExternalIdentity("llm-labeling-scaffold", "worker-service"),
     }
 
 
@@ -257,6 +276,11 @@ def test_role_matrix_task_acl_and_workspace_isolation(seeded_service):
         "shared-key",
         Permission.TASK_EDIT,
     ).allowed
+    assert not service.authorize_workspace(
+        seeded_service["viewer"],
+        "workspace-a",
+        Permission.TASK_CREATE,
+    ).allowed
 
     assert service.authorize_task(
         seeded_service["annotator"],
@@ -282,6 +306,11 @@ def test_role_matrix_task_acl_and_workspace_isolation(seeded_service):
         "other-task",
         Permission.TASK_READ,
     ).allowed
+    assert not service.authorize_workspace(
+        seeded_service["annotator"],
+        "workspace-a",
+        Permission.TASK_CREATE,
+    ).allowed
 
     experimenter = seeded_service["experimenter"]
     for permission in (
@@ -294,15 +323,80 @@ def test_role_matrix_task_acl_and_workspace_isolation(seeded_service):
     ):
         assert service.authorize_task(experimenter, "workspace-a", "shared-key", permission).allowed
     assert service.authorize_workspace(experimenter, "workspace-a", Permission.AUDIT_VIEW).allowed
+    assert service.authorize_workspace(experimenter, "workspace-a", Permission.TASK_CREATE).allowed
     assert not service.authorize_workspace(experimenter, "workspace-a", Permission.WORKSPACE_MANAGE).allowed
 
     admin = seeded_service["admin"]
+    assert service.authorize_workspace(admin, "workspace-a", Permission.TASK_CREATE).allowed
     assert service.authorize_workspace(admin, "workspace-a", Permission.WORKSPACE_MANAGE).allowed
-    cross_workspace = service.authorize_task(admin, "workspace-b", "shared-key", Permission.TASK_READ)
+    cross_workspace = service.authorize_task(admin, "workspace-b", "workspace-b-key", Permission.TASK_READ)
     assert cross_workspace.allowed is False
     assert cross_workspace.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
     assert cross_workspace.workspace is None
     assert cross_workspace.task is None
+
+
+def test_permission_scopes_fail_closed_and_filter_capabilities(seeded_service, engine):
+    service = seeded_service["service"]
+    admin = seeded_service["admin"]
+
+    workspace_with_task_permission = service.authorize_workspace(
+        admin,
+        "workspace-a",
+        Permission.TASK_READ,
+    )
+    task_with_workspace_permission = service.authorize_task(
+        admin,
+        "workspace-a",
+        "shared-key",
+        Permission.TASK_CREATE,
+    )
+    assert workspace_with_task_permission.allowed is False
+    assert workspace_with_task_permission.reason == AuthorizationReason.INVALID_PERMISSION_SCOPE
+    assert workspace_with_task_permission.workspace is None
+    assert task_with_workspace_permission.allowed is False
+    assert task_with_workspace_permission.reason == AuthorizationReason.INVALID_PERMISSION_SCOPE
+    assert task_with_workspace_permission.task is None
+
+    with Session(engine) as session, session.begin():
+        workspace_id = session.scalar(select(Workspace.id).where(Workspace.slug == "workspace-a"))
+        task_id = session.scalar(
+            select(Task.id).where(Task.workspace_id == workspace_id, Task.task_key == "shared-key"),
+        )
+        principal_id = session.scalar(select(Principal.id).where(Principal.subject == "mcp-service"))
+        session.add(
+            RoleBinding(
+                workspace_id=workspace_id,
+                principal_id=principal_id,
+                task_id=task_id,
+                role=Role.EXPERIMENTER,
+            )
+        )
+
+    assert service.authorize_task(
+        seeded_service["mcp"],
+        "workspace-a",
+        "shared-key",
+        Permission.TASK_EDIT,
+    ).allowed
+    assert service.authorize_workspace(
+        seeded_service["mcp"],
+        "workspace-a",
+        Permission.AUDIT_VIEW,
+    ).reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+    workspace_access = service.get_session(seeded_service["mcp"]).workspaces[0]
+    assert workspace_access.roles == ()
+    assert workspace_access.workspace_capabilities == ()
+    assert workspace_access.task_capabilities == ()
+    task_access = service.list_authorized_tasks(
+        seeded_service["mcp"],
+        "workspace-a",
+        limit=10,
+    ).items[0]
+    assert Permission.TASK_CREATE not in task_access.capabilities
+    assert Permission.AUDIT_VIEW not in task_access.capabilities
+    assert Permission.WORKSPACE_MANAGE not in task_access.capabilities
+    assert Permission.TASK_EDIT in task_access.capabilities
 
 
 def test_resolve_or_provision_never_merges_by_email_or_grants_membership(seeded_service, engine):
@@ -335,11 +429,11 @@ def test_resolve_or_provision_never_merges_by_email_or_grants_membership(seeded_
     assert refreshed.id == first.id
     assert refreshed.email_snapshot == "new@example.test"
     assert service.get_session(first_identity).workspaces == ()
-    assert service.authorize_workspace(first_identity, "workspace-a", Permission.TASK_READ).reason == (
+    assert service.authorize_workspace(first_identity, "workspace-a", Permission.AUDIT_VIEW).reason == (
         AuthorizationReason.RESOURCE_NOT_VISIBLE
     )
     with Session(engine) as session:
-        assert session.scalar(select(func.count()).select_from(Principal)) == 7
+        assert session.scalar(select(func.count()).select_from(Principal)) == 8
         assert session.scalar(
             select(func.count()).select_from(RoleBinding).where(
                 RoleBinding.principal_id.in_((first.id, second.id)),
@@ -369,7 +463,8 @@ def test_get_session_lists_only_authorized_workspaces_and_capabilities(seeded_se
     assert [access.workspace.slug for access in annotator_session.workspaces] == ["workspace-a"]
     annotator_workspace = annotator_session.workspaces[0]
     assert annotator_workspace.roles == ()
-    assert annotator_workspace.capabilities == ()
+    assert annotator_workspace.workspace_capabilities == ()
+    assert annotator_workspace.task_capabilities == ()
     annotator_tasks = service.list_authorized_tasks(
         seeded_service["annotator"],
         "workspace-a",
@@ -383,7 +478,16 @@ def test_get_session_lists_only_authorized_workspaces_and_capabilities(seeded_se
 
     viewer_workspace = service.get_session(seeded_service["viewer"]).workspaces[0]
     assert viewer_workspace.roles == (Role.VIEWER,)
-    assert viewer_workspace.capabilities == (Permission.TASK_READ,)
+    assert viewer_workspace.workspace_capabilities == ()
+    assert viewer_workspace.task_capabilities == (Permission.TASK_READ,)
+
+    experimenter_workspace = service.get_session(seeded_service["experimenter"]).workspaces[0]
+    assert experimenter_workspace.workspace_capabilities == (
+        Permission.TASK_CREATE,
+        Permission.AUDIT_VIEW,
+    )
+    assert Permission.TASK_CREATE not in experimenter_workspace.task_capabilities
+    assert Permission.TASK_EDIT in experimenter_workspace.task_capabilities
 
 
 def test_authorized_task_listing_is_explicit_and_bounded(seeded_service, engine):
@@ -497,11 +601,11 @@ def test_workspace_and_task_role_binding_uniqueness(engine):
             )
 
 
-def test_task_key_and_task_acl_are_scoped_to_workspace(seeded_service, engine):
+def test_task_key_is_globally_unique_and_task_acl_stays_workspace_scoped(seeded_service, engine):
     with Session(engine) as session:
         assert session.scalar(
             select(func.count()).select_from(Task).where(Task.task_key == "shared-key"),
-        ) == 2
+        ) == 1
         workspace_a_id = session.scalar(select(Workspace.id).where(Workspace.slug == "workspace-a"))
         workspace_b_id = session.scalar(select(Workspace.id).where(Workspace.slug == "workspace-b"))
         task_a_id = session.scalar(
@@ -512,6 +616,10 @@ def test_task_key_and_task_acl_are_scoped_to_workspace(seeded_service, engine):
     with pytest.raises(IntegrityError):
         with Session(engine) as session, session.begin():
             session.add(Task(workspace_id=workspace_a_id, task_key="shared-key", name="Duplicate"))
+
+    with pytest.raises(IntegrityError):
+        with Session(engine) as session, session.begin():
+            session.add(Task(workspace_id=workspace_b_id, task_key="shared-key", name="Cross Workspace Duplicate"))
 
     with pytest.raises(IntegrityError):
         with Session(engine) as session, session.begin():
@@ -553,7 +661,7 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
                 actor_principal_id=actor_id,
                 caller_principal_id=caller_id,
                 operation="task.publish",
-                idempotency_key="request-1",
+                idempotency_key_hash=hashlib.sha256(b"request-1").hexdigest(),
                 request_fingerprint="fingerprint-a",
                 state=IdempotencyState.PENDING,
             )
@@ -570,7 +678,7 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
                     actor_principal_id=different_actor_id,
                     caller_principal_id=different_caller_id,
                     operation="task.publish",
-                    idempotency_key="request-1",
+                    idempotency_key_hash=hashlib.sha256(b"request-1").hexdigest(),
                     request_fingerprint="fingerprint-b",
                     state=IdempotencyState.PENDING,
                 )
@@ -580,6 +688,84 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
         record = session.scalar(select(IdempotencyRecord))
         assert record.request_fingerprint == "fingerprint-a"
         assert record.actor_principal_id != record.caller_principal_id
+        assert record.idempotency_key_hash == hashlib.sha256(b"request-1").hexdigest()
+        assert "idempotency_key" not in IdempotencyRecord.__table__.columns
+
+
+def test_idempotency_claim_conflicts_and_successful_replay(seeded_service):
+    service = seeded_service["service"]
+    claim_args = {
+        "actor_identity": seeded_service["admin"],
+        "caller_identity": seeded_service["mcp"],
+        "workspace_slug": "workspace-a",
+        "task_key": "shared-key",
+        "required_permission": Permission.TASK_PUBLISH,
+        "operation": "task.publish",
+        "idempotency_key": "claim-1",
+    }
+
+    first = service.claim_idempotency(
+        **claim_args,
+        request_payload={"label": "e\u0301", "count": 2},
+    )
+    pending = service.claim_idempotency(
+        **claim_args,
+        request_payload={"count": 2, "label": "é"},
+    )
+
+    assert first.status == IdempotencyClaimStatus.CLAIMED
+    assert pending.status == IdempotencyClaimStatus.PENDING
+    assert first.record_id == pending.record_id
+    assert first.request_fingerprint == pending.request_fingerprint
+    assert first.idempotency_key_hash == hashlib.sha256(b"claim-1").hexdigest()
+    assert not hasattr(first, "idempotency_key")
+    assert pending.response_body is None
+
+    completed = service.complete_idempotency(
+        first,
+        response_status=202,
+        response_body={"published": True},
+    )
+    replay = service.claim_idempotency(
+        **claim_args,
+        request_payload={"count": 2, "label": "é"},
+    )
+
+    assert completed.status == IdempotencyClaimStatus.REPLAY
+    assert replay.status == IdempotencyClaimStatus.REPLAY
+    assert replay.response_status == 202
+    assert replay.response_body == {"published": True}
+
+    with pytest.raises(IdempotencyConflict) as actor_conflict:
+        service.claim_idempotency(
+            **{
+                **claim_args,
+                "actor_identity": seeded_service["viewer"],
+                "required_permission": Permission.TASK_READ,
+            },
+            request_payload={"count": 2, "label": "é"},
+        )
+    with pytest.raises(IdempotencyConflict) as caller_conflict:
+        service.claim_idempotency(
+            **{**claim_args, "caller_identity": seeded_service["worker"]},
+            request_payload={"count": 2, "label": "é"},
+        )
+    with pytest.raises(IdempotencyConflict) as fingerprint_conflict:
+        service.claim_idempotency(
+            **claim_args,
+            request_payload={"count": 3, "label": "é"},
+        )
+
+    assert actor_conflict.value.code == "idempotency_conflict"
+    assert caller_conflict.value.code == "idempotency_conflict"
+    assert fingerprint_conflict.value.code == "idempotency_conflict"
+
+    with pytest.raises(AuthorizationDenied) as user_caller:
+        service.claim_idempotency(
+            **{**claim_args, "caller_identity": seeded_service["viewer"]},
+            request_payload={"count": 2, "label": "é"},
+        )
+    assert user_caller.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
 
 
 def test_bootstrap_is_idempotent_and_audit_actor_is_structured(engine):
@@ -614,10 +800,14 @@ def test_bootstrap_is_idempotent_and_audit_actor_is_structured(engine):
         assert session.scalar(select(func.count()).select_from(RoleBinding)) == 1
         assert session.scalar(select(func.count()).select_from(AuditEvent)) == 1
         event = session.scalar(select(AuditEvent))
-        assert event.actor_principal_id == first.principal_id
-        assert event.caller_principal_id == first.principal_id
+        assert event.actor_type == AuditActorType.SYSTEM
+        assert event.actor_principal_id is None
+        assert event.caller_principal_id is None
         assert event.channel == AuditChannel.CLI
-        assert event.actor_email_snapshot == "admin@example.test"
+        assert event.actor_email_snapshot is None
+        assert event.details["granted_principal_id"] == str(first.principal_id)
+        assert event.details["workspace_id"] == str(first.workspace_id)
+        assert event.details["granted_role"] == Role.ADMIN.value
 
 
 def test_facade_appends_audit_without_exposing_orm(seeded_service, engine):
@@ -636,8 +826,8 @@ def test_facade_appends_audit_without_exposing_orm(seeded_service, engine):
             actor_identity=seeded_service["admin"],
             caller_identity=seeded_service["mcp"],
             channel=AuditChannel.MCP,
-            resource_type="task",
-            resource_id=decision.task.id,
+            required_permission=Permission.TASK_PUBLISH,
+            task_key="shared-key",
         )
 
     assert event_ref.actor_principal_id == decision.principal.id
@@ -646,6 +836,104 @@ def test_facade_appends_audit_without_exposing_orm(seeded_service, engine):
     with Session(engine) as session:
         event = session.get(AuditEvent, event_ref.id)
         assert event.resource_id == str(decision.task.id)
+
+
+def test_audit_facade_allows_actor_as_caller_and_rejects_inactive_service_caller(seeded_service, engine):
+    service = seeded_service["service"]
+    event = service.append_audit(
+        workspace_slug="workspace-a",
+        event_type="workspace.viewed",
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+        required_permission=Permission.AUDIT_VIEW,
+    )
+    assert event.actor_principal_id == event.caller_principal_id
+
+    with Session(engine) as session, session.begin():
+        worker = session.scalar(select(Principal).where(Principal.subject == "worker-service"))
+        worker.is_active = False
+
+    with pytest.raises(AuthorizationDenied) as inactive_service:
+        service.append_audit(
+            workspace_slug="workspace-a",
+            event_type="workspace.viewed",
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["worker"],
+            channel=AuditChannel.WORKER,
+            required_permission=Permission.AUDIT_VIEW,
+        )
+    assert inactive_service.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
+
+
+def test_audit_facade_rejects_cross_workspace_system_spoof_and_unknown_caller(seeded_service, engine):
+    service = seeded_service["service"]
+    with Session(engine) as session:
+        initial_count = session.scalar(select(func.count()).select_from(AuditEvent))
+
+    with pytest.raises(AuthorizationDenied) as cross_workspace:
+        service.append_audit(
+            workspace_slug="workspace-b",
+            event_type="workspace.viewed",
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.API,
+            required_permission=Permission.AUDIT_VIEW,
+        )
+    with pytest.raises(AuthorizationDenied) as missing_workspace:
+        service.append_audit(
+            workspace_slug="missing-workspace",
+            event_type="workspace.viewed",
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.API,
+            required_permission=Permission.AUDIT_VIEW,
+        )
+    with pytest.raises(AuthorizationDenied) as system_spoof:
+        service.append_audit(
+            workspace_slug="workspace-a",
+            event_type="workspace.viewed",
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.SYSTEM,
+            required_permission=Permission.AUDIT_VIEW,
+        )
+    with pytest.raises(AuthorizationDenied) as null_actor:
+        service.append_audit(
+            workspace_slug="workspace-a",
+            event_type="workspace.viewed",
+            actor_identity=None,
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.API,
+            required_permission=Permission.AUDIT_VIEW,
+        )
+    with pytest.raises(AuthorizationDenied) as unknown_caller:
+        service.append_audit(
+            workspace_slug="workspace-a",
+            event_type="workspace.viewed",
+            actor_identity=seeded_service["admin"],
+            caller_identity=ExternalIdentity("issuer", "unknown-caller"),
+            channel=AuditChannel.API,
+            required_permission=Permission.AUDIT_VIEW,
+        )
+    with pytest.raises(AuthorizationDenied) as user_caller:
+        service.append_audit(
+            workspace_slug="workspace-a",
+            event_type="workspace.viewed",
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["viewer"],
+            channel=AuditChannel.API,
+            required_permission=Permission.AUDIT_VIEW,
+        )
+
+    assert cross_workspace.value.decision.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+    assert missing_workspace.value.decision.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+    assert system_spoof.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
+    assert null_actor.value.decision.reason == AuthorizationReason.UNKNOWN_PRINCIPAL
+    assert unknown_caller.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
+    assert user_caller.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(AuditEvent)) == initial_count
 
 
 def test_audit_events_are_append_only_in_orm(engine):

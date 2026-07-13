@@ -34,7 +34,6 @@ from .enums import (
     MigrationStatus,
     PrincipalType,
     Role,
-    TaskStatus,
 )
 
 
@@ -112,10 +111,9 @@ class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
         UniqueConstraint("workspace_id", "id", name="uq_tasks_workspace_id_id"),
-        UniqueConstraint("workspace_id", "task_key", name="uq_tasks_workspace_task_key"),
+        UniqueConstraint("task_key", name="uq_tasks_task_key"),
         CheckConstraint("length(trim(task_key)) > 0", name="task_key_not_blank"),
         CheckConstraint("length(trim(name)) > 0", name="name_not_blank"),
-        Index("ix_tasks_workspace_status", "workspace_id", "status"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -127,12 +125,6 @@ class Task(Base):
     task_key: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    status: Mapped[TaskStatus] = mapped_column(
-        _enum_type(TaskStatus, "task_status"),
-        nullable=False,
-        default=TaskStatus.DRAFT,
-        server_default=TaskStatus.DRAFT.value,
-    )
     created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("principals.id", ondelete="RESTRICT"),
@@ -203,58 +195,17 @@ class RoleBinding(Base):
     )
 
 
-class TaskRevision(Base):
-    __tablename__ = "task_revisions"
-    __table_args__ = (
-        ForeignKeyConstraint(
-            ["workspace_id", "task_id"],
-            ["tasks.workspace_id", "tasks.id"],
-            name="fk_task_revisions_workspace_task",
-            ondelete="CASCADE",
-        ),
-        UniqueConstraint(
-            "workspace_id",
-            "task_id",
-            "revision",
-            name="uq_task_revisions_workspace_task_revision",
-        ),
-        CheckConstraint("revision > 0", name="revision_positive"),
-        Index("ix_task_revisions_task_created", "workspace_id", "task_id", "created_at"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    workspace_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey("workspaces.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    task_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    revision: Mapped[int] = mapped_column(Integer, nullable=False)
-    definition: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
-    content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
-    created_by_principal_id: Mapped[uuid.UUID] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey("principals.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True),
-        nullable=False,
-        server_default=func.now(),
-    )
-
-
 class IdempotencyRecord(Base):
     __tablename__ = "idempotency_records"
     __table_args__ = (
         UniqueConstraint(
             "workspace_id",
             "operation",
-            "idempotency_key",
-            name="uq_idempotency_records_workspace_operation_key",
+            "idempotency_key_hash",
+            name="uq_idempotency_records_workspace_operation_key_hash",
         ),
         CheckConstraint("length(trim(operation)) > 0", name="operation_not_blank"),
-        CheckConstraint("length(trim(idempotency_key)) > 0", name="key_not_blank"),
+        CheckConstraint("length(idempotency_key_hash) = 64", name="key_hash_sha256"),
         Index("ix_idempotency_records_workspace_state", "workspace_id", "state"),
         Index(
             "ix_idempotency_records_actor_caller",
@@ -282,7 +233,7 @@ class IdempotencyRecord(Base):
         nullable=False,
     )
     operation: Mapped[str] = mapped_column(String(255), nullable=False)
-    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     request_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
     state: Mapped[IdempotencyState] = mapped_column(
         _enum_type(IdempotencyState, "idempotency_state"),

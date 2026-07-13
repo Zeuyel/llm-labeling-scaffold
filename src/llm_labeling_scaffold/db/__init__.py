@@ -1,7 +1,6 @@
 from .enums import AuditChannel, PrincipalType, Role
 from .rbac import Permission, role_allows
 from .service import (
-    AuditActorNotFound,
     AuditEventRef,
     AuthorizationDecision,
     AuthorizationDenied,
@@ -10,6 +9,9 @@ from .service import (
     AuthorizationUnavailable,
     DatabaseService,
     ExternalIdentity,
+    IdempotencyClaim,
+    IdempotencyClaimStatus,
+    IdempotencyConflict,
     IdentityTypeConflict,
     PrincipalRef,
     TaskAccess,
@@ -20,7 +22,6 @@ from .service import (
 )
 
 __all__ = [
-    "AuditActorNotFound",
     "AuditChannel",
     "AuditEventRef",
     "AuthorizationDecision",
@@ -30,6 +31,9 @@ __all__ = [
     "AuthorizationUnavailable",
     "DatabaseService",
     "ExternalIdentity",
+    "IdempotencyClaim",
+    "IdempotencyClaimStatus",
+    "IdempotencyConflict",
     "IdentityTypeConflict",
     "Permission",
     "PrincipalRef",

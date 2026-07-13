@@ -30,7 +30,6 @@ def _json_document():
 
 def upgrade() -> None:
     principal_type = _enum("principal_type", ("user", "service"))
-    task_status = _enum("task_status", ("draft", "published", "archived"))
     role_name = _enum("role_name", ("viewer", "annotator", "experimenter", "admin"))
     idempotency_state = _enum("idempotency_state", ("pending", "succeeded", "failed"))
     audit_actor_type = _enum("audit_actor_type", ("principal", "system"))
@@ -77,7 +76,6 @@ def upgrade() -> None:
         sa.Column("task_key", sa.String(length=255), nullable=False),
         sa.Column("name", sa.String(length=255), nullable=False),
         sa.Column("description", sa.Text(), nullable=True),
-        sa.Column("status", task_status, server_default=sa.text("'draft'"), nullable=False),
         sa.Column("created_by_principal_id", sa.Uuid(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
@@ -97,10 +95,8 @@ def upgrade() -> None:
         ),
         sa.PrimaryKeyConstraint("id", name="pk_tasks"),
         sa.UniqueConstraint("workspace_id", "id", name="uq_tasks_workspace_id_id"),
-        sa.UniqueConstraint("workspace_id", "task_key", name="uq_tasks_workspace_task_key"),
+        sa.UniqueConstraint("task_key", name="uq_tasks_task_key"),
     )
-    op.create_index("ix_tasks_workspace_status", "tasks", ["workspace_id", "status"])
-
     op.create_table(
         "role_bindings",
         sa.Column("id", sa.Uuid(), nullable=False),
@@ -159,56 +155,13 @@ def upgrade() -> None:
     )
 
     op.create_table(
-        "task_revisions",
-        sa.Column("id", sa.Uuid(), nullable=False),
-        sa.Column("workspace_id", sa.Uuid(), nullable=False),
-        sa.Column("task_id", sa.Uuid(), nullable=False),
-        sa.Column("revision", sa.Integer(), nullable=False),
-        sa.Column("definition", json_document, nullable=False),
-        sa.Column("content_hash", sa.String(length=128), nullable=False),
-        sa.Column("created_by_principal_id", sa.Uuid(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.CheckConstraint("revision > 0", name="ck_task_revisions_revision_positive"),
-        sa.ForeignKeyConstraint(
-            ["created_by_principal_id"],
-            ["principals.id"],
-            name="fk_task_revisions_created_by_principal_id_principals",
-            ondelete="RESTRICT",
-        ),
-        sa.ForeignKeyConstraint(
-            ["workspace_id"],
-            ["workspaces.id"],
-            name="fk_task_revisions_workspace_id_workspaces",
-            ondelete="CASCADE",
-        ),
-        sa.ForeignKeyConstraint(
-            ["workspace_id", "task_id"],
-            ["tasks.workspace_id", "tasks.id"],
-            name="fk_task_revisions_workspace_task",
-            ondelete="CASCADE",
-        ),
-        sa.PrimaryKeyConstraint("id", name="pk_task_revisions"),
-        sa.UniqueConstraint(
-            "workspace_id",
-            "task_id",
-            "revision",
-            name="uq_task_revisions_workspace_task_revision",
-        ),
-    )
-    op.create_index(
-        "ix_task_revisions_task_created",
-        "task_revisions",
-        ["workspace_id", "task_id", "created_at"],
-    )
-
-    op.create_table(
         "idempotency_records",
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("workspace_id", sa.Uuid(), nullable=False),
         sa.Column("actor_principal_id", sa.Uuid(), nullable=False),
         sa.Column("caller_principal_id", sa.Uuid(), nullable=False),
         sa.Column("operation", sa.String(length=255), nullable=False),
-        sa.Column("idempotency_key", sa.String(length=255), nullable=False),
+        sa.Column("idempotency_key_hash", sa.String(length=64), nullable=False),
         sa.Column("request_fingerprint", sa.String(length=128), nullable=False),
         sa.Column("state", idempotency_state, server_default=sa.text("'pending'"), nullable=False),
         sa.Column("response_status", sa.Integer(), nullable=True),
@@ -217,7 +170,10 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.CheckConstraint("length(trim(operation)) > 0", name="ck_idempotency_records_operation_not_blank"),
-        sa.CheckConstraint("length(trim(idempotency_key)) > 0", name="ck_idempotency_records_key_not_blank"),
+        sa.CheckConstraint(
+            "length(idempotency_key_hash) = 64",
+            name="ck_idempotency_records_key_hash_sha256",
+        ),
         sa.ForeignKeyConstraint(
             ["actor_principal_id"],
             ["principals.id"],
@@ -240,8 +196,8 @@ def upgrade() -> None:
         sa.UniqueConstraint(
             "workspace_id",
             "operation",
-            "idempotency_key",
-            name="uq_idempotency_records_workspace_operation_key",
+            "idempotency_key_hash",
+            name="uq_idempotency_records_workspace_operation_key_hash",
         ),
     )
     op.create_index(
@@ -378,6 +334,13 @@ def upgrade() -> None:
             FOR EACH ROW EXECUTE FUNCTION lls_reject_audit_event_mutation()
             """
         )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_append_only_truncate
+            BEFORE TRUNCATE ON audit_events
+            FOR EACH STATEMENT EXECUTE FUNCTION lls_reject_audit_event_mutation()
+            """
+        )
     elif op.get_bind().dialect.name == "sqlite":
         op.execute(
             """
@@ -401,6 +364,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     if op.get_bind().dialect.name == "postgresql":
+        op.execute("DROP TRIGGER IF EXISTS trg_audit_events_append_only_truncate ON audit_events")
         op.execute("DROP TRIGGER IF EXISTS trg_audit_events_append_only ON audit_events")
         op.execute("DROP FUNCTION IF EXISTS lls_reject_audit_event_mutation()")
     elif op.get_bind().dialect.name == "sqlite":
@@ -419,13 +383,10 @@ def downgrade() -> None:
     op.drop_index("ix_idempotency_records_actor_caller", table_name="idempotency_records")
     op.drop_index("ix_idempotency_records_workspace_state", table_name="idempotency_records")
     op.drop_table("idempotency_records")
-    op.drop_index("ix_task_revisions_task_created", table_name="task_revisions")
-    op.drop_table("task_revisions")
     op.drop_index("ix_role_bindings_principal_workspace", table_name="role_bindings")
     op.drop_index("uq_role_bindings_task_principal", table_name="role_bindings")
     op.drop_index("uq_role_bindings_workspace_principal", table_name="role_bindings")
     op.drop_table("role_bindings")
-    op.drop_index("ix_tasks_workspace_status", table_name="tasks")
     op.drop_table("tasks")
     op.drop_table("workspaces")
     op.drop_index("ix_principals_type_active", table_name="principals")
@@ -438,7 +399,6 @@ def downgrade() -> None:
             "audit_actor_type",
             "idempotency_state",
             "role_name",
-            "task_status",
             "principal_type",
         ):
             postgresql.ENUM(name=name).drop(op.get_bind(), checkfirst=True)

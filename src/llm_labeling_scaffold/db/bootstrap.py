@@ -117,12 +117,17 @@ def bootstrap_admin(
                 session,
                 workspace_id=workspace.id,
                 event_type="workspace.admin_bootstrapped",
-                actor=principal,
-                caller=principal,
+                actor=None,
+                caller=None,
                 channel=AuditChannel.CLI,
                 resource_type="workspace",
                 resource_id=workspace.id,
-                details={"changes": changed_fields},
+                details={
+                    "changes": changed_fields,
+                    "granted_principal_id": str(principal.id),
+                    "granted_role": Role.ADMIN.value,
+                    "workspace_id": str(workspace.id),
+                },
             )
 
     return BootstrapResult(

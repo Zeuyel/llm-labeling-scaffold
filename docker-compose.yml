@@ -25,8 +25,8 @@ services:
       - LLS_PANEL_PASSWORD=${LLS_PANEL_PASSWORD:-changeme}
       - LLS_DATABASE_HOST=scaffold-postgres
       - LLS_DATABASE_PORT=5432
-      - LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_USER:-scaffold}
-      - LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_PASSWORD:?Set SCAFFOLD_POSTGRES_PASSWORD}
+      - LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}
+      - LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}
       - LLS_DATABASE_NAME=${SCAFFOLD_POSTGRES_DB:-scaffold}
       - LLS_MCP_INTERNAL_TOKEN=${LLS_MCP_INTERNAL_TOKEN:-}
       - LLS_MCP_ENABLE_WRITES=${LLS_MCP_ENABLE_WRITES:-0}
@@ -60,10 +60,31 @@ services:
     environment:
       - LLS_DATABASE_HOST=scaffold-postgres
       - LLS_DATABASE_PORT=5432
-      - LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_USER:-scaffold}
-      - LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_PASSWORD:?Set SCAFFOLD_POSTGRES_PASSWORD}
+      - LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_OWNER_USER:-scaffold_owner}
+      - LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_OWNER_PASSWORD:?Set SCAFFOLD_POSTGRES_OWNER_PASSWORD}
       - LLS_DATABASE_NAME=${SCAFFOLD_POSTGRES_DB:-scaffold}
     command: ["python", "-m", "llm_labeling_scaffold.cli", "db", "upgrade"]
+    depends_on:
+      db-role-init:
+        condition: service_completed_successfully
+    networks:
+      - lls
+
+  db-role-init:
+    image: postgres:16
+    restart: "no"
+    environment:
+      PGHOST: scaffold-postgres
+      PGPASSWORD: ${SCAFFOLD_POSTGRES_OWNER_PASSWORD:?Set SCAFFOLD_POSTGRES_OWNER_PASSWORD}
+      POSTGRES_USER: ${SCAFFOLD_POSTGRES_OWNER_USER:-scaffold_owner}
+      POSTGRES_DB: ${SCAFFOLD_POSTGRES_DB:-scaffold}
+      SCAFFOLD_POSTGRES_APP_USER: ${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}
+      SCAFFOLD_POSTGRES_APP_PASSWORD: ${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}
+      LLS_RUNTIME_ROLE_SQL_PATH: /usr/local/share/lls/init-runtime-role.sql
+    command: ["/usr/local/bin/lls-init-runtime-role"]
+    volumes:
+      - ./docker/postgres/init-runtime-role.sh:/usr/local/bin/lls-init-runtime-role:ro
+      - ./docker/postgres/init-runtime-role.sql:/usr/local/share/lls/init-runtime-role.sql:ro
     depends_on:
       scaffold-postgres:
         condition: service_healthy
@@ -142,11 +163,16 @@ services:
     ports:
       - "${SCAFFOLD_POSTGRES_BIND_HOST:-127.0.0.1}:${SCAFFOLD_POSTGRES_PORT:-5433}:5432"
     environment:
-      POSTGRES_USER: ${SCAFFOLD_POSTGRES_USER:-scaffold}
-      POSTGRES_PASSWORD: ${SCAFFOLD_POSTGRES_PASSWORD:?Set SCAFFOLD_POSTGRES_PASSWORD}
+      POSTGRES_USER: ${SCAFFOLD_POSTGRES_OWNER_USER:-scaffold_owner}
+      POSTGRES_PASSWORD: ${SCAFFOLD_POSTGRES_OWNER_PASSWORD:?Set SCAFFOLD_POSTGRES_OWNER_PASSWORD}
       POSTGRES_DB: ${SCAFFOLD_POSTGRES_DB:-scaffold}
+      SCAFFOLD_POSTGRES_APP_USER: ${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}
+      SCAFFOLD_POSTGRES_APP_PASSWORD: ${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}
+      LLS_RUNTIME_ROLE_SQL_PATH: /usr/local/share/lls/init-runtime-role.sql
     volumes:
       - scaffold-postgres-data:/var/lib/postgresql/data
+      - ./docker/postgres/init-runtime-role.sh:/docker-entrypoint-initdb.d/10-init-runtime-role.sh:ro
+      - ./docker/postgres/init-runtime-role.sql:/usr/local/share/lls/init-runtime-role.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s

@@ -13,13 +13,15 @@ MLflow 不再是默认依赖。它只作为可选外部模型记录服务，适�
 
 ```bash
 cp .env.example .env
-db_password="$(openssl rand -hex 32)"
-sed -i "s|^SCAFFOLD_POSTGRES_PASSWORD=.*|SCAFFOLD_POSTGRES_PASSWORD=${db_password}|" .env
-unset db_password
+owner_password="$(openssl rand -hex 32)"
+app_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_OWNER_PASSWORD=.*|SCAFFOLD_POSTGRES_OWNER_PASSWORD=${owner_password}|" .env
+sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${app_password}|" .env
+unset owner_password app_password
 ./scripts/stack up
 ```
 
-Compose 对 `SCAFFOLD_POSTGRES_PASSWORD` 使用必填校验，缺失时直接退出；Panel、migration 和 PostgreSQL 从同一组 `SCAFFOLD_POSTGRES_*` 变量取得连接参数。正式部署应由 secret manager 注入随机密码，不使用仓库默认凭据。
+Compose 对 owner/app 两个数据库密码使用必填校验，任一缺失时直接退出。`migrate` 使用 schema owner，Panel 只使用受限 runtime app role；两个账号和密码必须不同。正式部署应由 secret manager 注入独立随机密码，不使用仓库默认凭据。
 
 默认启动：
 
@@ -157,9 +159,11 @@ ghcr.io/zeuyel/llm-labeling-scaffold/panel
 git clone <repo-url>
 cd llm-labeling-scaffold
 cp .env.example .env
-db_password="$(openssl rand -hex 32)"
-sed -i "s|^SCAFFOLD_POSTGRES_PASSWORD=.*|SCAFFOLD_POSTGRES_PASSWORD=${db_password}|" .env
-unset db_password
+owner_password="$(openssl rand -hex 32)"
+app_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_OWNER_PASSWORD=.*|SCAFFOLD_POSTGRES_OWNER_PASSWORD=${owner_password}|" .env
+sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${app_password}|" .env
+unset owner_password app_password
 export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:main
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull panel
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
@@ -183,9 +187,11 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --prof
 git clone <repo-url>
 cd llm-labeling-scaffold
 cp .env.example .env
-db_password="$(openssl rand -hex 32)"
-sed -i "s|^SCAFFOLD_POSTGRES_PASSWORD=.*|SCAFFOLD_POSTGRES_PASSWORD=${db_password}|" .env
-unset db_password
+owner_password="$(openssl rand -hex 32)"
+app_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_OWNER_PASSWORD=.*|SCAFFOLD_POSTGRES_OWNER_PASSWORD=${owner_password}|" .env
+sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${app_password}|" .env
+unset owner_password app_password
 ./scripts/stack up
 ```
 
@@ -253,8 +259,10 @@ LLS_PANEL_PASSWORD=changeme
 
 SCAFFOLD_POSTGRES_BIND_HOST=127.0.0.1
 SCAFFOLD_POSTGRES_PORT=5433
-SCAFFOLD_POSTGRES_USER=scaffold
-SCAFFOLD_POSTGRES_PASSWORD=
+SCAFFOLD_POSTGRES_OWNER_USER=scaffold_owner
+SCAFFOLD_POSTGRES_OWNER_PASSWORD=
+SCAFFOLD_POSTGRES_APP_USER=scaffold_app
+SCAFFOLD_POSTGRES_APP_PASSWORD=
 SCAFFOLD_POSTGRES_DB=scaffold
 
 ARGILLA_PORT=6900

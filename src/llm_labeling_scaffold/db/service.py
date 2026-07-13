@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import unicodedata
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -8,14 +11,16 @@ from enum import Enum
 from typing import Any
 
 from sqlalchemy import Engine, and_, or_, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .audit import append_audit_event
 from .database import create_database_engine, create_session_factory
-from .enums import AuditChannel, PrincipalType, Role
-from .models import AuditEvent, Principal, RoleBinding, Task, Workspace
-from .rbac import Permission, role_allows
+from .enums import AuditChannel, IdempotencyState, PrincipalType, Role
+from .models import AuditEvent, IdempotencyRecord, Principal, RoleBinding, Task, Workspace
+from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS, Permission, role_allows
 
 
 MAX_AUTHORIZED_TASKS_PAGE_SIZE = 100
@@ -27,6 +32,8 @@ class AuthorizationReason(str, Enum):
     INACTIVE_PRINCIPAL = "inactive_principal"
     RESOURCE_NOT_VISIBLE = "resource_not_visible"
     INACTIVE_WORKSPACE = "inactive_workspace"
+    INVALID_PERMISSION_SCOPE = "invalid_permission_scope"
+    INVALID_AUDIT_CONTEXT = "invalid_audit_context"
     ROLE_DENIED = "role_denied"
 
 
@@ -78,7 +85,8 @@ class TaskAccess:
 class WorkspaceAccess:
     workspace: WorkspaceRef
     roles: tuple[Role, ...]
-    capabilities: tuple[Permission, ...]
+    workspace_capabilities: tuple[Permission, ...]
+    task_capabilities: tuple[Permission, ...]
 
 
 @dataclass(frozen=True)
@@ -115,6 +123,27 @@ class AuditEventRef:
     event_type: str
 
 
+class IdempotencyClaimStatus(str, Enum):
+    CLAIMED = "claimed"
+    PENDING = "pending"
+    REPLAY = "replay"
+
+
+@dataclass(frozen=True)
+class IdempotencyClaim:
+    record_id: uuid.UUID
+    workspace_id: uuid.UUID
+    actor_principal_id: uuid.UUID
+    caller_principal_id: uuid.UUID
+    operation: str
+    idempotency_key_hash: str
+    request_fingerprint: str
+    status: IdempotencyClaimStatus
+    state: IdempotencyState
+    response_status: int | None
+    response_body: dict[str, Any] | None
+
+
 class AuthorizationUnavailable(RuntimeError):
     pass
 
@@ -129,8 +158,11 @@ class IdentityTypeConflict(RuntimeError):
     pass
 
 
-class AuditActorNotFound(RuntimeError):
-    pass
+class IdempotencyConflict(RuntimeError):
+    code = "idempotency_conflict"
+
+    def __init__(self):
+        super().__init__(self.code)
 
 
 class DatabaseService:
@@ -234,16 +266,56 @@ class DatabaseService:
             raise AuthorizationDenied(decision)
         return decision
 
+    def claim_idempotency(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        required_permission: Permission,
+        operation: str,
+        idempotency_key: str,
+        request_payload: Any,
+        task_key: str | None = None,
+    ) -> IdempotencyClaim:
+        with self.transaction() as transaction:
+            return transaction.claim_idempotency(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                required_permission=required_permission,
+                operation=operation,
+                idempotency_key=idempotency_key,
+                request_payload=request_payload,
+                task_key=task_key,
+            )
+
+    def complete_idempotency(
+        self,
+        claim: IdempotencyClaim,
+        *,
+        response_status: int,
+        response_body: dict[str, Any] | None,
+        succeeded: bool = True,
+    ) -> IdempotencyClaim:
+        with self.transaction() as transaction:
+            return transaction.complete_idempotency(
+                claim,
+                response_status=response_status,
+                response_body=response_body,
+                succeeded=succeeded,
+            )
+
     def append_audit(
         self,
         *,
         workspace_slug: str,
         event_type: str,
-        actor_identity: ExternalIdentity | None,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
         channel: AuditChannel,
-        caller_identity: ExternalIdentity | None = None,
-        resource_type: str | None = None,
-        resource_id: str | uuid.UUID | None = None,
+        required_permission: Permission,
+        task_key: str | None = None,
         request_id: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> AuditEventRef:
@@ -254,8 +326,8 @@ class DatabaseService:
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
                 channel=channel,
-                resource_type=resource_type,
-                resource_id=resource_id,
+                required_permission=required_permission,
+                task_key=task_key,
                 request_id=request_id,
                 details=details,
             )
@@ -381,7 +453,7 @@ class DatabaseTransaction:
                 TaskAccess(
                     task=_task_ref(task),
                     roles=roles,
-                    capabilities=_capabilities(roles),
+                    capabilities=_capabilities(roles, TASK_PERMISSIONS),
                 )
             )
         next_cursor = page_tasks[-1].task_key if has_more and page_tasks else None
@@ -397,6 +469,8 @@ class DatabaseTransaction:
         workspace_slug: str,
         permission: Permission,
     ) -> AuthorizationDecision:
+        if permission not in WORKSPACE_PERMISSIONS:
+            return _decision(permission, AuthorizationReason.INVALID_PERMISSION_SCOPE)
         principal = self._find_principal(identity)
         if principal is None:
             return _decision(permission, AuthorizationReason.UNKNOWN_PRINCIPAL)
@@ -446,6 +520,8 @@ class DatabaseTransaction:
         task_key: str,
         permission: Permission,
     ) -> AuthorizationDecision:
+        if permission not in TASK_PERMISSIONS:
+            return _decision(permission, AuthorizationReason.INVALID_PERMISSION_SCOPE)
         principal = self._find_principal(identity)
         if principal is None:
             return _decision(permission, AuthorizationReason.UNKNOWN_PRINCIPAL)
@@ -497,35 +573,141 @@ class DatabaseTransaction:
         if not decision.allowed:
             raise AuthorizationDenied(decision)
 
+    def claim_idempotency(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        required_permission: Permission,
+        operation: str,
+        idempotency_key: str,
+        request_payload: Any,
+        task_key: str | None = None,
+    ) -> IdempotencyClaim:
+        if not operation.strip() or not idempotency_key.strip():
+            raise ValueError("operation and idempotency_key must not be blank")
+        if task_key is None:
+            decision = self.authorize_workspace(actor_identity, workspace_slug, required_permission)
+        else:
+            decision = self.authorize_task(actor_identity, workspace_slug, task_key, required_permission)
+        self.require(decision)
+        caller = self._require_caller(caller_identity, decision.principal.id, required_permission)
+
+        request_fingerprint = canonical_request_fingerprint(request_payload)
+        key_hash = idempotency_key_hash(idempotency_key)
+        candidate_id = uuid.uuid4()
+        values = {
+            "id": candidate_id,
+            "workspace_id": decision.workspace.id,
+            "actor_principal_id": decision.principal.id,
+            "caller_principal_id": caller.id,
+            "operation": operation,
+            "idempotency_key_hash": key_hash,
+            "request_fingerprint": request_fingerprint,
+            "state": IdempotencyState.PENDING,
+        }
+        dialect_name = self._session.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            statement = postgresql_insert(IdempotencyRecord).values(**values).on_conflict_do_nothing(
+                index_elements=["workspace_id", "operation", "idempotency_key_hash"],
+            ).returning(IdempotencyRecord.id)
+        elif dialect_name == "sqlite":
+            statement = sqlite_insert(IdempotencyRecord).values(**values).on_conflict_do_nothing(
+                index_elements=["workspace_id", "operation", "idempotency_key_hash"],
+            ).returning(IdempotencyRecord.id)
+        else:
+            raise AuthorizationUnavailable(f"unsupported idempotency dialect: {dialect_name}")
+        inserted = self._session.scalar(statement) == candidate_id
+        record = self._session.scalar(
+            select(IdempotencyRecord)
+            .where(
+                IdempotencyRecord.workspace_id == decision.workspace.id,
+                IdempotencyRecord.operation == operation,
+                IdempotencyRecord.idempotency_key_hash == key_hash,
+            )
+            .with_for_update(),
+        )
+        if record is None:
+            raise AuthorizationUnavailable("idempotency claim was not readable after insert")
+        if (
+            record.actor_principal_id != decision.principal.id
+            or record.caller_principal_id != caller.id
+            or record.request_fingerprint != request_fingerprint
+        ):
+            raise IdempotencyConflict()
+        if inserted:
+            status = IdempotencyClaimStatus.CLAIMED
+        elif record.state == IdempotencyState.PENDING:
+            status = IdempotencyClaimStatus.PENDING
+        else:
+            status = IdempotencyClaimStatus.REPLAY
+        return _idempotency_claim(record, status)
+
+    def complete_idempotency(
+        self,
+        claim: IdempotencyClaim,
+        *,
+        response_status: int,
+        response_body: dict[str, Any] | None,
+        succeeded: bool = True,
+    ) -> IdempotencyClaim:
+        record = self._session.scalar(
+            select(IdempotencyRecord).where(IdempotencyRecord.id == claim.record_id).with_for_update(),
+        )
+        if record is None or (
+            record.workspace_id != claim.workspace_id
+            or record.actor_principal_id != claim.actor_principal_id
+            or record.caller_principal_id != claim.caller_principal_id
+            or record.operation != claim.operation
+            or record.idempotency_key_hash != claim.idempotency_key_hash
+            or record.request_fingerprint != claim.request_fingerprint
+        ):
+            raise IdempotencyConflict()
+        if record.state == IdempotencyState.PENDING:
+            record.state = IdempotencyState.SUCCEEDED if succeeded else IdempotencyState.FAILED
+            record.response_status = response_status
+            record.response_body = response_body
+            self._session.flush()
+        elif record.response_status != response_status or record.response_body != response_body:
+            raise IdempotencyConflict()
+        return _idempotency_claim(record, IdempotencyClaimStatus.REPLAY)
+
     def append_audit(
         self,
         *,
         workspace_slug: str,
         event_type: str,
-        actor_identity: ExternalIdentity | None,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
         channel: AuditChannel,
-        caller_identity: ExternalIdentity | None = None,
-        resource_type: str | None = None,
-        resource_id: str | uuid.UUID | None = None,
+        required_permission: Permission,
+        task_key: str | None = None,
         request_id: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> AuditEventRef:
-        workspace = self._session.scalar(select(Workspace).where(Workspace.slug == workspace_slug))
-        if workspace is None:
-            raise AuditActorNotFound("audit target or actor is unavailable")
+        if channel == AuditChannel.SYSTEM:
+            raise AuthorizationDenied(
+                _decision(required_permission, AuthorizationReason.INVALID_AUDIT_CONTEXT),
+            )
+        if task_key is None:
+            decision = self.authorize_workspace(actor_identity, workspace_slug, required_permission)
+        else:
+            decision = self.authorize_task(actor_identity, workspace_slug, task_key, required_permission)
+        self.require(decision)
 
-        actor = self._find_principal(actor_identity) if actor_identity is not None else None
-        if actor_identity is not None and actor is None:
-            raise AuditActorNotFound("audit target or actor is unavailable")
-
-        effective_caller_identity = caller_identity if caller_identity is not None else actor_identity
-        caller = self._find_principal(effective_caller_identity) if effective_caller_identity is not None else None
-        if effective_caller_identity is not None and caller is None:
-            raise AuditActorNotFound("audit target or actor is unavailable")
+        actor = self._find_principal(actor_identity)
+        if actor is None or not actor.is_active:
+            raise AuthorizationDenied(
+                _decision(required_permission, AuthorizationReason.INVALID_AUDIT_CONTEXT),
+            )
+        caller = self._require_caller(caller_identity, actor.id, required_permission)
+        resource_type = "task" if decision.task is not None else "workspace"
+        resource_id = decision.task.id if decision.task is not None else decision.workspace.id
 
         event = append_audit_event(
             self._session,
-            workspace_id=workspace.id,
+            workspace_id=decision.workspace.id,
             event_type=event_type,
             actor=actor,
             caller=caller,
@@ -547,6 +729,21 @@ class DatabaseTransaction:
                 Principal.subject == identity.subject,
             ),
         )
+
+    def _require_caller(
+        self,
+        identity: ExternalIdentity,
+        actor_principal_id: uuid.UUID,
+        permission: Permission,
+    ) -> Principal:
+        caller = self._find_principal(identity)
+        if caller is None or not caller.is_active or (
+            caller.id != actor_principal_id and caller.principal_type != PrincipalType.SERVICE
+        ):
+            raise AuthorizationDenied(
+                _decision(permission, AuthorizationReason.INVALID_AUDIT_CONTEXT),
+            )
+        return caller
 
     def _roles(
         self,
@@ -590,7 +787,8 @@ class DatabaseTransaction:
                 WorkspaceAccess(
                     workspace=_workspace_ref(workspace),
                     roles=roles,
-                    capabilities=_capabilities(roles),
+                    workspace_capabilities=_capabilities(roles, WORKSPACE_PERMISSIONS),
+                    task_capabilities=_capabilities(roles, TASK_PERMISSIONS),
                 )
             )
         return tuple(access)
@@ -641,8 +839,15 @@ def _sorted_roles(values) -> tuple[Role, ...]:
     return tuple(sorted(set(values), key=order.__getitem__))
 
 
-def _capabilities(roles: tuple[Role, ...]) -> tuple[Permission, ...]:
-    return tuple(permission for permission in Permission if any(role_allows(role, permission) for role in roles))
+def _capabilities(
+    roles: tuple[Role, ...],
+    allowed_permissions: frozenset[Permission],
+) -> tuple[Permission, ...]:
+    return tuple(
+        permission
+        for permission in Permission
+        if permission in allowed_permissions and any(role_allows(role, permission) for role in roles)
+    )
 
 
 def _principal_ref(principal: Principal) -> PrincipalRef:
@@ -673,4 +878,42 @@ def _audit_event_ref(event: AuditEvent) -> AuditEventRef:
         caller_principal_id=event.caller_principal_id,
         channel=event.channel,
         event_type=event.event_type,
+    )
+
+
+def canonical_request_fingerprint(request_payload: Any) -> str:
+    try:
+        canonical_json = json.dumps(
+            request_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("request_payload must be canonical JSON data") from exc
+    normalized = unicodedata.normalize("NFC", canonical_json)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def idempotency_key_hash(idempotency_key: str) -> str:
+    return hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+
+
+def _idempotency_claim(
+    record: IdempotencyRecord,
+    status: IdempotencyClaimStatus,
+) -> IdempotencyClaim:
+    return IdempotencyClaim(
+        record_id=record.id,
+        workspace_id=record.workspace_id,
+        actor_principal_id=record.actor_principal_id,
+        caller_principal_id=record.caller_principal_id,
+        operation=record.operation,
+        idempotency_key_hash=record.idempotency_key_hash,
+        request_fingerprint=record.request_fingerprint,
+        status=status,
+        state=record.state,
+        response_status=record.response_status if status == IdempotencyClaimStatus.REPLAY else None,
+        response_body=record.response_body if status == IdempotencyClaimStatus.REPLAY else None,
     )

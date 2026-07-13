@@ -15,12 +15,6 @@ class Role(str, Enum):
     ADMIN = "admin"
 
 
-class TaskStatus(str, Enum):
-    DRAFT = "draft"
-    PUBLISHED = "published"
-    ARCHIVED = "archived"
-
-
 class IdempotencyState(str, Enum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"
