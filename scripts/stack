@@ -37,10 +37,11 @@ env_value() {
 
 usage() {
   cat >&2 <<'EOF'
-用法：scripts/stack [up|down|logs|ps|restart] [--mlflow]
+用法：scripts/stack [up|down|logs|ps|restart] [--mlflow] [--mcp]
 
 默认启动 light panel 和 Argilla 标注服务。
 如需可选模型记录服务，使用：scripts/stack up --mlflow
+如需 MCP companion service，使用：scripts/stack up --mcp
 EOF
 }
 
@@ -50,6 +51,7 @@ if [ "$#" -gt 0 ]; then
 fi
 
 enable_mlflow=0
+enable_mcp=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --mlflow|--profile=mlflow)
@@ -60,10 +62,17 @@ while [ "$#" -gt 0 ]; do
       if [ "${2:-}" = "mlflow" ]; then
         enable_mlflow=1
         shift 2
+      elif [ "${2:-}" = "mcp" ]; then
+        enable_mcp=1
+        shift 2
       else
         usage
         exit 2
       fi
+      ;;
+    --mcp|--profile=mcp)
+      enable_mcp=1
+      shift
       ;;
     *)
       usage
@@ -71,6 +80,15 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+if [ "$enable_mcp" -eq 1 ] && [ "$cmd" = "up" ]; then
+  mcp_bearer_token="$(env_value LLS_MCP_BEARER_TOKEN "")"
+  mcp_internal_token="$(env_value LLS_MCP_INTERNAL_TOKEN "")"
+  if [ "${#mcp_bearer_token}" -lt 32 ] || [[ "$mcp_bearer_token" =~ [[:space:]] ]] || [ "${#mcp_internal_token}" -lt 32 ] || [[ "$mcp_internal_token" =~ [[:space:]] ]] || [ "$mcp_bearer_token" = "$mcp_internal_token" ]; then
+    echo "启用 MCP 前必须设置彼此不同、至少 32 个非空白字符的 LLS_MCP_BEARER_TOKEN 和 LLS_MCP_INTERNAL_TOKEN。" >&2
+    exit 2
+  fi
+fi
 
 task_source="$(env_value LLS_TASK_SOURCE control)"
 compose=(docker compose -f docker-compose.yml)
@@ -86,6 +104,10 @@ if [ "$enable_mlflow" -eq 1 ]; then
   compose+=(--profile mlflow)
   services+=(mlflow)
 fi
+if [ "$enable_mcp" -eq 1 ]; then
+  compose+=(--profile mcp)
+  services+=(mcp)
+fi
 
 print_urls() {
   local registry_uri
@@ -97,12 +119,19 @@ print_urls() {
   if [ "$enable_mlflow" -eq 1 ]; then
     echo "模型记录服务： http://localhost:$(env_value MLFLOW_PORT 5000)"
   fi
+  if [ "$enable_mcp" -eq 1 ]; then
+    echo "MCP：         http://localhost:$(env_value MCP_PORT 8766)/mcp"
+  fi
   echo
   echo "panel 登录：admin / $(env_value LLS_PANEL_PASSWORD changeme)"
   echo "Argilla 登录：$(env_value ARGILLA_USERNAME argilla) / $(env_value ARGILLA_PASSWORD 12345678)"
   if [ "$enable_mlflow" -eq 0 ]; then
     echo
     echo "默认未启动模型记录服务；需要时运行：scripts/stack up --mlflow"
+  fi
+  if [ "$enable_mcp" -eq 0 ]; then
+    echo
+    echo "默认未启动 MCP；需要时先配置 LLS_MCP_BEARER_TOKEN 和 LLS_MCP_INTERNAL_TOKEN，再运行：scripts/stack up --mcp"
   fi
   case "${task_source,,}" in
     r2|data_lake|registry)

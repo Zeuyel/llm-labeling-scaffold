@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
 from .config import load_task
@@ -19,7 +19,7 @@ from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
 
-API_CONTRACT_VERSION = "2026-07-12"
+API_CONTRACT_VERSION = "2026-07-13"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -49,6 +49,21 @@ def _truthy_value(value: Any) -> bool:
 
 def _valid_idempotency_key(value: str) -> bool:
     return bool(value) and len(value) <= 200 and not any(ord(ch) < 32 for ch in value)
+
+
+def _valid_service_token(value: str) -> bool:
+    return len(value) >= 32 and not any(char.isspace() for char in value)
+
+
+def _if_match_value(value: str | None) -> str:
+    text = str(value or "").strip()
+    if text.startswith("W/"):
+        text = text[2:].strip()
+    return text.strip('"')
+
+
+def _mcp_writes_enabled() -> bool:
+    return _truthy_env("LLS_MCP_ENABLE_WRITES")
 
 
 def _allow_data_lake_overrides() -> bool:
@@ -124,6 +139,7 @@ def _public_settings_response(settings: dict) -> dict:
             "task_registry_configured": bool(settings["task_registry_uri"]),
             "data_lake_r2_prefix_configured": bool(settings["data_lake_r2_prefix"]),
             "rclone_configured": bool(settings["rclone_config_path"]),
+            "mcp_writes_enabled": _mcp_writes_enabled(),
         }
     }
 
@@ -132,7 +148,7 @@ def _contract_capabilities() -> dict[str, Any]:
     return {
         "service": "llm-labeling-scaffold",
         "api_contract_version": API_CONTRACT_VERSION,
-        "auth": {"type": "basic", "multi_user": False},
+        "auth": {"types": ["basic", "mcp_service_bearer"], "multi_user": False},
         "endpoints": [
             {
                 "method": "GET",
@@ -179,6 +195,7 @@ def _contract_capabilities() -> dict[str, Any]:
                                 "task_registry_configured",
                                 "data_lake_r2_prefix_configured",
                                 "rclone_configured",
+                                "mcp_writes_enabled",
                             ],
                         }
                     },
@@ -228,6 +245,7 @@ def _contract_capabilities() -> dict[str, Any]:
                 "side_effects": True,
                 "requires_task_source": "control",
                 "path_params": {"task_id": {"type": "string"}},
+                "required_headers": {"If-Match": {"type": "string", "format": "sha256"}},
                 "request_schema": {"type": "object", "required": ["task_id", "text_fields", "primary_label_values"]},
                 "response_schema": {"type": "object", "required": ["ok", "task"]},
             },
@@ -238,7 +256,16 @@ def _contract_capabilities() -> dict[str, Any]:
                 "side_effects": True,
                 "requires_task_source": "control",
                 "path_params": {"task_id": {"type": "string"}},
-                "request_schema": {"type": "object", "additionalProperties": False},
+                "request_schema": {
+                    "type": "object",
+                    "required": ["confirm", "idempotency_key"],
+                    "properties": {
+                        "confirm": {"const": True},
+                        "idempotency_key": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "required_headers": {"If-Match": {"type": "string", "format": "sha256"}},
                 "response_schema": {"type": "object", "required": ["ok", "task", "published"]},
             },
             {
@@ -433,8 +460,34 @@ def _contract_task_path(path: str, *, suffix: str = "") -> str | None:
         rest = rest[: -len(marker)]
     elif "/" in rest:
         return None
-    task_id = rest.strip()
+    task_id = unquote(rest).strip()
     return task_id if _safe_segment(task_id) else None
+
+
+def _mcp_route_allowed(method: str, path: str) -> bool:
+    if method == "GET":
+        if path in {
+            "/api/health",
+            "/api/version",
+            "/api/settings/public",
+            "/api/tasks",
+            "/api/task/control",
+            "/api/task/imports",
+            "/api/import/detail",
+            "/api/task/data_lake",
+            "/api/jobs",
+        }:
+            return True
+        return _contract_task_path(path) is not None
+    if method == "POST":
+        if path == "/api/import/data_lake" or _contract_task_path(path, suffix="check") is not None:
+            return True
+        if not _mcp_writes_enabled():
+            return False
+        return path == "/api/tasks" or _contract_task_path(path, suffix="publish") is not None
+    if method == "PUT" and _mcp_writes_enabled():
+        return _contract_task_path(path) is not None
+    return False
 
 
 def _safe_data_lake_summary(data_lake: dict[str, Any]) -> dict[str, Any]:
@@ -599,34 +652,46 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         pass
 
-    def _authed(self) -> bool:
+    def _authenticate(self) -> tuple[str, str] | None:
         header = self.headers.get("Authorization", "")
-        if not header.startswith("Basic "):
-            return False
-        try:
-            raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
-        except Exception:
-            return False
-        user, _, pw = raw.partition(":")
-        return hmac.compare_digest(user, self.auth_user) and hmac.compare_digest(pw, self.auth_pass)
+        parts = header.split()
+        if len(parts) != 2:
+            return None
+        scheme, credentials = parts
+        if scheme.lower() == "basic":
+            try:
+                raw = base64.b64decode(credentials).decode("utf-8", "replace")
+            except Exception:
+                return None
+            user, _, password = raw.partition(":")
+            if hmac.compare_digest(user, self.auth_user) and hmac.compare_digest(password, self.auth_pass):
+                return "panel", user or self.auth_user
+            return None
+        if scheme.lower() == "bearer":
+            internal_token = str(os.environ.get("LLS_MCP_INTERNAL_TOKEN") or "").strip()
+            if _valid_service_token(internal_token) and hmac.compare_digest(credentials, internal_token):
+                return "mcp", "mcp"
+        return None
 
     def _actor(self) -> str:
-        header = self.headers.get("Authorization", "")
-        if header.startswith("Basic "):
-            try:
-                raw = base64.b64decode(header[6:]).decode("utf-8", "replace")
-                user, _, _ = raw.partition(":")
-                if user:
-                    return user
-            except Exception:
-                pass
-        return self.auth_user or "panel"
+        return str(getattr(self, "_request_actor", self.auth_user or "panel"))
+
+    def _is_mcp_request(self) -> bool:
+        return getattr(self, "_request_principal", "") == "mcp"
 
     def _require_auth(self) -> bool:
-        if self._authed():
+        principal = self._authenticate()
+        if principal is not None:
+            kind, actor = principal
+            if kind == "mcp" and not _mcp_route_allowed(self.command, urlparse(self.path).path):
+                self._json({"error": "MCP 服务身份无权访问该接口"}, status=HTTPStatus.FORBIDDEN)
+                return False
+            self._request_principal = kind
+            self._request_actor = actor
             return True
         self.send_response(HTTPStatus.UNAUTHORIZED)
         self.send_header("WWW-Authenticate", 'Basic realm="lls-panel"')
+        self.send_header("WWW-Authenticate", "Bearer")
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"authentication required\n")
@@ -1173,10 +1238,31 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "只有 scaffold 控制面任务来源模式支持发布任务 revision"}, status=400)
                 return
             try:
-                from .task_control import publish_task
+                from .task_control import TaskConflictError, publish_task
 
-                result = publish_task(self.runs_root, self.tasks_root, publish_task_id, actor=self._actor())
+                body = self._read_body()
+                idempotency_key = str(body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "").strip()
+                expected_fingerprint = _if_match_value(self.headers.get("If-Match"))
+                if not _truthy_value(body.get("confirm")):
+                    self._json({"error": "任务发布必须显式设置 confirm=true"}, status=400)
+                    return
+                if not _valid_idempotency_key(idempotency_key):
+                    self._json({"error": "任务发布必须提供有效的 idempotency_key 或 Idempotency-Key header"}, status=400)
+                    return
+                if not expected_fingerprint:
+                    self._json({"error": "任务发布必须通过 If-Match 提交当前草稿指纹"}, status=HTTPStatus.PRECONDITION_REQUIRED)
+                    return
+                result = publish_task(
+                    self.runs_root,
+                    self.tasks_root,
+                    publish_task_id,
+                    expected_draft_fingerprint=expected_fingerprint,
+                    actor=self._actor(),
+                    idempotency_key=idempotency_key,
+                )
                 self._json({"ok": True, **result})
+            except TaskConflictError as exc:
+                self._json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/tasks/sync":
@@ -1296,11 +1382,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "只有 scaffold 控制面任务来源模式支持编辑任务草稿"}, status=400)
             return
         body = self._read_body()
+        expected_fingerprint = _if_match_value(self.headers.get("If-Match"))
+        if not expected_fingerprint:
+            self._json({"error": "保存草稿必须通过 If-Match 提交当前草稿指纹"}, status=HTTPStatus.PRECONDITION_REQUIRED)
+            return
         try:
-            from .task_control import update_draft
+            from .task_control import TaskConflictError, update_draft
 
-            result = update_draft(self.runs_root, task_id, body, actor=self._actor())
+            result = update_draft(
+                self.runs_root,
+                task_id,
+                body,
+                expected_draft_fingerprint=expected_fingerprint,
+                actor=self._actor(),
+            )
             self._json({"ok": True, **result})
+        except TaskConflictError as exc:
+            self._json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
         except Exception as exc:
             self._json({"error": str(exc)}, status=400)
 
@@ -1408,6 +1506,9 @@ class _Handler(BaseHTTPRequestHandler):
         import_id = str(body.get("import_id") or params.get("import_id", [""])[0] or "").strip()
         dry_run_value = body.get("dry_run", body.get("dryRun", params.get("dry_run", [""])[0]))
         dry_run = _truthy_value(dry_run_value)
+        if self._is_mcp_request() and not dry_run and not _mcp_writes_enabled():
+            self._json({"error": "当前部署未启用 MCP 写操作"}, status=HTTPStatus.FORBIDDEN)
+            return
         override_keys = (
             "lake_registry_uri",
             "source_dataset_id",

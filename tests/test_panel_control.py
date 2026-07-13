@@ -40,15 +40,24 @@ def _panel_server(runs_root: Path, tasks_root: Path):
             setattr(panel._Handler, key, value)
 
 
-def _request(base_url: str, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, dict]:
+def _request(
+    base_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
+    request_headers = {
+        "Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii"),
+        "Content-Type": "application/json",
+    }
+    request_headers.update(headers or {})
     request = urllib.request.Request(
         base_url + path,
         data=data,
-        headers={
-            "Authorization": "Basic " + base64.b64encode(b"admin:secret").decode("ascii"),
-            "Content-Type": "application/json",
-        },
+        headers=request_headers,
         method=method,
     )
     try:
@@ -107,7 +116,7 @@ def test_control_api_updates_publishes_revisions_and_rejects_delete(tmp_path: Pa
     }
 
     with _panel_server(runs_root, tasks_root) as base_url:
-        status, _ = _request(base_url, "/api/tasks", method="POST", body=spec)
+        status, created = _request(base_url, "/api/tasks", method="POST", body=spec)
         assert status == 200
 
         status, updated = _request(
@@ -115,12 +124,19 @@ def test_control_api_updates_publishes_revisions_and_rejects_delete(tmp_path: Pa
             f"/api/tasks/{spec['task_id']}",
             method="PUT",
             body=updated_spec,
+            headers={"If-Match": created["record"]["draft_fingerprint"]},
         )
         assert status == 200
         assert updated["action"] == "updated"
         assert updated["record"]["draft_spec"] == updated_spec
 
-        status, first = _request(base_url, f"/api/tasks/{spec['task_id']}/publish", method="POST", body={})
+        status, first = _request(
+            base_url,
+            f"/api/tasks/{spec['task_id']}/publish",
+            method="POST",
+            body={"confirm": True, "idempotency_key": "publish-001"},
+            headers={"If-Match": updated["record"]["draft_fingerprint"]},
+        )
         assert status == 200
         first_snapshot = Path(first["published"]["snapshot_path"])
         assert first["task"]["revision"] == 1
@@ -128,7 +144,13 @@ def test_control_api_updates_publishes_revisions_and_rejects_delete(tmp_path: Pa
         assert first_snapshot.exists()
         assert load_task(first_snapshot).raw["revision"] == 1
 
-        status, second = _request(base_url, f"/api/tasks/{spec['task_id']}/publish", method="POST", body={})
+        status, second = _request(
+            base_url,
+            f"/api/tasks/{spec['task_id']}/publish",
+            method="POST",
+            body={"confirm": True, "idempotency_key": "publish-002"},
+            headers={"If-Match": first["record"]["draft_fingerprint"]},
+        )
         assert status == 200
         assert second["task"]["revision"] == 2
         assert Path(second["published"]["snapshot_path"]).name == "task.yaml"
@@ -153,8 +175,14 @@ def test_control_actions_resolve_to_the_published_revision(tmp_path: Path, monke
 
     from llm_labeling_scaffold import task_control as control
 
-    control.create_draft(runs_root, tasks_root, spec)
-    control.publish_task(runs_root, tasks_root, spec["task_id"])
+    created = control.create_draft(runs_root, tasks_root, spec)
+    control.publish_task(
+        runs_root,
+        tasks_root,
+        spec["task_id"],
+        expected_draft_fingerprint=created["record"]["draft_fingerprint"],
+        idempotency_key="publish-001",
+    )
     task_path = tasks_root / spec["task_id"] / "task.yaml"
 
     class Resolver:
@@ -164,3 +192,127 @@ def test_control_actions_resolve_to_the_published_revision(tmp_path: Path, monke
 
     resolved = handler_class._resolve_action_task_path(Resolver(), str(task_path))
     assert resolved == str(task_path)
+
+
+def test_control_publish_endpoint_reuses_an_idempotency_key(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = _draft_spec()
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, created = _request(base_url, "/api/tasks", method="POST", body=spec)
+        assert status == 200
+
+        status, unconfirmed = _request(
+            base_url,
+            f"/api/tasks/{spec['task_id']}/publish",
+            method="POST",
+            body={"idempotency_key": "publish-001"},
+        )
+        assert status == 400
+        assert "confirm=true" in unconfirmed["error"]
+
+        payload = {"confirm": True, "idempotency_key": "publish-001"}
+        headers = {"If-Match": created["record"]["draft_fingerprint"]}
+        status, first = _request(base_url, f"/api/tasks/{spec['task_id']}/publish", method="POST", body=payload, headers=headers)
+        assert status == 200
+        status, second = _request(base_url, f"/api/tasks/{spec['task_id']}/publish", method="POST", body=payload, headers=headers)
+        assert status == 200
+
+    assert first["published"]["revision"] == 1
+    assert second["published"]["revision"] == 1
+    assert second["idempotent"] is True
+
+
+def test_control_records_the_trusted_mcp_actor(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    monkeypatch.setenv("LLS_MCP_INTERNAL_TOKEN", "mcp-internal-0123456789-abcdef-012")
+    monkeypatch.setenv("LLS_MCP_ENABLE_WRITES", "1")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, created = _request(
+            base_url,
+            "/api/tasks",
+            method="POST",
+            body=_draft_spec(),
+            headers={"Authorization": "Bearer mcp-internal-0123456789-abcdef-012"},
+        )
+
+    assert status == 200
+    assert created["record"]["created_by"] == "mcp"
+
+
+def test_mcp_service_identity_cannot_call_unlisted_panel_routes(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    monkeypatch.setenv("LLS_MCP_INTERNAL_TOKEN", "mcp-internal-0123456789-abcdef-012")
+    monkeypatch.setenv("LLS_MCP_ENABLE_WRITES", "1")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    headers = {"Authorization": "Bearer mcp-internal-0123456789-abcdef-012"}
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, _ = _request(base_url, "/api/tasks", headers=headers)
+        assert status == 200
+        status, denied = _request(
+            base_url,
+            "/api/action",
+            method="POST",
+            body={"task": "tasks/unsafe/task.yaml", "action": "argilla_push"},
+            headers=headers,
+        )
+
+    assert status == 403
+    assert "无权" in denied["error"]
+
+
+def test_mcp_service_identity_is_read_only_unless_writes_are_enabled(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    monkeypatch.setenv("LLS_MCP_INTERNAL_TOKEN", "mcp-internal-0123456789-abcdef-012")
+    monkeypatch.delenv("LLS_MCP_ENABLE_WRITES", raising=False)
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, denied = _request(
+            base_url,
+            "/api/tasks",
+            method="POST",
+            body=_draft_spec(),
+            headers={"Authorization": "Bearer mcp-internal-0123456789-abcdef-012"},
+        )
+
+    assert status == 403
+    assert "无权" in denied["error"]
+
+
+def test_control_update_rejects_a_stale_draft_fingerprint(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = _draft_spec()
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        _, created = _request(base_url, "/api/tasks", method="POST", body=spec)
+        stale = created["record"]["draft_fingerprint"]
+        first_spec = {**spec, "annotation_guidelines": "first"}
+        status, _ = _request(
+            base_url,
+            f"/api/tasks/{spec['task_id']}",
+            method="PUT",
+            body=first_spec,
+            headers={"If-Match": stale},
+        )
+        assert status == 200
+        status, conflict = _request(
+            base_url,
+            f"/api/tasks/{spec['task_id']}",
+            method="PUT",
+            body={**spec, "annotation_guidelines": "stale"},
+            headers={"If-Match": stale},
+        )
+
+    assert status == 409
+    assert "重新加载" in conflict["error"]

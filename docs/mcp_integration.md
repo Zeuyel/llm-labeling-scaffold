@@ -1,128 +1,135 @@
-# MCP 接入边界
+# MCP 接入说明
 
-MCP 只作为 scaffold 的受控调用层。数据湖和任务治理仍以 R2 数据湖登记表、manifest 和登记表指向的 `task.yaml` 为权威，scaffold 只负责检查、导入任务级 JSONL，并读取本地执行状态。`task_registry_uri` 指向数据湖治理登记表，一般是 `data_lake.yaml`；它不是 `task.yaml`，具体任务文件由 `tasks.<task_id>.task_uri` 指向。
+Scaffold 提供独立的 MCP companion service，供 Codex 和其他 MCP client 调用。它不直接读取或写入 R2、`runs/`、`tasks/`，所有操作都代理到已认证的 Panel HTTP API，因此任务、数据湖、异步 job 和审计仍遵循同一套边界。
 
-## 推荐调用方式
+```text
+MCP client
+  -> Streamable HTTP /mcp
+  -> MCP companion service
+  -> Panel API
+  -> Scaffold 控制面 / 数据湖执行器 / Argilla
+```
 
-MCP server 优先在仓库根目录下调用 CLI，并读取 stdout 中的 JSON：
+R2 仍是数据湖：保存已登记的输入对象和回写产物。`LLS_TASK_SOURCE=control` 时，任务单、草稿和 revision 由 Scaffold 控制面管理，R2 不作为任务单来源。
+
+## Transport
+
+- `streamable-http`：面向部署后的 SaaS/服务端 client，地址为 `http(s)://<host>:8766/mcp`。
+- `stdio`：面向同一台受控机器上的本地 agent，不开放网络端口。
+
+Docker 默认不启动 MCP。只有显式启用 `mcp` profile 后才会暴露端口。
+
+Docker 默认将 MCP 端口绑定到 `127.0.0.1`，由 HTTPS 反向代理对外暴露。只有明确配置 `MCP_BIND_HOST=0.0.0.0` 时才直接监听公网接口。
+
+## 安全边界
+
+首版使用 `LLS_MCP_BEARER_TOKEN` 保护 Streamable HTTP endpoint。token 只用于单租户受控部署，必须至少 32 个非空白字符，并通过 secret manager 或服务器 `.env` 注入，不能写入仓库、任务单、提示词、日志或返回结果。`LLS_MCP_INTERNAL_TOKEN` 是 MCP 到 Panel 的独立受限服务凭据，长度要求相同，不能与 bearer token 复用。Panel 使用该身份执行独立路由白名单，不向 MCP 容器提供管理员密码。
+
+MCP 默认只读。只有 Panel 与 MCP 同时设置 `LLS_MCP_ENABLE_WRITES=1` 时，才允许并注册任务草稿创建、草稿更新、任务发布和数据湖导入提交工具。即使写入已开启，服务身份仍不能调用删除、归档、Argilla、训练、推理或系统设置接口。
+
+生产环境必须在 HTTPS 反向代理之后公开 `/mcp`。`/healthz` 仅供容器健康检查，不要求 token；其余 MCP 请求必须带：
+
+```http
+Authorization: Bearer <LLS_MCP_BEARER_TOKEN>
+```
+
+这不是 OAuth/OIDC 或多用户 RBAC。用户身份、组织隔离、任务级权限和真实审计主体由 [#41](https://github.com/Zeuyel/llm-labeling-scaffold/issues/41) 单独交付；在那之前，不应把 bearer token 当作多用户授权方案。
+
+## 启动
+
+在服务器 `.env` 设置高熵 token：
+
+```text
+LLS_MCP_BEARER_TOKEN=<由服务器 secret manager 生成的随机值>
+LLS_MCP_INTERNAL_TOKEN=<另一条由服务器 secret manager 生成的随机值>
+LLS_MCP_ENABLE_WRITES=0
+MCP_PORT=8766
+```
+
+需要写工具时，将 `LLS_MCP_ENABLE_WRITES` 显式改为 `1` 后重新创建 Panel 与 MCP 容器。
+
+然后启动：
 
 ```bash
-PYTHONPATH=src python3 -m llm_labeling_scaffold.cli <command>
+./scripts/stack up --mcp
 ```
 
-CLI 适合无 UI 的 MCP tool。面板 HTTP API 也能提供同等只读信息，但需要面板进程和 Basic Auth；若生产面板已常驻运行，可以复用 API。
-
-#14 的 SaaS/MCP mutating submit 验收路径使用面板 HTTP API：先 dry-run，再带 `confirm: true` 和 `idempotency_key` submit。CLI `data-lake import` 只作为本地 operator direct import 命令。
-
-部署验收时可使用 `smoke` runner 读取本地环境变量，不要把真实 URL、token、Basic Auth 密码、rclone config、Argilla key、数据库密码或 secret path 写入仓库：
+或者：
 
 ```bash
-export LLS_SMOKE_SERVER_URL=http://127.0.0.1:8765
-export LLS_SMOKE_BASIC_USER=admin
-export LLS_SMOKE_BASIC_PASSWORD='<read-from-local-secret-manager>'
-PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format markdown
+docker compose --profile mcp up -d
 ```
 
-如果使用 Bearer token，则改用 `LLS_SMOKE_TOKEN`。runner 会检查 contract discovery、任务检查和 import dry-run；当服务未声明 side-effect-free import dry-run contract 时，该项返回 `not_supported`，不会调用可能产生真实导入的 endpoint。
+MCP companion 通过 Docker 内网访问 `http://panel:8765`，使用内部 bearer 服务身份访问 Panel 的 MCP 路由白名单，控制面审计 actor 记录为 `mcp`。它不持有 Panel 管理员密码，也不挂载 R2 凭据、`runs/` 或 `tasks/`。
 
-## 允许动作
+本地 stdio 调用示例：
 
-- 检查数据湖来源：只读取 registry、dataset manifest 和选中的对象元数据。
-- 从数据湖导入：先 dry-run 检查将要读取的 task/source/manifest 和 import id；真实提交只把 `task.yaml` 指定的任务级 JSONL materialize 到 `runs/<task_id>/imports/<import_id>/`。通过面板 API 发起 mutating submit 时必须携带 `confirm: true` 和 `idempotency_key`，返回异步 job，并通过 job 状态查询进度。
-- 规划本地产物发布：对 decisions、gold、predictions、model metadata 执行 `data-lake publish plan`，只读本地产物并返回目标 R2 URI、publish manifest URI、bytes 和 sha256。
-- 提交本地产物发布：只有在操作者显式提供 confirm 和 idempotency key 时，才可执行 `data-lake publish submit`。submit 只写入任务 `data_lake.output_base_uri` 下的 artifact 与 publish manifest，并在上传后回读校验 hash。
-- 查询任务列表和任务阶段状态。
-- 查询导入列表和导入详情。
-- 查询 annotation job、decision artifact、gold version 的只读 list/detail/status，用于 smoke contract 检查。
-- 读取面板 API 的等价只读端点。
-
-## 禁止动作
-
-- 不允许 MCP 修改 `task.yaml`、R2 registry、源数据集 R2 manifest 或任务快照。
-- 不允许 MCP 写 registry/governance/current 路径，不允许自动 promotion。
-- 生产模式下不允许覆盖 `lake_registry_uri`、`source_dataset_id`、`source_manifest_uri`、`source_object_path`。
-- 不允许调用删除、归档、任务新建、样本新建、Argilla 分发/拉回、训练、推理或 Docker 管理动作。
-- 不允许把只读 status smoke 自动升级为 `POST /api/action`。`argilla_push`、`argilla_pull`、`gold` 都是操作者授权后的写入动作。
-- 不允许绕过 manifest 直接传入任意 `storage_uri`。
-- 不允许把 data lake 的上游大数据复制成 scaffold 的第二份权威数据。
-
-## CLI 映射
-
-| MCP tool | scaffold command | 说明 |
-| --- | --- | --- |
-| `scaffold_data_lake_check` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake check --task tasks/<task_id>/task.yaml` | 只读检查 R2 registry、manifest 和对象选择。 |
-| `operator_data_lake_import` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake import --task tasks/<task_id>/task.yaml --runs-root runs [--import-id <id>]` | 本地 operator 命令，直接写入本地 import 缓存；不作为 #14 SaaS/MCP mutating submit 验收路径。 |
-| `scaffold_data_lake_publish_plan` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake publish plan --task tasks/<task_id>/task.yaml --runs-root runs --kind <decisions\|gold\|predictions\|model_metadata> --artifact-id <id>` | dry-run；不写 R2；返回本地 artifact、目标 R2 URI、publish manifest URI、bytes 和 sha256。 |
-| `scaffold_data_lake_publish_submit` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli data-lake publish submit --task tasks/<task_id>/task.yaml --runs-root runs --kind <kind> --artifact-id <id> --confirm --idempotency-key <key>` | 受控写入 artifact 和 publish manifest；缺少 confirm 或 idempotency key 必须拒绝；上传后校验 hash；manifest 和返回值只记录 key digest。 |
-| `scaffold_task_list` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli task list --tasks-root tasks` | 读取本地任务缓存，输出稳定 JSON。 |
-| `scaffold_task_status` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli task status --task tasks/<task_id>/task.yaml --runs-root runs` | 输出 profile 阶段状态。也可用 `--task-id <task_id> --tasks-root tasks`。 |
-| `scaffold_import_list` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli import list --task tasks/<task_id>/task.yaml --runs-root runs` | 输出该任务所有本地 import manifest 摘要。 |
-| `scaffold_import_detail` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli import detail --task tasks/<task_id>/task.yaml --runs-root runs --import-id <id>` | 输出单个 import 的 manifest、字段和依赖摘要。 |
-| `scaffold_saas_smoke` | `PYTHONPATH=src python3 -m llm_labeling_scaffold.cli smoke --format json` | 从环境变量读取服务地址和认证信息，输出脱敏验收摘要。 |
-
-MCP 可读取面板 settings 和任务 `task.yaml` 中的 `data_lake` 配置；任务文件可类似这样声明来源：
-
-```yaml
-data_lake:
-  lake_registry_uri: r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.yaml
-  source_dataset_id: example_labeling_v1
-  source_object_path: example_label_inputs/v1/raw.jsonl
+```bash
+LLS_MCP_PANEL_URL=http://127.0.0.1:8765 \
+LLS_MCP_INTERNAL_TOKEN='<从本机 secret manager 读取的内部服务凭据>' \
+lls mcp --transport stdio
 ```
 
-MCP 在生产调用 `data-lake import` 时不应传 `--source-object-path`。该参数只用于人工排查，并且必须由操作者明确授权。
+## MCP Client 配置
 
-## 面板 API 等价端点
+不同 client 的配置键可能不同。核心要求是连接 `/mcp`，并传入 bearer header。概念示例：
 
-面板 API 返回 JSON，并要求 Basic Auth：
+```json
+{
+  "mcpServers": {
+    "llm-labeling-scaffold": {
+      "url": "https://labeling.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <从 secret manager 读取的 token>"
+      }
+    }
+  }
+}
+```
 
-### Contract discovery endpoints
+不要把真实 token 提交到 MCP client 配置仓库或共享任务文件。
 
-这些端点是 scaffold server 对 MCP 暴露的第一阶段稳定 contract。它们不要求 MCP 读取或修改本地文件：
+## 工具范围
 
-| HTTP API | 说明 |
-| --- | --- |
-| `GET /api/health` | 返回服务存活状态。 |
-| `GET /api/version` | 返回 scaffold 包版本和 API contract 版本。 |
-| `GET /api/capabilities` | 返回机器可读 endpoint/action/schema 概要，用于 MCP 能力发现。 |
-| `GET /api/settings/public` | 只返回非敏感运行状态：任务来源模式、是否允许手工导入/数据湖覆盖、registry/R2/rclone 是否已配置。不会返回 token、rclone 配置内容、rclone 配置路径、Argilla 密钥或具体 R2 URI。 |
-| `GET /api/tasks/{task_id}` | 返回单个任务的稳定摘要，包括 profile、字段、标签和 data lake 配置摘要。 |
-| `POST /api/tasks/{task_id}/check` | 只读检查任务是否可加载、profile 是否有效、data lake 配置是否存在且可 preview。R2/rclone 不可访问时返回 `ok: false`、`checks[]` 和结构化 `errors[]`。 |
+| MCP tool | 类型 | Panel API | 说明 |
+| --- | --- | --- | --- |
+| `scaffold_platform_status` | 只读 | health/version/settings | 读取服务健康和非敏感配置。 |
+| `scaffold_task_list` | 只读 | tasks list | 列出任务及发布状态。 |
+| `scaffold_task_detail` | 只读 | task detail | 读取已发布任务摘要。 |
+| `scaffold_task_draft_detail` | 只读 | control detail | 读取草稿和 revision，仅 control 模式。 |
+| `scaffold_task_check` | 只读 | task check | 检查 profile 与数据湖来源。 |
+| `scaffold_import_list` | 只读 | imports list | 列出本地导入资产。 |
+| `scaffold_import_detail` | 只读 | import detail | 读取 manifest、字段和依赖摘要。 |
+| `scaffold_data_lake_preview` | 只读 | data lake status | 预览受登记的数据湖对象。 |
+| `scaffold_job_status` | 只读 | jobs | 读取异步任务状态。 |
+| `scaffold_task_draft_create` | 写入 | create draft | 仅启用写操作时注册；创建不可执行草稿。 |
+| `scaffold_task_draft_update` | 写入 | update draft | 仅启用写操作时注册；必须提交当前 `draft_fingerprint`。 |
+| `scaffold_task_publish` | 写入 | publish | 仅启用写操作时注册；必须提交草稿指纹、`confirm=true` 与稳定 `idempotency_key`。 |
+| `scaffold_data_lake_import_dry_run` | 只读 | import dry-run | 验证将要 materialize 的受登记对象。 |
+| `scaffold_data_lake_import_submit` | 写入 | import submit | 仅启用写操作时注册；必须 `confirm=true` 与稳定 `idempotency_key`。 |
 
-`task_check` 不接受 data lake override。生产环境中的数据来源必须来自受控 `task.yaml` / R2 registry。
+任务草稿详情返回 `draft_fingerprint`。更新和发布必须提交读取时获得的指纹；草稿被其他页面或 client 修改后，旧指纹会得到 `409 Conflict`，不会静默覆盖。同一个发布 key 和同一草稿会返回原 revision；同一个 key 作用于不同草稿会拒绝。
 
-| MCP tool | HTTP API |
-| --- | --- |
-| `scaffold_task_list` | `GET /api/tasks` |
-| `scaffold_task_status` | `GET /api/task/profile?task_id=<task_id>` |
-| `scaffold_import_list` | `GET /api/task/imports?task_id=<task_id>` |
-| `scaffold_import_detail` | `GET /api/import/detail?task_id=<task_id>&import_id=<id>` |
-| `scaffold_annotation_job_list` | `GET /api/task/annotation_jobs?task_id=<task_id>` |
-| `scaffold_annotation_job_detail` | `GET /api/annotation_job/detail?task_id=<task_id>&annotation_id=<id>` |
-| `scaffold_decision_artifact_list` | `GET /api/task/decision_artifacts?task_id=<task_id>` |
-| `scaffold_decision_artifact_detail` | `GET /api/decision_artifact/detail?task_id=<task_id>&decision_id=<id>` |
-| `scaffold_gold_version_list` | `GET /api/task/gold_versions?task_id=<task_id>` |
-| `scaffold_gold_version_detail` | `GET /api/gold_version/detail?task_id=<task_id>&version=<version>` |
-| `scaffold_data_lake_check` | `GET /api/task/data_lake?task_id=<task_id>` |
-| `scaffold_data_lake_import` dry-run | `POST /api/import/data_lake` with `{"task_id":"<task_id>","import_id":"<optional>","dry_run":true}`，返回 `{"ok":true/false,"dry_run":true,"result":{...}}`，其中 `result` 包含 task/source/manifest 摘要、import id 和 validation |
-| `scaffold_data_lake_import` submit | `POST /api/import/data_lake` with `{"task_id":"<task_id>","import_id":"<optional>","confirm":true,"idempotency_key":"<stable-key>"}`，返回 job；同 key 同请求返回同一 job，同 key 不同请求拒绝 |
-| `scaffold_job_status` | `GET /api/jobs?task_id=<task_id>` |
+数据湖导入的 idempotency 由现有 import job 记录保证：同 key、同请求复用同一 job；同 key、不同请求拒绝。
 
-annotation / decisions / gold 的 list/detail 端点只读取本地 manifest 和文件存在性。返回字段会区分：
+## 明确禁止
 
-- `local_dispatch_file` / `local_dispatch_file_exists`：本地分发 JSONL 是否存在。
-- `argilla_published`：已有 annotation manifest 是否能证明已发布到 Argilla。
-- `decisions_pulled`：已有 decision manifest 或结果文件是否能证明已拉回标注结果。
-- `gold_generated`：已有 gold manifest 或训练集文件是否能证明已生成 gold。
-- `state`、`linked_decision_ids`、`linked_gold_versions`：从本地 manifest 可安全推导的当前状态和下游关联。
+MCP 首版不暴露以下操作：
 
-这些端点适合 MCP 做空状态、fixture 状态和回归 smoke：空列表、404 detail 或 fixture manifest 只能说明 API contract 可执行，不能说明生产标注已完成，也不能替代真实 Argilla 发布、人工提交、结果拉回或 gold 构建。
+- 删除或归档任务、导入、样本、标注任务。
+- 手动上传/粘贴数据。
+- 修改 R2 registry、manifest、`current` 或任意上游源对象。
+- 绕过 manifest 传入任意 `storage_uri`、覆盖数据湖来源或自动 promotion。
+- Argilla 分发/拉回、gold 构建、训练、批量推理和 Docker 管理。
 
-`POST /api/action` 是 operator-gated 写入入口，当前可用于 `argilla_push`、`argilla_pull`、`gold` 等动作。MCP 只有在操作者明确授权并提供参数时才应调用；调用后应通过 job/status 和上述只读 list/detail 端点复核产物。
+这些操作具有更高业务或数据风险，需在真实身份/RBAC 与专门审计能力完成后再单独开放。
 
-当 `LLS_TASK_SOURCE=r2` 时，面板 API 会先从 `LLS_TASK_REGISTRY_URI` 指向的数据湖治理登记表同步启用任务到本地 `tasks/` 缓存。CLI 不隐式同步 registry，只读取当前本地任务文件；因此 MCP 使用 CLI 前应确保任务缓存已存在并来自受控同步。
+## 验收
 
-## 返回值和错误处理
+MCP server 的单元测试覆盖：受限服务身份、默认只读工具白名单、乐观并发、写入确认门、异步并发代理、bearer token 拒绝逻辑和无 token 启动拒绝。部署后可检查：
 
-所有推荐 CLI 命令成功时都在 stdout 输出 JSON。MCP 应把非零退出码视为调用失败，并把 stderr/stdout 摘要返回给操作者。CLI `data-lake import` 是本地 operator direct import 命令，不带 SaaS/API 的 submit gate，不作为 #14 的 MCP mutating submit 验收路径。通过面板 API 发起 R2 导入时，MCP 应先调用 dry-run；真实 submit 必须携带 `confirm: true` 和稳定 `idempotency_key`。MCP 应记录返回的 job，并轮询 job 状态；导入成功后再触发 profile 的样本抽取阶段。`data-lake publish submit` 不应自动重试，除非操作者确认使用同一个 idempotency key 继续同一发布动作。
+```bash
+curl -fsS http://127.0.0.1:8766/healthz
+```
 
-`data-lake check` 和 `data-lake import` 需要运行环境可执行 `rclone` 且配置了 `r2` remote。生产环境应按“系统设置”或 `LLS_DATA_LAKE_R2_PREFIX` 配置允许访问的 R2 前缀，例如 `r2:YOUR_BUCKET/...`；本地路径和 `file://` 只允许在测试中显式设置 `LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1`。
+该健康检查只说明 MCP 进程存活。实际任务和数据湖连通性仍应通过 `scaffold_platform_status`、`scaffold_task_check` 和数据湖 dry-run 逐项验证。

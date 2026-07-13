@@ -38,6 +38,9 @@ export const dataLakeImportPayload = (taskId, payload = {}) => {
   };
 };
 
+export const taskPublishIdempotencyKey = (taskId, draftFingerprint) =>
+  `task-publish:${keyPart(taskId, "task")}:${keyPart(draftFingerprint, "draft")}`;
+
 export const getTasks = () => req("/api/tasks");
 export const syncTasks = () => req("/api/tasks/sync", { method: "POST" });
 export const getTaskControl = (taskId) =>
@@ -71,19 +74,24 @@ export const createTask = (payload) =>
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
-  }).then((data) => data.task || data);
+  });
 
-export const updateTask = (taskId, payload) =>
+export const updateTask = (taskId, payload, draftFingerprint) =>
   req(`/api/tasks/${encodeURIComponent(taskId)}`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "If-Match": draftFingerprint },
     body: JSON.stringify(payload),
-  }).then((data) => data.task || data);
+  });
 
-export const publishTask = (taskId) =>
+export const publishTask = (taskId, draftFingerprint) =>
   req(`/api/tasks/${encodeURIComponent(taskId)}/publish`, {
     method: "POST",
-  }).then((data) => data.task || data);
+    headers: { "Content-Type": "application/json", "If-Match": draftFingerprint },
+    body: JSON.stringify({
+      confirm: true,
+      idempotency_key: taskPublishIdempotencyKey(taskId, draftFingerprint),
+    }),
+  });
 
 export const updateSettings = (payload) =>
   req("/api/settings", {
