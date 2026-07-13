@@ -15,8 +15,12 @@ from .io import read_json, write_json, write_text_atomic
 from .pipeline import build_task_raw_from_spec
 
 
-REGISTRY_SCHEMA_VERSION = 1
+REGISTRY_SCHEMA_VERSION = 2
 _LOCK = threading.Lock()
+
+
+class TaskConflictError(ValueError):
+    pass
 
 
 def _now() -> str:
@@ -34,9 +38,16 @@ def _idempotency_key_digest(value: str) -> str:
 def _validate_idempotency_key(value: str | None) -> str:
     text = str(value or "").strip()
     if not text:
-        return ""
+        raise ValueError("发布任务必须提供 idempotency_key")
     if len(text) > 200 or any(ord(char) < 32 for char in text):
         raise ValueError("idempotency_key 必须是长度不超过 200 的可打印字符串")
+    return text
+
+
+def _validate_draft_fingerprint(value: str | None) -> str:
+    text = str(value or "").strip().lower()
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        raise ValueError("必须提供有效的 expected_draft_fingerprint")
     return text
 
 
@@ -46,6 +57,18 @@ def _draft_fingerprint(record: dict[str, Any]) -> str:
     except (TypeError, ValueError) as exc:
         raise ValueError("任务草稿无法生成幂等指纹") from exc
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _record_with_fingerprint(record: dict[str, Any]) -> dict[str, Any]:
+    out = dict(record)
+    out["draft_fingerprint"] = _draft_fingerprint(record)
+    return out
+
+
+def _canonical_draft_spec(spec: dict[str, Any], task_id: str) -> dict[str, Any]:
+    out = dict(spec)
+    out["task_id"] = task_id
+    return out
 
 
 def _published_revision(record: dict[str, Any], revision: int) -> dict[str, Any] | None:
@@ -126,6 +149,7 @@ def _task_summary_from_record(record: dict[str, Any]) -> dict[str, Any]:
         "deletable": False,
         "editable": True,
         "revision": record.get("revision", 0),
+        "draft_fingerprint": _draft_fingerprint(record),
         "updated_at": record.get("updated_at"),
         "published_at": record.get("published_at"),
         "path": published.get("path"),
@@ -158,12 +182,13 @@ def get_task_record(runs_root: str | Path, task_id: str) -> dict[str, Any]:
     record = registry["tasks"].get(task_id)
     if not record:
         raise ValueError(f"任务单不存在: {task_id}")
-    return dict(record)
+    return _record_with_fingerprint(record)
 
 
 def create_draft(runs_root: str | Path, tasks_root: str | Path, spec: dict[str, Any], *, actor: str = "panel") -> dict[str, Any]:
     raw = _validate_spec(spec)
     task_id = str(raw["task_id"])
+    draft_spec = _canonical_draft_spec(spec, task_id)
     with _LOCK:
         registry = _read_registry(runs_root)
         if task_id in registry["tasks"]:
@@ -175,7 +200,7 @@ def create_draft(runs_root: str | Path, tasks_root: str | Path, spec: dict[str, 
             "task_id": task_id,
             "status": "draft",
             "revision": 0,
-            "draft_spec": dict(spec),
+            "draft_spec": draft_spec,
             "created_at": now,
             "updated_at": now,
             "created_by": actor,
@@ -184,23 +209,34 @@ def create_draft(runs_root: str | Path, tasks_root: str | Path, spec: dict[str, 
         }
         registry["tasks"][task_id] = record
         _write_registry(runs_root, registry)
-        return {"action": "created", "task": _task_summary_from_record(record), "record": record}
+        return {"action": "created", "task": _task_summary_from_record(record), "record": _record_with_fingerprint(record)}
 
 
-def update_draft(runs_root: str | Path, task_id: str, spec: dict[str, Any], *, actor: str = "panel") -> dict[str, Any]:
-    _validate_spec(spec, task_id=task_id)
+def update_draft(
+    runs_root: str | Path,
+    task_id: str,
+    spec: dict[str, Any],
+    *,
+    expected_draft_fingerprint: str,
+    actor: str = "panel",
+) -> dict[str, Any]:
+    raw = _validate_spec(spec, task_id=task_id)
+    expected = _validate_draft_fingerprint(expected_draft_fingerprint)
     with _LOCK:
         registry = _read_registry(runs_root)
         record = registry["tasks"].get(task_id)
         if not record:
             raise ValueError(f"任务单不存在: {task_id}")
-        record["draft_spec"] = dict(spec)
+        current = _draft_fingerprint(record)
+        if current != expected:
+            raise TaskConflictError("任务草稿已被其他操作修改，请重新加载后再保存")
+        record["draft_spec"] = _canonical_draft_spec(spec, str(raw["task_id"]))
         record["status"] = "draft" if int(record.get("revision") or 0) <= 0 else "published_with_draft"
         record["updated_at"] = _now()
         record["updated_by"] = actor
         registry["tasks"][task_id] = record
         _write_registry(runs_root, registry)
-        return {"action": "updated", "task": _task_summary_from_record(record), "record": record}
+        return {"action": "updated", "task": _task_summary_from_record(record), "record": _record_with_fingerprint(record)}
 
 
 def _write_published_task(
@@ -266,39 +302,42 @@ def publish_task(
     tasks_root: str | Path,
     task_id: str,
     *,
+    expected_draft_fingerprint: str,
     actor: str = "panel",
-    idempotency_key: str | None = None,
+    idempotency_key: str,
 ) -> dict[str, Any]:
     if not _safe_segment(task_id):
         raise ValueError("非法任务编号")
     key = _validate_idempotency_key(idempotency_key)
+    expected = _validate_draft_fingerprint(expected_draft_fingerprint)
     with _LOCK:
         registry = _read_registry(runs_root)
         record = registry["tasks"].get(task_id)
         if not record:
             raise ValueError(f"任务单不存在: {task_id}")
-        draft_fingerprint = _draft_fingerprint(record)
         idempotency_records = record.get("publish_idempotency")
         if idempotency_records is None:
             idempotency_records = {}
         if not isinstance(idempotency_records, dict):
             raise ValueError("任务发布幂等记录必须是 JSON 对象")
-        if key:
-            key_digest = _idempotency_key_digest(key)
-            existing = idempotency_records.get(key_digest)
-            if isinstance(existing, dict):
-                if existing.get("draft_fingerprint") != draft_fingerprint:
-                    raise ValueError("幂等 key 已用于不同任务草稿，请使用新的 idempotency_key")
-                published = _published_revision(record, int(existing.get("revision") or 0))
-                if published is None:
-                    raise ValueError("幂等发布记录缺少对应 revision，请使用新的 idempotency_key")
-                return {
-                    "action": "published",
-                    "idempotent": True,
-                    "task": _task_summary_from_record(record),
-                    "record": record,
-                    "published": published,
-                }
+        key_digest = _idempotency_key_digest(key)
+        existing = idempotency_records.get(key_digest)
+        if isinstance(existing, dict):
+            if existing.get("draft_fingerprint") != expected:
+                raise ValueError("幂等 key 已用于不同任务草稿，请使用新的 idempotency_key")
+            published = _published_revision(record, int(existing.get("revision") or 0))
+            if published is None:
+                raise ValueError("幂等发布记录缺少对应 revision，请使用新的 idempotency_key")
+            return {
+                "action": "published",
+                "idempotent": True,
+                "task": _task_summary_from_record(record),
+                "record": _record_with_fingerprint(record),
+                "published": published,
+            }
+        draft_fingerprint = _draft_fingerprint(record)
+        if draft_fingerprint != expected:
+            raise TaskConflictError("任务草稿已被其他操作修改，请重新加载后再发布")
         revision = int(record.get("revision") or 0) + 1
         raw = _validate_spec(
             record.get("draft_spec") or {},
@@ -314,19 +353,18 @@ def publish_task(
         record["updated_at"] = published["published_at"]
         record["published_by"] = actor
         record.setdefault("revisions", []).append(published)
-        if key:
-            idempotency_records[_idempotency_key_digest(key)] = {
-                "draft_fingerprint": draft_fingerprint,
-                "revision": revision,
-                "published_at": published["published_at"],
-            }
-            record["publish_idempotency"] = idempotency_records
+        idempotency_records[key_digest] = {
+            "draft_fingerprint": draft_fingerprint,
+            "revision": revision,
+            "published_at": published["published_at"],
+        }
+        record["publish_idempotency"] = idempotency_records
         registry["tasks"][task_id] = record
         _write_registry(runs_root, registry)
         return {
             "action": "published",
             "idempotent": False,
             "task": _task_summary_from_record(record),
-            "record": record,
+            "record": _record_with_fingerprint(record),
             "published": published,
         }

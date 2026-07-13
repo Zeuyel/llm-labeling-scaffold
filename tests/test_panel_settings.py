@@ -290,6 +290,7 @@ def test_contract_metadata_and_public_settings_do_not_leak_secrets(
         "task_registry_configured": True,
         "data_lake_r2_prefix_configured": True,
         "rclone_configured": True,
+        "mcp_writes_enabled": False,
     }
     serialized = json.dumps(public, ensure_ascii=False)
     assert "r2:tenant" not in serialized

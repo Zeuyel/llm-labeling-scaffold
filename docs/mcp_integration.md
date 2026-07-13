@@ -23,7 +23,9 @@ Docker 默认将 MCP 端口绑定到 `127.0.0.1`，由 HTTPS 反向代理对外�
 
 ## 安全边界
 
-首版使用 `LLS_MCP_BEARER_TOKEN` 保护 Streamable HTTP endpoint。token 只用于单租户受控部署，必须至少 32 个非空白字符，并通过 secret manager 或服务器 `.env` 注入，不能写入仓库、任务单、提示词、日志或返回结果。`LLS_MCP_INTERNAL_TOKEN` 是 MCP 到 Panel 的独立内部服务凭据，长度要求相同，不能与 bearer token 复用。
+首版使用 `LLS_MCP_BEARER_TOKEN` 保护 Streamable HTTP endpoint。token 只用于单租户受控部署，必须至少 32 个非空白字符，并通过 secret manager 或服务器 `.env` 注入，不能写入仓库、任务单、提示词、日志或返回结果。`LLS_MCP_INTERNAL_TOKEN` 是 MCP 到 Panel 的独立受限服务凭据，长度要求相同，不能与 bearer token 复用。Panel 使用该身份执行独立路由白名单，不向 MCP 容器提供管理员密码。
+
+MCP 默认只读。只有 Panel 与 MCP 同时设置 `LLS_MCP_ENABLE_WRITES=1` 时，才允许并注册任务草稿创建、草稿更新、任务发布和数据湖导入提交工具。即使写入已开启，服务身份仍不能调用删除、归档、Argilla、训练、推理或系统设置接口。
 
 生产环境必须在 HTTPS 反向代理之后公开 `/mcp`。`/healthz` 仅供容器健康检查，不要求 token；其余 MCP 请求必须带：
 
@@ -40,8 +42,11 @@ Authorization: Bearer <LLS_MCP_BEARER_TOKEN>
 ```text
 LLS_MCP_BEARER_TOKEN=<由服务器 secret manager 生成的随机值>
 LLS_MCP_INTERNAL_TOKEN=<另一条由服务器 secret manager 生成的随机值>
+LLS_MCP_ENABLE_WRITES=0
 MCP_PORT=8766
 ```
+
+需要写工具时，将 `LLS_MCP_ENABLE_WRITES` 显式改为 `1` 后重新创建 Panel 与 MCP 容器。
 
 然后启动：
 
@@ -55,14 +60,12 @@ MCP_PORT=8766
 docker compose --profile mcp up -d
 ```
 
-MCP companion 通过 Docker 内网访问 `http://panel:8765`，使用与 Panel 相同的部署账号，并使用内部服务凭据让控制面审计记录 actor 为 `mcp`。它不挂载 R2 凭据、`runs/` 或 `tasks/`，因此不能绕过 Panel 的 API 边界。
+MCP companion 通过 Docker 内网访问 `http://panel:8765`，使用内部 bearer 服务身份访问 Panel 的 MCP 路由白名单，控制面审计 actor 记录为 `mcp`。它不持有 Panel 管理员密码，也不挂载 R2 凭据、`runs/` 或 `tasks/`。
 
 本地 stdio 调用示例：
 
 ```bash
 LLS_MCP_PANEL_URL=http://127.0.0.1:8765 \
-LLS_MCP_PANEL_USER=admin \
-LLS_MCP_PANEL_PASSWORD='<从本机 secret manager 读取>' \
 LLS_MCP_INTERNAL_TOKEN='<从本机 secret manager 读取的内部服务凭据>' \
 lls mcp --transport stdio
 ```
@@ -99,13 +102,13 @@ lls mcp --transport stdio
 | `scaffold_import_detail` | 只读 | import detail | 读取 manifest、字段和依赖摘要。 |
 | `scaffold_data_lake_preview` | 只读 | data lake status | 预览受登记的数据湖对象。 |
 | `scaffold_job_status` | 只读 | jobs | 读取异步任务状态。 |
-| `scaffold_task_draft_create` | 写入 | create draft | 创建不可执行草稿。 |
-| `scaffold_task_draft_update` | 写入 | update draft | 更新草稿，不覆盖已发布 revision。 |
-| `scaffold_task_publish` | 写入 | publish | 必须 `confirm=true` 与稳定 `idempotency_key`。 |
+| `scaffold_task_draft_create` | 写入 | create draft | 仅启用写操作时注册；创建不可执行草稿。 |
+| `scaffold_task_draft_update` | 写入 | update draft | 仅启用写操作时注册；必须提交当前 `draft_fingerprint`。 |
+| `scaffold_task_publish` | 写入 | publish | 仅启用写操作时注册；必须提交草稿指纹、`confirm=true` 与稳定 `idempotency_key`。 |
 | `scaffold_data_lake_import_dry_run` | 只读 | import dry-run | 验证将要 materialize 的受登记对象。 |
-| `scaffold_data_lake_import_submit` | 写入 | import submit | 必须 `confirm=true` 与稳定 `idempotency_key`。 |
+| `scaffold_data_lake_import_submit` | 写入 | import submit | 仅启用写操作时注册；必须 `confirm=true` 与稳定 `idempotency_key`。 |
 
-任务发布使用 task draft 内容生成指纹。同一个 key 和同一草稿会返回原 revision；同一个 key 作用于不同草稿会拒绝，防止 MCP client 网络重试重复发布版本。
+任务草稿详情返回 `draft_fingerprint`。更新和发布必须提交读取时获得的指纹；草稿被其他页面或 client 修改后，旧指纹会得到 `409 Conflict`，不会静默覆盖。同一个发布 key 和同一草稿会返回原 revision；同一个 key 作用于不同草稿会拒绝。
 
 数据湖导入的 idempotency 由现有 import job 记录保证：同 key、同请求复用同一 job；同 key、不同请求拒绝。
 
@@ -123,7 +126,7 @@ MCP 首版不暴露以下操作：
 
 ## 验收
 
-MCP server 的单元测试覆盖：工具白名单、Panel API 代理、写入确认门、bearer token 拒绝逻辑和无 token 启动拒绝。部署后可检查：
+MCP server 的单元测试覆盖：受限服务身份、默认只读工具白名单、乐观并发、写入确认门、异步并发代理、bearer token 拒绝逻辑和无 token 启动拒绝。部署后可检查：
 
 ```bash
 curl -fsS http://127.0.0.1:8766/healthz

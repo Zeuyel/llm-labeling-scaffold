@@ -24,6 +24,7 @@ services:
     environment:
       - LLS_PANEL_PASSWORD=${LLS_PANEL_PASSWORD:-changeme}
       - LLS_MCP_INTERNAL_TOKEN=${LLS_MCP_INTERNAL_TOKEN:-}
+      - LLS_MCP_ENABLE_WRITES=${LLS_MCP_ENABLE_WRITES:-0}
       - ARGILLA_API_URL=http://argilla:6900
       - ARGILLA_API_KEY=${ARGILLA_API_KEY:-argilla.apikey}
       - ARGILLA_WORKSPACE=${ARGILLA_WORKSPACE:-argilla}
@@ -53,10 +54,9 @@ services:
       - "${MCP_BIND_HOST:-127.0.0.1}:${MCP_PORT:-8766}:8766"
     environment:
       - LLS_MCP_PANEL_URL=http://panel:8765
-      - LLS_MCP_PANEL_USER=admin
-      - LLS_PANEL_PASSWORD=${LLS_PANEL_PASSWORD:-changeme}
       - LLS_MCP_BEARER_TOKEN=${LLS_MCP_BEARER_TOKEN:-}
       - LLS_MCP_INTERNAL_TOKEN=${LLS_MCP_INTERNAL_TOKEN:-}
+      - LLS_MCP_ENABLE_WRITES=${LLS_MCP_ENABLE_WRITES:-0}
       - LLS_MCP_TIMEOUT_SECONDS=${LLS_MCP_TIMEOUT_SECONDS:-15}
     command: ["python", "-m", "llm_labeling_scaffold.cli", "mcp", "--transport", "streamable-http", "--host", "0.0.0.0", "--port", "8766"]
     depends_on:

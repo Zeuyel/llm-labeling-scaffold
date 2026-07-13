@@ -115,6 +115,7 @@ export default function TasksPage({
   const showDataLakeFields = controlTaskSource || allowDataLakeOverrides;
   const [open, setOpen] = useState(false);
   const [editingTaskId, setEditingTaskId] = useState("");
+  const [draftFingerprint, setDraftFingerprint] = useState("");
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [notice, setNotice] = useState("");
@@ -133,6 +134,7 @@ export default function TasksPage({
     setForm(emptyForm());
     setAuxiliary([]);
     setEditingTaskId("");
+    setDraftFingerprint("");
   }
 
   function openNewTask() {
@@ -211,14 +213,18 @@ export default function TasksPage({
         setNotice("任务已保存。");
       } else {
         const taskId = editingTaskId || payload.task_id;
+        let result;
         if (editingTaskId) {
-          await api.updateTask(taskId, payload);
+          result = await api.updateTask(taskId, payload, draftFingerprint);
         } else {
-          await api.createTask(payload);
+          result = await api.createTask(payload);
           setEditingTaskId(taskId);
         }
+        const currentFingerprint = result?.record?.draft_fingerprint || result?.task?.draft_fingerprint;
+        if (!currentFingerprint) throw new Error("服务端未返回草稿指纹，请刷新后重试");
+        setDraftFingerprint(currentFingerprint);
         if (publishNow) {
-          await api.publishTask(taskId);
+          await api.publishTask(taskId, currentFingerprint);
           closeEditor();
           setNotice("任务单已发布为新 revision，可进入执行流程。");
         } else {
@@ -242,6 +248,7 @@ export default function TasksPage({
       setForm(formFromSpec(record.draft_spec));
       setAuxiliary(auxiliaryFromSpec(record.draft_spec));
       setEditingTaskId(task.task_id);
+      setDraftFingerprint(record.draft_fingerprint || "");
       setOpen(true);
     } catch (requestError) {
       onError(String(requestError));
@@ -255,7 +262,9 @@ export default function TasksPage({
     setBusy(true);
     setNotice("");
     try {
-      await api.publishTask(task.task_id);
+      const fingerprint = task.draft_fingerprint || (await api.getTaskControl(task.task_id)).draft_fingerprint;
+      if (!fingerprint) throw new Error("服务端未返回草稿指纹，请刷新后重试");
+      await api.publishTask(task.task_id, fingerprint);
       await onReload();
       setNotice(`任务单 ${task.task_id} 已发布为新 revision。`);
     } catch (requestError) {

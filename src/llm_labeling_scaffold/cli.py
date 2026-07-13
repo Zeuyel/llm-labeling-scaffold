@@ -183,10 +183,9 @@ def build_parser() -> argparse.ArgumentParser:
     mcp.add_argument("--host", default="127.0.0.1")
     mcp.add_argument("--port", type=int, default=8766)
     mcp.add_argument("--panel-url")
-    mcp.add_argument("--panel-user")
-    mcp.add_argument("--panel-password")
     mcp.add_argument("--bearer-token")
     mcp.add_argument("--internal-token")
+    mcp.add_argument("--enable-writes", action=argparse.BooleanOptionalAction, default=None)
     mcp.add_argument("--timeout", type=float)
 
     return p
@@ -324,10 +323,9 @@ def main(argv: list[str] | None = None) -> None:
 
         config = McpServerConfig.from_env(
             panel_url=args.panel_url,
-            panel_user=args.panel_user,
-            panel_password=args.panel_password,
             bearer_token=args.bearer_token,
             internal_token=args.internal_token,
+            enable_writes=args.enable_writes,
             timeout_seconds=args.timeout,
         )
         serve_mcp(config, transport=args.transport, host=args.host, port=args.port)

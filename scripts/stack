@@ -81,7 +81,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$enable_mcp" -eq 1 ]; then
+if [ "$enable_mcp" -eq 1 ] && [ "$cmd" = "up" ]; then
   mcp_bearer_token="$(env_value LLS_MCP_BEARER_TOKEN "")"
   mcp_internal_token="$(env_value LLS_MCP_INTERNAL_TOKEN "")"
   if [ "${#mcp_bearer_token}" -lt 32 ] || [[ "$mcp_bearer_token" =~ [[:space:]] ]] || [ "${#mcp_internal_token}" -lt 32 ] || [[ "$mcp_internal_token" =~ [[:space:]] ]] || [ "$mcp_bearer_token" = "$mcp_internal_token" ]; then

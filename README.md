@@ -59,13 +59,13 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 脚本会在 `--mlflow` 模式下临时把 `MLFLOW_TRACKING_URI=http://mlflow:5000` 传给控制台；默认模式不会注入这个地址。
 
-需要让 Codex 或其他 MCP client 调用平台时，先在 `.env` 设置 `LLS_MCP_BEARER_TOKEN`，再启用 MCP profile：
+需要让 Codex 或其他 MCP client 调用平台时，先在 `.env` 设置外部 bearer token 与内部服务 token，再启用 MCP profile：
 
 ```bash
 ./scripts/stack up --mcp
 ```
 
-MCP endpoint 为 `http://localhost:8766/mcp`。Docker 默认只绑定本机回环地址，应通过 HTTPS 反向代理对外暴露。它通过 Panel API 执行受控任务草稿、任务发布、数据湖 preview 和导入，不直接操作 R2 或本地数据目录。启用前必须配置彼此不同的 `LLS_MCP_BEARER_TOKEN` 与 `LLS_MCP_INTERNAL_TOKEN`；首版不是多用户 OAuth/RBAC，完整边界见 [MCP 接入说明](docs/mcp_integration.md)。
+MCP endpoint 为 `http://localhost:8766/mcp`。Docker 默认只绑定本机回环地址，应通过 HTTPS 反向代理对外暴露。MCP 使用受限 Panel 服务身份，不持有 Panel 管理员密码，也不直接操作 R2 或本地数据目录。默认只注册只读工具；确需创建草稿、发布任务或提交数据湖导入时，才在受控部署中设置 `LLS_MCP_ENABLE_WRITES=1`。首版不是多用户 OAuth/RBAC，完整边界见 [MCP 接入说明](docs/mcp_integration.md)。
 
 ## 平台流程
 
@@ -235,6 +235,7 @@ MCP_PORT=8766
 MCP_BIND_HOST=127.0.0.1
 LLS_MCP_BEARER_TOKEN=<由服务器 secret manager 生成的随机值>
 LLS_MCP_INTERNAL_TOKEN=<另一条由服务器 secret manager 生成的随机值>
+LLS_MCP_ENABLE_WRITES=0
 LLS_MCP_TIMEOUT_SECONDS=15
 LLS_TASK_SOURCE=control
 LLS_TASK_REGISTRY_URI=r2:YOUR_BUCKET/governance/data_lake/v1/current/data_lake.yaml
@@ -311,11 +312,11 @@ export MLFLOW_TRACKING_URI=http://localhost:5000
 ```bash
 pip install -e ".[mcp]"
 LLS_MCP_PANEL_URL=http://127.0.0.1:8765 \
-LLS_MCP_PANEL_USER=admin \
-LLS_MCP_PANEL_PASSWORD='<从本机 secret manager 读取>' \
 LLS_MCP_INTERNAL_TOKEN='<从本机 secret manager 读取的内部服务凭据>' \
 lls mcp --transport stdio
 ```
+
+stdio 默认同样只读。调试写工具时需同时为 Panel 和 MCP 进程设置 `LLS_MCP_ENABLE_WRITES=1`。
 
 前端本地开发：
 
