@@ -22,6 +22,12 @@ def _enum(name: str, values: tuple[str, ...]) -> sa.Enum:
     return sa.Enum(*values, name=name, native_enum=False, create_constraint=True)
 
 
+def _json_document():
+    if op.get_bind().dialect.name == "postgresql":
+        return postgresql.JSONB()
+    return sa.JSON()
+
+
 def upgrade() -> None:
     principal_type = _enum("principal_type", ("user", "service"))
     task_status = _enum("task_status", ("draft", "published", "archived"))
@@ -30,6 +36,7 @@ def upgrade() -> None:
     audit_actor_type = _enum("audit_actor_type", ("principal", "system"))
     audit_channel = _enum("audit_channel", ("panel", "mcp", "api", "cli", "worker", "system"))
     migration_status = _enum("migration_status", ("running", "succeeded", "failed"))
+    json_document = _json_document()
 
     op.create_table(
         "principals",
@@ -157,7 +164,7 @@ def upgrade() -> None:
         sa.Column("workspace_id", sa.Uuid(), nullable=False),
         sa.Column("task_id", sa.Uuid(), nullable=False),
         sa.Column("revision", sa.Integer(), nullable=False),
-        sa.Column("definition", sa.JSON(), nullable=False),
+        sa.Column("definition", json_document, nullable=False),
         sa.Column("content_hash", sa.String(length=128), nullable=False),
         sa.Column("created_by_principal_id", sa.Uuid(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
@@ -205,7 +212,7 @@ def upgrade() -> None:
         sa.Column("request_fingerprint", sa.String(length=128), nullable=False),
         sa.Column("state", idempotency_state, server_default=sa.text("'pending'"), nullable=False),
         sa.Column("response_status", sa.Integer(), nullable=True),
-        sa.Column("response_body", sa.JSON(), nullable=True),
+        sa.Column("response_body", json_document, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
@@ -254,7 +261,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), nullable=False),
         sa.Column("workspace_id", sa.Uuid(), nullable=False),
         sa.Column("setting_key", sa.String(length=255), nullable=False),
-        sa.Column("setting_value", sa.JSON(), nullable=False),
+        sa.Column("setting_value", json_document, nullable=False),
         sa.Column("updated_by_principal_id", sa.Uuid(), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
@@ -291,7 +298,7 @@ def upgrade() -> None:
         sa.Column("resource_type", sa.String(length=255), nullable=True),
         sa.Column("resource_id", sa.String(length=255), nullable=True),
         sa.Column("request_id", sa.String(length=255), nullable=True),
-        sa.Column("details", sa.JSON(), nullable=False),
+        sa.Column("details", json_document, nullable=False),
         sa.Column("occurred_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.CheckConstraint("length(trim(actor_issuer)) > 0", name="ck_audit_events_actor_issuer_not_blank"),
         sa.CheckConstraint("length(trim(actor_subject)) > 0", name="ck_audit_events_actor_subject_not_blank"),
@@ -371,12 +378,34 @@ def upgrade() -> None:
             FOR EACH ROW EXECUTE FUNCTION lls_reject_audit_event_mutation()
             """
         )
+    elif op.get_bind().dialect.name == "sqlite":
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_append_only_update
+            BEFORE UPDATE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_events is append-only');
+            END
+            """
+        )
+        op.execute(
+            """
+            CREATE TRIGGER trg_audit_events_append_only_delete
+            BEFORE DELETE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'audit_events is append-only');
+            END
+            """
+        )
 
 
 def downgrade() -> None:
     if op.get_bind().dialect.name == "postgresql":
         op.execute("DROP TRIGGER IF EXISTS trg_audit_events_append_only ON audit_events")
         op.execute("DROP FUNCTION IF EXISTS lls_reject_audit_event_mutation()")
+    elif op.get_bind().dialect.name == "sqlite":
+        op.execute("DROP TRIGGER IF EXISTS trg_audit_events_append_only_update")
+        op.execute("DROP TRIGGER IF EXISTS trg_audit_events_append_only_delete")
 
     op.drop_index("ix_migration_runs_started_at", table_name="migration_runs")
     op.drop_table("migration_runs")

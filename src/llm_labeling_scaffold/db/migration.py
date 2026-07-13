@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,9 @@ from sqlalchemy.orm import Session
 from .database import create_database_engine, resolve_database_url
 from .enums import MigrationStatus
 from .models import MigrationRun
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,14 +42,17 @@ def upgrade_database(database_url: str | None = None, target_revision: str = "he
     try:
         command.upgrade(build_alembic_config(url), target_revision)
     except Exception as exc:
-        _record_run_if_available(
-            url,
-            target_revision=target_revision,
-            applied_revision=None,
-            status=MigrationStatus.FAILED,
-            started_at=started_at,
-            error=str(exc),
-        )
+        try:
+            _record_run_if_available(
+                url,
+                target_revision=target_revision,
+                applied_revision=None,
+                status=MigrationStatus.FAILED,
+                started_at=started_at,
+                error=str(exc),
+            )
+        except Exception:
+            logger.warning("failed to record migration failure", exc_info=True)
         raise
 
     engine = create_database_engine(url)

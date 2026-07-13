@@ -16,6 +16,7 @@ from llm_labeling_scaffold.db import DatabaseService, ExternalIdentity, Identity
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
 from llm_labeling_scaffold.db.database import create_database_engine
 from llm_labeling_scaffold.db.migration import build_alembic_config, upgrade_database
+from llm_labeling_scaffold.db import migration as migration_module
 from llm_labeling_scaffold.db.models import AuditEvent, MigrationRun, Principal, RoleBinding
 
 
@@ -55,8 +56,47 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
         assert second.applied_revision == "20260713_0001"
         with Session(engine) as session:
             assert len(session.scalars(select(MigrationRun)).all()) == 2
+        with Session(engine) as session:
+            result = bootstrap_admin(
+                session,
+                issuer="https://sqlite-migration.example",
+                subject="admin",
+                workspace_slug="sqlite-migration",
+                workspace_name="SQLite Migration",
+            )
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(
+                    update(AuditEvent)
+                    .where(AuditEvent.workspace_id == result.workspace_id)
+                    .values(event_type="overwritten"),
+                )
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(
+                    delete(AuditEvent).where(AuditEvent.workspace_id == result.workspace_id),
+                )
     finally:
         engine.dispose()
+
+
+def test_upgrade_preserves_original_error_when_failure_recording_also_fails(monkeypatch, caplog):
+    original_error = RuntimeError("migration failed")
+
+    def fail_upgrade(config, revision):
+        raise original_error
+
+    def fail_recorder(*args, **kwargs):
+        raise OSError("recorder failed")
+
+    monkeypatch.setattr(migration_module.command, "upgrade", fail_upgrade)
+    monkeypatch.setattr(migration_module, "_record_run_if_available", fail_recorder)
+
+    with caplog.at_level("WARNING"), pytest.raises(RuntimeError) as exc_info:
+        upgrade_database("sqlite+pysqlite:///:memory:")
+
+    assert exc_info.value is original_error
+    assert "failed to record migration failure" in caplog.text
 
 
 @pytest.mark.skipif(not os.environ.get("LLS_TEST_POSTGRES_URL"), reason="LLS_TEST_POSTGRES_URL is not set")
@@ -91,7 +131,24 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
                 text("SELECT event_type FROM audit_events WHERE workspace_id = :workspace_id"),
                 {"workspace_id": result.workspace_id},
             )
+            jsonb_columns = set(
+                connection.execute(
+                    text(
+                        """
+                        SELECT table_name, column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema() AND data_type = 'jsonb'
+                        """
+                    )
+                ).tuples()
+            )
         assert event_type == "workspace.admin_bootstrapped"
+        assert {
+            ("task_revisions", "definition"),
+            ("idempotency_records", "response_body"),
+            ("workspace_settings", "setting_value"),
+            ("audit_events", "details"),
+        } <= jsonb_columns
     finally:
         engine.dispose()
 

@@ -18,6 +18,9 @@ from .models import AuditEvent, Principal, RoleBinding, Task, Workspace
 from .rbac import Permission, role_allows
 
 
+MAX_AUTHORIZED_TASKS_PAGE_SIZE = 100
+
+
 class AuthorizationReason(str, Enum):
     ALLOWED = "allowed"
     UNKNOWN_PRINCIPAL = "unknown_principal"
@@ -76,7 +79,13 @@ class WorkspaceAccess:
     workspace: WorkspaceRef
     roles: tuple[Role, ...]
     capabilities: tuple[Permission, ...]
-    tasks: tuple[TaskAccess, ...]
+
+
+@dataclass(frozen=True)
+class TaskAccessPage:
+    workspace: WorkspaceRef | None
+    items: tuple[TaskAccess, ...]
+    next_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -166,6 +175,22 @@ class DatabaseService:
 
     def list_authorized_workspaces(self, identity: ExternalIdentity) -> tuple[WorkspaceAccess, ...]:
         return self.get_session(identity).workspaces
+
+    def list_authorized_tasks(
+        self,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+        *,
+        limit: int,
+        after_task_key: str | None = None,
+    ) -> TaskAccessPage:
+        with self.transaction() as transaction:
+            return transaction.list_authorized_tasks(
+                identity,
+                workspace_slug,
+                limit=limit,
+                after_task_key=after_task_key,
+            )
 
     def authorize_workspace(
         self,
@@ -288,6 +313,82 @@ class DatabaseTransaction:
         return AuthorizationSession(
             principal=principal_ref,
             workspaces=self._list_authorized_workspaces(principal.id),
+        )
+
+    def list_authorized_tasks(
+        self,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+        *,
+        limit: int,
+        after_task_key: str | None = None,
+    ) -> TaskAccessPage:
+        if limit < 1 or limit > MAX_AUTHORIZED_TASKS_PAGE_SIZE:
+            raise ValueError(f"limit must be between 1 and {MAX_AUTHORIZED_TASKS_PAGE_SIZE}")
+        principal = self._find_principal(identity)
+        if principal is None or not principal.is_active:
+            return TaskAccessPage(workspace=None, items=(), next_cursor=None)
+
+        workspace = self._session.scalar(
+            select(Workspace)
+            .join(
+                RoleBinding,
+                and_(
+                    RoleBinding.workspace_id == Workspace.id,
+                    RoleBinding.principal_id == principal.id,
+                ),
+            )
+            .where(Workspace.slug == workspace_slug, Workspace.is_active.is_(True))
+            .limit(1),
+        )
+        if workspace is None:
+            return TaskAccessPage(workspace=None, items=(), next_cursor=None)
+
+        workspace_roles = self._roles(principal.id, workspace.id)
+        task_query = select(Task).where(Task.workspace_id == workspace.id)
+        if not workspace_roles:
+            task_query = task_query.join(
+                RoleBinding,
+                and_(
+                    RoleBinding.workspace_id == Task.workspace_id,
+                    RoleBinding.task_id == Task.id,
+                    RoleBinding.principal_id == principal.id,
+                ),
+            )
+        if after_task_key is not None:
+            task_query = task_query.where(Task.task_key > after_task_key)
+        tasks = self._session.scalars(
+            task_query.order_by(Task.task_key).limit(limit + 1),
+        ).all()
+        has_more = len(tasks) > limit
+        page_tasks = tasks[:limit]
+        task_roles: dict[uuid.UUID, set[Role]] = {}
+        if page_tasks:
+            rows = self._session.execute(
+                select(RoleBinding.task_id, RoleBinding.role).where(
+                    RoleBinding.principal_id == principal.id,
+                    RoleBinding.workspace_id == workspace.id,
+                    RoleBinding.task_id.in_([task.id for task in page_tasks]),
+                ),
+            ).all()
+            for task_id, role in rows:
+                task_roles.setdefault(task_id, set()).add(role)
+
+        items: list[TaskAccess] = []
+        for task in page_tasks:
+            roles = _sorted_roles((*workspace_roles, *task_roles.get(task.id, set())))
+            items.append(
+                TaskAccess(
+                    task=_task_ref(task),
+                    roles=roles,
+                    capabilities=_capabilities(roles),
+                )
+            )
+        next_cursor = page_tasks[-1].task_key if has_more and page_tasks else None
+        return TaskAccessPage(
+            workspace=_workspace_ref(workspace),
+            items=tuple(items),
+            next_cursor=next_cursor,
         )
 
     def authorize_workspace(
@@ -466,54 +567,33 @@ class DatabaseTransaction:
         return _sorted_roles(values)
 
     def _list_authorized_workspaces(self, principal_id: uuid.UUID) -> tuple[WorkspaceAccess, ...]:
-        rows = self._session.execute(
-            select(RoleBinding, Workspace)
-            .join(Workspace, Workspace.id == RoleBinding.workspace_id)
-            .where(RoleBinding.principal_id == principal_id, Workspace.is_active.is_(True)),
+        workspaces = self._session.scalars(
+            select(Workspace)
+            .join(RoleBinding, RoleBinding.workspace_id == Workspace.id)
+            .where(RoleBinding.principal_id == principal_id, Workspace.is_active.is_(True))
+            .distinct()
+            .order_by(Workspace.slug),
         ).all()
-        grouped: dict[uuid.UUID, dict[str, Any]] = {}
-        for binding, workspace in rows:
-            entry = grouped.setdefault(
-                workspace.id,
-                {
-                    "workspace": workspace,
-                    "workspace_roles": set(),
-                    "task_roles": {},
-                },
-            )
-            if binding.task_id is None:
-                entry["workspace_roles"].add(binding.role)
-            else:
-                entry["task_roles"].setdefault(binding.task_id, set()).add(binding.role)
-
+        role_rows = self._session.execute(
+            select(RoleBinding.workspace_id, RoleBinding.role).where(
+                RoleBinding.principal_id == principal_id,
+                RoleBinding.task_id.is_(None),
+            ),
+        ).all()
+        roles_by_workspace: dict[uuid.UUID, set[Role]] = {}
+        for workspace_id, role in role_rows:
+            roles_by_workspace.setdefault(workspace_id, set()).add(role)
         access: list[WorkspaceAccess] = []
-        for entry in grouped.values():
-            workspace = entry["workspace"]
-            workspace_roles = _sorted_roles(entry["workspace_roles"])
-            task_roles: dict[uuid.UUID, set[Role]] = entry["task_roles"]
-            task_query = select(Task).where(Task.workspace_id == workspace.id)
-            if not workspace_roles:
-                task_query = task_query.where(Task.id.in_(tuple(task_roles)))
-            tasks = self._session.scalars(task_query.order_by(Task.task_key)).all()
-            task_access = []
-            for task in tasks:
-                roles = _sorted_roles((*workspace_roles, *task_roles.get(task.id, set())))
-                task_access.append(
-                    TaskAccess(
-                        task=_task_ref(task),
-                        roles=roles,
-                        capabilities=_capabilities(roles),
-                    )
-                )
+        for workspace in workspaces:
+            roles = _sorted_roles(roles_by_workspace.get(workspace.id, set()))
             access.append(
                 WorkspaceAccess(
                     workspace=_workspace_ref(workspace),
-                    roles=workspace_roles,
-                    capabilities=_capabilities(workspace_roles),
-                    tasks=tuple(task_access),
+                    roles=roles,
+                    capabilities=_capabilities(roles),
                 )
             )
-        return tuple(sorted(access, key=lambda item: item.workspace.slug))
+        return tuple(access)
 
 
 def _role_decision(

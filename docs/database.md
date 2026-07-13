@@ -14,6 +14,8 @@ Scaffold 使用独立 PostgreSQL 保存身份、工作空间、授权和审计�
 - `audit_events`：带 actor 身份快照的追加式审计事件。
 - `migration_runs`：`lls db upgrade` 的执行记录；Alembic revision 仍由 `alembic_version` 管理。
 
+`task_revisions.definition`、`idempotency_records.response_body`、`workspace_settings.setting_value` 和 `audit_events.details` 在 PostgreSQL 使用 `JSONB`，SQLite 测试环境保持通用 `JSON`。
+
 不会创建密码、session、OAuth client、authorization code、access token 或 refresh token 表。
 
 ## 角色矩阵
@@ -33,7 +35,8 @@ Panel、MCP 和后续认证层不直接接收 SQLAlchemy ORM 或 `Session`。公
 
 - `resolve_identity`：只按 `(issuer, subject)` 查找 principal。
 - `resolve_or_provision`：未知身份只创建零权限 principal；相同邮箱不会合并身份或授予 membership。
-- `get_session`、`list_authorized_workspaces`：返回不可变的 principal、workspace、task 和 capability 引用，不创建数据库 session/token 表。
+- `get_session`、`list_authorized_workspaces`：只返回不可变的 principal、workspace 级角色和 capabilities，不枚举任务，也不创建数据库 session/token 表。
+- `list_authorized_tasks`：按 workspace 和 task ACL 延迟加载任务，必须显式传入 `limit`，单页上限 100，并使用 `after_task_key` cursor 翻页。
 - `authorize_workspace`、`authorize_task`：每次从数据库读取角色，不缓存放行结果。
 - `transaction`、`append_audit`：在 façade 事务内组合授权和追加审计，不向调用方暴露 ORM session。
 
@@ -83,7 +86,7 @@ docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap
 
 ## 审计不可变性
 
-应用通过 `append_audit_event` 写入事件，SQLAlchemy ORM 会拒绝更新或删除已存在事件。PostgreSQL migration 还安装了 `BEFORE UPDATE OR DELETE` 触发器，因此普通 SQL 也不能覆盖或删除审计历史。管理员读取权限不包含修改审计表的能力；数据库所有者仅应在受控恢复流程中使用。
+应用通过 `append_audit_event` 写入事件，SQLAlchemy ORM 会拒绝更新或删除已存在事件。PostgreSQL migration 安装 `BEFORE UPDATE OR DELETE` 触发器；SQLite migration 和 `Base.metadata.create_all` 测试路径也安装 UPDATE/DELETE 触发器，因此 bulk SQL 不能覆盖或删除审计历史。管理员读取权限不包含修改审计表的能力；数据库所有者仅应在受控恢复流程中使用。
 
 ## 备份与恢复
 

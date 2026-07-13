@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    DDL,
     Enum as SqlEnum,
     ForeignKey,
     ForeignKeyConstraint,
@@ -22,6 +23,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -34,6 +36,9 @@ from .enums import (
     Role,
     TaskStatus,
 )
+
+
+JSON_DOCUMENT = JSON().with_variant(postgresql.JSONB(), "postgresql")
 
 
 def _enum_type(enum_class: type, name: str) -> SqlEnum:
@@ -225,7 +230,7 @@ class TaskRevision(Base):
     )
     task_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
-    definition: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
     content_hash: Mapped[str] = mapped_column(String(128), nullable=False)
     created_by_principal_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -286,7 +291,7 @@ class IdempotencyRecord(Base):
         server_default=IdempotencyState.PENDING.value,
     )
     response_status: Mapped[int | None] = mapped_column(Integer)
-    response_body: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    response_body: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -315,7 +320,7 @@ class WorkspaceSetting(Base):
         nullable=False,
     )
     setting_key: Mapped[str] = mapped_column(String(255), nullable=False)
-    setting_value: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    setting_value: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
     updated_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("principals.id", ondelete="RESTRICT"),
@@ -375,7 +380,7 @@ class AuditEvent(Base):
     resource_type: Mapped[str | None] = mapped_column(String(255))
     resource_id: Mapped[str | None] = mapped_column(String(255))
     request_id: Mapped[str | None] = mapped_column(String(255))
-    details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    details: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False, default=dict)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -402,6 +407,34 @@ class MigrationRun(Base):
 
 class ImmutableAuditEventError(RuntimeError):
     pass
+
+
+event.listen(
+    AuditEvent.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_audit_events_append_only_update
+        BEFORE UPDATE ON audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_events is append-only');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    AuditEvent.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_audit_events_append_only_delete
+        BEFORE DELETE ON audit_events
+        BEGIN
+            SELECT RAISE(ABORT, 'audit_events is append-only');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
 
 
 @event.listens_for(AuditEvent, "before_update")

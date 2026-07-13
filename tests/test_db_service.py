@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, delete, event, func, select, update
 from sqlalchemy.engine import make_url
-from sqlalchemy.exc import IntegrityError, StatementError
+from sqlalchemy.exc import DBAPIError, IntegrityError, StatementError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -370,16 +370,74 @@ def test_get_session_lists_only_authorized_workspaces_and_capabilities(seeded_se
     annotator_workspace = annotator_session.workspaces[0]
     assert annotator_workspace.roles == ()
     assert annotator_workspace.capabilities == ()
-    assert [task.task.task_key for task in annotator_workspace.tasks] == ["shared-key"]
-    assert annotator_workspace.tasks[0].capabilities == (
+    annotator_tasks = service.list_authorized_tasks(
+        seeded_service["annotator"],
+        "workspace-a",
+        limit=10,
+    )
+    assert [task.task.task_key for task in annotator_tasks.items] == ["shared-key"]
+    assert annotator_tasks.items[0].capabilities == (
         Permission.TASK_READ,
         Permission.ANNOTATION_WORK,
     )
 
     viewer_workspace = service.get_session(seeded_service["viewer"]).workspaces[0]
     assert viewer_workspace.roles == (Role.VIEWER,)
-    assert [task.task.task_key for task in viewer_workspace.tasks] == ["other-task", "shared-key"]
     assert viewer_workspace.capabilities == (Permission.TASK_READ,)
+
+
+def test_authorized_task_listing_is_explicit_and_bounded(seeded_service, engine):
+    with Session(engine) as session, session.begin():
+        workspace_id = session.scalar(select(Workspace.id).where(Workspace.slug == "workspace-a"))
+        session.add_all(
+            [
+                Task(workspace_id=workspace_id, task_key=f"bulk-{index:04d}", name=f"Bulk {index}")
+                for index in range(250)
+            ]
+        )
+
+    statements: list[str] = []
+
+    def capture_sql(connection, cursor, statement, parameters, context, executemany):
+        statements.append(statement.lower())
+
+    event.listen(engine, "before_cursor_execute", capture_sql)
+    try:
+        auth_session = seeded_service["service"].get_session(seeded_service["viewer"])
+    finally:
+        event.remove(engine, "before_cursor_execute", capture_sql)
+
+    assert [access.workspace.slug for access in auth_session.workspaces] == ["workspace-a"]
+    assert not any("from tasks" in statement for statement in statements)
+
+    service = seeded_service["service"]
+    with pytest.raises(TypeError):
+        service.list_authorized_tasks(seeded_service["viewer"], "workspace-a")
+    with pytest.raises(ValueError):
+        service.list_authorized_tasks(seeded_service["viewer"], "workspace-a", limit=0)
+    with pytest.raises(ValueError):
+        service.list_authorized_tasks(seeded_service["viewer"], "workspace-a", limit=101)
+
+    first_page = service.list_authorized_tasks(
+        seeded_service["viewer"],
+        "workspace-a",
+        limit=25,
+    )
+    second_page = service.list_authorized_tasks(
+        seeded_service["viewer"],
+        "workspace-a",
+        limit=25,
+        after_task_key=first_page.next_cursor,
+    )
+
+    assert first_page.workspace.slug == "workspace-a"
+    assert len(first_page.items) == 25
+    assert first_page.next_cursor == first_page.items[-1].task.task_key
+    assert len(second_page.items) == 25
+    assert {item.task.id for item in first_page.items}.isdisjoint(
+        {item.task.id for item in second_page.items},
+    )
+    assert all(item.capabilities == (Permission.TASK_READ,) for item in first_page.items)
 
 
 def test_workspace_and_task_role_binding_uniqueness(engine):
@@ -609,6 +667,14 @@ def test_audit_events_are_append_only_in_orm(engine):
         with Session(engine) as session, session.begin():
             event = session.scalar(select(AuditEvent))
             session.delete(event)
+
+    with pytest.raises(DBAPIError):
+        with Session(engine) as session, session.begin():
+            session.execute(update(AuditEvent).values(event_type="bulk-overwritten"))
+
+    with pytest.raises(DBAPIError):
+        with Session(engine) as session, session.begin():
+            session.execute(delete(AuditEvent))
 
     with Session(engine) as session:
         assert session.scalar(select(AuditEvent.workspace_id)) == result.workspace_id
