@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import base64
-import hmac
 import json
 import os
-import secrets
 import threading
 import time
 from http import HTTPStatus
@@ -14,12 +11,14 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import __version__
+from .auth import ActorContext, PanelAuthenticationError, PanelAuthenticator, build_panel_authenticator
 from .config import load_task
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
 
 API_CONTRACT_VERSION = "2026-07-13"
+AUTHORIZATION_STATE = "unavailable"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -49,10 +48,6 @@ def _truthy_value(value: Any) -> bool:
 
 def _valid_idempotency_key(value: str) -> bool:
     return bool(value) and len(value) <= 200 and not any(ord(ch) < 32 for ch in value)
-
-
-def _valid_service_token(value: str) -> bool:
-    return len(value) >= 32 and not any(char.isspace() for char in value)
 
 
 def _if_match_value(value: str | None) -> str:
@@ -144,11 +139,16 @@ def _public_settings_response(settings: dict) -> dict:
     }
 
 
-def _contract_capabilities() -> dict[str, Any]:
+def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
     return {
         "service": "llm-labeling-scaffold",
         "api_contract_version": API_CONTRACT_VERSION,
-        "auth": {"types": ["basic", "mcp_service_bearer"], "multi_user": False},
+        "auth": {
+            "active_type": auth_mode,
+            "types": ["cloudflare_access", "basic_dev", "mcp_service_bearer"],
+            "multi_user": auth_mode == "cloudflare_access",
+        },
+        "authorization": {"state": AUTHORIZATION_STATE},
         "endpoints": [
             {
                 "method": "GET",
@@ -168,6 +168,31 @@ def _contract_capabilities() -> dict[str, Any]:
                 "response_schema": {
                     "type": "object",
                     "required": ["service", "version", "api_contract_version"],
+                },
+            },
+            {
+                "method": "GET",
+                "path": "/api/session",
+                "action": "session",
+                "side_effects": False,
+                "response_schema": {
+                    "type": "object",
+                    "required": ["authenticated", "user", "authentication", "authorization"],
+                    "properties": {
+                        "authenticated": {"const": True},
+                        "user": {
+                            "type": "object",
+                            "properties": {
+                                "display_name": {"type": "string"},
+                                "email": {"type": "string"},
+                            },
+                        },
+                        "authorization": {
+                            "type": "object",
+                            "required": ["state"],
+                            "properties": {"state": {"const": AUTHORIZATION_STATE}},
+                        },
+                    },
                 },
             },
             {
@@ -490,6 +515,17 @@ def _mcp_route_allowed(method: str, path: str) -> bool:
     return False
 
 
+def _access_route_allowed_without_authorization(method: str, path: str) -> bool:
+    if not path.startswith("/api/"):
+        return method == "GET"
+    return method == "GET" and path in {
+        "/api/health",
+        "/api/version",
+        "/api/capabilities",
+        "/api/session",
+    }
+
+
 def _safe_data_lake_summary(data_lake: dict[str, Any]) -> dict[str, Any]:
     return {
         "configured": bool(data_lake),
@@ -646,62 +682,60 @@ class _Handler(BaseHTTPRequestHandler):
     runs_root: Path = Path("runs")
     tasks_root: Path = Path("tasks")
     static_dir: Path | None = None
-    auth_user: str = "admin"
-    auth_pass: str = ""
+    authenticator: PanelAuthenticator | None = None
 
     def log_message(self, *args) -> None:
         pass
 
-    def _authenticate(self) -> tuple[str, str] | None:
-        header = self.headers.get("Authorization", "")
-        parts = header.split()
-        if len(parts) != 2:
-            return None
-        scheme, credentials = parts
-        if scheme.lower() == "basic":
-            try:
-                raw = base64.b64decode(credentials).decode("utf-8", "replace")
-            except Exception:
-                return None
-            user, _, password = raw.partition(":")
-            if hmac.compare_digest(user, self.auth_user) and hmac.compare_digest(password, self.auth_pass):
-                return "panel", user or self.auth_user
-            return None
-        if scheme.lower() == "bearer":
-            internal_token = str(os.environ.get("LLS_MCP_INTERNAL_TOKEN") or "").strip()
-            if _valid_service_token(internal_token) and hmac.compare_digest(credentials, internal_token):
-                return "mcp", "mcp"
-        return None
+    def _authenticate(self) -> ActorContext:
+        if self.authenticator is None:
+            raise PanelAuthenticationError(
+                "authentication_not_configured",
+                "Panel 认证未配置",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return self.authenticator.authenticate(self.headers)
 
     def _actor(self) -> str:
-        return str(getattr(self, "_request_actor", self.auth_user or "panel"))
+        context = getattr(self, "_request_context", None)
+        return context.actor.audit_id if isinstance(context, ActorContext) else "system"
 
     def _is_mcp_request(self) -> bool:
-        return getattr(self, "_request_principal", "") == "mcp"
+        context = getattr(self, "_request_context", None)
+        return isinstance(context, ActorContext) and context.caller.is_static_mcp_service
 
     def _require_auth(self) -> bool:
-        principal = self._authenticate()
-        if principal is not None:
-            kind, actor = principal
-            if kind == "mcp" and not _mcp_route_allowed(self.command, urlparse(self.path).path):
-                self._json({"error": "MCP 服务身份无权访问该接口"}, status=HTTPStatus.FORBIDDEN)
-                return False
-            self._request_principal = kind
-            self._request_actor = actor
-            return True
-        self.send_response(HTTPStatus.UNAUTHORIZED)
-        self.send_header("WWW-Authenticate", 'Basic realm="lls-panel"')
-        self.send_header("WWW-Authenticate", "Bearer")
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"authentication required\n")
-        return False
+        try:
+            context = self._authenticate()
+        except PanelAuthenticationError as exc:
+            headers = {}
+            if self.authenticator is not None and self.authenticator.challenge:
+                headers["WWW-Authenticate"] = self.authenticator.challenge
+            self._json({"error": exc.message, "code": exc.code}, status=exc.status, headers=headers)
+            return False
+        path = urlparse(self.path).path
+        if context.caller.is_static_mcp_service and not _mcp_route_allowed(self.command, path):
+            self._json({"error": "MCP 服务身份无权访问该接口"}, status=HTTPStatus.FORBIDDEN)
+            return False
+        if (
+            context.actor.authentication_method == "cloudflare_access"
+            and not _access_route_allowed_without_authorization(self.command, path)
+        ):
+            self._json(
+                {"error": "授权层尚不可用", "code": "authorization_unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return False
+        self._request_context = context
+        return True
 
-    def _json(self, obj, status: int = 200) -> None:
+    def _json(self, obj, status: int = 200, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
@@ -935,8 +969,26 @@ class _Handler(BaseHTTPRequestHandler):
                 "version": __version__,
                 "api_contract_version": API_CONTRACT_VERSION,
             })
+        elif path == "/api/session":
+            context = getattr(self, "_request_context", None)
+            if not isinstance(context, ActorContext) or context.actor.kind != "user":
+                self._json({"error": "session unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            self._json(
+                {
+                    "authenticated": True,
+                    "user": context.actor.identity.display_snapshot(),
+                    "authentication": {"method": context.caller.authentication_method},
+                    "authorization": {"state": AUTHORIZATION_STATE},
+                },
+                headers={
+                    "Cache-Control": "no-store, private",
+                    "Pragma": "no-cache",
+                },
+            )
         elif path == "/api/capabilities":
-            self._json(_contract_capabilities())
+            auth_mode = self.authenticator.mode if self.authenticator is not None else "unconfigured"
+            self._json(_contract_capabilities(auth_mode))
         elif path == "/api/settings/public":
             try:
                 settings = _apply_runtime_settings(self.runs_root)
@@ -1337,7 +1389,7 @@ class _Handler(BaseHTTPRequestHandler):
                     self.runs_root,
                     task_id,
                     reason=reason,
-                    actor="panel",
+                    actor=self._actor(),
                     r2_task_source=_r2_task_source_enabled(),
                 )
                 self._json({"ok": True, "archive": result})
@@ -1350,7 +1402,7 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                result = pipeline.execute_task_cache_cleanup(self.runs_root, task_id, actor="panel")
+                result = pipeline.execute_task_cache_cleanup(self.runs_root, task_id, actor=self._actor())
                 self._json({"ok": result.get("ok", False), "cleanup": result})
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
@@ -1644,24 +1696,30 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve_panel(runs_root: str | Path = "runs", host: str = "127.0.0.1",
-                port: int = 8765, user: str = "admin", password: str | None = None,
-                static_dir: str | Path | None = None,
-                tasks_root: str | Path = "tasks") -> None:
-    password = password or os.environ.get("LLS_PANEL_PASSWORD")
-    if not password:
-        password = secrets.token_urlsafe(12)
-        print(f"[lls panel] generated password for user '{user}': {password}")
+def serve_panel(
+    runs_root: str | Path = "runs",
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    user: str = "admin",
+    password: str | None = None,
+    static_dir: str | Path | None = None,
+    tasks_root: str | Path = "tasks",
+    auth_mode: str | None = None,
+) -> None:
+    authenticator = build_panel_authenticator(
+        mode=auth_mode,
+        basic_user=user,
+        basic_password=password,
+    )
     _Handler.runs_root = Path(runs_root)
     _Handler.tasks_root = Path(tasks_root)
-    _Handler.auth_user = user
-    _Handler.auth_pass = password
+    _Handler.authenticator = authenticator
     if static_dir is None:
         guess = Path("frontend/dist")
         static_dir = guess if guess.is_dir() else None
     _Handler.static_dir = Path(static_dir) if static_dir else None
     httpd = ThreadingHTTPServer((host, port), _Handler)
-    print(f"[lls panel] serving on http://{host}:{port} (basic auth user='{user}')")
+    print(f"[lls panel] serving on http://{host}:{port} (auth mode='{authenticator.mode}')")
     if _Handler.static_dir:
         print(f"[lls panel] serving frontend from {_Handler.static_dir}")
     else:

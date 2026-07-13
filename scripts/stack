@@ -81,11 +81,66 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$enable_mcp" -eq 1 ] && [ "$cmd" = "up" ]; then
+apply_config=0
+case "$cmd" in
+  up|restart)
+    apply_config=1
+    ;;
+esac
+
+if [ "$enable_mcp" -eq 1 ] && [ "$apply_config" -eq 1 ]; then
   mcp_bearer_token="$(env_value LLS_MCP_BEARER_TOKEN "")"
   mcp_internal_token="$(env_value LLS_MCP_INTERNAL_TOKEN "")"
   if [ "${#mcp_bearer_token}" -lt 32 ] || [[ "$mcp_bearer_token" =~ [[:space:]] ]] || [ "${#mcp_internal_token}" -lt 32 ] || [[ "$mcp_internal_token" =~ [[:space:]] ]] || [ "$mcp_bearer_token" = "$mcp_internal_token" ]; then
     echo "启用 MCP 前必须设置彼此不同、至少 32 个非空白字符的 LLS_MCP_BEARER_TOKEN 和 LLS_MCP_INTERNAL_TOKEN。" >&2
+    exit 2
+  fi
+fi
+
+panel_auth_mode="$(env_value LLS_PANEL_AUTH_MODE cloudflare_access)"
+panel_bind_host="$(env_value PANEL_BIND_HOST 127.0.0.1)"
+if [ "$apply_config" -eq 1 ]; then
+  case "${panel_auth_mode,,}" in
+    basic_dev)
+      if [ -z "$(env_value LLS_PANEL_PASSWORD "")" ]; then
+        echo "basic_dev 模式必须设置 LLS_PANEL_PASSWORD。" >&2
+        exit 2
+      fi
+      case "$panel_bind_host" in
+        127.0.0.1|::1)
+          ;;
+        localhost)
+          panel_bind_host="127.0.0.1"
+          ;;
+        *)
+          echo "basic_dev 模式只允许 PANEL_BIND_HOST 使用 127.0.0.1、localhost 或 ::1。" >&2
+          exit 2
+          ;;
+      esac
+      ;;
+    cloudflare_access)
+      if [ -z "$(env_value LLS_CF_ACCESS_ISSUER "")" ] || [ -z "$(env_value LLS_CF_ACCESS_AUD "")" ]; then
+        echo "cloudflare_access 模式必须设置 LLS_CF_ACCESS_ISSUER 和 LLS_CF_ACCESS_AUD。" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "LLS_PANEL_AUTH_MODE 只能是 cloudflare_access 或 basic_dev。" >&2
+      exit 2
+      ;;
+  esac
+  export PANEL_BIND_HOST="$panel_bind_host"
+fi
+
+if [ "$apply_config" -eq 1 ]; then
+  database_owner_password="$(env_value SCAFFOLD_POSTGRES_OWNER_PASSWORD "")"
+  database_app_password="$(env_value SCAFFOLD_POSTGRES_APP_PASSWORD "")"
+  if [ -z "$database_owner_password" ] || [ -z "$database_app_password" ]; then
+    echo "up/restart 前必须设置 SCAFFOLD_POSTGRES_OWNER_PASSWORD 和 SCAFFOLD_POSTGRES_APP_PASSWORD。" >&2
+    exit 2
+  fi
+  if [ "$database_owner_password" = "$database_app_password" ]; then
+    echo "数据库 owner 和 app role 必须使用不同密码。" >&2
     exit 2
   fi
 fi
@@ -99,7 +154,7 @@ case "${task_source,,}" in
     compose+=(-f docker-compose.rclone.example.yml)
     ;;
 esac
-services=(panel argilla argilla-worker argilla-postgres elasticsearch redis)
+services=(scaffold-postgres db-role-init migrate panel argilla argilla-worker argilla-postgres elasticsearch redis)
 if [ "$enable_mlflow" -eq 1 ]; then
   compose+=(--profile mlflow)
   services+=(mlflow)
@@ -123,7 +178,11 @@ print_urls() {
     echo "MCP：         http://localhost:$(env_value MCP_PORT 8766)/mcp"
   fi
   echo
-  echo "panel 登录：admin / $(env_value LLS_PANEL_PASSWORD changeme)"
+  if [ "${panel_auth_mode,,}" = "basic_dev" ]; then
+    echo "panel 本地开发登录：admin / $(env_value LLS_PANEL_PASSWORD changeme)"
+  else
+    echo "panel 登录：Cloudflare Access"
+  fi
   echo "Argilla 登录：$(env_value ARGILLA_USERNAME argilla) / $(env_value ARGILLA_PASSWORD 12345678)"
   if [ "$enable_mlflow" -eq 0 ]; then
     echo
@@ -172,9 +231,9 @@ case "$cmd" in
     ;;
   restart)
     if [ "$enable_mlflow" -eq 1 ]; then
-      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" restart "${services[@]}"
+      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --force-recreate "${services[@]}"
     else
-      "${compose[@]}" restart "${services[@]}"
+      "${compose[@]}" up -d --force-recreate "${services[@]}"
     fi
     ;;
   *)

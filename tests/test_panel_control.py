@@ -10,6 +10,7 @@ import urllib.error
 import urllib.request
 
 from llm_labeling_scaffold import panel
+from llm_labeling_scaffold.auth import build_panel_authenticator
 from llm_labeling_scaffold.config import load_task
 
 
@@ -19,14 +20,16 @@ def _panel_server(runs_root: Path, tasks_root: Path):
         "runs_root": panel._Handler.runs_root,
         "tasks_root": panel._Handler.tasks_root,
         "static_dir": panel._Handler.static_dir,
-        "auth_user": panel._Handler.auth_user,
-        "auth_pass": panel._Handler.auth_pass,
+        "authenticator": panel._Handler.authenticator,
     }
     panel._Handler.runs_root = runs_root
     panel._Handler.tasks_root = tasks_root
     panel._Handler.static_dir = None
-    panel._Handler.auth_user = "admin"
-    panel._Handler.auth_pass = "secret"
+    panel._Handler.authenticator = build_panel_authenticator(
+        mode="basic_dev",
+        basic_user="admin",
+        basic_password="secret",
+    )
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), panel._Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

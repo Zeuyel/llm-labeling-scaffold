@@ -53,6 +53,25 @@ def test_compose_role_initialization_paths_are_explicit():
     compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     services = compose["services"]
 
+    panel = services["panel"]
+    panel_environment = set(panel["environment"])
+    assert panel["ports"] == ["${PANEL_BIND_HOST:-127.0.0.1}:${PANEL_PORT:-8765}:8765"]
+    assert "LLS_PANEL_AUTH_MODE=${LLS_PANEL_AUTH_MODE:-cloudflare_access}" in panel_environment
+    assert "LLS_CF_ACCESS_ISSUER=${LLS_CF_ACCESS_ISSUER:-}" in panel_environment
+    assert "LLS_CF_ACCESS_AUD=${LLS_CF_ACCESS_AUD:-}" in panel_environment
+    assert "LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}" in panel_environment
+    assert (
+        "LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}"
+        in panel_environment
+    )
+
+    migrate_environment = set(services["migrate"]["environment"])
+    assert "LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_OWNER_USER:-scaffold_owner}" in migrate_environment
+    assert (
+        "LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_OWNER_PASSWORD:?Set SCAFFOLD_POSTGRES_OWNER_PASSWORD}"
+        in migrate_environment
+    )
+
     first_init = services["scaffold-postgres"]
     assert first_init["environment"]["LLS_RUNTIME_ROLE_SQL_PATH"] == (
         "/usr/local/share/lls/init-runtime-role.sql"
