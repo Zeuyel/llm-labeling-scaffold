@@ -33,7 +33,7 @@ LLS_PANEL_AUTH_MODE=basic_dev
 LLS_PANEL_PASSWORD=<local-only-password>
 ```
 
-生产模式不会在 Access 配置缺失或验证失败时回退到 Basic Auth。
+`scripts/stack up` 和 `scripts/stack restart` 会拒绝将 `basic_dev` 绑定到 `127.0.0.1`、`localhost`、`::1` 之外的地址。restart 使用强制重建容器，以应用认证和 MCP 环境变量变更。生产模式不会在 Access 配置缺失或验证失败时回退到 Basic Auth。
 
 ## Tunnel-only 源站
 

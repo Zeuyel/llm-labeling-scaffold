@@ -417,6 +417,65 @@ def test_ttl_expiry_refreshes_known_keys_normally():
     assert len(fetcher.calls) == 2
 
 
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"jwks_ttl_seconds": float("nan")},
+        {"jwks_ttl_seconds": float("inf")},
+        {"http_timeout_seconds": float("nan")},
+        {"http_timeout_seconds": float("-inf")},
+        {"clock_skew_seconds": float("nan")},
+        {"clock_skew_seconds": float("inf")},
+        {"unknown_kid_cooldown_seconds": float("nan")},
+        {"unknown_kid_cooldown_seconds": float("inf")},
+        {"refresh_failure_cooldown_seconds": float("nan")},
+        {"refresh_failure_cooldown_seconds": float("-inf")},
+    ],
+)
+def test_verifier_rejects_non_finite_security_timing_values(kwargs: dict):
+    _, jwk = _signing_key("key-1")
+
+    with pytest.raises(ValueError):
+        _verifier(jwk, **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("LLS_CF_ACCESS_JWKS_TTL_SECONDS", "nan"),
+        ("LLS_CF_ACCESS_JWKS_TTL_SECONDS", "inf"),
+        ("LLS_CF_ACCESS_HTTP_TIMEOUT_SECONDS", "-inf"),
+        ("LLS_CF_ACCESS_CLOCK_SKEW_SECONDS", "nan"),
+        ("LLS_CF_ACCESS_CLOCK_SKEW_SECONDS", "inf"),
+    ],
+)
+def test_environment_rejects_non_finite_access_timing_values(monkeypatch, name: str, value: str):
+    monkeypatch.setenv("LLS_PANEL_AUTH_MODE", "cloudflare_access")
+    monkeypatch.setenv("LLS_CF_ACCESS_ISSUER", ISSUER)
+    monkeypatch.setenv("LLS_CF_ACCESS_AUD", EXPECTED_AUDIENCE)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        build_panel_authenticator()
+
+
+def test_non_finite_clock_skew_cannot_bypass_expired_token_validation():
+    private_key, jwk = _signing_key("key-1")
+    with pytest.raises(ValueError):
+        _verifier(jwk, clock_skew_seconds=float("nan"))
+
+    verifier = _verifier(jwk, clock_skew_seconds=0)
+    with pytest.raises(TokenVerificationError) as exc_info:
+        verifier.verify(
+            _assertion(
+                private_key,
+                "key-1",
+                claims={"exp": int(time.time()) - 1},
+            )
+        )
+    assert exc_info.value.code == "expired_access_assertion"
+
+
 def test_jwks_network_failure_fails_closed():
     private_key, jwk = _signing_key("key-1")
     fetcher = _SequenceFetcher(OSError("network unavailable"))
@@ -503,14 +562,32 @@ def _request(
     body: dict | None = None,
     headers: dict[str, str] | None = None,
 ) -> tuple[int, dict]:
+    status, payload, _ = _request_with_headers(
+        base_url,
+        path,
+        method=method,
+        body=body,
+        headers=headers,
+    )
+    return status, payload
+
+
+def _request_with_headers(
+    base_url: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict, dict[str, str]]:
     request_headers = {"Content-Type": "application/json", **(headers or {})}
     data = json.dumps(body).encode("utf-8") if body is not None else None
     request = urllib.request.Request(base_url + path, data=data, headers=request_headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
-            return response.status, json.loads(response.read().decode("utf-8"))
+            return response.status, json.loads(response.read().decode("utf-8")), dict(response.headers)
     except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8"))
+        return exc.code, json.loads(exc.read().decode("utf-8")), dict(exc.headers)
 
 
 def _draft_spec() -> dict:
@@ -539,7 +616,7 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
     }
 
     with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
-        status, session = _request(base_url, "/api/session", headers=headers)
+        status, session, session_headers = _request_with_headers(base_url, "/api/session", headers=headers)
         health_status, health = _request(base_url, "/api/health", headers=headers)
         capabilities_status, capabilities = _request(base_url, "/api/capabilities", headers=headers)
         settings_status, settings_body = _request(base_url, "/api/settings/public", headers=headers)
@@ -568,6 +645,8 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
     assert "workspace" not in session
     assert "capabilities" not in session
     assert token not in json.dumps(session)
+    assert session_headers["Cache-Control"] == "no-store, private"
+    assert session_headers["Pragma"] == "no-cache"
     assert (health_status, health["ok"]) == (200, True)
     assert capabilities_status == 200
     assert capabilities["authorization"] == {"state": "unavailable"}
@@ -598,6 +677,46 @@ def test_actor_context_separates_actor_from_caller_and_mcp_checks_caller():
 
     holder = type("Holder", (), {"_request_context": managed_mcp_context})()
     assert panel._Handler._is_mcp_request(holder) is True
+
+
+def test_authorization_gate_uses_actor_for_delegated_mcp_context():
+    user = Principal(
+        kind="user",
+        authentication_method="cloudflare_access",
+        identity=Identity(ISSUER, SUBJECT, email="alice@example.com"),
+    )
+    service = Principal(
+        kind="service",
+        authentication_method="mcp_service_bearer",
+        identity=Identity("urn:lls:mcp-service", "mcp"),
+    )
+
+    class HandlerStub:
+        command = "GET"
+        path = "/api/tasks"
+        authenticator = None
+
+        def __init__(self, context: ActorContext) -> None:
+            self.context = context
+            self.response = None
+
+        def _authenticate(self) -> ActorContext:
+            return self.context
+
+        def _json(self, body, status=200, headers=None) -> None:
+            self.response = (body, status, headers)
+
+    delegated = HandlerStub(ActorContext(actor=user, caller=service))
+    assert panel._Handler._require_auth(delegated) is False
+    assert delegated.response == (
+        {"error": "授权层尚不可用", "code": "authorization_unavailable"},
+        503,
+        None,
+    )
+
+    static_service = HandlerStub(ActorContext.direct(service))
+    assert panel._Handler._require_auth(static_service) is True
+    assert static_service._request_context == ActorContext.direct(service)
 
 
 def test_cloudflare_mode_rejects_missing_assertion_and_does_not_fall_back_to_basic(tmp_path: Path):

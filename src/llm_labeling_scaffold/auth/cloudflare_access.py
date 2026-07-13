@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import threading
 import time
 import urllib.error
@@ -102,17 +103,25 @@ class _BoundedJwksCache:
         fetcher: JwksFetcher,
         clock: Callable[[], float],
     ) -> None:
-        if ttl_seconds <= 0 or ttl_seconds > 3600:
+        if not math.isfinite(ttl_seconds) or ttl_seconds <= 0 or ttl_seconds > 3600:
             raise ValueError("JWKS cache TTL 必须在 0 到 3600 秒之间")
-        if timeout_seconds <= 0 or timeout_seconds > 30:
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("JWKS 请求超时必须在 0 到 30 秒之间")
         if max_keys <= 0 or max_keys > 32:
             raise ValueError("JWKS key 缓存上限必须在 1 到 32 之间")
         if max_negative_kids <= 0 or max_negative_kids > 1024:
             raise ValueError("未知 kid 负缓存上限必须在 1 到 1024 之间")
-        if unknown_kid_cooldown_seconds <= 0 or unknown_kid_cooldown_seconds > 300:
+        if (
+            not math.isfinite(unknown_kid_cooldown_seconds)
+            or unknown_kid_cooldown_seconds <= 0
+            or unknown_kid_cooldown_seconds > 300
+        ):
             raise ValueError("未知 kid 刷新 cooldown 必须在 0 到 300 秒之间")
-        if refresh_failure_cooldown_seconds <= 0 or refresh_failure_cooldown_seconds > 300:
+        if (
+            not math.isfinite(refresh_failure_cooldown_seconds)
+            or refresh_failure_cooldown_seconds <= 0
+            or refresh_failure_cooldown_seconds > 300
+        ):
             raise ValueError("JWKS 失败重试 cooldown 必须在 0 到 300 秒之间")
         self._url = url
         self._ttl_seconds = ttl_seconds
@@ -275,7 +284,7 @@ class CloudflareAccessVerifier:
         self.expected_audience = str(expected_audience or "").strip()
         if not self.expected_audience or len(self.expected_audience) > 512:
             raise ValueError("Cloudflare Access AUD 必须是非空字符串")
-        if clock_skew_seconds < 0 or clock_skew_seconds > 60:
+        if not math.isfinite(clock_skew_seconds) or clock_skew_seconds < 0 or clock_skew_seconds > 60:
             raise ValueError("JWT clock skew 必须在 0 到 60 秒之间")
         self._clock_skew_seconds = clock_skew_seconds
         self.jwks_url = f"{self.issuer}/cdn-cgi/access/certs"

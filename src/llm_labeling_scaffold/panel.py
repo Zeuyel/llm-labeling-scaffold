@@ -718,7 +718,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "MCP 服务身份无权访问该接口"}, status=HTTPStatus.FORBIDDEN)
             return False
         if (
-            context.caller.authentication_method == "cloudflare_access"
+            context.actor.authentication_method == "cloudflare_access"
             and not _access_route_allowed_without_authorization(self.command, path)
         ):
             self._json(
@@ -974,12 +974,18 @@ class _Handler(BaseHTTPRequestHandler):
             if not isinstance(context, ActorContext) or context.actor.kind != "user":
                 self._json({"error": "session unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
                 return
-            self._json({
-                "authenticated": True,
-                "user": context.actor.identity.display_snapshot(),
-                "authentication": {"method": context.caller.authentication_method},
-                "authorization": {"state": AUTHORIZATION_STATE},
-            })
+            self._json(
+                {
+                    "authenticated": True,
+                    "user": context.actor.identity.display_snapshot(),
+                    "authentication": {"method": context.caller.authentication_method},
+                    "authorization": {"state": AUTHORIZATION_STATE},
+                },
+                headers={
+                    "Cache-Control": "no-store, private",
+                    "Pragma": "no-cache",
+                },
+            )
         elif path == "/api/capabilities":
             auth_mode = self.authenticator.mode if self.authenticator is not None else "unconfigured"
             self._json(_contract_capabilities(auth_mode))

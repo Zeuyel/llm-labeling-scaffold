@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import math
 import os
 from http import HTTPStatus
 from typing import Mapping
@@ -38,7 +39,7 @@ def _bounded_float_env(name: str, default: float, minimum: float, maximum: float
         value = float(raw)
     except ValueError as exc:
         raise ValueError(f"{name} 必须是数字") from exc
-    if value < minimum or value > maximum:
+    if not math.isfinite(value) or value < minimum or value > maximum:
         raise ValueError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
     return value
 

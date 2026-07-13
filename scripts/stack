@@ -81,7 +81,14 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-if [ "$enable_mcp" -eq 1 ] && [ "$cmd" = "up" ]; then
+apply_config=0
+case "$cmd" in
+  up|restart)
+    apply_config=1
+    ;;
+esac
+
+if [ "$enable_mcp" -eq 1 ] && [ "$apply_config" -eq 1 ]; then
   mcp_bearer_token="$(env_value LLS_MCP_BEARER_TOKEN "")"
   mcp_internal_token="$(env_value LLS_MCP_INTERNAL_TOKEN "")"
   if [ "${#mcp_bearer_token}" -lt 32 ] || [[ "$mcp_bearer_token" =~ [[:space:]] ]] || [ "${#mcp_internal_token}" -lt 32 ] || [[ "$mcp_internal_token" =~ [[:space:]] ]] || [ "$mcp_bearer_token" = "$mcp_internal_token" ]; then
@@ -91,13 +98,25 @@ if [ "$enable_mcp" -eq 1 ] && [ "$cmd" = "up" ]; then
 fi
 
 panel_auth_mode="$(env_value LLS_PANEL_AUTH_MODE cloudflare_access)"
-if [ "$cmd" = "up" ]; then
+panel_bind_host="$(env_value PANEL_BIND_HOST 127.0.0.1)"
+if [ "$apply_config" -eq 1 ]; then
   case "${panel_auth_mode,,}" in
     basic_dev)
       if [ -z "$(env_value LLS_PANEL_PASSWORD "")" ]; then
         echo "basic_dev 模式必须设置 LLS_PANEL_PASSWORD。" >&2
         exit 2
       fi
+      case "$panel_bind_host" in
+        127.0.0.1|::1)
+          ;;
+        localhost)
+          panel_bind_host="127.0.0.1"
+          ;;
+        *)
+          echo "basic_dev 模式只允许 PANEL_BIND_HOST 使用 127.0.0.1、localhost 或 ::1。" >&2
+          exit 2
+          ;;
+      esac
       ;;
     cloudflare_access)
       if [ -z "$(env_value LLS_CF_ACCESS_ISSUER "")" ] || [ -z "$(env_value LLS_CF_ACCESS_AUD "")" ]; then
@@ -110,6 +129,7 @@ if [ "$cmd" = "up" ]; then
       exit 2
       ;;
   esac
+  export PANEL_BIND_HOST="$panel_bind_host"
 fi
 
 task_source="$(env_value LLS_TASK_SOURCE control)"
@@ -198,9 +218,9 @@ case "$cmd" in
     ;;
   restart)
     if [ "$enable_mlflow" -eq 1 ]; then
-      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" restart "${services[@]}"
+      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --force-recreate "${services[@]}"
     else
-      "${compose[@]}" restart "${services[@]}"
+      "${compose[@]}" up -d --force-recreate "${services[@]}"
     fi
     ;;
   *)
