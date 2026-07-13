@@ -23,6 +23,11 @@ services:
       - "${PANEL_PORT:-8765}:8765"
     environment:
       - LLS_PANEL_PASSWORD=${LLS_PANEL_PASSWORD:-changeme}
+      - LLS_DATABASE_HOST=scaffold-postgres
+      - LLS_DATABASE_PORT=5432
+      - LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_USER:-scaffold}
+      - LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_PASSWORD:?Set SCAFFOLD_POSTGRES_PASSWORD}
+      - LLS_DATABASE_NAME=${SCAFFOLD_POSTGRES_DB:-scaffold}
       - LLS_MCP_INTERNAL_TOKEN=${LLS_MCP_INTERNAL_TOKEN:-}
       - LLS_MCP_ENABLE_WRITES=${LLS_MCP_ENABLE_WRITES:-0}
       - ARGILLA_API_URL=http://argilla:6900
@@ -41,7 +46,27 @@ services:
       - ./tasks:/app/tasks
       - ./configs:/app/configs:ro
     depends_on:
-      - argilla
+      migrate:
+        condition: service_completed_successfully
+      argilla:
+        condition: service_started
+    networks:
+      - lls
+
+  migrate:
+    image: ${PANEL_IMAGE:-llm-labeling-scaffold-panel:local}
+    user: "${PANEL_UID:-1000}:${PANEL_GID:-1000}"
+    restart: "no"
+    environment:
+      - LLS_DATABASE_HOST=scaffold-postgres
+      - LLS_DATABASE_PORT=5432
+      - LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_USER:-scaffold}
+      - LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_PASSWORD:?Set SCAFFOLD_POSTGRES_PASSWORD}
+      - LLS_DATABASE_NAME=${SCAFFOLD_POSTGRES_DB:-scaffold}
+    command: ["python", "-m", "llm_labeling_scaffold.cli", "db", "upgrade"]
+    depends_on:
+      scaffold-postgres:
+        condition: service_healthy
     networks:
       - lls
 
@@ -108,6 +133,25 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - lls
+
+  scaffold-postgres:
+    image: postgres:16
+    restart: unless-stopped
+    ports:
+      - "${SCAFFOLD_POSTGRES_BIND_HOST:-127.0.0.1}:${SCAFFOLD_POSTGRES_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: ${SCAFFOLD_POSTGRES_USER:-scaffold}
+      POSTGRES_PASSWORD: ${SCAFFOLD_POSTGRES_PASSWORD:?Set SCAFFOLD_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${SCAFFOLD_POSTGRES_DB:-scaffold}
+    volumes:
+      - scaffold-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
     networks:
       - lls
 
@@ -199,6 +243,7 @@ networks:
     driver: bridge
 
 volumes:
+  scaffold-postgres-data:
   argilla-data:
   argilla-postgres-data:
   elasticsearch-data:

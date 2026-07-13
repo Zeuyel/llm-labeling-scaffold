@@ -12,13 +12,21 @@ MLflow 不再是默认依赖。它只作为可选外部模型记录服务，适�
 源码部署时直接使用内置脚本：
 
 ```bash
+cp .env.example .env
+db_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_PASSWORD=.*|SCAFFOLD_POSTGRES_PASSWORD=${db_password}|" .env
+unset db_password
 ./scripts/stack up
 ```
+
+Compose 对 `SCAFFOLD_POSTGRES_PASSWORD` 使用必填校验，缺失时直接退出；Panel、migration 和 PostgreSQL 从同一组 `SCAFFOLD_POSTGRES_*` 变量取得连接参数。正式部署应由 secret manager 注入随机密码，不使用仓库默认凭据。
 
 默认启动：
 
 - 轻量控制台：`http://localhost:8765`，默认账号 `admin` / `changeme`
 - Argilla：`http://localhost:6900`，默认账号 `argilla` / `12345678`
+- Scaffold 自有 PostgreSQL：默认仅绑定 `127.0.0.1:5433`
+- 一次性 Alembic 迁移服务：数据库健康后执行并正常退出
 - Argilla 依赖服务：PostgreSQL、Elasticsearch、Redis
 
 Argilla 依赖 Elasticsearch。低配测试机如果看到 Argilla 日志反复提示 Elasticsearch 不可用，先检查：
@@ -45,6 +53,18 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 ./scripts/stack restart
 ./scripts/stack down
 ```
+
+首次部署必须显式创建首位管理员，身份键使用认证提供方的稳定 `issuer` 和 `subject`，不能使用邮箱代替：
+
+```bash
+docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap \
+  --issuer https://example.cloudflareaccess.com \
+  --subject '<stable-access-subject>' \
+  --workspace-slug default \
+  --workspace-name 'Default Workspace'
+```
+
+数据库 schema、角色矩阵、迁移以及备份恢复说明见 [Scaffold 数据库与 RBAC](docs/database.md)。
 
 需要模型记录服务时再启用 Docker Compose 的 mlflow profile：
 
@@ -115,7 +135,7 @@ runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/draft
 
 ## 认证边界
 
-控制面没有引入完整的多用户登录、团队隔离或 RBAC。面板仍使用一个静态 Basic Auth 账号（Docker 默认用户名为 `admin`，密码由部署的 `LLS_PANEL_PASSWORD` 提供）；任务记录中的操作者只是该已认证账号。部署时应通过环境或 secret manager 注入真实密码，不能将其提交到仓库。
+Scaffold 已有独立的用户、工作空间、任务 ACL 和 RBAC 持久化层，但本阶段不改变 Panel、MCP 或现有文件任务流程的认证行为。面板仍使用一个静态 Basic Auth 账号（Docker 默认用户名为 `admin`，密码由部署的 `LLS_PANEL_PASSWORD` 提供）；后续认证接入应把外部身份映射到 `(issuer, subject)`，再调用数据库 RBAC 判定。部署时应通过环境或 secret manager 注入真实密码，不能将其提交到仓库。
 
 ## 服务器测试
 
@@ -137,6 +157,9 @@ ghcr.io/zeuyel/llm-labeling-scaffold/panel
 git clone <repo-url>
 cd llm-labeling-scaffold
 cp .env.example .env
+db_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_PASSWORD=.*|SCAFFOLD_POSTGRES_PASSWORD=${db_password}|" .env
+unset db_password
 export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:main
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull panel
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
@@ -159,6 +182,10 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --prof
 ```bash
 git clone <repo-url>
 cd llm-labeling-scaffold
+cp .env.example .env
+db_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_PASSWORD=.*|SCAFFOLD_POSTGRES_PASSWORD=${db_password}|" .env
+unset db_password
 ./scripts/stack up
 ```
 
@@ -224,6 +251,12 @@ import dry-run 只会在 `/api/capabilities` 声明了 side-effect-free dry-run 
 PANEL_PORT=8765
 LLS_PANEL_PASSWORD=changeme
 
+SCAFFOLD_POSTGRES_BIND_HOST=127.0.0.1
+SCAFFOLD_POSTGRES_PORT=5433
+SCAFFOLD_POSTGRES_USER=scaffold
+SCAFFOLD_POSTGRES_PASSWORD=
+SCAFFOLD_POSTGRES_DB=scaffold
+
 ARGILLA_PORT=6900
 ARGILLA_USERNAME=argilla
 ARGILLA_PASSWORD=12345678
@@ -256,6 +289,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 控制台镜像会把前端构建产物打进后端镜像，并安装：
 
 - 核心流水线依赖
+- SQLAlchemy 2、Alembic 和 PostgreSQL 驱动
 - Argilla 集成依赖
 - 基线训练依赖：`scikit-learn`、`joblib`
 - MLflow 客户端依赖
