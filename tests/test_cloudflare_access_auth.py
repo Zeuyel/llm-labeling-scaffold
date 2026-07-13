@@ -89,12 +89,61 @@ class _SequenceFetcher:
         return response
 
 
-def _verifier(jwk: dict, *, fetcher=None, max_jwks_keys: int = 8) -> CloudflareAccessVerifier:
+class _BlockingFetcher:
+    def __init__(
+        self,
+        initial: dict,
+        *,
+        blocked_result: dict | None = None,
+        blocked_error: Exception | None = None,
+        later_result: dict | None = None,
+        later_error: Exception | None = None,
+    ) -> None:
+        self.initial = initial
+        self.blocked_result = blocked_result
+        self.blocked_error = blocked_error
+        self.later_result = later_result
+        self.later_error = later_error
+        self.calls: list[tuple[str, float]] = []
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self._lock = threading.Lock()
+
+    def __call__(self, url: str, timeout_seconds: float) -> dict:
+        with self._lock:
+            self.calls.append((url, timeout_seconds))
+            call_number = len(self.calls)
+        if call_number == 1:
+            return self.initial
+        if call_number == 2:
+            self.started.set()
+            if not self.release.wait(timeout=5):
+                raise TimeoutError("test fetch was not released")
+            if self.blocked_error is not None:
+                raise self.blocked_error
+            if self.blocked_result is None:
+                raise AssertionError("blocked_result is required")
+            return self.blocked_result
+        if self.later_error is not None:
+            raise self.later_error
+        if self.later_result is None:
+            raise AssertionError("unexpected JWKS fetch")
+        return self.later_result
+
+
+def _verifier(
+    jwk: dict,
+    *,
+    fetcher=None,
+    max_jwks_keys: int = 8,
+    **kwargs,
+) -> CloudflareAccessVerifier:
     return CloudflareAccessVerifier(
         ISSUER,
         EXPECTED_AUDIENCE,
         jwks_fetcher=fetcher or _SequenceFetcher({"keys": [jwk]}),
         max_jwks_keys=max_jwks_keys,
+        **kwargs,
     )
 
 
@@ -179,6 +228,192 @@ def test_unknown_kid_refreshes_jwks_once_and_accepts_rotated_key():
     identity = verifier.verify(_assertion(second_private_key, "key-2"))
 
     assert identity.subject == SUBJECT
+    assert len(fetcher.calls) == 2
+
+
+def test_known_kid_is_not_blocked_by_an_unknown_kid_refresh():
+    valid_private_key, valid_jwk = _signing_key("key-1")
+    unknown_private_key, _ = _signing_key("unknown-key")
+    fetcher = _BlockingFetcher(
+        {"keys": [valid_jwk]},
+        blocked_result={"keys": [valid_jwk]},
+    )
+    verifier = _verifier(valid_jwk, fetcher=fetcher)
+    valid_token = _assertion(valid_private_key, "key-1")
+    unknown_token = _assertion(unknown_private_key, "unknown-key")
+    verifier.verify(valid_token)
+
+    unknown_errors: list[Exception] = []
+    known_errors: list[Exception] = []
+    known_done = threading.Event()
+
+    def verify_unknown() -> None:
+        try:
+            verifier.verify(unknown_token)
+        except Exception as exc:
+            unknown_errors.append(exc)
+
+    def verify_known() -> None:
+        try:
+            verifier.verify(valid_token)
+        except Exception as exc:
+            known_errors.append(exc)
+        finally:
+            known_done.set()
+
+    unknown_thread = threading.Thread(target=verify_unknown)
+    unknown_thread.start()
+    assert fetcher.started.wait(timeout=1)
+    known_thread = threading.Thread(target=verify_known)
+    known_thread.start()
+    try:
+        assert known_done.wait(timeout=1)
+        assert unknown_thread.is_alive()
+    finally:
+        fetcher.release.set()
+        unknown_thread.join(timeout=2)
+        known_thread.join(timeout=2)
+
+    assert known_errors == []
+    assert len(unknown_errors) == 1
+    assert isinstance(unknown_errors[0], TokenVerificationError)
+    assert len(fetcher.calls) == 2
+
+
+def test_random_unknown_kids_are_single_flight_and_rate_limited_until_rotation_cooldown():
+    valid_private_key, valid_jwk = _signing_key("key-1")
+    rotated_private_key, rotated_jwk = _signing_key("key-2")
+    clock_value = [100.0]
+    fetcher = _BlockingFetcher(
+        {"keys": [valid_jwk]},
+        blocked_result={"keys": [valid_jwk]},
+        later_result={"keys": [valid_jwk, rotated_jwk]},
+    )
+    verifier = _verifier(
+        valid_jwk,
+        fetcher=fetcher,
+        clock=lambda: clock_value[0],
+        max_negative_kids=8,
+        unknown_kid_cooldown_seconds=10,
+    )
+    verifier.verify(_assertion(valid_private_key, "key-1"))
+
+    start = threading.Event()
+    errors: list[Exception] = []
+    tokens = [
+        _assertion(rotated_private_key, f"random-{index}")
+        for index in range(24)
+    ]
+
+    def verify_random(token: str) -> None:
+        start.wait(timeout=1)
+        try:
+            verifier.verify(token)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=verify_random, args=(token,)) for token in tokens]
+    for thread in threads:
+        thread.start()
+    start.set()
+    assert fetcher.started.wait(timeout=1)
+    try:
+        time.sleep(0.05)
+        assert len(fetcher.calls) == 2
+    finally:
+        fetcher.release.set()
+        for thread in threads:
+            thread.join(timeout=2)
+
+    assert len(fetcher.calls) == 2
+    assert len(errors) == len(tokens)
+    for index in range(24, 48):
+        with pytest.raises(TokenVerificationError):
+            verifier.verify(_assertion(rotated_private_key, f"random-{index}"))
+    assert len(fetcher.calls) == 2
+    assert len(verifier._jwks._negative_kids) <= 8
+
+    clock_value[0] += 11
+    identity = verifier.verify(_assertion(rotated_private_key, "key-2"))
+    assert identity.subject == SUBJECT
+    assert len(fetcher.calls) == 3
+
+
+def test_failed_refresh_has_single_flight_and_does_not_form_a_retry_storm():
+    valid_private_key, valid_jwk = _signing_key("key-1")
+    unknown_private_key, _ = _signing_key("unknown-key")
+    clock_value = [200.0]
+    fetcher = _BlockingFetcher(
+        {"keys": [valid_jwk]},
+        blocked_error=OSError("network unavailable"),
+        later_error=OSError("network still unavailable"),
+    )
+    verifier = _verifier(
+        valid_jwk,
+        fetcher=fetcher,
+        clock=lambda: clock_value[0],
+        refresh_failure_cooldown_seconds=10,
+    )
+    valid_token = _assertion(valid_private_key, "key-1")
+    verifier.verify(valid_token)
+
+    refresh_errors: list[Exception] = []
+
+    def trigger_failed_refresh() -> None:
+        try:
+            verifier.verify(_assertion(unknown_private_key, "unknown-key"))
+        except Exception as exc:
+            refresh_errors.append(exc)
+
+    refresh_thread = threading.Thread(target=trigger_failed_refresh)
+    refresh_thread.start()
+    assert fetcher.started.wait(timeout=1)
+    verifier.verify(valid_token)
+    for index in range(20):
+        with pytest.raises(TokenVerificationError):
+            verifier.verify(_assertion(unknown_private_key, f"during-failure-{index}"))
+    assert len(fetcher.calls) == 2
+    fetcher.release.set()
+    refresh_thread.join(timeout=2)
+
+    assert len(refresh_errors) == 1
+    assert isinstance(refresh_errors[0], JwksUnavailableError)
+    for index in range(40):
+        with pytest.raises(JwksUnavailableError):
+            verifier.verify(_assertion(unknown_private_key, f"cooldown-{index}"))
+    assert len(fetcher.calls) == 2
+    verifier.verify(valid_token)
+
+    clock_value[0] += 11
+    with pytest.raises(JwksUnavailableError):
+        verifier.verify(_assertion(unknown_private_key, "retry-after-cooldown"))
+    assert len(fetcher.calls) == 3
+    for index in range(20):
+        with pytest.raises(JwksUnavailableError):
+            verifier.verify(_assertion(unknown_private_key, f"second-cooldown-{index}"))
+    assert len(fetcher.calls) == 3
+
+
+def test_ttl_expiry_refreshes_known_keys_normally():
+    valid_private_key, valid_jwk = _signing_key("key-1")
+    clock_value = [300.0]
+    fetcher = _SequenceFetcher(
+        {"keys": [valid_jwk]},
+        {"keys": [valid_jwk]},
+    )
+    verifier = _verifier(
+        valid_jwk,
+        fetcher=fetcher,
+        clock=lambda: clock_value[0],
+        jwks_ttl_seconds=5,
+    )
+    valid_token = _assertion(valid_private_key, "key-1")
+
+    verifier.verify(valid_token)
+    verifier.verify(valid_token)
+    assert len(fetcher.calls) == 1
+    clock_value[0] += 6
+    verifier.verify(valid_token)
     assert len(fetcher.calls) == 2
 
 

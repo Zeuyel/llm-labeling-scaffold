@@ -5,6 +5,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import OrderedDict
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -15,6 +16,9 @@ from .models import Identity
 _MAX_ASSERTION_BYTES = 64 * 1024
 _MAX_JWKS_BYTES = 1024 * 1024
 _DEFAULT_MAX_JWKS_KEYS = 8
+_DEFAULT_MAX_NEGATIVE_KIDS = 64
+_DEFAULT_UNKNOWN_KID_COOLDOWN_SECONDS = 10.0
+_DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS = 10.0
 
 
 class TokenVerificationError(Exception):
@@ -92,6 +96,9 @@ class _BoundedJwksCache:
         ttl_seconds: float,
         timeout_seconds: float,
         max_keys: int,
+        max_negative_kids: int,
+        unknown_kid_cooldown_seconds: float,
+        refresh_failure_cooldown_seconds: float,
         fetcher: JwksFetcher,
         clock: Callable[[], float],
     ) -> None:
@@ -101,38 +108,106 @@ class _BoundedJwksCache:
             raise ValueError("JWKS 请求超时必须在 0 到 30 秒之间")
         if max_keys <= 0 or max_keys > 32:
             raise ValueError("JWKS key 缓存上限必须在 1 到 32 之间")
+        if max_negative_kids <= 0 or max_negative_kids > 1024:
+            raise ValueError("未知 kid 负缓存上限必须在 1 到 1024 之间")
+        if unknown_kid_cooldown_seconds <= 0 or unknown_kid_cooldown_seconds > 300:
+            raise ValueError("未知 kid 刷新 cooldown 必须在 0 到 300 秒之间")
+        if refresh_failure_cooldown_seconds <= 0 or refresh_failure_cooldown_seconds > 300:
+            raise ValueError("JWKS 失败重试 cooldown 必须在 0 到 300 秒之间")
         self._url = url
         self._ttl_seconds = ttl_seconds
         self._timeout_seconds = timeout_seconds
         self._max_keys = max_keys
+        self._max_negative_kids = max_negative_kids
+        self._unknown_kid_cooldown_seconds = unknown_kid_cooldown_seconds
+        self._refresh_failure_cooldown_seconds = refresh_failure_cooldown_seconds
         self._fetcher = fetcher
         self._clock = clock
         self._keys: dict[str, Any] = {}
         self._expires_at = 0.0
-        self._lock = threading.Lock()
+        self._negative_kids: OrderedDict[str, float] = OrderedDict()
+        self._unknown_refresh_retry_at = 0.0
+        self._failure_retry_at = 0.0
+        self._last_refresh_error_code = "jwks_unavailable"
+        self._refresh_in_flight = False
+        self._condition = threading.Condition(threading.Lock())
 
     def signing_key(self, kid: str) -> Any:
-        with self._lock:
-            now = self._clock()
-            cache_is_fresh = bool(self._keys) and now < self._expires_at
-            if not cache_is_fresh:
-                self._refresh(now)
+        while True:
+            refresh_reason = ""
+            with self._condition:
+                now = self._clock()
+                self._prune_negative_kids(now)
+                cache_is_fresh = bool(self._keys) and now < self._expires_at
                 key = self._keys.get(kid)
+                if cache_is_fresh and key is not None:
+                    return key
+
+                if now < self._failure_retry_at:
+                    self._remember_negative_kid(kid, self._failure_retry_at)
+                    raise JwksUnavailableError(self._last_refresh_error_code)
+
+                if cache_is_fresh:
+                    if self._negative_kid_is_active(kid, now):
+                        raise TokenVerificationError("unknown_signing_key")
+                    if now < self._unknown_refresh_retry_at:
+                        self._remember_negative_kid(kid, self._unknown_refresh_retry_at)
+                        raise TokenVerificationError("unknown_signing_key")
+                    if self._refresh_in_flight:
+                        self._remember_negative_kid(kid, now + self._unknown_kid_cooldown_seconds)
+                        raise TokenVerificationError("unknown_signing_key")
+                    self._refresh_in_flight = True
+                    refresh_reason = "unknown"
+                else:
+                    if self._refresh_in_flight:
+                        self._condition.wait()
+                        continue
+                    self._refresh_in_flight = True
+                    refresh_reason = "initial" if not self._keys else "expired"
+
+            try:
+                parsed = self._fetch_keys()
+            except JwksUnavailableError as exc:
+                completed_at = self._clock()
+                with self._condition:
+                    self._refresh_in_flight = False
+                    self._last_refresh_error_code = exc.code
+                    self._failure_retry_at = completed_at + self._refresh_failure_cooldown_seconds
+                    if refresh_reason == "unknown":
+                        self._unknown_refresh_retry_at = max(
+                            self._unknown_refresh_retry_at,
+                            completed_at + self._unknown_kid_cooldown_seconds,
+                        )
+                    self._remember_negative_kid(
+                        kid,
+                        max(self._failure_retry_at, self._unknown_refresh_retry_at),
+                    )
+                    self._condition.notify_all()
+                raise
+
+            completed_at = self._clock()
+            with self._condition:
+                self._keys = parsed
+                self._expires_at = completed_at + self._ttl_seconds
+                self._failure_retry_at = 0.0
+                self._last_refresh_error_code = "jwks_unavailable"
+                key = self._keys.get(kid)
+                if refresh_reason == "unknown" or key is None:
+                    self._unknown_refresh_retry_at = max(
+                        self._unknown_refresh_retry_at,
+                        completed_at + self._unknown_kid_cooldown_seconds,
+                    )
+                if key is None:
+                    self._remember_negative_kid(kid, self._unknown_refresh_retry_at)
+                else:
+                    self._negative_kids.pop(kid, None)
+                self._refresh_in_flight = False
+                self._condition.notify_all()
                 if key is None:
                     raise TokenVerificationError("unknown_signing_key")
                 return key
 
-            key = self._keys.get(kid)
-            if key is not None:
-                return key
-
-            self._refresh(now)
-            key = self._keys.get(kid)
-            if key is None:
-                raise TokenVerificationError("unknown_signing_key")
-            return key
-
-    def _refresh(self, now: float) -> None:
+    def _fetch_keys(self) -> dict[str, Any]:
         try:
             payload = self._fetcher(self._url, self._timeout_seconds)
         except JwksUnavailableError:
@@ -156,9 +231,28 @@ class _BoundedJwksCache:
                 parsed[kid] = jwt.PyJWK.from_dict(item, algorithm="RS256").key
             except Exception as exc:
                 raise JwksUnavailableError("invalid_jwks_response") from exc
+        return parsed
 
-        self._keys = parsed
-        self._expires_at = now + self._ttl_seconds
+    def _negative_kid_is_active(self, kid: str, now: float) -> bool:
+        expires_at = self._negative_kids.get(kid)
+        if expires_at is None:
+            return False
+        if expires_at <= now:
+            self._negative_kids.pop(kid, None)
+            return False
+        self._negative_kids.move_to_end(kid)
+        return True
+
+    def _remember_negative_kid(self, kid: str, expires_at: float) -> None:
+        self._negative_kids.pop(kid, None)
+        self._negative_kids[kid] = expires_at
+        while len(self._negative_kids) > self._max_negative_kids:
+            self._negative_kids.popitem(last=False)
+
+    def _prune_negative_kids(self, now: float) -> None:
+        expired = [kid for kid, expires_at in self._negative_kids.items() if expires_at <= now]
+        for kid in expired:
+            self._negative_kids.pop(kid, None)
 
 
 class CloudflareAccessVerifier:
@@ -171,6 +265,9 @@ class CloudflareAccessVerifier:
         http_timeout_seconds: float = 5,
         clock_skew_seconds: float = 0,
         max_jwks_keys: int = _DEFAULT_MAX_JWKS_KEYS,
+        max_negative_kids: int = _DEFAULT_MAX_NEGATIVE_KIDS,
+        unknown_kid_cooldown_seconds: float = _DEFAULT_UNKNOWN_KID_COOLDOWN_SECONDS,
+        refresh_failure_cooldown_seconds: float = _DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS,
         jwks_fetcher: JwksFetcher = _fetch_jwks,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -187,6 +284,9 @@ class CloudflareAccessVerifier:
             ttl_seconds=jwks_ttl_seconds,
             timeout_seconds=http_timeout_seconds,
             max_keys=max_jwks_keys,
+            max_negative_kids=max_negative_kids,
+            unknown_kid_cooldown_seconds=unknown_kid_cooldown_seconds,
+            refresh_failure_cooldown_seconds=refresh_failure_cooldown_seconds,
             fetcher=jwks_fetcher,
             clock=clock,
         )
