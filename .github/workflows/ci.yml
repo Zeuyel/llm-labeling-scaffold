@@ -13,6 +13,23 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: scaffold_owner
+          POSTGRES_PASSWORD: owner_ci_password
+          POSTGRES_DB: scaffold
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U scaffold_owner -d scaffold"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      LLS_TEST_POSTGRES_URL: postgresql+psycopg://scaffold_owner:owner_ci_password@127.0.0.1:5432/scaffold
+      LLS_TEST_POSTGRES_APP_URL: postgresql+psycopg://scaffold_app:app_ci_password@127.0.0.1:5432/scaffold
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,6 +41,16 @@ jobs:
 
       - name: Install Python dependencies
         run: python -m pip install -e ".[dev]"
+
+      - name: Initialize PostgreSQL runtime role
+        env:
+          PGHOST: 127.0.0.1
+          PGPASSWORD: owner_ci_password
+          POSTGRES_USER: scaffold_owner
+          POSTGRES_DB: scaffold
+          SCAFFOLD_POSTGRES_APP_USER: scaffold_app
+          SCAFFOLD_POSTGRES_APP_PASSWORD: app_ci_password
+        run: ./docker/postgres/init-runtime-role.sh
 
       - name: Run Python tests
         run: python -m pytest tests -q

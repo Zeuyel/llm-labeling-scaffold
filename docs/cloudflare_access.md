@@ -19,7 +19,7 @@ LLS_CF_ACCESS_CLOCK_SKEW_SECONDS=0
 
 ## 当前授权边界
 
-Issue #44 的 RBAC 数据库尚未接入，因此 Access 身份只证明“谁已登录”，不授予管理员能力：
+Scaffold 已包含 #44 的 RBAC 数据层，但它尚未接入 Panel 业务授权路径。#46 完成接线和资源迁移前，Access 身份只证明“谁已登录”，不授予管理员能力：
 
 - `/api/health`、`/api/version`、`/api/capabilities`、`/api/session` 可在 assertion 验证通过后访问。
 - 其他业务 API，包括业务数据读取和写操作，统一返回 `503` 与 `code=authorization_unavailable`。

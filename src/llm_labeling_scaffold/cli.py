@@ -189,6 +189,10 @@ def build_parser() -> argparse.ArgumentParser:
     mcp.add_argument("--enable-writes", action=argparse.BooleanOptionalAction, default=None)
     mcp.add_argument("--timeout", type=float)
 
+    from .db.cli import add_db_parser
+
+    add_db_parser(sub)
+
     return p
 
 
@@ -339,6 +343,10 @@ def main(argv: list[str] | None = None) -> None:
             timeout_seconds=args.timeout,
         )
         serve_mcp(config, transport=args.transport, host=args.host, port=args.port)
+    elif args.cmd == "db":
+        from .db.cli import handle_db_command
+
+        handle_db_command(args)
 
 
 if __name__ == "__main__":

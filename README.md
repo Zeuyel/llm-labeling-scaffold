@@ -12,13 +12,23 @@ MLflow 不再是默认依赖。它只作为可选外部模型记录服务，适�
 源码部署时直接使用内置脚本：
 
 ```bash
+cp .env.example .env
+owner_password="$(openssl rand -hex 32)"
+app_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_OWNER_PASSWORD=.*|SCAFFOLD_POSTGRES_OWNER_PASSWORD=${owner_password}|" .env
+sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${app_password}|" .env
+unset owner_password app_password
 ./scripts/stack up
 ```
+
+Compose 对 owner/app 两个数据库密码使用必填校验，任一缺失时直接退出。`migrate` 使用 schema owner，Panel 只使用受限 runtime app role；两个账号和密码必须不同。正式部署应由 secret manager 注入独立随机密码，不使用仓库默认凭据。
 
 默认启动：
 
 - 轻量控制台：`http://localhost:8765`；本地 `.env.example` 显式启用 `basic_dev`，账号 `admin` / `changeme`
 - Argilla：`http://localhost:6900`，默认账号 `argilla` / `12345678`
+- Scaffold 自有 PostgreSQL：默认仅绑定 `127.0.0.1:5433`
+- 一次性 Alembic 迁移服务：数据库健康后执行并正常退出
 - Argilla 依赖服务：PostgreSQL、Elasticsearch、Redis
 
 Argilla 依赖 Elasticsearch。低配测试机如果看到 Argilla 日志反复提示 Elasticsearch 不可用，先检查：
@@ -45,6 +55,18 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 ./scripts/stack restart
 ./scripts/stack down
 ```
+
+首次部署必须显式创建首位管理员，身份键使用认证提供方的稳定 `issuer` 和 `subject`，不能使用邮箱代替：
+
+```bash
+docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap \
+  --issuer https://example.cloudflareaccess.com \
+  --subject '<stable-access-subject>' \
+  --workspace-slug default \
+  --workspace-name 'Default Workspace'
+```
+
+数据库 schema、角色矩阵、迁移以及备份恢复说明见 [Scaffold 数据库与 RBAC](docs/database.md)。
 
 需要模型记录服务时再启用 Docker Compose 的 mlflow profile：
 
@@ -117,7 +139,7 @@ runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/draft
 
 生产 Panel 使用 Cloudflare Access 注入的 `Cf-Access-Jwt-Assertion`，源站验证 RS256 签名、JWKS、issuer、显式 application AUD、时间声明和 `type=app`。稳定用户身份使用 `(issuer, subject)`，邮箱与显示名只作为显示快照；客户端自报 actor 或邮箱头不会建立身份。
 
-当前 #44/RBAC 尚未接入。Access 用户可以读取 `/api/session` 等系统认证态端点，但所有业务 API 都会以 `503 authorization_unavailable` fail closed，不能因为“已登录”而获得原有管理员能力。现有 Basic Auth 只在显式 `LLS_PANEL_AUTH_MODE=basic_dev` 时用于本地开发；生产默认 `cloudflare_access`，配置或验证失败不会回退到 Basic。完整配置与 Tunnel-only 源站要求见 [Cloudflare Access 身份验证](docs/cloudflare_access.md)。
+Scaffold 已有独立的用户、工作空间、任务 ACL 和 RBAC 持久化层，但尚未接入 Panel 业务授权路径。#46 完成接线和资源迁移前，Access 用户只能读取 `/api/session` 等系统认证态端点，所有业务 API 都会以 `503 authorization_unavailable` fail closed，不能因为“已登录”而获得原有管理员能力。现有 Basic Auth 只在显式 `LLS_PANEL_AUTH_MODE=basic_dev` 时用于本地开发；生产默认 `cloudflare_access`，配置或验证失败不会回退到 Basic。完整配置与 Tunnel-only 源站要求见 [Cloudflare Access 身份验证](docs/cloudflare_access.md)。
 
 ## 服务器测试
 
@@ -139,6 +161,11 @@ ghcr.io/zeuyel/llm-labeling-scaffold/panel
 git clone <repo-url>
 cd llm-labeling-scaffold
 cp .env.example .env
+owner_password="$(openssl rand -hex 32)"
+app_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_OWNER_PASSWORD=.*|SCAFFOLD_POSTGRES_OWNER_PASSWORD=${owner_password}|" .env
+sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${app_password}|" .env
+unset owner_password app_password
 export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:main
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull panel
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
@@ -161,6 +188,12 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --prof
 ```bash
 git clone <repo-url>
 cd llm-labeling-scaffold
+cp .env.example .env
+owner_password="$(openssl rand -hex 32)"
+app_password="$(openssl rand -hex 32)"
+sed -i "s|^SCAFFOLD_POSTGRES_OWNER_PASSWORD=.*|SCAFFOLD_POSTGRES_OWNER_PASSWORD=${owner_password}|" .env
+sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${app_password}|" .env
+unset owner_password app_password
 ./scripts/stack up
 ```
 
@@ -232,6 +265,14 @@ LLS_PANEL_PASSWORD=changeme
 # LLS_CF_ACCESS_ISSUER=https://YOUR_TEAM.cloudflareaccess.com
 # LLS_CF_ACCESS_AUD=<Access application Audience Tag>
 
+SCAFFOLD_POSTGRES_BIND_HOST=127.0.0.1
+SCAFFOLD_POSTGRES_PORT=5433
+SCAFFOLD_POSTGRES_OWNER_USER=scaffold_owner
+SCAFFOLD_POSTGRES_OWNER_PASSWORD=
+SCAFFOLD_POSTGRES_APP_USER=scaffold_app
+SCAFFOLD_POSTGRES_APP_PASSWORD=
+SCAFFOLD_POSTGRES_DB=scaffold
+
 ARGILLA_PORT=6900
 ARGILLA_USERNAME=argilla
 ARGILLA_PASSWORD=12345678
@@ -266,6 +307,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 控制台镜像会把前端构建产物打进后端镜像，并安装：
 
 - 核心流水线依赖
+- SQLAlchemy 2、Alembic 和 PostgreSQL 驱动
 - Argilla 集成依赖
 - 基线训练依赖：`scikit-learn`、`joblib`
 - MLflow 客户端依赖

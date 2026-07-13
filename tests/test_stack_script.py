@@ -77,6 +77,8 @@ def test_stack_accepts_basic_dev_loopback_bind_hosts(tmp_path: Path, host: str):
             "LLS_PANEL_AUTH_MODE": "basic_dev",
             "LLS_PANEL_PASSWORD": "secret",
             "PANEL_BIND_HOST": host,
+            "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
+            "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
             "LLS_TASK_SOURCE": "local",
         },
         "restart",
@@ -86,6 +88,40 @@ def test_stack_accepts_basic_dev_loopback_bind_hosts(tmp_path: Path, host: str):
     expected_host = "127.0.0.1" if host == "localhost" else host
     assert calls[-1].startswith(f"PANEL_BIND_HOST={expected_host};")
     assert "up -d --force-recreate" in calls[-1]
+
+
+@pytest.mark.parametrize("command", ["up", "restart"])
+@pytest.mark.parametrize(
+    ("owner_password", "app_password", "message"),
+    [
+        ("", "app-password", "必须设置 SCAFFOLD_POSTGRES_OWNER_PASSWORD"),
+        ("owner-password", "", "必须设置 SCAFFOLD_POSTGRES_OWNER_PASSWORD"),
+        ("shared-password", "shared-password", "必须使用不同密码"),
+    ],
+)
+def test_stack_validates_database_passwords_for_up_and_restart(
+    tmp_path: Path,
+    command: str,
+    owner_password: str,
+    app_password: str,
+    message: str,
+):
+    result, calls = _run_stack(
+        tmp_path,
+        {
+            "LLS_PANEL_AUTH_MODE": "basic_dev",
+            "LLS_PANEL_PASSWORD": "secret",
+            "PANEL_BIND_HOST": "127.0.0.1",
+            "SCAFFOLD_POSTGRES_OWNER_PASSWORD": owner_password,
+            "SCAFFOLD_POSTGRES_APP_PASSWORD": app_password,
+            "LLS_TASK_SOURCE": "local",
+        },
+        command,
+    )
+
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert calls == ["PANEL_BIND_HOST=;MLFLOW_TRACKING_URI=|compose version"]
 
 
 @pytest.mark.parametrize("command", ["up", "restart"])
@@ -132,6 +168,8 @@ def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp
             "LLS_CF_ACCESS_ISSUER": "https://team.cloudflareaccess.com",
             "LLS_CF_ACCESS_AUD": "configured-audience",
             "PANEL_BIND_HOST": "0.0.0.0",
+            "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
+            "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
             "LLS_TASK_SOURCE": "local",
         },
         "restart",
@@ -142,5 +180,8 @@ def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp
     deploy_call = calls[-1]
     assert deploy_call.startswith("PANEL_BIND_HOST=0.0.0.0;MLFLOW_TRACKING_URI=http://mlflow:5000|")
     assert "compose -f docker-compose.yml --profile mlflow up -d --force-recreate" in deploy_call
-    assert deploy_call.endswith("panel argilla argilla-worker argilla-postgres elasticsearch redis mlflow")
+    assert deploy_call.endswith(
+        "scaffold-postgres db-role-init migrate panel argilla argilla-worker "
+        "argilla-postgres elasticsearch redis mlflow"
+    )
     assert " restart " not in deploy_call
