@@ -34,6 +34,7 @@ from .enums import (
     MigrationStatus,
     PrincipalType,
     Role,
+    TaskMaterializationState,
 )
 
 
@@ -125,6 +126,15 @@ class Task(Base):
     task_key: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
+    current_revision_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "task_revisions.id",
+            name="fk_tasks_current_revision_id_task_revisions",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+    )
     created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("principals.id", ondelete="RESTRICT"),
@@ -289,6 +299,181 @@ class WorkspaceSetting(Base):
     )
 
 
+class TaskDraft(Base):
+    __tablename__ = "task_drafts"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "task_id"],
+            ["tasks.workspace_id", "tasks.id"],
+            name="fk_task_drafts_workspace_task",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("task_id", name="uq_task_drafts_task_id"),
+        CheckConstraint("version > 0", name="version_positive"),
+        CheckConstraint("length(fingerprint) = 64", name="fingerprint_sha256"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    rendered_task: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class TaskRevision(Base):
+    __tablename__ = "task_revisions"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "task_id"],
+            ["tasks.workspace_id", "tasks.id"],
+            name="fk_task_revisions_workspace_task",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "task_id", "previous_revision_id"],
+            ["task_revisions.workspace_id", "task_revisions.task_id", "task_revisions.id"],
+            name="fk_task_revisions_previous_revision",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint(
+            "workspace_id",
+            "task_id",
+            "id",
+            name="uq_task_revisions_workspace_task_id",
+        ),
+        UniqueConstraint(
+            "task_id",
+            "revision_number",
+            name="uq_task_revisions_task_number",
+        ),
+        UniqueConstraint("idempotency_record_id", name="uq_task_revisions_idempotency_record_id"),
+        CheckConstraint("revision_number > 0", name="revision_number_positive"),
+        CheckConstraint("draft_version > 0", name="draft_version_positive"),
+        CheckConstraint("length(draft_fingerprint) = 64", name="draft_fingerprint_sha256"),
+        CheckConstraint("length(content_hash) = 64", name="content_hash_sha256"),
+        CheckConstraint("length(trim(reason)) > 0", name="reason_not_blank"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    revision_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    draft_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    draft_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    definition: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    rendered_task: Mapped[str] = mapped_column(Text, nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    actor_principal_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("principals.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    caller_principal_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("principals.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    channel: Mapped[AuditChannel] = mapped_column(
+        _enum_type(AuditChannel, "audit_channel"),
+        nullable=False,
+    )
+    previous_revision_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("idempotency_records.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class TaskRevisionMaterialization(Base):
+    __tablename__ = "task_revision_materializations"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "task_id"],
+            ["tasks.workspace_id", "tasks.id"],
+            name="fk_task_revision_materializations_workspace_task",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "task_id", "revision_id"],
+            ["task_revisions.workspace_id", "task_revisions.task_id", "task_revisions.id"],
+            name="fk_task_revision_materializations_revision",
+            ondelete="CASCADE",
+        ),
+        UniqueConstraint("revision_id", name="uq_task_revision_materializations_revision_id"),
+        CheckConstraint("attempt_count >= 0", name="attempt_count_nonnegative"),
+        Index(
+            "ix_task_revision_materializations_pending",
+            "state",
+            "available_at",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    revision_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    state: Mapped[TaskMaterializationState] = mapped_column(
+        _enum_type(TaskMaterializationState, "task_materialization_state"),
+        nullable=False,
+        default=TaskMaterializationState.PENDING,
+        server_default=TaskMaterializationState.PENDING.value,
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    claimed_by: Mapped[str | None] = mapped_column(String(255))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    materialized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
@@ -360,6 +545,38 @@ class ImmutableAuditEventError(RuntimeError):
     pass
 
 
+class ImmutableTaskRevisionError(RuntimeError):
+    pass
+
+
+event.listen(
+    TaskRevision.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_task_revisions_immutable_update
+        BEFORE UPDATE ON task_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'task_revisions is immutable');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    TaskRevision.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_task_revisions_immutable_delete
+        BEFORE DELETE ON task_revisions
+        BEGIN
+            SELECT RAISE(ABORT, 'task_revisions is immutable');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+
+
 event.listen(
     AuditEvent.__table__,
     "after_create",
@@ -392,3 +609,9 @@ event.listen(
 @event.listens_for(AuditEvent, "before_delete")
 def _reject_audit_event_mutation(mapper, connection, target) -> None:
     raise ImmutableAuditEventError("audit events are append-only")
+
+
+@event.listens_for(TaskRevision, "before_update")
+@event.listens_for(TaskRevision, "before_delete")
+def _reject_task_revision_mutation(mapper, connection, target) -> None:
+    raise ImmutableTaskRevisionError("task revisions are immutable")

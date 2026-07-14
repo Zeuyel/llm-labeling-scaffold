@@ -45,6 +45,9 @@ EXPECTED_TABLES = {
     "workspace_settings",
     "audit_events",
     "migration_runs",
+    "task_drafts",
+    "task_revisions",
+    "task_revision_materializations",
 }
 
 FORBIDDEN_TABLES = {
@@ -71,8 +74,9 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
         idempotency_columns = {column["name"] for column in inspect(engine).get_columns("idempotency_records")}
         assert "idempotency_key_hash" in idempotency_columns
         assert "idempotency_key" not in idempotency_columns
-        assert first.applied_revision == "20260713_0001"
-        assert second.applied_revision == "20260713_0001"
+        assert "current_revision_id" in {column["name"] for column in inspect(engine).get_columns("tasks")}
+        assert first.applied_revision == "20260714_0002"
+        assert second.applied_revision == "20260714_0002"
         with Session(engine) as session:
             assert len(session.scalars(select(MigrationRun)).all()) == 2
         with Session(engine) as session:
@@ -169,6 +173,8 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
             ("idempotency_records", "response_body"),
             ("workspace_settings", "setting_value"),
             ("audit_events", "details"),
+            ("task_drafts", "definition"),
+            ("task_revisions", "definition"),
         } <= jsonb_columns
     finally:
         engine.dispose()
