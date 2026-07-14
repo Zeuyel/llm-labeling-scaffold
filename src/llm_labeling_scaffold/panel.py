@@ -373,7 +373,11 @@ def _contract_capabilities(
                 "requires_task_source": "control",
                 "path_params": {"task_id": {"type": "string"}},
                 "required_headers": {"If-Match": {"type": "string", "format": "strong-etag"}},
-                "request_schema": {"type": "object", "required": ["task_id", "text_fields", "primary_label_values"]},
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id", "text_fields", "primary_label_values"],
+                    "properties": {"workspace": {"type": "string"}},
+                },
                 "response_schema": {"type": "object", "required": ["ok", "task"]},
             },
             {
@@ -403,7 +407,11 @@ def _contract_capabilities(
                 "action": "task_check",
                 "side_effects": False,
                 "path_params": {"task_id": {"type": "string"}},
-                "request_schema": {"type": "object", "additionalProperties": False},
+                "request_schema": {
+                    "type": "object",
+                    "properties": {"workspace": {"type": "string"}},
+                    "additionalProperties": False,
+                },
                 "response_schema": {
                     "type": "object",
                     "required": ["ok", "task_id", "checks", "warnings", "errors"],
@@ -539,6 +547,7 @@ def _contract_capabilities(
                         "task_id": {"type": "string"},
                         "import_id": {"type": "string"},
                         "dry_run": {"const": True},
+                        "workspace": {"type": "string"},
                     },
                     "additionalProperties": True,
                 },
@@ -565,6 +574,7 @@ def _contract_capabilities(
                         "import_id": {"type": "string"},
                         "confirm": {"const": True},
                         "idempotency_key": {"type": "string"},
+                        "workspace": {"type": "string"},
                     },
                     "additionalProperties": True,
                 },

@@ -342,6 +342,51 @@ def test_role_matrix_task_acl_and_workspace_isolation(seeded_service):
     assert cross_workspace.task is None
 
 
+def test_annotation_management_permissions_remain_separate(seeded_service):
+    service = seeded_service["service"]
+
+    for subject in ("viewer", "annotator"):
+        identity = seeded_service[subject]
+        assert service.authorize_task(
+            identity,
+            "workspace-a",
+            "shared-key",
+            Permission.TASK_READ,
+        ).allowed
+        assert not service.authorize_task(
+            identity,
+            "workspace-a",
+            "shared-key",
+            Permission.ANNOTATION_REVIEW,
+        ).allowed
+
+    experimenter = seeded_service["experimenter"]
+    assert service.authorize_task(
+        experimenter,
+        "workspace-a",
+        "shared-key",
+        Permission.ANNOTATION_REVIEW,
+    ).allowed
+    assert not service.authorize_workspace(
+        experimenter,
+        "workspace-a",
+        Permission.WORKSPACE_MANAGE,
+    ).allowed
+
+    admin = seeded_service["admin"]
+    assert service.authorize_task(
+        admin,
+        "workspace-a",
+        "shared-key",
+        Permission.ANNOTATION_REVIEW,
+    ).allowed
+    assert service.authorize_workspace(
+        admin,
+        "workspace-a",
+        Permission.WORKSPACE_MANAGE,
+    ).allowed
+
+
 def test_permission_scopes_fail_closed_and_filter_capabilities(seeded_service, engine):
     service = seeded_service["service"]
     admin = seeded_service["admin"]
