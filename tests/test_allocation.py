@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import hashlib
+from collections import defaultdict
+from dataclasses import replace
 
 import pytest
 
 from llm_labeling_scaffold.allocation import (
+    AllocationValidationError,
     AllocationRequest,
     AllocationStrategy,
     AnnotatorSpec,
+    AssignmentPhase,
+    AssignmentRole,
     CalibrationRule,
     ManifestKind,
+    OverlapMatrixMode,
     OverlapRule,
     RecordSpec,
     SourceManifestRef,
     TaskRevisionRef,
+    WorkspaceMode,
     canonical_hash,
+    plan_allocation,
     validate_allocation_request,
 )
 
@@ -165,3 +173,181 @@ def test_calibration_requires_known_unique_expected_annotators():
         "duplicate_expected_annotator",
         "unknown_expected_annotator",
     }
+
+
+def test_fixed_partition_is_stable_balanced_and_capacity_bounded():
+    records = tuple(
+        RecordSpec(
+            record_id=f"record-{index:02d}",
+            content_hash=_hash(f"fixed-content-{index}"),
+            batch_id=f"batch-{index // 4}",
+        )
+        for index in range(12)
+    )
+    request = _request(
+        records=records,
+        annotators=tuple(
+            AnnotatorSpec(annotator_id=f"annotator-{index}", cohort_id="cohort-a", capacity=5)
+            for index in range(4)
+        ),
+        overlap=OverlapRule(count=4, assignees_per_record=2),
+    )
+
+    first = plan_allocation(request)
+    reordered = plan_allocation(
+        replace(request, records=tuple(reversed(request.records)), annotators=tuple(reversed(request.annotators)))
+    )
+
+    assert first == reordered
+    assert first.fingerprint == canonical_hash(first.fingerprint_payload())
+    assert first.unsatisfied_constraints == ()
+    assert all(group.mode == WorkspaceMode.PERSONAL for group in first.workspace_groups)
+    assert all(group.min_submitted == 1 for group in first.dataset_groups)
+
+    by_record = defaultdict(list)
+    for assignment in first.assignments:
+        by_record[assignment.record_id].append(assignment)
+    overlap_records = {
+        record_id
+        for record_id, assignments in by_record.items()
+        if any(item.role == AssignmentRole.OVERLAP for item in assignments)
+    }
+    assert len(overlap_records) == 4
+    assert all(len(by_record[record_id]) == 2 for record_id in overlap_records)
+    assert all(
+        len({item.assignee_id for item in by_record[record_id]}) == 2
+        for record_id in overlap_records
+    )
+    assert len({(item.record_id, item.assignee_id) for item in first.assignments}) == len(
+        first.assignments
+    )
+
+    assigned_rows = [item.assigned_rows for item in first.annotator_loads]
+    assert sum(assigned_rows) == 16
+    assert max(assigned_rows) - min(assigned_rows) <= 1
+    assert all(item.assigned_rows <= item.capacity for item in first.annotator_loads)
+    assert first.overlap_matrix.mode == OverlapMatrixMode.ASSIGNEE
+    assert sum(cell.count for cell in first.overlap_matrix.cells) == 4
+
+
+def test_fixed_partition_assignment_changes_across_seeds():
+    request = _request(
+        records=tuple(
+            RecordSpec(record_id=f"record-{index}", content_hash=_hash(f"seed-content-{index}"))
+            for index in range(18)
+        ),
+        annotators=tuple(
+            AnnotatorSpec(annotator_id=f"annotator-{index}", cohort_id="cohort-a", capacity=9)
+            for index in range(3)
+        ),
+    )
+
+    matrices = {
+        tuple((item.record_id, item.assignee_id) for item in plan_allocation(replace(request, seed=seed)).assignments)
+        for seed in range(6)
+    }
+
+    assert len(matrices) > 1
+
+
+def test_shared_queue_keeps_one_source_row_and_splits_min_submitted_groups():
+    records = tuple(
+        RecordSpec(record_id=f"record-{index}", content_hash=_hash(f"shared-content-{index}"))
+        for index in range(8)
+    )
+    request = _request(
+        strategy=AllocationStrategy.SHARED_QUEUE,
+        records=records,
+        annotators=tuple(
+            AnnotatorSpec(annotator_id=f"annotator-{index}", cohort_id="cohort-a", capacity=6)
+            for index in range(3)
+        ),
+        overlap=OverlapRule(record_ids=("record-1", "record-5"), assignees_per_record=3),
+    )
+
+    plan = plan_allocation(request)
+
+    assert len(plan.assignments) == len(records)
+    assert len({item.record_id for item in plan.assignments}) == len(records)
+    assert all(item.assignee_id is None and item.pool_id == "cohort-a" for item in plan.assignments)
+    assert {group.min_submitted for group in plan.dataset_groups} == {1, 3}
+    assert len(plan.dataset_groups) == 2
+    assert [group.mode for group in plan.workspace_groups] == [WorkspaceMode.SHARED]
+    assert plan.overlap_matrix.mode == OverlapMatrixMode.POOL
+    assert {item.record_id for item in plan.overlap_matrix.pool_requirements} == {
+        "record-1",
+        "record-5",
+    }
+    assert sum(item.assigned_rows for item in plan.annotator_loads) == 0
+    assert sum(item.reserved_shared_rows for item in plan.annotator_loads) == 12
+    assert all(item.reserved_shared_rows <= item.capacity for item in plan.annotator_loads)
+
+
+def test_calibration_then_partition_emits_expected_responder_gate():
+    records = tuple(
+        RecordSpec(record_id=f"record-{index}", content_hash=_hash(f"calibration-content-{index}"))
+        for index in range(10)
+    )
+    request = _request(
+        strategy=AllocationStrategy.CALIBRATION_THEN_PARTITION,
+        records=records,
+        annotators=tuple(
+            AnnotatorSpec(annotator_id=f"annotator-{index}", cohort_id="cohort-a", capacity=8)
+            for index in range(3)
+        ),
+        overlap=OverlapRule(count=2, assignees_per_record=2),
+        calibration=CalibrationRule(
+            record_ids=("record-0", "record-1"),
+            expected_annotator_ids=("annotator-0", "annotator-2"),
+        ),
+    )
+
+    plan = plan_allocation(request)
+
+    calibration_assignments = tuple(
+        item for item in plan.assignments if item.phase == AssignmentPhase.CALIBRATION
+    )
+    production_assignments = tuple(
+        item for item in plan.assignments if item.phase == AssignmentPhase.PRODUCTION
+    )
+    assert len(calibration_assignments) == 4
+    assert {item.record_id for item in calibration_assignments} == {"record-0", "record-1"}
+    assert {item.assignee_id for item in calibration_assignments} == {
+        "annotator-0",
+        "annotator-2",
+    }
+    assert not {"record-0", "record-1"} & {item.record_id for item in production_assignments}
+
+    assert len(plan.gates) == 1
+    gate = plan.gates[0]
+    assert gate.plan_fingerprint == plan.fingerprint
+    assert gate.task_revision_hash == request.task_revision.revision_hash
+    assert gate.source_manifest_hash == request.source_manifest.manifest_hash
+    assert gate.cohort_id == "cohort-a"
+    assert {item.record_id for item in gate.expectations} == {"record-0", "record-1"}
+    assert all(
+        item.expected_annotator_ids == ("annotator-0", "annotator-2")
+        for item in gate.expectations
+    )
+    assert all(item.gate_id == gate.gate_id for item in production_assignments)
+
+    calibration_datasets = [
+        item for item in plan.dataset_groups if item.phase == AssignmentPhase.CALIBRATION
+    ]
+    assert len(calibration_datasets) == 1
+    assert calibration_datasets[0].min_submitted == 2
+    assert calibration_datasets[0].record_ids == ("record-0", "record-1")
+    assert len(calibration_datasets[0].assignment_ids) == 4
+    assert sum(item.assigned_rows for item in plan.annotator_loads) == len(plan.assignments)
+    assert all(item.assigned_rows <= item.capacity for item in plan.annotator_loads)
+
+
+def test_plan_allocation_fails_before_emitting_a_partial_plan():
+    request = _request(
+        annotators=(AnnotatorSpec(annotator_id="annotator-a", cohort_id="cohort-a", capacity=1),),
+    )
+
+    with pytest.raises(AllocationValidationError) as exc_info:
+        plan_allocation(request)
+
+    assert [issue.code for issue in exc_info.value.report.issues] == ["insufficient_capacity"]
