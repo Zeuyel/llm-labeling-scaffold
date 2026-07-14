@@ -54,6 +54,7 @@ def _argilla_contract(dataset: str, *, min_submitted: int = 1) -> dict:
             "sample": "2" * 64,
             "batch": "3" * 64,
             "plan": "4" * 64,
+            "settings": "5" * 64,
             "push": "f" * 64,
         },
     }
@@ -2467,6 +2468,55 @@ def test_argilla_push_retry_passes_existing_manifest_contract(tmp_path: Path):
 
     assert "expected_contract" not in captured_params[0]
     assert captured_params[1]["expected_contract"] == _argilla_contract("argilla_retry_dataset")
+
+
+def test_argilla_pull_uses_annotation_manifest_contract_and_persists_identity(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "argilla_pull_contract_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    annotation_dir = tmp_path / "runs" / task.task_id / "annotation_jobs" / "round_1"
+    contract = _argilla_contract("argilla_pull_dataset")
+    annotation_manifest = {
+        "task_id": task.task_id,
+        "annotation_id": "round_1",
+        "source": "argilla",
+        "argilla_dataset": "argilla_pull_dataset",
+        "sample_id": "sample_a",
+        "argilla_contract": contract,
+    }
+    write_json(annotation_manifest, annotation_dir / "manifest.json")
+    captured = {}
+
+    def fake_pull(task_arg, dataset, output, argilla_params):
+        captured["dataset"] = dataset
+        captured["params"] = dict(argilla_params)
+        write_jsonl([], output)
+        return {"responses": 0, "artifact": str(output), "contract": contract}
+
+    with patch("llm_labeling_scaffold.integrations.argilla.pull_responses", side_effect=fake_pull):
+        job = pipeline.start_action(
+            tmp_path / "runs",
+            created["path"],
+            "argilla_pull",
+            {"annotation_id": "round_1", "decision_id": "decision_1"},
+        )
+        current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+
+    assert current["status"] == "succeeded"
+    assert captured["dataset"] == "argilla_pull_dataset"
+    assert captured["params"]["manifest"] == annotation_manifest
+    decision_manifest = read_json(tmp_path / "runs" / task.task_id / "decisions" / "decision_1" / "manifest.json")
+    assert decision_manifest["annotation_id"] == "round_1"
+    assert decision_manifest["argilla_contract"] == contract
+    assert decision_manifest["annotation_manifest_path"] == str(annotation_dir / "manifest.json")
 
 
 def test_argilla_push_batch_plan_fails_on_same_batch_duplicate_original_id(tmp_path: Path):

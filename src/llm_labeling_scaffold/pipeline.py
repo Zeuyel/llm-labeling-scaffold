@@ -1948,17 +1948,26 @@ def _argilla_push_params(
 
 def _argilla_lineage_for_pull(runs_root: str | Path, task_id: str, params: dict[str, Any], dataset: str) -> dict[str, Any]:
     annotation_manifest: dict[str, Any] = {}
+    annotation_manifest_path: Path | None = None
     annotation_id = str(params.get("annotation_id") or params.get("job_id") or "").strip()
     if annotation_id and _safe_segment(annotation_id):
         manifest_path = Path(runs_root) / task_id / "annotation_jobs" / annotation_id / "manifest.json"
         if manifest_path.exists():
             annotation_manifest = read_json(manifest_path)
+            annotation_manifest_path = manifest_path
     if not annotation_manifest:
-        for item in list_annotation_jobs(Path(runs_root), task_id):
-            if item.get("argilla_dataset") == dataset or item.get("dataset") == dataset:
-                annotation_manifest = item
-                annotation_id = str(item.get("annotation_id") or annotation_id)
-                break
+        matches = [
+            item
+            for item in list_annotation_jobs(Path(runs_root), task_id)
+            if item.get("argilla_dataset") == dataset or item.get("dataset") == dataset
+        ]
+        if len(matches) > 1:
+            raise ValueError("多个 annotation manifest 使用同名 Argilla dataset；pull 必须显式提供 annotation_id")
+        if matches:
+            annotation_manifest = matches[0]
+            annotation_id = str(annotation_manifest.get("annotation_id") or annotation_id)
+            manifest_value = annotation_manifest.get("manifest_path")
+            annotation_manifest_path = Path(manifest_value) if manifest_value else None
 
     lineage: dict[str, Any] = {}
     for key in (
@@ -1982,6 +1991,10 @@ def _argilla_lineage_for_pull(runs_root: str | Path, task_id: str, params: dict[
     if annotation_id:
         lineage["annotation_id"] = annotation_id
         lineage["source_annotation_id"] = annotation_id
+    if annotation_manifest:
+        lineage["_annotation_manifest"] = annotation_manifest
+    if annotation_manifest_path:
+        lineage["annotation_manifest_path"] = str(annotation_manifest_path)
     return lineage
 
 
@@ -2097,10 +2110,18 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             dataset = params.get("dataset") or lineage.get("argilla_dataset") or _default_argilla_dataset(task.task_id, sample_id)
             if not lineage or lineage.get("argilla_dataset") != dataset:
                 lineage = _argilla_lineage_for_pull(runs_root, task.task_id, params, dataset)
+            annotation_manifest = lineage.get("_annotation_manifest")
+            if not isinstance(annotation_manifest, dict):
+                raise ValueError("Argilla pull 缺少对应 annotation push manifest")
             decision_id = params.get("decision_id") or dataset
             decision_dir = Path(runs_root) / task.task_id / "decisions" / decision_id
             output = Path(params.get("output") or decision_dir / "decisions.jsonl")
-            result = pull_responses(task, dataset, output, params.get("argilla", {}))
+            pull_params = dict(params.get("argilla") or {})
+            pull_params["manifest"] = annotation_manifest
+            result = pull_responses(task, dataset, output, pull_params)
+            contract = result.get("contract")
+            if not isinstance(contract, dict):
+                raise RuntimeError("Argilla pull 未返回 identity contract")
             manifest = {
                 "task_id": task.task_id,
                 "decision_id": decision_id,
@@ -2110,10 +2131,11 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                 "sample_path": lineage.get("sample_path") or params.get("sample"),
                 "path": str(output),
                 "rows": result.get("responses", 0),
+                "argilla_contract": contract,
                 "created_at": _now(),
                 "result": result,
             }
-            for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path", "batch_ids", "batch_files", "overlap_item_ids", "annotation_id", "source_annotation_id"):
+            for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path", "batch_ids", "batch_files", "overlap_item_ids", "annotation_id", "source_annotation_id", "annotation_manifest_path"):
                 if lineage.get(key) not in (None, "", [], {}):
                     manifest[key] = lineage[key]
             write_json(manifest, decision_dir / "manifest.json")

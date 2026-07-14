@@ -328,7 +328,9 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 
 配置了 `data_lake` 的任务可以从 R2 数据湖 manifest 生成本地导入。R2 导入是下载、校验和原子提交过程，应作为异步 job 执行；页面通过 job 状态反馈排队、运行、成功或失败。导入成功后，profile 的下一步是从该导入中抽取样本。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。生产面板默认不能覆盖数据湖来源，只按 `task.yaml` 中的治理登记表配置导入；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。Docker 部署时需要叠加 `docker-compose.rclone.example.yml`，把 rclone 配置以只读方式映射到面板容器。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
 
-推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题。拉回标注结果时，这些字段会完整写入 `human_label`，再进入训练集版本构建。
+推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题，并在 annotation manifest 中记录 server/SDK 版本、workspace/dataset UUID、settings schema 与 task/sample/batch/plan fingerprint。拉回时只接受 `submitted` response，并保留回答者 UUID、用户名、角色和 workspace UUID。
+
+如果进程在 `dataset.create()` 后、首批 record 写入前中断，远端空 dataset 没有可验证的 contract marker。平台会拒绝按同名 dataset 自动恢复；确认该 dataset 没有任何回答后，使用 `if_exists=replace` 显式重建。已有回答的 dataset 始终禁止 replace。
 
 ## 本地命令开发
 
