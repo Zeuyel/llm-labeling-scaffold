@@ -11,9 +11,10 @@ from threading import Barrier, Event
 import pytest
 import yaml
 from alembic import command
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.db import AuditChannel, DatabaseService, ExternalIdentity
 from llm_labeling_scaffold.db.base import Base
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
@@ -147,6 +148,15 @@ def _expire_lease(env: dict, materialization_id: uuid.UUID) -> None:
 
 def test_publish_202_status_loader_and_compatibility_cache_are_separate(materialization_env):
     env = materialization_env
+    logical_task_path = env["tasks_root"] / "controlled-task" / "task.yaml"
+    relative_input = logical_task_path.parent / "raw" / "input.jsonl"
+    relative_input.parent.mkdir(parents=True)
+    relative_input.write_text('{"record_id":"1","text":"example"}\n', encoding="utf-8")
+    logical_task_path.write_text(
+        _render_task(_task_definition("controlled-task", "legacy")),
+        encoding="utf-8",
+    )
+    legacy_input_path = load_task(logical_task_path).input_path
     _draft, published = _publish(env, "v1", "publish-v1")
     worker = _worker(env, worker_id="worker-happy")
 
@@ -166,18 +176,26 @@ def test_publish_202_status_loader_and_compatibility_cache_are_separate(material
         published.content_hash,
     )
 
-    loader = ControlTaskSnapshotLoader(env["factory"], env["runs_root"])
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
     loaded = loader.load("workspace", "controlled-task")
-    assert loaded.path == final.snapshot_path / "task.yaml"
+    assert loaded.path == logical_task_path
     assert loaded.raw["marker"] == "v1"
+    assert loaded.input_path == legacy_input_path == relative_input.resolve()
+    assert relative_input.exists()
 
-    cache_path = env["tasks_root"] / "controlled-task" / "task.yaml"
+    cache_path = logical_task_path
     metadata_path = cache_path.parent / CACHE_METADATA_FILE
     assert cache_path.exists()
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert metadata["revision_id"] == str(published.revision_id)
     cache_path.write_text(_render_task(_task_definition("controlled-task", "stale-cache")), encoding="utf-8")
-    assert loader.load("workspace", "controlled-task").raw["marker"] == "v1"
+    reloaded = loader.load("workspace", "controlled-task")
+    assert reloaded.raw["marker"] == "v1"
+    assert reloaded.input_path == legacy_input_path
 
     assert worker.run_once(published.materialization_id).action == "idle"
     with Session(env["engine"]) as session:
@@ -229,6 +247,101 @@ def test_half_written_staging_is_invisible_and_expired_lease_recovers(materializ
     assert final.activation_state == "active"
     assert final.attempt_count == 2
     assert final.snapshot_valid is True
+
+
+@pytest.mark.parametrize("link_kind", ["directory", "task", "metadata"])
+def test_compatibility_cache_rejects_symlinks_and_recovers(materialization_env, link_kind: str):
+    env = materialization_env
+    target = env["tasks_root"] / "controlled-task"
+    outside = env["tasks_root"].parent / f"outside-{link_kind}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if link_kind == "directory":
+        outside.mkdir()
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        target.mkdir()
+        outside.write_text("sentinel", encoding="utf-8")
+        filename = "task.yaml" if link_kind == "task" else CACHE_METADATA_FILE
+        (target / filename).symlink_to(outside)
+
+    _draft, published = _publish(env, "symlink", f"publish-symlink-{link_kind}")
+    worker = _worker(env, worker_id=f"worker-symlink-{link_kind}")
+    result = worker.run_once(published.materialization_id)
+    assert result.activation_state == "active"
+    assert result.cache_refreshed is False
+    assert "compatibility cache" in result.error
+    assert worker.status(published.materialization_id).activation_state == "active"
+    assert ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    ).load("workspace", "controlled-task").raw["marker"] == "symlink"
+    assert worker.recover_compatibility_caches() == 0
+
+    if link_kind == "directory":
+        assert list(outside.iterdir()) == []
+        target.unlink()
+        target.mkdir()
+    else:
+        assert outside.read_text(encoding="utf-8") == "sentinel"
+        filename = "task.yaml" if link_kind == "task" else CACHE_METADATA_FILE
+        (target / filename).unlink()
+    assert worker.recover_compatibility_caches() == 1
+    assert not target.is_symlink()
+    assert not (target / "task.yaml").is_symlink()
+    assert not (target / CACHE_METADATA_FILE).is_symlink()
+
+
+def test_compatibility_cache_mismatch_after_crash_is_detected_and_recovered(materialization_env):
+    env = materialization_env
+    first_draft, first = _publish(env, "cache-v1", "publish-cache-v1")
+    first_worker = _worker(env, worker_id="worker-cache-v1")
+    first_worker.drain(first.materialization_id, timeout_seconds=1)
+    metadata_path = env["tasks_root"] / "controlled-task" / CACHE_METADATA_FILE
+    task_path = env["tasks_root"] / "controlled-task" / "task.yaml"
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["revision_id"] == str(
+        first.revision_id,
+    )
+
+    _second_draft, second = _publish(
+        env,
+        "cache-v2",
+        "publish-cache-v2",
+        if_match=first_draft.etag,
+    )
+    crashed = False
+
+    def inject(point, revision):
+        nonlocal crashed
+        if point == "after_cache_task_write" and revision.revision_id == second.revision_id and not crashed:
+            crashed = True
+            raise MaterializationCrash("cache metadata not committed")
+
+    crashing_worker = _worker(
+        env,
+        worker_id="worker-cache-crash",
+        fault_injector=inject,
+    )
+    with pytest.raises(MaterializationCrash):
+        crashing_worker.run_once(second.materialization_id)
+    assert crashing_worker.status(second.materialization_id).activation_state == "active"
+    assert yaml.safe_load(task_path.read_text(encoding="utf-8"))["marker"] == "cache-v2"
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["revision_id"] == str(
+        first.revision_id,
+    )
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
+    assert loader.load("workspace", "controlled-task").raw["marker"] == "cache-v2"
+
+    recovery = _worker(env, worker_id="worker-cache-recovery")
+    assert recovery.recover_compatibility_caches() == 1
+    assert json.loads(metadata_path.read_text(encoding="utf-8"))["revision_id"] == str(
+        second.revision_id,
+    )
+    assert recovery.recover_compatibility_caches() == 0
 
 
 def test_crash_before_snapshot_commit_recovers_from_a_new_attempt(materialization_env):
@@ -365,7 +478,11 @@ def test_conflicting_target_fails_closed_and_keeps_old_active_revision(materiali
     assert failed.snapshot_valid is False
     assert conflict_path.read_text(encoding="utf-8") == "task_id: controlled-task\n"
 
-    loader = ControlTaskSnapshotLoader(env["factory"], env["runs_root"])
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
     assert loader.load("workspace", "controlled-task").raw["marker"] == "v1"
     with Session(env["engine"]) as session:
         assert session.get(Task, env["task_id"]).current_revision_id == first.revision_id
@@ -463,6 +580,9 @@ def test_postgres_workers_skip_locked_fence_duplicates_and_activate_monotonicall
     task_key = f"materialize-task-{suffix}"
     identity = ExternalIdentity("https://materialization-postgres.example", f"admin-{suffix}")
     owner_engine = create_database_engine(owner_url)
+    deferred_materializations: list[
+        tuple[uuid.UUID, datetime, datetime | None]
+    ] = []
     try:
         with Session(owner_engine) as session:
             bootstrap = bootstrap_admin(
@@ -529,6 +649,40 @@ def test_postgres_workers_skip_locked_fence_duplicates_and_activate_monotonicall
             )
         finally:
             service.close()
+
+        with Session(owner_engine) as session, session.begin():
+            deferred_materializations = list(
+                session.execute(
+                    select(
+                        TaskRevisionMaterialization.id,
+                        TaskRevisionMaterialization.available_at,
+                        TaskRevisionMaterialization.lease_expires_at,
+                    ).where(
+                        TaskRevisionMaterialization.state.in_(
+                            [
+                                TaskMaterializationState.PENDING,
+                                TaskMaterializationState.PROCESSING,
+                            ],
+                        ),
+                        TaskRevisionMaterialization.id.not_in(
+                            [first.materialization_id, second.materialization_id],
+                        ),
+                    ),
+                ),
+            )
+            if deferred_materializations:
+                session.execute(
+                    update(TaskRevisionMaterialization)
+                    .where(
+                        TaskRevisionMaterialization.id.in_(
+                            [item[0] for item in deferred_materializations],
+                        ),
+                    )
+                    .values(
+                        available_at=datetime.now(timezone.utc) + timedelta(days=1),
+                        lease_expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+                    ),
+                )
 
         newer_activated = Event()
 
@@ -645,4 +799,15 @@ def test_postgres_workers_skip_locked_fence_duplicates_and_activate_monotonicall
             first_worker.close()
             second_worker.close()
     finally:
+        if deferred_materializations:
+            with Session(owner_engine) as session, session.begin():
+                for materialization_id, available_at, lease_expires_at in deferred_materializations:
+                    session.execute(
+                        update(TaskRevisionMaterialization)
+                        .where(TaskRevisionMaterialization.id == materialization_id)
+                        .values(
+                            available_at=available_at,
+                            lease_expires_at=lease_expires_at,
+                        ),
+                    )
         owner_engine.dispose()

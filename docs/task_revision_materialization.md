@@ -46,7 +46,11 @@ snapshot ready 后，worker 开启新的数据库事务并锁定 task 行：
 3. candidate 等于 current 时幂等返回。
 4. candidate 小于 current 时返回 `superseded`，禁止回退。
 
-更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。事务提交后，worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 兼容缓存；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。control loader 直接查询数据库 current revision 并校验 immutable snapshot，不读取兼容缓存。
+更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。事务提交后，worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 与 `.task_source.json`；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。缓存目录及两个目标文件都拒绝 symlink。
+
+兼容缓存是可恢复缓存，不是原子目录 snapshot。worker 先原子替换 `task.yaml`，再原子替换包含 revision ID、content hash 和 task file hash 的 `.task_source.json`。任一步崩溃都会留下可检测的 file/metadata mismatch；worker 重启或显式 cache recovery 会从数据库 current snapshot 重建。缓存失败不会回退已提交的 activation，也不会阻塞其他 outbox；坏缓存会记录错误并在后续恢复中重试。该过程不替换任务目录，也不删除 `raw/`、prompt 或其他相对路径资源。
+
+control loader 直接查询数据库 current revision 并校验 immutable snapshot，不读取兼容缓存内容。它以 snapshot 中的 YAML 作为 `TaskConfig.raw`，同时把 `TaskConfig.path` 设为调用方提供的稳定逻辑路径 `tasks_root/<task_key>/task.yaml`。因此 `input.path` 及未来相对 task 路径字段继续相对同一任务目录解析；snapshot 物理路径只用于 provenance 和完整性校验，不改变运行时基址。
 
 ## Operation/status 契约
 
@@ -71,4 +75,4 @@ snapshot ready 后，worker 开启新的数据库事务并锁定 task 行：
 | 两个 worker 同时领取 | 每行只有一个有效 lease/attempt | `SKIP LOCKED` 领取不同工作；目标锁处理重复写 | 同一 attempt 只有一个数据库完成者 |
 | revision 2 先于 revision 1 ready | revision 2 先激活 | revision 1 后续变为 `superseded` | current revision number 单调递增 |
 | 目标已有不同或不完整内容 | DB 进入 `failed` | 人工调查，不自动覆盖 | 旧 active revision 继续执行 |
-| 激活后兼容缓存刷新崩溃 | DB current 已更新，缓存可能旧或缺失 | worker 启动恢复从 DB current 重建缓存 | loader 始终读取 immutable snapshot |
+| 激活后兼容缓存刷新崩溃 | DB current 已更新，task/metadata 可能不匹配 | metadata file hash 检出 mismatch，worker 从 DB current 重建 | loader 始终读取 immutable snapshot |

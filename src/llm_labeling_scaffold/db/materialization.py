@@ -346,10 +346,13 @@ class CompatibilityTaskCache:
         session_factory,
         snapshot_store: TaskSnapshotStore,
         tasks_root: str | Path,
+        *,
+        fault_injector: FaultInjector | None = None,
     ):
         self._session_factory = session_factory
         self._snapshot_store = snapshot_store
         self.root = _cache_root(tasks_root)
+        self._fault_injector = fault_injector
 
     def refresh(self, task_id: uuid.UUID) -> bool:
         with self._session_factory() as session, session.begin():
@@ -377,11 +380,23 @@ class CompatibilityTaskCache:
             )
         changed = 0
         for task_id in task_ids:
-            changed += int(self.refresh(task_id))
+            try:
+                changed += int(self.refresh(task_id))
+            except Exception:
+                logger.exception("task compatibility cache refresh failed", extra={"task_id": str(task_id)})
         return changed
 
     def _write_cache(self, revision: RevisionSnapshot, snapshot: SnapshotRef) -> bool:
         target = self.root / revision.task_key
+        if target.is_symlink() or (target.exists() and not target.is_dir()):
+            raise SnapshotValidationError(f"compatibility cache target is not a directory: {target}")
+        task_path = target / "task.yaml"
+        metadata_path = target / CACHE_METADATA_FILE
+        for cache_path in (task_path, metadata_path):
+            if cache_path.is_symlink() or (cache_path.exists() and not cache_path.is_file()):
+                raise SnapshotValidationError(
+                    f"compatibility cache file is not a regular file: {cache_path}",
+                )
         metadata = {
             "source": "database_current_revision",
             "workspace_id": str(revision.workspace_id),
@@ -396,27 +411,23 @@ class CompatibilityTaskCache:
         if _cache_matches(target, metadata, snapshot.task_path):
             return False
 
-        staging_root = self.root / "_staging" / "task_materialization"
-        staging_root.mkdir(parents=True, exist_ok=True)
-        staging = staging_root / f"{revision.task_id}.{os.getpid()}.{uuid.uuid4().hex}"
-        publish = staging / "publish"
-        publish.mkdir(parents=True, exist_ok=False)
-        try:
-            _copy_file_fsync(snapshot.task_path, publish / "task.yaml")
-            _write_bytes_fsync(
-                publish / CACHE_METADATA_FILE,
-                (json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(
-                    "utf-8",
-                ),
-            )
-            cached = load_task(publish / "task.yaml")
-            if cached.task_id != revision.task_key:
-                raise SnapshotValidationError("compatibility cache task_id differs from current revision")
-            _fsync_dir(publish)
-            _replace_directory(publish, target)
-            return True
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
+        target.mkdir(parents=True, exist_ok=True)
+        _write_bytes_atomic(task_path, snapshot.task_path.read_bytes())
+        self._inject("after_cache_task_write", revision)
+        _write_bytes_atomic(
+            metadata_path,
+            (json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(
+                "utf-8",
+            ),
+        )
+        cached = load_task(task_path)
+        if cached.task_id != revision.task_key:
+            raise SnapshotValidationError("compatibility cache task_id differs from current revision")
+        return True
+
+    def _inject(self, point: str, revision: RevisionSnapshot) -> None:
+        if self._fault_injector is not None:
+            self._fault_injector(point, revision)
 
     @contextmanager
     def _task_lock(self, task_key: str):
@@ -435,9 +446,17 @@ class CompatibilityTaskCache:
 
 
 class ControlTaskSnapshotLoader:
-    def __init__(self, session_factory, runs_root: str | Path, *, engine=None):
+    def __init__(
+        self,
+        session_factory,
+        runs_root: str | Path,
+        tasks_root: str | Path = "tasks",
+        *,
+        engine=None,
+    ):
         self._session_factory = session_factory
         self._snapshot_store = TaskSnapshotStore(runs_root)
+        self._logical_root = _cache_root(tasks_root)
         self._engine = engine
 
     @classmethod
@@ -445,9 +464,10 @@ class ControlTaskSnapshotLoader:
         cls,
         database_url: str | None,
         runs_root: str | Path,
+        tasks_root: str | Path = "tasks",
     ) -> ControlTaskSnapshotLoader:
         engine = create_database_engine(database_url)
-        return cls(create_session_factory(engine), runs_root, engine=engine)
+        return cls(create_session_factory(engine), runs_root, tasks_root, engine=engine)
 
     def close(self) -> None:
         if self._engine is not None:
@@ -473,7 +493,11 @@ class ControlTaskSnapshotLoader:
         if row is None:
             raise SnapshotValidationError(f"task has no ready current revision: {workspace_slug}/{task_key}")
         task, revision, _materialization = row
-        return self._snapshot_store.load(_revision_snapshot(task, revision))
+        snapshot_task = self._snapshot_store.load(_revision_snapshot(task, revision))
+        return TaskConfig(
+            path=self._logical_root / task_key / "task.yaml",
+            raw=snapshot_task.raw,
+        )
 
 
 class TaskMaterializationWorker:
@@ -506,7 +530,12 @@ class TaskMaterializationWorker:
         self._fault_injector = fault_injector
         self._snapshot_store = TaskSnapshotStore(runs_root, fault_injector=fault_injector)
         self._cache = (
-            CompatibilityTaskCache(session_factory, self._snapshot_store, tasks_root)
+            CompatibilityTaskCache(
+                session_factory,
+                self._snapshot_store,
+                tasks_root,
+                fault_injector=fault_injector,
+            )
             if tasks_root is not None
             else None
         )
@@ -582,7 +611,12 @@ class TaskMaterializationWorker:
             self._cache.recover_all()
         while True:
             try:
-                result = self.run_once()
+                ready = self._next_ready_for_activation(None)
+                result = (
+                    self._activate_ready(ready, action="activated")
+                    if ready is not None
+                    else self.run_once()
+                )
             except MaterializationCrash:
                 raise
             except Exception:
@@ -829,12 +863,22 @@ class TaskMaterializationWorker:
         self._inject("before_activation", ready.revision)
         activation = self._activate(ready.revision.revision_id)
         self._inject("after_activation", ready.revision)
-        cache_refreshed = self._refresh_cache(ready.revision.task_id)
+        cache_error: str | None = None
+        try:
+            cache_refreshed = self._refresh_cache(ready.revision.task_id)
+        except Exception as exc:
+            cache_refreshed = False
+            cache_error = _error_text(exc)
+            logger.exception(
+                "task compatibility cache refresh failed after activation",
+                extra={"task_id": str(ready.revision.task_id)},
+            )
         return WorkerRunResult(
             action=action,
             materialization_id=ready.materialization_id,
             activation_state=activation.state,
             cache_refreshed=cache_refreshed,
+            error=cache_error,
         )
 
     def _record_ready_failure(
@@ -849,6 +893,11 @@ class TaskMaterializationWorker:
                 .with_for_update(),
             )
             if materialization is None or materialization.state != TaskMaterializationState.SUCCEEDED:
+                return
+            task = session.scalar(
+                select(Task).where(Task.id == materialization.task_id).with_for_update(),
+            )
+            if task is None or task.current_revision_id == materialization.revision_id:
                 return
             materialization.state = TaskMaterializationState.FAILED
             materialization.last_error = _error_text(error)
@@ -875,10 +924,12 @@ class TaskMaterializationWorker:
         with self._session_factory() as session, session.begin():
             revision = session.get(TaskRevision, revision_id)
             materialization = session.scalar(
-                select(TaskRevisionMaterialization).where(
+                select(TaskRevisionMaterialization)
+                .where(
                     TaskRevisionMaterialization.revision_id == revision_id,
                     TaskRevisionMaterialization.state == TaskMaterializationState.SUCCEEDED,
-                ),
+                )
+                .with_for_update(),
             )
             if revision is None or materialization is None:
                 raise MaterializationError("revision is not ready for activation")
@@ -1038,40 +1089,18 @@ def _cache_root(tasks_root: str | Path) -> Path:
 
 def _cache_matches(target: Path, metadata: dict[str, Any], task_path: Path) -> bool:
     try:
-        if not target.is_dir():
+        if target.is_symlink() or not target.is_dir():
             return False
-        stored = json.loads((target / CACHE_METADATA_FILE).read_text(encoding="utf-8"))
+        metadata_path = target / CACHE_METADATA_FILE
+        cached_task = target / "task.yaml"
+        if metadata_path.is_symlink() or cached_task.is_symlink():
+            return False
+        stored = json.loads(metadata_path.read_text(encoding="utf-8"))
         if stored != metadata:
             return False
-        cached_task = target / "task.yaml"
         return cached_task.is_file() and cached_task.read_bytes() == task_path.read_bytes()
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return False
-
-
-def _replace_directory(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    backup: Path | None = None
-    if target.exists():
-        backup = target.with_name(f".{target.name}.old.{os.getpid()}.{uuid.uuid4().hex}")
-        os.replace(target, backup)
-    try:
-        os.replace(source, target)
-        _fsync_dir(target.parent)
-    except Exception:
-        if backup is not None and backup.exists() and not target.exists():
-            os.replace(backup, target)
-        raise
-    if backup is not None:
-        shutil.rmtree(backup, ignore_errors=True)
-
-
-def _copy_file_fsync(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with source.open("rb") as source_handle, target.open("xb") as target_handle:
-        shutil.copyfileobj(source_handle, target_handle)
-        target_handle.flush()
-        os.fsync(target_handle.fileno())
 
 
 def _write_bytes_fsync(path: Path, value: bytes) -> None:
@@ -1080,6 +1109,18 @@ def _write_bytes_fsync(path: Path, value: bytes) -> None:
         handle.write(value)
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def _write_bytes_atomic(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        _write_bytes_fsync(temporary, value)
+        os.replace(temporary, path)
+        _fsync_dir(path.parent)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _fsync_dir(path: str | Path) -> None:
