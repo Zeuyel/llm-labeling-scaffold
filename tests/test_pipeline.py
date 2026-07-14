@@ -35,6 +35,30 @@ def _wait_for_job(runs_root: Path, task_id: str, job_id: str, *, attempts: int =
     raise AssertionError(f"job did not finish: {job_id}")
 
 
+def _argilla_contract(dataset: str, *, min_submitted: int = 1) -> dict:
+    return {
+        "schema_version": 1,
+        "server_version": "2.8.0",
+        "sdk_version": "2.8.0",
+        "workspace": {
+            "uuid": "00000000-0000-0000-0000-000000000001",
+            "name": "argilla",
+        },
+        "dataset": {
+            "uuid": "00000000-0000-0000-0000-000000000002",
+            "name": dataset,
+        },
+        "min_submitted": min_submitted,
+        "fingerprints": {
+            "task": "1" * 64,
+            "sample": "2" * 64,
+            "batch": "3" * 64,
+            "plan": "4" * 64,
+            "push": "f" * 64,
+        },
+    }
+
+
 def _create_local_data_lake_task(tmp_path: Path, *, task_id: str = "data_task"):
     source = tmp_path / f"{task_id}_lake_source.jsonl"
     source.write_text(
@@ -1545,7 +1569,7 @@ def test_argilla_push_uses_annotation_job_lock(
         return RecordingLock(asset_name)
 
     def fake_push_sample(task, dispatch_path: str, dataset: str, params: dict) -> dict:
-        return {"records": 1}
+        return {"records": 1, "contract": _argilla_contract(dataset)}
 
     from llm_labeling_scaffold.integrations import argilla as argilla_module
 
@@ -1838,6 +1862,7 @@ def test_argilla_push_batch_plan_dispatch_writes_dispatch_file_and_lineage(tmp_p
         captured["rows"] = rows
         return {
             "records": len(rows),
+            "contract": _argilla_contract(dataset),
             "record_id_policy": {
                 "strategy": argilla_params.get("record_id_strategy"),
                 "batch_id_field": "__lls_batch_id",
@@ -1896,6 +1921,7 @@ def test_argilla_push_batch_plan_dispatch_writes_dispatch_file_and_lineage(tmp_p
     assert manifest["argilla_dataset"] == "argilla_qc_dataset"
     assert manifest["rows"] == len(dispatch_rows)
     assert manifest["record_id_policy"]["strategy"] == "batch_scoped"
+    assert manifest["argilla_contract"] == _argilla_contract("argilla_qc_dataset")
 
 
 def test_annotation_decision_gold_status_contract_links_manifests(tmp_path: Path):
@@ -2090,6 +2116,7 @@ def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: 
             "dispatch_mode": "batch_plan",
             "batch_plan_id": "plan_1",
             "batch_ids": ["batch_00001.jsonl"],
+            "argilla_contract": _argilla_contract("argilla_dataset_1"),
         },
         annotation_dir / "manifest.json",
     )
@@ -2163,6 +2190,7 @@ def test_external_suggestions_export_import_and_publish(tmp_path: Path, monkeypa
             "dispatch_mode": "batch_plan",
             "batch_plan_id": "plan_1",
             "batch_ids": ["batch_00001.jsonl"],
+            "argilla_contract": _argilla_contract("argilla_dataset_1"),
         },
         annotation_dir / "manifest.json",
     )
@@ -2276,6 +2304,7 @@ def test_prelabel_reuse_persists_publish_metadata(tmp_path: Path, monkeypatch):
             "annotation_id": "argilla_round_1",
             "argilla_dataset": "argilla_dataset_1",
             "dispatch_path": str(dispatch_path),
+            "argilla_contract": _argilla_contract("argilla_dataset_1"),
         },
         annotation_dir / "manifest.json",
     )
@@ -2361,7 +2390,11 @@ def test_argilla_push_sample_dispatch_still_uses_sample_file_without_batch_plan(
         captured["path"] = str(path)
         captured["dataset"] = dataset
         captured["argilla_params"] = dict(argilla_params)
-        return {"records": len(read_jsonl(path)), "record_id_policy": {"strategy": "original"}}
+        return {
+            "records": len(read_jsonl(path)),
+            "record_id_policy": {"strategy": "original"},
+            "contract": _argilla_contract(dataset),
+        }
 
     with patch("llm_labeling_scaffold.integrations.argilla.push_sample", side_effect=fake_push_sample):
         job = pipeline.start_action(
@@ -2378,7 +2411,10 @@ def test_argilla_push_sample_dispatch_still_uses_sample_file_without_batch_plan(
 
     assert current["status"] == "succeeded"
     assert captured["path"] == str(sample_path)
-    assert captured["argilla_params"] == {}
+    assert captured["argilla_params"] == {
+        "dispatch_mode": "sample",
+        "sample_path": str(sample_path),
+    }
     manifest = read_json(tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_sample_round" / "manifest.json")
     assert manifest["dispatch_mode"] == "sample"
     assert manifest["sample_path"] == str(sample_path)
@@ -2386,6 +2422,51 @@ def test_argilla_push_sample_dispatch_still_uses_sample_file_without_batch_plan(
     assert manifest["batch_manifest_path"] is None
     assert manifest["batch_ids"] == []
     assert manifest["rows"] == 2
+    assert manifest["argilla_contract"] == _argilla_contract("argilla_sample_dataset")
+
+
+def test_argilla_push_retry_passes_existing_manifest_contract(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "argilla_retry_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    source = tmp_path / "source.jsonl"
+    source.write_text('{"record_id":"r1","title":"A"}\n', encoding="utf-8")
+    sample_path = sample_records(task, 1, "sample_a", "head", source_path=source)
+    captured_params: list[dict] = []
+
+    def fake_push_sample(task_arg, path, dataset, argilla_params):
+        captured_params.append(dict(argilla_params))
+        return {
+            "records": 1,
+            "record_id_policy": {"strategy": "original"},
+            "contract": _argilla_contract(dataset),
+        }
+
+    with patch("llm_labeling_scaffold.integrations.argilla.push_sample", side_effect=fake_push_sample):
+        for _ in range(2):
+            job = pipeline.start_action(
+                tmp_path / "runs",
+                created["path"],
+                "argilla_push",
+                {
+                    "sample": str(sample_path),
+                    "annotation_id": "argilla_retry_round",
+                    "dataset": "argilla_retry_dataset",
+                },
+            )
+            current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+            assert current["status"] == "succeeded"
+
+    assert "expected_contract" not in captured_params[0]
+    assert captured_params[1]["expected_contract"] == _argilla_contract("argilla_retry_dataset")
 
 
 def test_argilla_push_batch_plan_fails_on_same_batch_duplicate_original_id(tmp_path: Path):

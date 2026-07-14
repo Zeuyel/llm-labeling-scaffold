@@ -1,12 +1,23 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 from pathlib import Path
+import re
 from typing import Any
+import urllib.request
+from uuid import UUID
 
 from ..config import TaskConfig, build_text
-from ..io import read_jsonl, write_jsonl
+from ..io import read_json, read_jsonl, write_jsonl
+
+
+_ARGILLA_CONTRACT_SCHEMA_VERSION = 1
+_ARGILLA_PUSH_FINGERPRINT_FIELD = "__lls_push_fingerprint"
+_ARGILLA_FINGERPRINT_NAMES = ("task", "sample", "batch", "plan")
+_ARGILLA_VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?")
 
 
 def _load_argilla():
@@ -27,6 +38,119 @@ def _client(api_url: str | None = None, api_key: str | None = None):
 
 def _api_url(api_url: str | None = None) -> str:
     return api_url or os.environ.get("ARGILLA_API_URL", "http://localhost:6900")
+
+
+def _require_argilla_2_8_version(component: str, value: Any) -> str:
+    version = str(value or "").strip()
+    match = _ARGILLA_VERSION_PATTERN.match(version)
+    if not match or (int(match.group(1)), int(match.group(2))) != (2, 8):
+        raise RuntimeError(f"{component} 必须是 Argilla 2.8.x，实际版本: {version or '<missing>'}")
+    return version
+
+
+def _server_version(api_url: str, timeout: float = 5.0) -> str:
+    url = f"{api_url.rstrip('/')}/api/v1/version"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.load(response)
+    except Exception as exc:
+        raise RuntimeError("无法读取 Argilla server version endpoint") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Argilla server version endpoint 返回了非 JSON object")
+    return _require_argilla_2_8_version("Argilla server", payload.get("version"))
+
+
+def _runtime_versions(rg, api_url: str) -> dict[str, str]:
+    return {
+        "sdk": _require_argilla_2_8_version("Argilla SDK", getattr(rg, "__version__", None)),
+        "server": _server_version(api_url),
+    }
+
+
+def _stable_hash(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _jsonl_fingerprint(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    for row in read_jsonl(path):
+        digest.update(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _task_fingerprint(task: TaskConfig) -> str:
+    task_definition = dict(task.raw)
+    task_definition.pop("runs_dir", None)
+    return _stable_hash(task_definition)
+
+
+def _push_fingerprints(task: TaskConfig, sample_path: str | Path, params: dict[str, Any]) -> dict[str, str]:
+    source_sample = Path(str(params.get("sample_path") or sample_path))
+    if not source_sample.is_file():
+        raise ValueError(f"Argilla sample fingerprint 文件不存在: {source_sample}")
+    sample_fingerprint = _jsonl_fingerprint(source_sample)
+
+    batch_files = [Path(value) for value in _string_list(params.get("batch_files"))]
+    batch_ids = _string_list(params.get("batch_ids"))
+    if not batch_files:
+        batch_files = [Path(sample_path)]
+        batch_ids = [Path(sample_path).name]
+    batch_entries: list[dict[str, str]] = []
+    for index, batch_file in enumerate(batch_files):
+        if not batch_file.is_file():
+            raise ValueError(f"Argilla batch fingerprint 文件不存在: {batch_file}")
+        batch_id = batch_ids[index] if index < len(batch_ids) else batch_file.name
+        batch_entries.append({"batch_id": batch_id, "sha256": _jsonl_fingerprint(batch_file)})
+    batch_entries.sort(key=lambda item: (item["batch_id"], item["sha256"]))
+    batch_fingerprint = _stable_hash({"dispatch_mode": params.get("dispatch_mode") or "sample", "batches": batch_entries})
+
+    plan_manifest_path = str(params.get("batch_manifest_path") or "").strip()
+    if plan_manifest_path:
+        plan_path = Path(plan_manifest_path)
+        if not plan_path.is_file():
+            raise ValueError(f"Argilla plan fingerprint manifest 不存在: {plan_path}")
+        plan_manifest = dict(read_json(plan_path))
+        plan_manifest.pop("sample", None)
+    else:
+        plan_manifest = {
+            "dispatch_mode": params.get("dispatch_mode") or "sample",
+            "batch_plan_id": params.get("batch_plan_id"),
+        }
+    plan_fingerprint = _stable_hash({
+        "manifest": plan_manifest,
+        "sample_fingerprint": sample_fingerprint,
+        "batch_fingerprint": batch_fingerprint,
+        "selected_batch_ids": batch_ids,
+    })
+    return {
+        "task": _task_fingerprint(task),
+        "sample": sample_fingerprint,
+        "batch": batch_fingerprint,
+        "plan": plan_fingerprint,
+    }
+
+
+def _push_fingerprint(
+    *,
+    versions: dict[str, str],
+    workspace_name: str,
+    dataset_name: str,
+    min_submitted: int,
+    record_id_policy: dict[str, Any],
+    fingerprints: dict[str, str],
+) -> str:
+    return _stable_hash({
+        "schema_version": _ARGILLA_CONTRACT_SCHEMA_VERSION,
+        "versions": versions,
+        "workspace_name": workspace_name,
+        "dataset_name": dataset_name,
+        "min_submitted": min_submitted,
+        "record_id_policy": record_id_policy,
+        "fingerprints": fingerprints,
+    })
 
 
 def _all_label_fields(task: TaskConfig) -> list[dict[str, Any]]:
@@ -326,26 +450,254 @@ def _workspace_name(value) -> str:
     return str(value)
 
 
-def _existing_dataset(client, dataset_name: str, workspace: str):
-    for dataset in client.datasets.list():
-        if getattr(dataset, "name", None) == dataset_name and _workspace_name(getattr(dataset, "workspace", "")) == workspace:
-            return dataset
-    return None
+def _resource_uuid(resource: Any, label: str) -> str:
+    value = getattr(resource, "id", None)
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise RuntimeError(f"Argilla {label} 缺少有效 UUID") from exc
 
 
-def _prepare_dataset(client, dataset, dataset_name: str, workspace: str, if_exists: str):
-    if_exists = if_exists or "fail"
-    if if_exists not in {"fail", "append", "replace"}:
-        raise ValueError("Argilla 同名数据集策略只能是 fail、append 或 replace")
-    existing = _existing_dataset(client, dataset_name, workspace)
-    if not existing:
+def _contract_uuid(value: Any, label: str) -> str:
+    try:
+        return str(UUID(str(value)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"Argilla manifest 缺少有效 {label}") from exc
+
+
+def _validated_contract(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Argilla manifest 缺少 argilla_contract")
+    if value.get("schema_version") != _ARGILLA_CONTRACT_SCHEMA_VERSION:
+        raise ValueError("Argilla manifest contract schema_version 不兼容")
+    workspace = value.get("workspace")
+    dataset = value.get("dataset")
+    fingerprints = value.get("fingerprints")
+    if not isinstance(workspace, dict) or not isinstance(dataset, dict) or not isinstance(fingerprints, dict):
+        raise ValueError("Argilla manifest identity/fingerprint 字段不完整")
+    normalized_fingerprints: dict[str, str] = {}
+    for name in (*_ARGILLA_FINGERPRINT_NAMES, "push"):
+        fingerprint = str(fingerprints.get(name) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+            raise ValueError(f"Argilla manifest 缺少有效 {name} fingerprint")
+        normalized_fingerprints[name] = fingerprint
+    workspace_name = str(workspace.get("name") or "").strip()
+    dataset_name = str(dataset.get("name") or "").strip()
+    if not workspace_name or not dataset_name:
+        raise ValueError("Argilla manifest workspace/dataset name 不完整")
+    try:
+        min_submitted = int(value.get("min_submitted"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Argilla manifest min_submitted 无效") from exc
+    if min_submitted < 1:
+        raise ValueError("Argilla manifest min_submitted 必须大于 0")
+    return {
+        "schema_version": _ARGILLA_CONTRACT_SCHEMA_VERSION,
+        "server_version": _require_argilla_2_8_version("Argilla manifest server", value.get("server_version")),
+        "sdk_version": _require_argilla_2_8_version("Argilla manifest SDK", value.get("sdk_version")),
+        "workspace": {
+            "uuid": _contract_uuid(workspace.get("uuid"), "workspace UUID"),
+            "name": workspace_name,
+        },
+        "dataset": {
+            "uuid": _contract_uuid(dataset.get("uuid"), "dataset UUID"),
+            "name": dataset_name,
+        },
+        "min_submitted": min_submitted,
+        "fingerprints": normalized_fingerprints,
+    }
+
+
+def _workspace_by_identity(client, name: str, expected_uuid: str | None = None):
+    workspace = client.workspaces(id=expected_uuid) if expected_uuid else client.workspaces(name=name)
+    if workspace is None:
+        if expected_uuid:
+            raise ValueError("Argilla workspace UUID 在当前环境不存在；拒绝按同名 workspace 回退")
+        raise ValueError(f"Argilla workspace 不存在: {name}")
+    actual_uuid = _resource_uuid(workspace, "workspace")
+    actual_name = _workspace_name(workspace)
+    if actual_name != name or (expected_uuid and actual_uuid != expected_uuid):
+        raise ValueError("Argilla workspace 身份与 manifest 不一致")
+    return workspace
+
+
+def _dataset_by_identity(client, name: str, workspace, expected_uuid: str | None = None):
+    dataset = client.datasets(id=expected_uuid) if expected_uuid else client.datasets(name=name, workspace=workspace)
+    if dataset is None:
+        if expected_uuid:
+            raise ValueError("Argilla dataset UUID 在当前环境不存在；拒绝按同名 dataset 回退")
+        return None
+    actual_uuid = _resource_uuid(dataset, "dataset")
+    dataset_workspace = getattr(dataset, "workspace", None)
+    actual_workspace_uuid = _resource_uuid(dataset_workspace, "dataset workspace")
+    if (
+        str(getattr(dataset, "name", "")) != name
+        or actual_workspace_uuid != _resource_uuid(workspace, "workspace")
+        or (expected_uuid and actual_uuid != expected_uuid)
+    ):
+        raise ValueError("Argilla dataset 身份与 workspace/manifest 不一致")
+    return dataset
+
+
+def _record_metadata_dict(record: Any) -> dict[str, Any]:
+    metadata = getattr(record, "metadata", None)
+    if isinstance(metadata, dict):
+        return dict(metadata)
+    if hasattr(metadata, "to_dict"):
+        value = metadata.to_dict()
+        return dict(value) if isinstance(value, dict) else {}
+    return {}
+
+
+def _collection_has_items(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        return len(value) > 0
+    except TypeError:
+        return any(True for _ in value)
+
+
+def _remote_dataset_state(dataset) -> dict[str, Any]:
+    record_ids: set[str] = set()
+    fingerprints: set[str] = set()
+    missing_fingerprint = False
+    has_responses = False
+    for record in dataset.records:
+        record_ids.add(str(getattr(record, "id", "")))
+        fingerprint = str(_record_metadata_dict(record).get(_ARGILLA_PUSH_FINGERPRINT_FIELD) or "").strip()
+        if fingerprint:
+            fingerprints.add(fingerprint)
+        else:
+            missing_fingerprint = True
+        if _collection_has_items(getattr(record, "responses", None)):
+            has_responses = True
+    return {
+        "record_ids": record_ids,
+        "fingerprints": fingerprints,
+        "missing_fingerprint": missing_fingerprint,
+        "has_responses": has_responses,
+    }
+
+
+def _dataset_min_submitted(dataset) -> int:
+    distribution = getattr(dataset, "distribution", None)
+    value = getattr(distribution, "min_submitted", None)
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Argilla dataset 缺少公开 distribution.min_submitted") from exc
+    return resolved
+
+
+def _validate_dataset_resume(
+    existing,
+    *,
+    push_fingerprint: str,
+    desired_record_ids: set[str],
+    min_submitted: int,
+) -> None:
+    state = _remote_dataset_state(existing)
+    if _dataset_min_submitted(existing) != min_submitted:
+        raise ValueError("Argilla dataset min_submitted 与当前 push contract 不一致")
+    if state["missing_fingerprint"] or state["fingerprints"] != {push_fingerprint}:
+        raise ValueError("Argilla dataset fingerprint 与当前 push contract 不一致，禁止 append/resume 混入")
+    unexpected_ids = state["record_ids"] - desired_record_ids
+    if unexpected_ids:
+        raise ValueError("Argilla dataset 包含当前 push contract 之外的 record id，拒绝幂等恢复")
+
+
+def _prepare_dataset(
+    dataset,
+    existing,
+    if_exists: str,
+    *,
+    push_fingerprint: str,
+    desired_record_ids: set[str],
+    min_submitted: int,
+):
+    policy = str(if_exists or "resume").strip().lower()
+    if policy not in {"fail", "resume", "append", "replace"}:
+        raise ValueError("Argilla 同名数据集策略只能是 fail、resume、append 或 replace")
+    if existing is None:
         return dataset.create(), "created"
-    if if_exists == "fail":
-        raise ValueError(f"Argilla 数据集已存在: {workspace}/{dataset_name}")
-    if if_exists == "append":
-        return existing, "appended"
+    if policy == "fail":
+        raise ValueError(f"Argilla 数据集已存在: {_workspace_name(existing.workspace)}/{existing.name}")
+
+    if policy in {"resume", "append"}:
+        _validate_dataset_resume(
+            existing,
+            push_fingerprint=push_fingerprint,
+            desired_record_ids=desired_record_ids,
+            min_submitted=min_submitted,
+        )
+        return existing, "resumed"
+
+    state = _remote_dataset_state(existing)
+    if state["has_responses"]:
+        raise ValueError("Argilla dataset 已有回答，禁止 replace")
     existing.delete()
     return dataset.create(), "replaced"
+
+
+def _build_contract(
+    *,
+    versions: dict[str, str],
+    workspace,
+    dataset,
+    min_submitted: int,
+    fingerprints: dict[str, str],
+    push_fingerprint: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _ARGILLA_CONTRACT_SCHEMA_VERSION,
+        "server_version": versions["server"],
+        "sdk_version": versions["sdk"],
+        "workspace": {
+            "uuid": _resource_uuid(workspace, "workspace"),
+            "name": _workspace_name(workspace),
+        },
+        "dataset": {
+            "uuid": _resource_uuid(dataset, "dataset"),
+            "name": str(getattr(dataset, "name", "")),
+        },
+        "min_submitted": min_submitted,
+        "fingerprints": {**fingerprints, "push": push_fingerprint},
+    }
+
+
+def _validate_expected_push_contract(
+    value: Any,
+    *,
+    versions: dict[str, str],
+    workspace_name: str,
+    dataset_name: str,
+    min_submitted: int,
+    fingerprints: dict[str, str],
+    push_fingerprint: str,
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    contract = _validated_contract(value)
+    expected = {
+        "server_version": versions["server"],
+        "sdk_version": versions["sdk"],
+        "workspace_name": workspace_name,
+        "dataset_name": dataset_name,
+        "min_submitted": min_submitted,
+        "fingerprints": {**fingerprints, "push": push_fingerprint},
+    }
+    actual = {
+        "server_version": contract["server_version"],
+        "sdk_version": contract["sdk_version"],
+        "workspace_name": contract["workspace"]["name"],
+        "dataset_name": contract["dataset"]["name"],
+        "min_submitted": contract["min_submitted"],
+        "fingerprints": contract["fingerprints"],
+    }
+    if actual != expected:
+        raise ValueError("Argilla 既有 push manifest 与当前 task/sample/batch/plan contract 不一致")
+    return contract
 
 
 def _record_source_id(record, task: TaskConfig) -> str:
@@ -458,6 +810,9 @@ def _record_metadata(
     }
     metadata.update({field: row[field] for field in task.metadata_fields if field in row})
     metadata.update(_record_context_metadata(row, params))
+    push_fingerprint = params.get("_push_fingerprint")
+    if push_fingerprint:
+        metadata[_ARGILLA_PUSH_FINGERPRINT_FIELD] = str(push_fingerprint)
     return metadata
 
 
@@ -662,12 +1017,48 @@ def _record_suggestion_count(records: list) -> int:
 
 
 def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, params: dict[str, Any] | None = None) -> dict:
-    params = params or {}
+    params = dict(params or {})
     rg = _load_argilla()
-    workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
+    api_url = _api_url(params.get("api_url"))
+    versions = _runtime_versions(rg, api_url)
+    workspace_name = str(params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla")
     text_field = params.get("text_field", "text")
     min_submitted = int(params.get("min_submitted", 1))
-    if_exists = str(params.get("if_exists") or params.get("dataset_policy") or "fail")
+    if min_submitted < 1:
+        raise ValueError("Argilla min_submitted 必须大于 0")
+    if_exists = str(params.get("if_exists") or params.get("dataset_policy") or "resume")
+    fingerprints = _push_fingerprints(task, sample_path, params)
+    requested_record_id_policy = _record_id_policy(task, params)
+    push_fingerprint = _push_fingerprint(
+        versions=versions,
+        workspace_name=workspace_name,
+        dataset_name=dataset_name,
+        min_submitted=min_submitted,
+        record_id_policy=requested_record_id_policy,
+        fingerprints=fingerprints,
+    )
+    expected_contract = _validate_expected_push_contract(
+        params.get("expected_contract"),
+        versions=versions,
+        workspace_name=workspace_name,
+        dataset_name=dataset_name,
+        min_submitted=min_submitted,
+        fingerprints=fingerprints,
+        push_fingerprint=push_fingerprint,
+    )
+    client = _client(params.get("api_url"), params.get("api_key"))
+    workspace = _workspace_by_identity(
+        client,
+        workspace_name,
+        expected_contract["workspace"]["uuid"] if expected_contract else None,
+    )
+    existing = _dataset_by_identity(
+        client,
+        dataset_name,
+        workspace,
+        expected_contract["dataset"]["uuid"] if expected_contract else None,
+    )
+    params["_push_fingerprint"] = push_fingerprint
     records, record_id_policy, duplicate_record_ids = _prepare_records_for_push(
         rg,
         task,
@@ -676,7 +1067,6 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         params,
     )
 
-    client = _client(params.get("api_url"), params.get("api_key"))
     settings = rg.Settings(
         guidelines=_guidelines_for_task(task, params),
         fields=_argilla_text_fields(rg, task, text_field, params),
@@ -684,21 +1074,40 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         distribution=rg.TaskDistribution(min_submitted=min_submitted),
         allow_extra_metadata=True,
     )
-    dataset = rg.Dataset(name=dataset_name, workspace=workspace, settings=settings)
-    dataset, dataset_action = _prepare_dataset(client, dataset, dataset_name, workspace, if_exists)
+    dataset = rg.Dataset(name=dataset_name, workspace=workspace, settings=settings, client=client)
+    dataset, dataset_action = _prepare_dataset(
+        dataset,
+        existing,
+        if_exists,
+        push_fingerprint=push_fingerprint,
+        desired_record_ids={str(record.id) for record in records},
+        min_submitted=min_submitted,
+    )
+    contract = _build_contract(
+        versions=versions,
+        workspace=workspace,
+        dataset=dataset,
+        min_submitted=min_submitted,
+        fingerprints=fingerprints,
+        push_fingerprint=push_fingerprint,
+    )
 
     dataset.records.log(records)
     return {
         "backend": "argilla",
-        "workspace": workspace,
+        "workspace": workspace_name,
+        "workspace_uuid": contract["workspace"]["uuid"],
         "dataset": dataset_name,
+        "dataset_uuid": contract["dataset"]["uuid"],
         "dataset_action": dataset_action,
         "if_exists": if_exists,
+        "min_submitted": min_submitted,
         "records": len(records),
         "suggestions": _record_suggestion_count(records),
         "record_id_policy": record_id_policy,
         "duplicate_record_ids": duplicate_record_ids,
         "visible_fields": list(records[0].fields.keys()) if records else [text_field],
+        "contract": contract,
         "url": params.get("ui_url"),
     }
 
@@ -713,8 +1122,36 @@ def push_suggestions(
     params = dict(params or {})
     params["suggestions_path"] = str(suggestions_path)
     rg = _load_argilla()
-    workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
+    api_url = _api_url(params.get("api_url"))
+    versions = _runtime_versions(rg, api_url)
+    expected_value = params.get("expected_contract")
+    if expected_value is None:
+        raise ValueError("Argilla suggestion push 缺少 annotation manifest identity contract")
+    expected = _validated_contract(expected_value)
+    workspace_name = str(params.get("workspace") or expected["workspace"]["name"])
+    if workspace_name != expected["workspace"]["name"] or dataset_name != expected["dataset"]["name"]:
+        raise ValueError("Argilla suggestion push 的 workspace/dataset 与 manifest 不一致")
     text_field = params.get("text_field", "text")
+    fingerprints = _push_fingerprints(task, sample_path, params)
+    record_id_policy = _record_id_policy(task, params)
+    push_fingerprint = _push_fingerprint(
+        versions=versions,
+        workspace_name=workspace_name,
+        dataset_name=dataset_name,
+        min_submitted=expected["min_submitted"],
+        record_id_policy=record_id_policy,
+        fingerprints=fingerprints,
+    )
+    expected = _validate_expected_push_contract(
+        expected,
+        versions=versions,
+        workspace_name=workspace_name,
+        dataset_name=dataset_name,
+        min_submitted=expected["min_submitted"],
+        fingerprints=fingerprints,
+        push_fingerprint=push_fingerprint,
+    )
+    params["_push_fingerprint"] = push_fingerprint
     records, record_id_policy, duplicate_record_ids = _prepare_records_for_push(
         rg,
         task,
@@ -727,16 +1164,26 @@ def push_suggestions(
         raise ValueError("没有可写入 Argilla 的 suggestions")
 
     client = _client(params.get("api_url"), params.get("api_key"))
-    dataset = client.datasets(dataset_name, workspace=workspace)
+    workspace = _workspace_by_identity(client, workspace_name, expected["workspace"]["uuid"])
+    dataset = _dataset_by_identity(client, dataset_name, workspace, expected["dataset"]["uuid"])
+    _validate_dataset_resume(
+        dataset,
+        push_fingerprint=push_fingerprint,
+        desired_record_ids={str(record.id) for record in records},
+        min_submitted=expected["min_submitted"],
+    )
     dataset.records.log(records)
     return {
         "backend": "argilla",
-        "workspace": workspace,
+        "workspace": workspace_name,
+        "workspace_uuid": expected["workspace"]["uuid"],
         "dataset": dataset_name,
+        "dataset_uuid": expected["dataset"]["uuid"],
         "records": len(records),
         "suggestions": suggestion_count,
         "record_id_policy": record_id_policy,
         "duplicate_record_ids": duplicate_record_ids,
+        "contract": expected,
     }
 
 

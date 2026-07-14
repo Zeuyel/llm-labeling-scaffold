@@ -1919,16 +1919,30 @@ def _materialize_argilla_dispatch(dispatch: dict[str, Any], annotation_dir: Path
     return str(dispatch["dispatch_path"])
 
 
-def _argilla_push_params(params: dict[str, Any], dispatch: dict[str, Any]) -> dict[str, Any]:
+def _argilla_push_params(
+    params: dict[str, Any],
+    dispatch: dict[str, Any],
+    existing_manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     out = dict(params.get("argilla") or {})
-    if dispatch.get("dispatch_mode") == "sample":
-        return out
     if dispatch.get("dispatch_mode") == "batch_plan":
         out.setdefault("record_id_strategy", "batch_scoped")
-    for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path"):
+    for key in (
+        "dispatch_mode",
+        "sample_path",
+        "batch_plan_id",
+        "batch_manifest_path",
+        "batch_ids",
+        "batch_files",
+    ):
         value = dispatch.get(key)
         if value not in (None, "", [], {}):
             out.setdefault(key, value)
+    if existing_manifest is not None:
+        contract = existing_manifest.get("argilla_contract")
+        if not isinstance(contract, dict):
+            raise ValueError("既有 Argilla annotation manifest 缺少 argilla_contract，拒绝覆盖")
+        out["expected_contract"] = contract
     return out
 
 
@@ -2032,9 +2046,14 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                 annotation_dir = _annotation_job_dir(runs_root, task.task_id, annotation_id)
                 if not annotation_dir.exists() and _archived_annotation_job_exists(runs_root, task.task_id, annotation_id):
                     raise ValueError(f"标注任务编号已归档，不能复用: {annotation_id}。请使用新的标注任务编号。")
+                manifest_path = annotation_dir / "manifest.json"
+                existing_manifest = read_json(manifest_path) if manifest_path.is_file() else None
                 dispatch_path = _materialize_argilla_dispatch(dispatch, annotation_dir)
-                argilla_params = _argilla_push_params(params, dispatch)
+                argilla_params = _argilla_push_params(params, dispatch, existing_manifest)
                 result = push_sample(task, dispatch_path, dataset, argilla_params)
+                contract = result.get("contract")
+                if not isinstance(contract, dict):
+                    raise RuntimeError("Argilla push 未返回 identity contract")
                 manifest = {
                     "task_id": task.task_id,
                     "annotation_id": annotation_id,
@@ -2053,11 +2072,12 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                     "rows": result.get("records", 0),
                     "record_id_policy": result.get("record_id_policy"),
                     "duplicate_record_ids": result.get("duplicate_record_ids"),
+                    "argilla_contract": contract,
                     "status": "已分发",
                     "created_at": _now(),
                     "result": result,
                 }
-                write_json(manifest, annotation_dir / "manifest.json")
+                write_json(manifest, manifest_path)
             return {
                 "kind": "annotation_job",
                 "annotation_id": annotation_id,
