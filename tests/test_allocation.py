@@ -10,6 +10,7 @@ from llm_labeling_scaffold.allocation import (
     AllocationValidationError,
     AllocationRequest,
     AllocationStrategy,
+    AnnotatorLoadMode,
     AnnotatorSpec,
     AssignmentPhase,
     AssignmentRole,
@@ -279,8 +280,11 @@ def test_shared_queue_keeps_one_source_row_and_splits_min_submitted_groups():
         "record-5",
     }
     assert sum(item.assigned_rows for item in plan.annotator_loads) == 0
-    assert sum(item.reserved_shared_rows for item in plan.annotator_loads) == 12
-    assert all(item.reserved_shared_rows <= item.capacity for item in plan.annotator_loads)
+    assert all(item.mode == AnnotatorLoadMode.SHARED_QUEUE_ADVISORY for item in plan.annotator_loads)
+    assert sum(item.advisory_reserved_shared_rows for item in plan.annotator_loads) == 12
+    assert all(
+        item.advisory_reserved_shared_rows <= item.capacity for item in plan.annotator_loads
+    )
 
 
 def test_calibration_then_partition_emits_expected_responder_gate():
@@ -337,6 +341,7 @@ def test_calibration_then_partition_emits_expected_responder_gate():
     assert len(calibration_datasets) == 1
     assert calibration_datasets[0].min_submitted == 2
     assert calibration_datasets[0].record_ids == ("record-0", "record-1")
+    assert len(calibration_datasets[0].record_ids) == len(set(calibration_datasets[0].record_ids))
     assert len(calibration_datasets[0].assignment_ids) == 4
     assert sum(item.assigned_rows for item in plan.annotator_loads) == len(plan.assignments)
     assert all(item.assigned_rows <= item.capacity for item in plan.annotator_loads)
