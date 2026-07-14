@@ -225,13 +225,14 @@ def test_stack_rejects_reused_panel_and_mcp_audience(tmp_path: Path):
     assert calls == ["PANEL_BIND_HOST=;MCP_BIND_HOST=;MLFLOW_TRACKING_URI=|compose version"]
 
 
+@pytest.mark.parametrize("host", ["0.0.0.0", "::1"])
 @pytest.mark.parametrize("mode", ["cloudflare_access", "static_dev"])
-def test_stack_rejects_non_loopback_mcp_host_publish(tmp_path: Path, mode: str):
+def test_stack_rejects_unsupported_mcp_host_publish(tmp_path: Path, mode: str, host: str):
     values = {
         "LLS_PANEL_AUTH_MODE": "basic_dev",
         "LLS_PANEL_PASSWORD": "secret",
         "PANEL_BIND_HOST": "127.0.0.1",
-        "MCP_BIND_HOST": "0.0.0.0",
+        "MCP_BIND_HOST": host,
         "LLS_MCP_AUTH_MODE": mode,
         "LLS_MCP_INTERNAL_TOKEN": "internal-token-0123456789-abcdef-012",
         "LLS_TASK_SOURCE": "local",

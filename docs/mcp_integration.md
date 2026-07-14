@@ -20,7 +20,7 @@ R2 仍是数据湖：保存已登记的输入对象和回写产物。`LLS_TASK_S
 `LLS_MCP_AUTH_MODE` 只允许两个值：
 
 - `cloudflare_access`：Streamable HTTP 的生产默认值。必须设置独立 MCP issuer/AUD 和 Panel 内部 service token。
-- `static_dev`：仅用于本地开发。必须显式设置静态 bearer，并将宿主发布地址限制为 `127.0.0.1`、`localhost` 或 `::1`。
+- `static_dev`：仅用于本地开发。必须显式设置静态 bearer；stack/Compose 的宿主发布地址只允许 `127.0.0.1`，输入 `localhost` 时会归一化为该地址。
 
 - `streamable-http`：面向部署后的 SaaS/服务端 client，地址为 `http(s)://<host>:8766/mcp`。
 - `stdio`：面向同一台受控机器上的本地 agent，不开放网络端口。
