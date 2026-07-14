@@ -5,8 +5,10 @@ import json
 import math
 import re
 import unicodedata
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
+from fractions import Fraction
+from itertools import combinations
 from typing import Any, Mapping, Sequence
 
 
@@ -266,6 +268,16 @@ class _ResolvedRequest:
     input_fingerprint: str
 
 
+@dataclass(frozen=True, slots=True)
+class _DatasetSpec:
+    dataset_group_id: str
+    workspace_group_id: str
+    phase: AssignmentPhase
+    min_submitted: int
+    assignee_id: str | None
+    pool_id: str | None
+
+
 def canonical_data(value: Any) -> Any:
     if isinstance(value, Enum):
         return value.value
@@ -303,6 +315,549 @@ def canonical_hash(value: Any) -> str:
 def validate_allocation_request(request: AllocationRequest) -> ValidationReport:
     _, issues = _resolve_request(request)
     return ValidationReport(issues=issues)
+
+
+def plan_allocation(request: AllocationRequest) -> AllocationPlan:
+    resolved, issues = _resolve_request(request)
+    if resolved is None:
+        raise AllocationValidationError(ValidationReport(issues=issues))
+
+    normalized = resolved.request
+    records_by_id = {item.record_id: item for item in normalized.records}
+    annotators_by_id = {item.annotator_id: item for item in normalized.annotators}
+    calibration_loads = {item.annotator_id: 0 for item in normalized.annotators}
+    assignments: list[Assignment] = []
+    workspace_groups: list[WorkspaceGroup] = []
+    dataset_specs: dict[str, _DatasetSpec] = {}
+    gates: list[AllocationGate] = []
+
+    gate_id: str | None = None
+    if normalized.strategy == AllocationStrategy.CALIBRATION_THEN_PARTITION:
+        gate_id = _stable_id("gate", resolved.input_fingerprint, "calibration")
+        calibration_workspace_id = _stable_id(
+            "workspace", resolved.input_fingerprint, AssignmentPhase.CALIBRATION.value
+        )
+        calibration_dataset_id = _stable_id(
+            "dataset", resolved.input_fingerprint, AssignmentPhase.CALIBRATION.value
+        )
+        workspace_groups.append(
+            WorkspaceGroup(
+                workspace_group_id=calibration_workspace_id,
+                phase=AssignmentPhase.CALIBRATION,
+                mode=WorkspaceMode.CALIBRATION,
+                cohort_id=resolved.cohort_id,
+                assignee_id=None,
+                member_annotator_ids=resolved.expected_calibration_annotator_ids,
+            )
+        )
+        dataset_specs[calibration_dataset_id] = _DatasetSpec(
+            dataset_group_id=calibration_dataset_id,
+            workspace_group_id=calibration_workspace_id,
+            phase=AssignmentPhase.CALIBRATION,
+            min_submitted=len(resolved.expected_calibration_annotator_ids),
+            assignee_id=None,
+            pool_id=resolved.cohort_id,
+        )
+        for record_id in resolved.calibration_record_ids:
+            record = records_by_id[record_id]
+            for annotator_id in resolved.expected_calibration_annotator_ids:
+                assignments.append(
+                    _assignment(
+                        resolved,
+                        record,
+                        phase=AssignmentPhase.CALIBRATION,
+                        role=AssignmentRole.CALIBRATION,
+                        workspace_group_id=calibration_workspace_id,
+                        dataset_group_id=calibration_dataset_id,
+                        assignee_id=annotator_id,
+                        pool_id=None,
+                        required_submissions=1,
+                        gate_id=None,
+                    )
+                )
+                calibration_loads[annotator_id] += 1
+        expectations = tuple(
+            CalibrationExpectation(
+                record_id=record_id,
+                expected_annotator_ids=resolved.expected_calibration_annotator_ids,
+            )
+            for record_id in resolved.calibration_record_ids
+        )
+        gates.append(
+            AllocationGate(
+                gate_id=gate_id,
+                gate_kind="calibration_expected_responder_set_v1",
+                blocks_phase=AssignmentPhase.PRODUCTION,
+                task_revision_hash=normalized.task_revision.revision_hash,
+                source_manifest_hash=normalized.source_manifest.manifest_hash,
+                cohort_id=resolved.cohort_id,
+                expectations=expectations,
+                plan_fingerprint="",
+            )
+        )
+
+    production_targets, final_loads = _allocate_production_targets(resolved, calibration_loads)
+    if normalized.strategy == AllocationStrategy.SHARED_QUEUE:
+        shared_workspace_id = _stable_id("workspace", "shared", resolved.cohort_id)
+        workspace_groups.append(
+            WorkspaceGroup(
+                workspace_group_id=shared_workspace_id,
+                phase=AssignmentPhase.PRODUCTION,
+                mode=WorkspaceMode.SHARED,
+                cohort_id=resolved.cohort_id,
+                assignee_id=None,
+                member_annotator_ids=tuple(annotators_by_id),
+            )
+        )
+        overlap_ids = set(resolved.overlap_record_ids)
+        for record_id in resolved.production_record_ids:
+            record = records_by_id[record_id]
+            required_submissions = (
+                normalized.overlap.assignees_per_record if record_id in overlap_ids else 1
+            )
+            dataset_group_id = _stable_id(
+                "dataset",
+                resolved.input_fingerprint,
+                AssignmentPhase.PRODUCTION.value,
+                "shared",
+                str(required_submissions),
+            )
+            dataset_specs.setdefault(
+                dataset_group_id,
+                _DatasetSpec(
+                    dataset_group_id=dataset_group_id,
+                    workspace_group_id=shared_workspace_id,
+                    phase=AssignmentPhase.PRODUCTION,
+                    min_submitted=required_submissions,
+                    assignee_id=None,
+                    pool_id=resolved.cohort_id,
+                ),
+            )
+            assignments.append(
+                _assignment(
+                    resolved,
+                    record,
+                    phase=AssignmentPhase.PRODUCTION,
+                    role=(
+                        AssignmentRole.OVERLAP
+                        if required_submissions > 1
+                        else AssignmentRole.SHARED
+                    ),
+                    workspace_group_id=shared_workspace_id,
+                    dataset_group_id=dataset_group_id,
+                    assignee_id=None,
+                    pool_id=resolved.cohort_id,
+                    required_submissions=required_submissions,
+                    gate_id=None,
+                )
+            )
+    else:
+        personal_workspaces: dict[str, str] = {}
+        for annotator in normalized.annotators:
+            workspace_group_id = _stable_id(
+                "workspace", "personal", resolved.cohort_id, annotator.annotator_id
+            )
+            personal_workspaces[annotator.annotator_id] = workspace_group_id
+            workspace_groups.append(
+                WorkspaceGroup(
+                    workspace_group_id=workspace_group_id,
+                    phase=AssignmentPhase.PRODUCTION,
+                    mode=WorkspaceMode.PERSONAL,
+                    cohort_id=resolved.cohort_id,
+                    assignee_id=annotator.annotator_id,
+                    member_annotator_ids=(annotator.annotator_id,),
+                )
+            )
+        overlap_ids = set(resolved.overlap_record_ids)
+        for record_id in resolved.production_record_ids:
+            record = records_by_id[record_id]
+            target_ids = production_targets[record_id]
+            primary_id = min(
+                target_ids,
+                key=lambda annotator_id: (
+                    _seed_rank(
+                        normalized.seed,
+                        normalized.algorithm_version,
+                        "primary",
+                        record_id,
+                        annotator_id,
+                    ),
+                    annotator_id,
+                ),
+            )
+            for annotator_id in target_ids:
+                workspace_group_id = personal_workspaces[annotator_id]
+                dataset_group_id = _stable_id(
+                    "dataset",
+                    resolved.input_fingerprint,
+                    AssignmentPhase.PRODUCTION.value,
+                    annotator_id,
+                )
+                dataset_specs.setdefault(
+                    dataset_group_id,
+                    _DatasetSpec(
+                        dataset_group_id=dataset_group_id,
+                        workspace_group_id=workspace_group_id,
+                        phase=AssignmentPhase.PRODUCTION,
+                        min_submitted=1,
+                        assignee_id=annotator_id,
+                        pool_id=None,
+                    ),
+                )
+                role = AssignmentRole.PRIMARY
+                if record_id in overlap_ids and annotator_id != primary_id:
+                    role = AssignmentRole.OVERLAP
+                assignments.append(
+                    _assignment(
+                        resolved,
+                        record,
+                        phase=AssignmentPhase.PRODUCTION,
+                        role=role,
+                        workspace_group_id=workspace_group_id,
+                        dataset_group_id=dataset_group_id,
+                        assignee_id=annotator_id,
+                        pool_id=None,
+                        required_submissions=1,
+                        gate_id=gate_id,
+                    )
+                )
+
+    assignments_tuple = tuple(sorted(assignments, key=_assignment_sort_key))
+    dataset_groups = _dataset_groups(assignments_tuple, dataset_specs)
+    annotator_loads = _annotator_loads(
+        resolved,
+        assignments_tuple,
+        calibration_loads,
+        final_loads,
+    )
+    overlap_matrix = _overlap_matrix(resolved, assignments_tuple)
+    plan = AllocationPlan(
+        schema_version="allocation_plan_v1",
+        strategy=normalized.strategy,
+        task_revision=normalized.task_revision,
+        source_manifest=normalized.source_manifest,
+        seed=normalized.seed,
+        algorithm_version=normalized.algorithm_version,
+        input_fingerprint=resolved.input_fingerprint,
+        fingerprint="",
+        assignments=assignments_tuple,
+        workspace_groups=tuple(sorted(workspace_groups, key=lambda item: item.workspace_group_id)),
+        dataset_groups=dataset_groups,
+        annotator_loads=annotator_loads,
+        overlap_matrix=overlap_matrix,
+        gates=tuple(gates),
+        unsatisfied_constraints=(),
+    )
+    fingerprint = canonical_hash(plan.fingerprint_payload())
+    bound_gates = tuple(replace(item, plan_fingerprint=fingerprint) for item in plan.gates)
+    return replace(plan, fingerprint=fingerprint, gates=bound_gates)
+
+
+def _allocate_production_targets(
+    resolved: _ResolvedRequest,
+    initial_loads: Mapping[str, int],
+) -> tuple[dict[str, tuple[str, ...]], dict[str, int]]:
+    request = resolved.request
+    capacities = {item.annotator_id: item.capacity for item in request.annotators}
+    loads = {
+        item.annotator_id: int(initial_loads.get(item.annotator_id, 0))
+        for item in request.annotators
+    }
+    targets: dict[str, tuple[str, ...]] = {}
+    overlap_ids = set(resolved.overlap_record_ids)
+    ordered_overlap = sorted(
+        overlap_ids,
+        key=lambda record_id: (
+            _seed_rank(
+                request.seed,
+                request.algorithm_version,
+                "overlap-record-order",
+                record_id,
+            ),
+            record_id,
+        ),
+    )
+    if ordered_overlap:
+        quotas = _overlap_quotas(
+            resolved,
+            loads=loads,
+            capacities=capacities,
+            overlap_count=len(ordered_overlap),
+            overlap_width=request.overlap.assignees_per_record,
+        )
+        remaining_quotas = dict(quotas)
+        for record_id in ordered_overlap:
+            candidates = sorted(
+                (annotator_id for annotator_id, quota in remaining_quotas.items() if quota > 0),
+                key=lambda annotator_id: (
+                    -remaining_quotas[annotator_id],
+                    _seed_rank(
+                        request.seed,
+                        request.algorithm_version,
+                        "overlap-edge",
+                        record_id,
+                        annotator_id,
+                    ),
+                    annotator_id,
+                ),
+            )
+            selected = candidates[: request.overlap.assignees_per_record]
+            if len(selected) != request.overlap.assignees_per_record:
+                raise RuntimeError("validated overlap degree sequence could not be realized")
+            targets[record_id] = tuple(sorted(selected))
+            for annotator_id in selected:
+                remaining_quotas[annotator_id] -= 1
+                loads[annotator_id] += 1
+        if any(remaining_quotas.values()):
+            raise RuntimeError("validated overlap degree sequence left unused quota")
+
+    regular_ids = sorted(
+        (record_id for record_id in resolved.production_record_ids if record_id not in overlap_ids),
+        key=lambda record_id: (
+            _seed_rank(
+                request.seed,
+                request.algorithm_version,
+                "regular-record-order",
+                record_id,
+            ),
+            record_id,
+        ),
+    )
+    for record_id in regular_ids:
+        candidates = [
+            annotator_id
+            for annotator_id, capacity in capacities.items()
+            if loads[annotator_id] < capacity
+        ]
+        if not candidates:
+            raise RuntimeError("validated production capacity was exhausted")
+        annotator_id = min(
+            candidates,
+            key=lambda candidate: (
+                Fraction(loads[candidate], capacities[candidate]),
+                loads[candidate],
+                _seed_rank(
+                    request.seed,
+                    request.algorithm_version,
+                    "regular-assignee",
+                    record_id,
+                    candidate,
+                ),
+                candidate,
+            ),
+        )
+        targets[record_id] = (annotator_id,)
+        loads[annotator_id] += 1
+
+    return targets, loads
+
+
+def _overlap_quotas(
+    resolved: _ResolvedRequest,
+    loads: Mapping[str, int],
+    capacities: Mapping[str, int],
+    overlap_count: int,
+    overlap_width: int,
+) -> dict[str, int]:
+    request = resolved.request
+    quotas = {annotator_id: 0 for annotator_id in capacities}
+    for slot in range(overlap_count * overlap_width):
+        candidates = [
+            annotator_id
+            for annotator_id, capacity in capacities.items()
+            if quotas[annotator_id] < min(capacity - loads[annotator_id], overlap_count)
+        ]
+        if not candidates:
+            raise RuntimeError("validated overlap capacity was exhausted while building quotas")
+        annotator_id = min(
+            candidates,
+            key=lambda candidate: (
+                Fraction(loads[candidate] + quotas[candidate], capacities[candidate]),
+                loads[candidate] + quotas[candidate],
+                _seed_rank(
+                    request.seed,
+                    request.algorithm_version,
+                    "overlap-quota",
+                    str(slot),
+                    candidate,
+                ),
+                candidate,
+            ),
+        )
+        quotas[annotator_id] += 1
+    return quotas
+
+
+def _assignment(
+    resolved: _ResolvedRequest,
+    record: RecordSpec,
+    *,
+    phase: AssignmentPhase,
+    role: AssignmentRole,
+    workspace_group_id: str,
+    dataset_group_id: str,
+    assignee_id: str | None,
+    pool_id: str | None,
+    required_submissions: int,
+    gate_id: str | None,
+) -> Assignment:
+    assignment_id = _stable_id(
+        "assignment",
+        resolved.input_fingerprint,
+        phase.value,
+        record.record_id,
+        record.content_hash,
+        role.value,
+        assignee_id or "",
+        pool_id or "",
+        str(required_submissions),
+    )
+    return Assignment(
+        assignment_id=assignment_id,
+        record_id=record.record_id,
+        record_content_hash=record.content_hash,
+        phase=phase,
+        batch_id=record.batch_id,
+        role=role,
+        workspace_group_id=workspace_group_id,
+        dataset_group_id=dataset_group_id,
+        assignee_id=assignee_id,
+        pool_id=pool_id,
+        required_submissions=required_submissions,
+        gate_id=gate_id,
+    )
+
+
+def _dataset_groups(
+    assignments: Sequence[Assignment],
+    specs: Mapping[str, _DatasetSpec],
+) -> tuple[DatasetGroup, ...]:
+    by_dataset: dict[str, list[Assignment]] = {dataset_id: [] for dataset_id in specs}
+    for assignment in assignments:
+        by_dataset[assignment.dataset_group_id].append(assignment)
+    groups: list[DatasetGroup] = []
+    for dataset_id, spec in specs.items():
+        dataset_assignments = by_dataset[dataset_id]
+        groups.append(
+            DatasetGroup(
+                dataset_group_id=dataset_id,
+                workspace_group_id=spec.workspace_group_id,
+                phase=spec.phase,
+                min_submitted=spec.min_submitted,
+                assignee_id=spec.assignee_id,
+                pool_id=spec.pool_id,
+                assignment_ids=tuple(sorted(item.assignment_id for item in dataset_assignments)),
+                record_ids=tuple(sorted({item.record_id for item in dataset_assignments})),
+                batch_ids=tuple(sorted({item.batch_id for item in dataset_assignments})),
+            )
+        )
+    return tuple(sorted(groups, key=lambda item: item.dataset_group_id))
+
+
+def _annotator_loads(
+    resolved: _ResolvedRequest,
+    assignments: Sequence[Assignment],
+    calibration_loads: Mapping[str, int],
+    final_loads: Mapping[str, int],
+) -> tuple[AnnotatorLoad, ...]:
+    calibration_rows = {item.annotator_id: 0 for item in resolved.request.annotators}
+    production_rows = {item.annotator_id: 0 for item in resolved.request.annotators}
+    for assignment in assignments:
+        if assignment.assignee_id is None:
+            continue
+        if assignment.phase == AssignmentPhase.CALIBRATION:
+            calibration_rows[assignment.assignee_id] += 1
+        else:
+            production_rows[assignment.assignee_id] += 1
+
+    shared = resolved.request.strategy == AllocationStrategy.SHARED_QUEUE
+    loads: list[AnnotatorLoad] = []
+    for annotator in resolved.request.annotators:
+        assigned_rows = calibration_rows[annotator.annotator_id] + production_rows[annotator.annotator_id]
+        reserved_shared_rows = 0
+        if shared:
+            reserved_shared_rows = final_loads[annotator.annotator_id] - calibration_loads[annotator.annotator_id]
+        planned_rows = assigned_rows + reserved_shared_rows
+        loads.append(
+            AnnotatorLoad(
+                annotator_id=annotator.annotator_id,
+                cohort_id=annotator.cohort_id,
+                capacity=annotator.capacity,
+                calibration_rows=calibration_rows[annotator.annotator_id],
+                production_rows=production_rows[annotator.annotator_id],
+                assigned_rows=assigned_rows,
+                reserved_shared_rows=reserved_shared_rows,
+                eligible_shared_rows=(len(resolved.production_record_ids) if shared else 0),
+                remaining_capacity=annotator.capacity - planned_rows,
+            )
+        )
+    return tuple(loads)
+
+
+def _overlap_matrix(
+    resolved: _ResolvedRequest,
+    assignments: Sequence[Assignment],
+) -> OverlapMatrix:
+    if resolved.request.strategy == AllocationStrategy.SHARED_QUEUE:
+        requirements = tuple(
+            PoolOverlapRequirement(
+                phase=assignment.phase,
+                pool_id=assignment.pool_id or resolved.cohort_id,
+                record_id=assignment.record_id,
+                required_submissions=assignment.required_submissions,
+            )
+            for assignment in assignments
+            if assignment.required_submissions > 1
+        )
+        return OverlapMatrix(
+            mode=OverlapMatrixMode.POOL,
+            cells=(),
+            pool_requirements=tuple(
+                sorted(requirements, key=lambda item: (item.phase.value, item.record_id, item.pool_id))
+            ),
+        )
+
+    assignees_by_record: dict[tuple[AssignmentPhase, str], set[str]] = {}
+    for assignment in assignments:
+        if assignment.assignee_id is None:
+            continue
+        assignees_by_record.setdefault((assignment.phase, assignment.record_id), set()).add(
+            assignment.assignee_id
+        )
+    records_by_pair: dict[tuple[AssignmentPhase, str, str], list[str]] = {}
+    for (phase, record_id), assignee_ids in assignees_by_record.items():
+        for annotator_a, annotator_b in combinations(sorted(assignee_ids), 2):
+            records_by_pair.setdefault((phase, annotator_a, annotator_b), []).append(record_id)
+    cells = tuple(
+        OverlapCell(
+            phase=phase,
+            annotator_a=annotator_a,
+            annotator_b=annotator_b,
+            record_ids=tuple(sorted(record_ids)),
+            count=len(record_ids),
+        )
+        for (phase, annotator_a, annotator_b), record_ids in sorted(
+            records_by_pair.items(),
+            key=lambda item: (item[0][0].value, item[0][1], item[0][2]),
+        )
+    )
+    return OverlapMatrix(mode=OverlapMatrixMode.ASSIGNEE, cells=cells, pool_requirements=())
+
+
+def _assignment_sort_key(assignment: Assignment) -> tuple[str, ...]:
+    return (
+        assignment.phase.value,
+        assignment.dataset_group_id,
+        assignment.batch_id,
+        assignment.record_id,
+        assignment.assignee_id or "",
+        assignment.pool_id or "",
+        assignment.role.value,
+    )
+
+
+def _stable_id(prefix: str, *parts: str) -> str:
+    return f"{prefix}_{canonical_hash(parts)[:24]}"
 
 
 def _resolve_request(
