@@ -57,15 +57,24 @@ class PanelAuthenticator:
         *,
         mode: str,
         cloudflare_verifier: CloudflareAccessVerifier | None = None,
+        mcp_cloudflare_verifier: CloudflareAccessVerifier | None = None,
         basic_user: str = "",
         basic_password: str = "",
         internal_token: str = "",
     ) -> None:
         self.mode = resolve_panel_auth_mode(mode)
         self._cloudflare_verifier = cloudflare_verifier
+        self._mcp_cloudflare_verifier = mcp_cloudflare_verifier
         self._basic_user = basic_user
         self._basic_password = basic_password
         self._internal_token = internal_token if _valid_service_token(internal_token) else ""
+        if (
+            self._cloudflare_verifier is not None
+            and self._mcp_cloudflare_verifier is not None
+            and self._cloudflare_verifier.expected_audience
+            == self._mcp_cloudflare_verifier.expected_audience
+        ):
+            raise ValueError("Panel 与 MCP Cloudflare Access verifier 必须使用不同的 audience")
         if self.mode == "cloudflare_access" and self._cloudflare_verifier is None:
             raise ValueError("cloudflare_access 模式缺少 verifier")
         if self.mode == "basic_dev" and (not self._basic_user or not self._basic_password):
@@ -86,8 +95,15 @@ class PanelAuthenticator:
                     ),
                 )
                 assertion = str(headers.get("Cf-Access-Jwt-Assertion") or "").strip()
-                if assertion and self.mode == "cloudflare_access":
-                    return ActorContext(actor=self._cloudflare_principal(assertion), caller=caller)
+                if assertion:
+                    return ActorContext(
+                        actor=self._verified_cloudflare_principal(
+                            assertion,
+                            self._mcp_cloudflare_verifier,
+                            unavailable_message="MCP Cloudflare Access 验证器未配置",
+                        ),
+                        caller=caller,
+                    )
                 return ActorContext.direct(caller)
 
         if self.mode == "basic_dev":
@@ -139,14 +155,25 @@ class PanelAuthenticator:
                 "Cloudflare Access assertion 缺失",
                 HTTPStatus.UNAUTHORIZED,
             )
-        return ActorContext.direct(self._cloudflare_principal(assertion))
+        return ActorContext.direct(
+            self._verified_cloudflare_principal(
+                assertion,
+                self._cloudflare_verifier,
+                unavailable_message="Cloudflare Access 验证器未配置",
+            ),
+        )
 
-    def _cloudflare_principal(self, assertion: str) -> Principal:
-        verifier = self._cloudflare_verifier
+    def _verified_cloudflare_principal(
+        self,
+        assertion: str,
+        verifier: CloudflareAccessVerifier | None,
+        *,
+        unavailable_message: str,
+    ) -> Principal:
         if verifier is None:
             raise PanelAuthenticationError(
                 "authentication_not_configured",
-                "Cloudflare Access 验证器未配置",
+                unavailable_message,
                 HTTPStatus.SERVICE_UNAVAILABLE,
             )
         try:
@@ -190,6 +217,22 @@ def build_panel_authenticator(
 ) -> PanelAuthenticator:
     resolved_mode = resolve_panel_auth_mode(mode)
     internal_token = str(os.environ.get("LLS_MCP_INTERNAL_TOKEN") or "").strip()
+    panel_audience = str(os.environ.get("LLS_CF_ACCESS_AUD") or "").strip() or None
+    mcp_issuer = str(os.environ.get("LLS_MCP_CF_ACCESS_ISSUER") or "").strip() or None
+    mcp_audience = str(os.environ.get("LLS_MCP_CF_ACCESS_AUD") or "").strip() or None
+    if bool(mcp_issuer) != bool(mcp_audience):
+        raise ValueError("必须同时设置 LLS_MCP_CF_ACCESS_ISSUER 和 LLS_MCP_CF_ACCESS_AUD")
+    if panel_audience and mcp_audience == panel_audience:
+        raise ValueError("LLS_MCP_CF_ACCESS_AUD 必须与 LLS_CF_ACCESS_AUD 使用不同的 Access application AUD")
+    mcp_verifier = None
+    if mcp_issuer and mcp_audience:
+        mcp_verifier = CloudflareAccessVerifier(
+            mcp_issuer,
+            mcp_audience,
+            jwks_ttl_seconds=_bounded_float_env("LLS_MCP_CF_ACCESS_JWKS_TTL_SECONDS", 300, 30, 3600),
+            http_timeout_seconds=_bounded_float_env("LLS_MCP_CF_ACCESS_HTTP_TIMEOUT_SECONDS", 5, 0.5, 15),
+            clock_skew_seconds=_bounded_float_env("LLS_MCP_CF_ACCESS_CLOCK_SKEW_SECONDS", 0, 0, 60),
+        )
     if resolved_mode == "basic_dev":
         password = str(basic_password or os.environ.get("LLS_PANEL_PASSWORD") or "")
         if not password:
@@ -199,10 +242,11 @@ def build_panel_authenticator(
             basic_user=basic_user,
             basic_password=password,
             internal_token=internal_token,
+            mcp_cloudflare_verifier=mcp_verifier,
         )
 
     issuer = str(os.environ.get("LLS_CF_ACCESS_ISSUER") or "").strip()
-    expected_audience = str(os.environ.get("LLS_CF_ACCESS_AUD") or "").strip()
+    expected_audience = panel_audience or ""
     if not issuer or not expected_audience:
         raise ValueError("cloudflare_access 模式必须设置 LLS_CF_ACCESS_ISSUER 和 LLS_CF_ACCESS_AUD")
     verifier = CloudflareAccessVerifier(
@@ -215,5 +259,6 @@ def build_panel_authenticator(
     return PanelAuthenticator(
         mode=resolved_mode,
         cloudflare_verifier=verifier,
+        mcp_cloudflare_verifier=mcp_verifier,
         internal_token=internal_token,
     )

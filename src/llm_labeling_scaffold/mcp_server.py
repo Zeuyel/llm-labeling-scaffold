@@ -183,6 +183,23 @@ def _path_segment(value: str, label: str) -> str:
     return quote(_safe_segment(value, label), safe="")
 
 
+def _optional_workspace(value: str) -> str:
+    text = str(value or "").strip()
+    return _safe_segment(text, "workspace") if text else ""
+
+
+def _with_workspace(payload: dict[str, Any], workspace: str) -> dict[str, Any]:
+    value = _optional_workspace(workspace)
+    return {**payload, "workspace": value} if value else payload
+
+
+def _strong_etag(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("W/") or len(text) < 2 or text[0] != '"' or text[-1] != '"' or "," in text:
+        raise ValueError("expected_draft_etag 必须是 GET draft 返回的完整强 ETag")
+    return text
+
+
 def _require_confirmed_idempotency(confirm: bool, idempotency_key: str, action: str) -> str:
     key = str(idempotency_key or "").strip()
     if not confirm:
@@ -234,82 +251,133 @@ def create_mcp_server(config: McpServerConfig, *, panel_client: Any | None = Non
         return {"health": health, "version": version, "settings": settings}
 
     @server.tool(description="列出当前可见任务及其发布状态。草稿任务不可执行。", annotations=READ_ONLY)
-    async def scaffold_task_list() -> dict[str, Any]:
-        return await client.get("/api/tasks")
+    async def scaffold_task_list(workspace: str = "") -> dict[str, Any]:
+        return await client.get("/api/tasks", _with_workspace({}, workspace) or None)
 
     @server.tool(description="读取已发布任务的字段、标签、流程预设和数据湖摘要。", annotations=READ_ONLY)
-    async def scaffold_task_detail(task_id: str) -> dict[str, Any]:
-        return await client.get(f"/api/tasks/{_path_segment(task_id, '任务编号')}")
+    async def scaffold_task_detail(task_id: str, workspace: str = "") -> dict[str, Any]:
+        return await client.get(
+            f"/api/tasks/{_path_segment(task_id, '任务编号')}",
+            _with_workspace({}, workspace) or None,
+        )
 
-    @server.tool(description="读取 Scaffold 控制面中的任务草稿、草稿指纹、revision 与发布记录。仅 control 模式可用。", annotations=READ_ONLY)
-    async def scaffold_task_draft_detail(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/task/control", {"task_id": _safe_segment(task_id, "任务编号")})
+    @server.tool(description="读取 Scaffold 控制面中的任务草稿、强 ETag、revision 与发布记录。仅 control 模式可用。", annotations=READ_ONLY)
+    async def scaffold_task_draft_detail(task_id: str, workspace: str = "") -> dict[str, Any]:
+        return await client.get(
+            "/api/task/control",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     @server.tool(description="检查任务配置、流程预设和数据湖来源是否可用。该工具不写入数据。", annotations=READ_EXTERNAL)
-    async def scaffold_task_check(task_id: str) -> dict[str, Any]:
-        return await client.post(f"/api/tasks/{_path_segment(task_id, '任务编号')}/check", {})
+    async def scaffold_task_check(task_id: str, workspace: str = "") -> dict[str, Any]:
+        return await client.post(
+            f"/api/tasks/{_path_segment(task_id, '任务编号')}/check",
+            _with_workspace({}, workspace),
+        )
 
     @server.tool(description="列出任务的本地导入资产和审计摘要。", annotations=READ_ONLY)
-    async def scaffold_import_list(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/task/imports", {"task_id": _safe_segment(task_id, "任务编号")})
+    async def scaffold_import_list(task_id: str, workspace: str = "") -> dict[str, Any]:
+        return await client.get(
+            "/api/task/imports",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     @server.tool(description="读取一个导入资产的 manifest、字段、依赖和可用性摘要。", annotations=READ_ONLY)
-    async def scaffold_import_detail(task_id: str, import_id: str) -> dict[str, Any]:
+    async def scaffold_import_detail(task_id: str, import_id: str, workspace: str = "") -> dict[str, Any]:
         return await client.get(
             "/api/import/detail",
-            {"task_id": _safe_segment(task_id, "任务编号"), "import_id": _safe_segment(import_id, "导入编号")},
+            _with_workspace(
+                {
+                    "task_id": _safe_segment(task_id, "任务编号"),
+                    "import_id": _safe_segment(import_id, "导入编号"),
+                },
+                workspace,
+            ),
         )
 
     @server.tool(description="预览任务在数据湖登记表中的来源对象与校验信息，不下载或写入数据。", annotations=READ_EXTERNAL)
-    async def scaffold_data_lake_preview(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/task/data_lake", {"task_id": _safe_segment(task_id, "任务编号")})
+    async def scaffold_data_lake_preview(task_id: str, workspace: str = "") -> dict[str, Any]:
+        return await client.get(
+            "/api/task/data_lake",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     @server.tool(description="对数据湖导入进行 dry-run，返回将要读取的受登记数据对象与导入编号。", annotations=READ_EXTERNAL)
-    async def scaffold_data_lake_import_dry_run(task_id: str, import_id: str = "") -> dict[str, Any]:
+    async def scaffold_data_lake_import_dry_run(
+        task_id: str,
+        import_id: str = "",
+        workspace: str = "",
+    ) -> dict[str, Any]:
         return await client.post(
             "/api/import/data_lake",
-            {"task_id": _safe_segment(task_id, "任务编号"), "import_id": import_id.strip(), "dry_run": True},
+            _with_workspace(
+                {
+                    "task_id": _safe_segment(task_id, "任务编号"),
+                    "import_id": import_id.strip(),
+                    "dry_run": True,
+                },
+                workspace,
+            ),
         )
 
     @server.tool(description="读取任务异步 job 的状态和结果摘要。", annotations=READ_ONLY)
-    async def scaffold_job_status(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/jobs", {"task_id": _safe_segment(task_id, "任务编号")})
+    async def scaffold_job_status(task_id: str, workspace: str = "") -> dict[str, Any]:
+        return await client.get(
+            "/api/jobs",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     if config.enable_writes:
         @server.tool(description="创建任务草稿。此操作不会发布任务，也不会执行数据导入。", annotations=WRITE_CREATE)
-        async def scaffold_task_draft_create(spec: dict[str, Any]) -> dict[str, Any]:
+        async def scaffold_task_draft_create(spec: dict[str, Any], workspace: str = "") -> dict[str, Any]:
             if not isinstance(spec, dict):
                 raise ValueError("spec 必须是任务单对象")
             task_id = _safe_segment(str(spec.get("task_id") or ""), "任务编号")
-            return await client.post("/api/tasks", {**spec, "task_id": task_id})
+            return await client.post(
+                "/api/tasks",
+                _with_workspace({**spec, "task_id": task_id}, workspace),
+            )
 
-        @server.tool(description="更新既有任务草稿。必须提交读取草稿时获得的 draft_fingerprint；冲突时拒绝覆盖。", annotations=WRITE_UPDATE)
+        @server.tool(description="更新既有任务草稿。必须提交读取草稿时获得的完整强 ETag；冲突时拒绝覆盖。", annotations=WRITE_UPDATE)
         async def scaffold_task_draft_update(
             task_id: str,
             spec: dict[str, Any],
-            expected_draft_fingerprint: str,
+            expected_draft_etag: str,
+            workspace: str = "",
         ) -> dict[str, Any]:
             safe_task_id = _safe_segment(task_id, "任务编号")
             if not isinstance(spec, dict) or str(spec.get("task_id") or "").strip() != safe_task_id:
                 raise ValueError("spec.task_id 必须与 task_id 一致")
             return await client.put(
                 f"/api/tasks/{_path_segment(safe_task_id, '任务编号')}",
-                {**spec, "task_id": safe_task_id},
-                headers={"If-Match": expected_draft_fingerprint.strip()},
+                _with_workspace({**spec, "task_id": safe_task_id}, workspace),
+                headers={"If-Match": _strong_etag(expected_draft_etag)},
             )
 
-        @server.tool(description="发布任务草稿为新 revision。必须提交草稿指纹、显式确认和稳定 idempotency_key。", annotations=WRITE_IDEMPOTENT)
+        @server.tool(description="发布任务草稿为新 revision。必须提交强 ETag、reason、显式确认和稳定 idempotency_key。", annotations=WRITE_IDEMPOTENT)
         async def scaffold_task_publish(
             task_id: str,
-            expected_draft_fingerprint: str,
+            expected_draft_etag: str,
+            reason: str,
             confirm: bool = False,
             idempotency_key: str = "",
+            workspace: str = "",
         ) -> dict[str, Any]:
             key = _require_confirmed_idempotency(confirm, idempotency_key, "发布任务")
+            normalized_reason = str(reason or "").strip()
+            if not normalized_reason:
+                raise ValueError("发布任务必须提供 reason")
             return await client.post(
                 f"/api/tasks/{_path_segment(task_id, '任务编号')}/publish",
-                {"confirm": True, "idempotency_key": key},
-                headers={"If-Match": expected_draft_fingerprint.strip()},
+                _with_workspace(
+                    {
+                        "confirm": True,
+                        "idempotency_key": key,
+                        "reason": normalized_reason,
+                    },
+                    workspace,
+                ),
+                headers={"If-Match": _strong_etag(expected_draft_etag)},
             )
 
         @server.tool(description="提交数据湖导入异步任务。必须显式确认并使用稳定 idempotency_key。", annotations=WRITE_EXTERNAL_IDEMPOTENT)
@@ -318,16 +386,20 @@ def create_mcp_server(config: McpServerConfig, *, panel_client: Any | None = Non
             idempotency_key: str,
             import_id: str = "",
             confirm: bool = False,
+            workspace: str = "",
         ) -> dict[str, Any]:
             key = _require_confirmed_idempotency(confirm, idempotency_key, "数据湖导入")
             return await client.post(
                 "/api/import/data_lake",
-                {
-                    "task_id": _safe_segment(task_id, "任务编号"),
-                    "import_id": import_id.strip(),
-                    "confirm": True,
-                    "idempotency_key": key,
-                },
+                _with_workspace(
+                    {
+                        "task_id": _safe_segment(task_id, "任务编号"),
+                        "import_id": import_id.strip(),
+                        "confirm": True,
+                        "idempotency_key": key,
+                    },
+                    workspace,
+                ),
             )
 
     return server

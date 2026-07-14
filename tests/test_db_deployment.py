@@ -59,6 +59,8 @@ def test_compose_role_initialization_paths_are_explicit():
     assert "LLS_PANEL_AUTH_MODE=${LLS_PANEL_AUTH_MODE:-cloudflare_access}" in panel_environment
     assert "LLS_CF_ACCESS_ISSUER=${LLS_CF_ACCESS_ISSUER:-}" in panel_environment
     assert "LLS_CF_ACCESS_AUD=${LLS_CF_ACCESS_AUD:-}" in panel_environment
+    assert "LLS_MCP_CF_ACCESS_ISSUER=${LLS_MCP_CF_ACCESS_ISSUER:-}" in panel_environment
+    assert "LLS_MCP_CF_ACCESS_AUD=${LLS_MCP_CF_ACCESS_AUD:-}" in panel_environment
     assert "LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}" in panel_environment
     assert (
         "LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}"

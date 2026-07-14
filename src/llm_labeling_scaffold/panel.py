@@ -4,21 +4,42 @@ import json
 import os
 import threading
 import time
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import parse_qs, unquote, urlparse
+
+import yaml
+from sqlalchemy import text
 
 from . import __version__
 from .auth import ActorContext, PanelAuthenticationError, PanelAuthenticator, build_panel_authenticator
 from .config import load_task
+from .db import (
+    AuditChannel,
+    AuthorizationDenied,
+    AuthorizationReason,
+    AuthorizationUnavailable,
+    DatabaseService,
+    ExternalIdentity,
+    IdempotencyConflict,
+    Permission,
+    TaskDraftConflict,
+    TaskDraftNotFound,
+    TaskPreconditionRequired,
+    TaskPublishInProgress,
+)
+from .db.database import create_database_engine, create_session_factory
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
 
-API_CONTRACT_VERSION = "2026-07-13"
-AUTHORIZATION_STATE = "unavailable"
+API_CONTRACT_VERSION = "2026-07-14"
+AUTHORIZATION_READY = "ready"
+AUTHORIZATION_UNAVAILABLE = "unavailable"
+REQUIRED_DATABASE_REVISION = "20260714_0002"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -50,11 +71,80 @@ def _valid_idempotency_key(value: str) -> bool:
     return bool(value) and len(value) <= 200 and not any(ord(ch) < 32 for ch in value)
 
 
-def _if_match_value(value: str | None) -> str:
+def _strong_if_match(value: str | None, *, allow_wildcard: bool = False) -> str | None:
     text = str(value or "").strip()
-    if text.startswith("W/"):
-        text = text[2:].strip()
-    return text.strip('"')
+    if not text:
+        return None
+    if allow_wildcard and text == "*":
+        return text
+    if text.startswith("W/") or len(text) < 2 or text[0] != '"' or text[-1] != '"' or "," in text:
+        raise ValueError("If-Match 必须是 GET draft 返回的强 ETag")
+    return text
+
+
+@dataclass(frozen=True)
+class ActiveTaskRevision:
+    revision_id: str
+    revision_number: int
+    definition: dict[str, Any]
+    rendered_task: str
+    task_config: Any | None = None
+
+
+class ActiveTaskLoader(Protocol):
+    def load_active_revision(self, workspace_slug: str, task_key: str) -> ActiveTaskRevision | None: ...
+
+
+class ActiveTaskLoaderUnavailable(RuntimeError):
+    pass
+
+
+class _PanelRouteError(RuntimeError):
+    def __init__(
+        self,
+        status: int,
+        code: str,
+        message: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+        self.headers = headers
+
+
+def _external_identity(principal) -> ExternalIdentity:
+    return ExternalIdentity(
+        issuer=principal.identity.issuer,
+        subject=principal.identity.subject,
+        email_snapshot=principal.identity.email,
+        display_name_snapshot=principal.identity.display_name,
+    )
+
+
+def _workspace_access_payload(access) -> dict[str, Any]:
+    return {
+        "slug": access.workspace.slug,
+        "name": access.workspace.name,
+        "roles": [role.value for role in access.roles],
+        "workspace_capabilities": [permission.value for permission in access.workspace_capabilities],
+        "task_capabilities": [permission.value for permission in access.task_capabilities],
+    }
+
+
+def _build_authorization_service(database_url: str | None = None) -> DatabaseService:
+    engine = create_database_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+        if revision != REQUIRED_DATABASE_REVISION:
+            raise AuthorizationUnavailable("database schema revision is not ready")
+        return DatabaseService(create_session_factory(engine), engine)
+    except Exception:
+        engine.dispose()
+        raise
 
 
 def _mcp_writes_enabled() -> bool:
@@ -139,7 +229,10 @@ def _public_settings_response(settings: dict) -> dict:
     }
 
 
-def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
+def _contract_capabilities(
+    auth_mode: str = "unconfigured",
+    authorization_state: str = AUTHORIZATION_UNAVAILABLE,
+) -> dict[str, Any]:
     return {
         "service": "llm-labeling-scaffold",
         "api_contract_version": API_CONTRACT_VERSION,
@@ -148,7 +241,7 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
             "types": ["cloudflare_access", "basic_dev", "mcp_service_bearer"],
             "multi_user": auth_mode == "cloudflare_access",
         },
-        "authorization": {"state": AUTHORIZATION_STATE},
+        "authorization": {"state": authorization_state},
         "endpoints": [
             {
                 "method": "GET",
@@ -190,7 +283,7 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
                         "authorization": {
                             "type": "object",
                             "required": ["state"],
-                            "properties": {"state": {"const": AUTHORIZATION_STATE}},
+                            "properties": {"state": {"enum": [AUTHORIZATION_READY, AUTHORIZATION_UNAVAILABLE]}},
                         },
                     },
                 },
@@ -232,6 +325,7 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
                 "action": "task_detail",
                 "side_effects": False,
                 "path_params": {"task_id": {"type": "string"}},
+                "query_params": {"workspace": {"type": "string", "required": False}},
                 "response_schema": {
                     "type": "object",
                     "required": ["task"],
@@ -243,6 +337,7 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
                 "path": "/api/tasks",
                 "action": "tasks_list",
                 "side_effects": False,
+                "query_params": {"workspace": {"type": "string", "required": False}},
                 "response_schema": {"type": "object", "required": ["tasks"]},
             },
             {
@@ -251,7 +346,10 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
                 "action": "task_control_detail",
                 "side_effects": False,
                 "requires_task_source": "control",
-                "query_params": {"task_id": {"type": "string", "required": True}},
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": False},
+                },
                 "response_schema": {"type": "object", "required": ["task"]},
             },
             {
@@ -260,7 +358,11 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
                 "action": "task_control_create_draft",
                 "side_effects": True,
                 "requires_task_source": "control",
-                "request_schema": {"type": "object", "required": ["task_id", "text_fields", "primary_label_values"]},
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id", "text_fields", "primary_label_values"],
+                    "properties": {"workspace": {"type": "string"}},
+                },
                 "response_schema": {"type": "object", "required": ["ok", "task"]},
             },
             {
@@ -270,7 +372,7 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
                 "side_effects": True,
                 "requires_task_source": "control",
                 "path_params": {"task_id": {"type": "string"}},
-                "required_headers": {"If-Match": {"type": "string", "format": "sha256"}},
+                "required_headers": {"If-Match": {"type": "string", "format": "strong-etag"}},
                 "request_schema": {"type": "object", "required": ["task_id", "text_fields", "primary_label_values"]},
                 "response_schema": {"type": "object", "required": ["ok", "task"]},
             },
@@ -283,14 +385,16 @@ def _contract_capabilities(auth_mode: str = "unconfigured") -> dict[str, Any]:
                 "path_params": {"task_id": {"type": "string"}},
                 "request_schema": {
                     "type": "object",
-                    "required": ["confirm", "idempotency_key"],
+                    "required": ["confirm", "idempotency_key", "reason"],
                     "properties": {
                         "confirm": {"const": True},
                         "idempotency_key": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "workspace": {"type": "string"},
                     },
                     "additionalProperties": False,
                 },
-                "required_headers": {"If-Match": {"type": "string", "format": "sha256"}},
+                "required_headers": {"If-Match": {"type": "string", "format": "strong-etag"}},
                 "response_schema": {"type": "object", "required": ["ok", "task", "published"]},
             },
             {
@@ -515,15 +619,34 @@ def _mcp_route_allowed(method: str, path: str) -> bool:
     return False
 
 
-def _access_route_allowed_without_authorization(method: str, path: str) -> bool:
+def _database_authorized_route(method: str, path: str) -> bool:
+    if method == "GET" and path == "/api/session":
+        return True
+    if not _control_task_source_enabled():
+        return False
+    if method == "GET":
+        if path in {"/api/tasks", "/api/task/control"}:
+            return True
+        return _contract_task_path(path) is not None
+    if method == "POST":
+        return (
+            path in {"/api/tasks", "/api/import/data_lake"}
+            or _contract_task_path(path, suffix="publish") is not None
+        )
+    return method == "PUT" and _contract_task_path(path) is not None
+
+
+def _cloudflare_route_allowed(method: str, path: str) -> bool:
     if not path.startswith("/api/"):
         return method == "GET"
-    return method == "GET" and path in {
+    if method == "GET" and path in {
         "/api/health",
         "/api/version",
         "/api/capabilities",
-        "/api/session",
-    }
+        "/api/settings/public",
+    }:
+        return True
+    return _database_authorized_route(method, path)
 
 
 def _safe_data_lake_summary(data_lake: dict[str, Any]) -> dict[str, Any]:
@@ -563,6 +686,87 @@ def _task_detail_payload(task) -> dict[str, Any]:
             "data_lake": _safe_data_lake_summary(task.data_lake),
         }
     }
+
+
+def _active_task_raw(active: ActiveTaskRevision) -> dict[str, Any]:
+    if not isinstance(active.definition, dict):
+        raise ActiveTaskLoaderUnavailable("active revision definition is invalid")
+    try:
+        return pipeline.build_task_raw_from_spec(active.definition, revision=active.revision_number)
+    except ValueError as exc:
+        raise ActiveTaskLoaderUnavailable("active revision definition is invalid") from exc
+
+
+def _active_task_summary(workspace_slug: str, access, active: ActiveTaskRevision | None) -> dict[str, Any]:
+    summary = {
+        "task_id": access.task.task_key,
+        "workspace": workspace_slug,
+        "source": "scaffold 控制面",
+        "source_type": "control",
+        "deletable": False,
+        "editable": Permission.TASK_EDIT in access.capabilities,
+        "capabilities": [permission.value for permission in access.capabilities],
+        "roles": [role.value for role in access.roles],
+    }
+    if active is None:
+        summary.update({"status": "unpublished", "revision": 0})
+        return summary
+    raw = _active_task_raw(active)
+    summary.update(
+        {
+            "status": "published",
+            "revision": active.revision_number,
+            "revision_id": active.revision_id,
+            "profile": raw["profile"],
+            "id_field": raw["id_field"],
+        },
+    )
+    primary = raw.get("labels", {}).get("primary")
+    if isinstance(primary, dict):
+        summary["primary_label"] = primary
+    return summary
+
+
+def _active_task_detail(workspace_slug: str, task_key: str, active: ActiveTaskRevision) -> dict[str, Any]:
+    raw = _active_task_raw(active)
+    return {
+        "task": {
+            "task_id": task_key,
+            "workspace": workspace_slug,
+            "revision": active.revision_number,
+            "revision_id": active.revision_id,
+            "profile": raw["profile"],
+            "id_field": raw["id_field"],
+            "text_fields": raw.get("input", {}).get("text_fields", []),
+            "metadata_fields": raw.get("input", {}).get("metadata_fields", []),
+            "primary_label": raw.get("labels", {}).get("primary"),
+            "auxiliary_labels": raw.get("labels", {}).get("auxiliary", []),
+            "data_lake": _safe_data_lake_summary(raw.get("data_lake", {})),
+        },
+    }
+
+
+def _draft_response(task_key: str, draft, *, action: str | None = None) -> dict[str, Any]:
+    record = {
+        "task_id": task_key,
+        "draft_spec": draft.definition,
+        "draft_version": draft.version,
+        "draft_fingerprint": draft.fingerprint,
+        "draft_etag": draft.etag,
+    }
+    payload = {
+        "task": {
+            "task_id": task_key,
+            "status": "draft",
+            "source": "scaffold 控制面",
+            "source_type": "control",
+            "editable": True,
+        },
+        "record": record,
+    }
+    if action is not None:
+        payload.update({"ok": True, "action": action})
+    return payload
 
 
 def _count_lines(path: Path) -> int:
@@ -683,6 +887,9 @@ class _Handler(BaseHTTPRequestHandler):
     tasks_root: Path = Path("tasks")
     static_dir: Path | None = None
     authenticator: PanelAuthenticator | None = None
+    authorization_service: DatabaseService | None = None
+    authorization_ready: bool = False
+    active_task_loader: ActiveTaskLoader | None = None
 
     def log_message(self, *args) -> None:
         pass
@@ -717,17 +924,206 @@ class _Handler(BaseHTTPRequestHandler):
         if context.caller.is_static_mcp_service and not _mcp_route_allowed(self.command, path):
             self._json({"error": "MCP 服务身份无权访问该接口"}, status=HTTPStatus.FORBIDDEN)
             return False
+        service_public_route = self.command == "GET" and path in {
+            "/api/health",
+            "/api/version",
+            "/api/settings/public",
+        }
+        if context.actor.kind != "user" and not service_public_route:
+            self._json(
+                {"error": "MCP 请求缺少经过验证的用户 actor", "code": "delegated_actor_required"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return False
         if (
             context.actor.authentication_method == "cloudflare_access"
-            and not _access_route_allowed_without_authorization(self.command, path)
+            and not _cloudflare_route_allowed(self.command, path)
         ):
             self._json(
-                {"error": "授权层尚不可用", "code": "authorization_unavailable"},
+                {"error": "该路由尚未接入数据库授权", "code": "route_authorization_unavailable"},
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
             )
             return False
         self._request_context = context
         return True
+
+    def _authorization_context(
+        self,
+    ) -> tuple[DatabaseService, ExternalIdentity, ExternalIdentity, AuditChannel]:
+        context = getattr(self, "_request_context", None)
+        if not isinstance(context, ActorContext) or context.actor.kind != "user":
+            raise _PanelRouteError(
+                HTTPStatus.FORBIDDEN,
+                "delegated_actor_required",
+                "请求缺少经过验证的用户 actor",
+            )
+        if context.caller != context.actor and not context.caller.is_static_mcp_service:
+            raise _PanelRouteError(
+                HTTPStatus.FORBIDDEN,
+                "invalid_caller",
+                "caller 不能代表该 actor 调用 Panel API",
+            )
+        service = self.authorization_service
+        if not self.authorization_ready or service is None:
+            raise _PanelRouteError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "authorization_unavailable",
+                "数据库授权暂时不可用",
+            )
+        channel = AuditChannel.MCP if context.caller.is_static_mcp_service else AuditChannel.PANEL
+        return service, _external_identity(context.actor), _external_identity(context.caller), channel
+
+    def _workspace_selector(self, params, body: dict[str, Any] | None = None) -> str | None:
+        values: list[str] = []
+        for name in ("workspace", "workspace_slug"):
+            query_value = str(params.get(name, [""])[0] or "").strip()
+            if query_value:
+                values.append(query_value)
+            if body is not None:
+                body_value = str(body.get(name) or "").strip()
+                if body_value:
+                    values.append(body_value)
+        if len(set(values)) > 1:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "workspace_selector_conflict",
+                "workspace 选择参数不一致",
+            )
+        value = values[0] if values else None
+        if value is not None and not _safe_segment(value):
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_workspace",
+                "workspace 必须是单段安全标识符",
+            )
+        return value
+
+    def _resolve_workspace(
+        self,
+        service: DatabaseService,
+        actor_identity: ExternalIdentity,
+        selected: str | None,
+    ) -> str:
+        if selected is not None:
+            return selected
+        session = service.get_session(actor_identity)
+        if len(session.workspaces) == 1:
+            return session.workspaces[0].workspace.slug
+        if not session.workspaces:
+            raise _PanelRouteError(
+                HTTPStatus.NOT_FOUND,
+                "resource_not_found",
+                "workspace 不可见",
+            )
+        raise _PanelRouteError(
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+            "workspace_required",
+            "当前用户有多个 workspace，必须显式选择 workspace",
+        )
+
+    def _load_active_revision(self, workspace_slug: str, task_key: str) -> ActiveTaskRevision | None:
+        loader = self.active_task_loader
+        if loader is None:
+            raise _PanelRouteError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "active_task_loader_unavailable",
+                "active task loader 尚未就绪",
+            )
+        try:
+            return loader.load_active_revision(workspace_slug, task_key)
+        except ActiveTaskLoaderUnavailable as exc:
+            raise _PanelRouteError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "active_task_loader_unavailable",
+                "active task loader 暂时不可用",
+            ) from exc
+        except Exception as exc:
+            raise _PanelRouteError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "active_task_loader_unavailable",
+                "active task loader 返回失败",
+            ) from exc
+
+    def _route_error(self, exc: Exception) -> None:
+        if isinstance(exc, _PanelRouteError):
+            self._json(
+                {"error": exc.message, "code": exc.code},
+                status=exc.status,
+                headers=exc.headers,
+            )
+            return
+        if isinstance(exc, AuthorizationDenied):
+            reason = exc.decision.reason
+            if reason in {
+                AuthorizationReason.UNKNOWN_PRINCIPAL,
+                AuthorizationReason.INACTIVE_PRINCIPAL,
+                AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                AuthorizationReason.INACTIVE_WORKSPACE,
+            }:
+                self._json(
+                    {"error": "资源不存在", "code": "resource_not_found"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            if reason in {AuthorizationReason.ROLE_DENIED, AuthorizationReason.INVALID_AUDIT_CONTEXT}:
+                self._json(
+                    {"error": "权限不足", "code": "permission_denied"},
+                    status=HTTPStatus.FORBIDDEN,
+                )
+                return
+            self._json(
+                {"error": "授权服务暂时不可用", "code": "authorization_unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        if isinstance(exc, AuthorizationUnavailable):
+            self._json(
+                {"error": "数据库授权暂时不可用", "code": "authorization_unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        if isinstance(exc, ActiveTaskLoaderUnavailable):
+            self._json(
+                {"error": "active task loader 返回无效数据", "code": "active_task_loader_unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        if isinstance(exc, TaskPreconditionRequired):
+            self._json(
+                {"error": "请求必须提供 If-Match", "code": exc.code},
+                status=HTTPStatus.PRECONDITION_REQUIRED,
+            )
+            return
+        if isinstance(exc, TaskDraftConflict):
+            headers = {"ETag": exc.current_etag} if exc.current_etag is not None else None
+            self._json(
+                {"error": "任务草稿已变化，请重新读取", "code": exc.code},
+                status=HTTPStatus.CONFLICT,
+                headers=headers,
+            )
+            return
+        if isinstance(exc, TaskDraftNotFound):
+            self._json(
+                {"error": "任务草稿不存在", "code": exc.code},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        if isinstance(exc, (IdempotencyConflict, TaskPublishInProgress)):
+            self._json(
+                {"error": "请求与现有发布操作冲突", "code": exc.code},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, ValueError):
+            self._json(
+                {"error": str(exc), "code": "invalid_definition"},
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+            return
+        self._json(
+            {"error": "Panel control API 暂时不可用", "code": "control_api_unavailable"},
+            status=HTTPStatus.SERVICE_UNAVAILABLE,
+        )
 
     def _json(self, obj, status: int = 200, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -776,6 +1172,343 @@ class _Handler(BaseHTTPRequestHandler):
             if ttl_seconds > 0:
                 _TASK_REGISTRY_SYNC_CACHE[cache_key] = (time.monotonic(), synced)
             return synced
+
+    def _session_payload(self) -> tuple[dict[str, Any], dict[str, str]]:
+        service, actor_identity, _, _ = self._authorization_context()
+        context = self._request_context
+        session = service.get_session(actor_identity)
+        return (
+            {
+                "authenticated": True,
+                "user": context.actor.identity.display_snapshot(),
+                "authentication": {"method": context.actor.authentication_method},
+                "authorization": {
+                    "state": AUTHORIZATION_READY,
+                    "workspaces": [_workspace_access_payload(access) for access in session.workspaces],
+                },
+            },
+            {
+                "Cache-Control": "no-store, private",
+                "Pragma": "no-cache",
+            },
+        )
+
+    def _control_task_list(self, params) -> None:
+        try:
+            service, actor_identity, _, _ = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params),
+            )
+            try:
+                limit = int(params.get("limit", ["100"])[0])
+            except ValueError as exc:
+                raise ValueError("limit 必须是整数") from exc
+            after_task_key = str(params.get("after", [""])[0] or "").strip() or None
+            page = service.list_authorized_tasks(
+                actor_identity,
+                workspace_slug,
+                limit=limit,
+                after_task_key=after_task_key,
+            )
+            if page.workspace is None:
+                raise _PanelRouteError(
+                    HTTPStatus.NOT_FOUND,
+                    "resource_not_found",
+                    "workspace 不可见",
+                )
+            tasks: list[dict[str, Any]] = []
+            for access in page.items:
+                if Permission.TASK_READ not in access.capabilities:
+                    continue
+                active = self._load_active_revision(workspace_slug, access.task.task_key)
+                if active is None and Permission.TASK_EDIT not in access.capabilities:
+                    continue
+                tasks.append(_active_task_summary(workspace_slug, access, active))
+            self._json(
+                {
+                    "workspace": workspace_slug,
+                    "tasks": tasks,
+                    "next_cursor": page.next_cursor,
+                },
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_task_detail(self, task_id: str, params) -> None:
+        try:
+            if not _safe_segment(task_id):
+                raise ValueError("task_id 必须是单段安全标识符")
+            service, actor_identity, _, _ = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params),
+            )
+            service.require_task(actor_identity, workspace_slug, task_id, Permission.TASK_READ)
+            active = self._load_active_revision(workspace_slug, task_id)
+            if active is None:
+                raise _PanelRouteError(
+                    HTTPStatus.NOT_FOUND,
+                    "resource_not_found",
+                    "active published revision 不存在",
+                )
+            self._json(_active_task_detail(workspace_slug, task_id, active))
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_draft_detail(self, params) -> None:
+        try:
+            task_id = str(params.get("task_id", [""])[0] or "").strip()
+            if not _safe_segment(task_id):
+                raise ValueError("task_id 必须是单段安全标识符")
+            service, actor_identity, _, _ = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params),
+            )
+            draft = service.get_task_draft(
+                identity=actor_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_id,
+            )
+            if draft is None:
+                raise _PanelRouteError(
+                    HTTPStatus.NOT_FOUND,
+                    "task_draft_not_found",
+                    "任务草稿不存在",
+                )
+            self._json(
+                _draft_response(task_id, draft),
+                headers={"ETag": draft.etag, "Cache-Control": "no-store, private"},
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _validated_draft_definition(
+        self,
+        body: dict[str, Any],
+        *,
+        task_id: str,
+    ) -> tuple[dict[str, Any], str]:
+        if not isinstance(body, dict):
+            raise ValueError("任务草稿必须是 JSON 对象")
+        forbidden = {"actor", "actor_id", "caller", "caller_id", "channel"}
+        supplied = sorted(forbidden.intersection(body))
+        if supplied:
+            raise ValueError(f"身份与 channel 由服务端推导，不能提交: {', '.join(supplied)}")
+        definition = dict(body)
+        definition.pop("workspace", None)
+        definition.pop("workspace_slug", None)
+        submitted_task_id = str(definition.get("task_id") or "").strip()
+        if submitted_task_id != task_id:
+            raise ValueError("body.task_id 必须与路由 task_id 一致")
+        raw = pipeline.build_task_raw_from_spec(definition)
+        rendered_task = yaml.safe_dump(raw, allow_unicode=True, sort_keys=False)
+        return definition, rendered_task
+
+    def _control_draft_save(
+        self,
+        task_id: str,
+        params,
+        body: dict[str, Any],
+        *,
+        if_match: str,
+        create: bool,
+    ) -> None:
+        try:
+            if not _safe_segment(task_id):
+                raise ValueError("task_id 必须是单段安全标识符")
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params, body),
+            )
+            definition, rendered_task = self._validated_draft_definition(body, task_id=task_id)
+            result = service.save_task_draft(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_id,
+                definition=definition,
+                rendered_task=rendered_task,
+                if_match=if_match,
+                channel=channel,
+            )
+            action = "created" if create else ("updated" if result.changed else "unchanged")
+            self._json(
+                _draft_response(task_id, result.draft, action=action),
+                headers={"ETag": result.draft.etag, "Cache-Control": "no-store, private"},
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_publish(self, task_id: str, params, body: dict[str, Any]) -> None:
+        try:
+            if not _safe_segment(task_id):
+                raise ValueError("task_id 必须是单段安全标识符")
+            if not isinstance(body, dict):
+                raise ValueError("发布请求必须是 JSON 对象")
+            forbidden = {"actor", "actor_id", "caller", "caller_id", "channel"}
+            supplied = sorted(forbidden.intersection(body))
+            if supplied:
+                raise ValueError(f"身份与 channel 由服务端推导，不能提交: {', '.join(supplied)}")
+            if not _truthy_value(body.get("confirm")):
+                raise ValueError("任务发布必须显式设置 confirm=true")
+            reason = str(body.get("reason") or "").strip()
+            if not reason:
+                raise ValueError("任务发布必须提供 reason")
+            idempotency_key = str(
+                body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "",
+            ).strip()
+            if not _valid_idempotency_key(idempotency_key):
+                raise ValueError("任务发布必须提供有效的 idempotency_key 或 Idempotency-Key header")
+            if_match = _strong_if_match(self.headers.get("If-Match"))
+            if if_match is None:
+                raise TaskPreconditionRequired()
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params, body),
+            )
+            result = service.publish_task_draft(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_id,
+                if_match=if_match,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                channel=channel,
+            )
+            self._json(
+                {
+                    "ok": True,
+                    "task": {
+                        "task_id": task_id,
+                        "workspace": workspace_slug,
+                        "status": "publishing",
+                        "revision": result.revision_number,
+                    },
+                    "published": {
+                        "revision": result.revision_number,
+                        "revision_id": str(result.revision_id),
+                        "previous_revision_id": (
+                            str(result.previous_revision_id) if result.previous_revision_id is not None else None
+                        ),
+                        "materialization_id": str(result.materialization_id),
+                        "materialization_state": result.materialization_state.value,
+                    },
+                    "replayed": result.replayed,
+                },
+                status=result.response_status,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_data_lake_import(self, params) -> None:
+        try:
+            body = self._read_body()
+            if not isinstance(body, dict):
+                raise ValueError("数据湖导入请求必须是 JSON 对象")
+            forbidden = {"actor", "actor_id", "caller", "caller_id", "channel"}
+            supplied = sorted(forbidden.intersection(body))
+            if supplied:
+                raise ValueError(f"身份与 channel 由服务端推导，不能提交: {', '.join(supplied)}")
+            task_id = str(body.get("task_id") or params.get("task_id", [""])[0] or "").strip()
+            if not _safe_segment(task_id):
+                raise ValueError("task_id 必须是单段安全标识符")
+            import_id = str(body.get("import_id") or params.get("import_id", [""])[0] or "").strip()
+            dry_run_value = body.get("dry_run", body.get("dryRun", params.get("dry_run", [""])[0]))
+            dry_run = _truthy_value(dry_run_value)
+            if self._is_mcp_request() and not dry_run and not _mcp_writes_enabled():
+                raise _PanelRouteError(
+                    HTTPStatus.FORBIDDEN,
+                    "mcp_writes_disabled",
+                    "当前部署未启用 MCP 写操作",
+                )
+            override_keys = (
+                "lake_registry_uri",
+                "source_dataset_id",
+                "source_manifest_uri",
+                "source_object_path",
+            )
+            provided_overrides = {
+                key: body.get(key)
+                for key in override_keys
+                if body.get(key) not in (None, "")
+            }
+            if provided_overrides and not _allow_data_lake_overrides():
+                raise ValueError("生产模式不允许覆盖数据湖来源；请在 active task 定义中配置")
+            overrides = provided_overrides if _allow_data_lake_overrides() else {}
+            idempotency_key = str(
+                body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "",
+            ).strip()
+            if not dry_run:
+                if not _truthy_value(body.get("confirm")):
+                    raise ValueError("数据湖导入提交必须显式设置 confirm=true")
+                if not _valid_idempotency_key(idempotency_key):
+                    raise ValueError("数据湖导入提交必须提供有效的 idempotency_key 或 Idempotency-Key header")
+
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params, body),
+            )
+            service.require_task(actor_identity, workspace_slug, task_id, Permission.IMPORT_SUBMIT)
+            active = self._load_active_revision(workspace_slug, task_id)
+            if active is None:
+                raise _PanelRouteError(
+                    HTTPStatus.NOT_FOUND,
+                    "resource_not_found",
+                    "active published revision 不存在",
+                )
+            if active.task_config is None:
+                raise _PanelRouteError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "active_task_materialization_unavailable",
+                    "active task 尚未完成物化",
+                )
+
+            max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
+            _apply_runtime_settings(self.runs_root)
+            if dry_run:
+                result = pipeline.dry_run_data_lake_import(
+                    self.runs_root,
+                    active.task_config,
+                    import_id=import_id or None,
+                    overrides=overrides,
+                    max_bytes=max_bytes,
+                )
+                self._json({"ok": bool(result["validation"]["ok"]), "dry_run": True, "result": result})
+                return
+
+            service.append_audit(
+                workspace_slug=workspace_slug,
+                event_type="task.import_requested",
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                channel=channel,
+                required_permission=Permission.IMPORT_SUBMIT,
+                task_key=task_id,
+                details={"import_id": import_id or None},
+            )
+            job = pipeline.start_data_lake_import(
+                self.runs_root,
+                active.task_config,
+                import_id=import_id or None,
+                overrides=overrides,
+                max_bytes=max_bytes,
+                idempotency_key=idempotency_key,
+            )
+            self._json({"ok": True, "job": job})
+        except Exception as exc:
+            self._route_error(exc)
 
     def _list_tasks(self) -> list[dict]:
         if _control_task_source_enabled():
@@ -970,25 +1703,15 @@ class _Handler(BaseHTTPRequestHandler):
                 "api_contract_version": API_CONTRACT_VERSION,
             })
         elif path == "/api/session":
-            context = getattr(self, "_request_context", None)
-            if not isinstance(context, ActorContext) or context.actor.kind != "user":
-                self._json({"error": "session unavailable"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
-                return
-            self._json(
-                {
-                    "authenticated": True,
-                    "user": context.actor.identity.display_snapshot(),
-                    "authentication": {"method": context.caller.authentication_method},
-                    "authorization": {"state": AUTHORIZATION_STATE},
-                },
-                headers={
-                    "Cache-Control": "no-store, private",
-                    "Pragma": "no-cache",
-                },
-            )
+            try:
+                payload, headers = self._session_payload()
+                self._json(payload, headers=headers)
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/capabilities":
             auth_mode = self.authenticator.mode if self.authenticator is not None else "unconfigured"
-            self._json(_contract_capabilities(auth_mode))
+            authorization_state = AUTHORIZATION_READY if self.authorization_ready else AUTHORIZATION_UNAVAILABLE
+            self._json(_contract_capabilities(auth_mode, authorization_state))
         elif path == "/api/settings/public":
             try:
                 settings = _apply_runtime_settings(self.runs_root)
@@ -996,7 +1719,10 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif contract_task_id is not None:
-            self._task_detail(contract_task_id)
+            if _control_task_source_enabled():
+                self._control_task_detail(contract_task_id, params)
+            else:
+                self._task_detail(contract_task_id)
         elif path.startswith("/api/tasks/"):
             self._json({"error": "not found"}, status=404)
         elif path == "/api/runs":
@@ -1021,24 +1747,18 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json({"gold": list_gold(self.runs_root, task)})
         elif path == "/api/tasks":
-            try:
-                self._json({"tasks": self._list_tasks()})
-            except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+            if _control_task_source_enabled():
+                self._control_task_list(params)
+            else:
+                try:
+                    self._json({"tasks": self._list_tasks()})
+                except Exception as exc:
+                    self._json({"error": str(exc)}, status=400)
         elif path == "/api/task/control":
             if not _control_task_source_enabled():
                 self._json({"error": "当前不是 scaffold 控制面任务来源模式"}, status=400)
                 return
-            task = params.get("task_id", [""])[0]
-            if not _safe_segment(task):
-                self._json({"error": "bad task"}, status=400)
-                return
-            try:
-                from .task_control import get_task_record
-
-                self._json({"task": get_task_record(self.runs_root, task)})
-            except Exception as exc:
-                self._json({"error": str(exc)}, status=404)
+            self._control_draft_detail(params)
         elif path == "/api/task/profile":
             task = params.get("task_id", [""])[0]
             preset = params.get("preset", [""])[0].strip() or None
@@ -1289,34 +2009,7 @@ class _Handler(BaseHTTPRequestHandler):
             if not _control_task_source_enabled():
                 self._json({"error": "只有 scaffold 控制面任务来源模式支持发布任务 revision"}, status=400)
                 return
-            try:
-                from .task_control import TaskConflictError, publish_task
-
-                body = self._read_body()
-                idempotency_key = str(body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "").strip()
-                expected_fingerprint = _if_match_value(self.headers.get("If-Match"))
-                if not _truthy_value(body.get("confirm")):
-                    self._json({"error": "任务发布必须显式设置 confirm=true"}, status=400)
-                    return
-                if not _valid_idempotency_key(idempotency_key):
-                    self._json({"error": "任务发布必须提供有效的 idempotency_key 或 Idempotency-Key header"}, status=400)
-                    return
-                if not expected_fingerprint:
-                    self._json({"error": "任务发布必须通过 If-Match 提交当前草稿指纹"}, status=HTTPStatus.PRECONDITION_REQUIRED)
-                    return
-                result = publish_task(
-                    self.runs_root,
-                    self.tasks_root,
-                    publish_task_id,
-                    expected_draft_fingerprint=expected_fingerprint,
-                    actor=self._actor(),
-                    idempotency_key=idempotency_key,
-                )
-                self._json({"ok": True, **result})
-            except TaskConflictError as exc:
-                self._json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
-            except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+            self._control_publish(publish_task_id, params, self._read_body())
         elif path == "/api/tasks/sync":
             self._sync_tasks_from_registry()
         elif path.startswith("/api/tasks/"):
@@ -1355,13 +2048,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._import_suggestions(params)
         elif path == "/api/tasks":
             body = self._read_body()
+            if _control_task_source_enabled():
+                task_id = str(body.get("task_id") or "").strip() if isinstance(body, dict) else ""
+                self._control_draft_save(task_id, params, body, if_match="*", create=True)
+                return
             try:
-                if _control_task_source_enabled():
-                    from .task_control import create_draft
-
-                    result = create_draft(self.runs_root, self.tasks_root, body, actor=self._actor())
-                    self._json({"ok": True, **result})
-                    return
                 if _r2_task_source_enabled():
                     self._json({"error": "生产模式任务必须从 R2 数据湖登记表拉取，不能在面板中新建本地任务"}, status=400)
                     return
@@ -1375,7 +2066,10 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/import":
             self._import(params)
         elif path == "/api/import/data_lake":
-            self._import_data_lake(params)
+            if _control_task_source_enabled():
+                self._control_data_lake_import(params)
+            else:
+                self._import_data_lake(params)
         elif path == "/api/task/archive":
             body = self._read_body()
             task_id = str(body.get("task_id") or params.get("task_id", [""])[0])
@@ -1426,6 +2120,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         parsed = urlparse(self.path)
         path = parsed.path
+        params = parse_qs(parsed.query)
         task_id = _contract_task_path(path)
         if task_id is None:
             self._json({"error": "not found"}, status=404)
@@ -1433,26 +2128,19 @@ class _Handler(BaseHTTPRequestHandler):
         if not _control_task_source_enabled():
             self._json({"error": "只有 scaffold 控制面任务来源模式支持编辑任务草稿"}, status=400)
             return
-        body = self._read_body()
-        expected_fingerprint = _if_match_value(self.headers.get("If-Match"))
-        if not expected_fingerprint:
-            self._json({"error": "保存草稿必须通过 If-Match 提交当前草稿指纹"}, status=HTTPStatus.PRECONDITION_REQUIRED)
-            return
         try:
-            from .task_control import TaskConflictError, update_draft
-
-            result = update_draft(
-                self.runs_root,
+            if_match = _strong_if_match(self.headers.get("If-Match"))
+            if if_match is None:
+                raise TaskPreconditionRequired()
+            self._control_draft_save(
                 task_id,
-                body,
-                expected_draft_fingerprint=expected_fingerprint,
-                actor=self._actor(),
+                params,
+                self._read_body(),
+                if_match=if_match,
+                create=False,
             )
-            self._json({"ok": True, **result})
-        except TaskConflictError as exc:
-            self._json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
         except Exception as exc:
-            self._json({"error": str(exc)}, status=400)
+            self._route_error(exc)
 
     def do_DELETE(self) -> None:
         if not self._require_auth():
@@ -1705,6 +2393,7 @@ def serve_panel(
     static_dir: str | Path | None = None,
     tasks_root: str | Path = "tasks",
     auth_mode: str | None = None,
+    active_task_loader: ActiveTaskLoader | None = None,
 ) -> None:
     authenticator = build_panel_authenticator(
         mode=auth_mode,
@@ -1714,6 +2403,13 @@ def serve_panel(
     _Handler.runs_root = Path(runs_root)
     _Handler.tasks_root = Path(tasks_root)
     _Handler.authenticator = authenticator
+    try:
+        authorization_service = _build_authorization_service()
+    except Exception:
+        authorization_service = None
+    _Handler.authorization_service = authorization_service
+    _Handler.authorization_ready = authorization_service is not None
+    _Handler.active_task_loader = active_task_loader
     if static_dir is None:
         guess = Path("frontend/dist")
         static_dir = guess if guess.is_dir() else None
@@ -1724,9 +2420,13 @@ def serve_panel(
         print(f"[lls panel] serving frontend from {_Handler.static_dir}")
     else:
         print("[lls panel] no frontend build found; run 'npm run build' in frontend/ or use the Vite dev server")
+    if authorization_service is None:
+        print("[lls panel] database authorization unavailable; protected routes fail closed")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         httpd.server_close()
+        if authorization_service is not None:
+            authorization_service.close()

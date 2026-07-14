@@ -85,7 +85,7 @@ def _panel_api_server():
 
 MCP_TOKEN = "mcp-secret-0123456789-abcdef-012345"
 INTERNAL_TOKEN = "mcp-internal-0123456789-abcdef-012"
-DRAFT_FINGERPRINT = "a" * 64
+DRAFT_ETAG = '"task-draft-v3-' + "a" * 64 + '"'
 
 
 def _config(*, bearer_token: str | None = MCP_TOKEN, enable_writes: bool = False) -> McpServerConfig:
@@ -133,19 +133,140 @@ def test_mcp_server_is_read_only_by_default_and_declares_annotations():
     assert "delete_task" not in tools
 
 
-def test_mcp_write_tools_proxy_fingerprint_confirmation_and_idempotency():
+def test_all_task_scoped_mcp_tools_forward_workspace():
+    panel = FakePanelClient()
+    server = create_mcp_server(_config(), panel_client=panel)
+
+    asyncio.run(server.call_tool("scaffold_task_detail", {"task_id": "task-a", "workspace": "workspace-a"}))
+    assert panel.calls[-1] == (
+        "GET",
+        "/api/tasks/task-a",
+        {"workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(
+        server.call_tool(
+            "scaffold_task_draft_detail",
+            {"task_id": "task-a", "workspace": "workspace-a"},
+        ),
+    )
+    assert panel.calls[-1] == (
+        "GET",
+        "/api/task/control",
+        {"task_id": "task-a", "workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(server.call_tool("scaffold_task_check", {"task_id": "task-a", "workspace": "workspace-a"}))
+    assert panel.calls[-1] == (
+        "POST",
+        "/api/tasks/task-a/check",
+        {"workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(server.call_tool("scaffold_import_list", {"task_id": "task-a", "workspace": "workspace-a"}))
+    assert panel.calls[-1] == (
+        "GET",
+        "/api/task/imports",
+        {"task_id": "task-a", "workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(
+        server.call_tool(
+            "scaffold_import_detail",
+            {"task_id": "task-a", "import_id": "import-a", "workspace": "workspace-a"},
+        ),
+    )
+    assert panel.calls[-1] == (
+        "GET",
+        "/api/import/detail",
+        {"task_id": "task-a", "import_id": "import-a", "workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(
+        server.call_tool(
+            "scaffold_data_lake_preview",
+            {"task_id": "task-a", "workspace": "workspace-a"},
+        ),
+    )
+    assert panel.calls[-1] == (
+        "GET",
+        "/api/task/data_lake",
+        {"task_id": "task-a", "workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(
+        server.call_tool(
+            "scaffold_data_lake_import_dry_run",
+            {"task_id": "task-a", "workspace": "workspace-a"},
+        ),
+    )
+    assert panel.calls[-1] == (
+        "POST",
+        "/api/import/data_lake",
+        {"task_id": "task-a", "import_id": "", "dry_run": True, "workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(server.call_tool("scaffold_job_status", {"task_id": "task-a", "workspace": "workspace-a"}))
+    assert panel.calls[-1] == (
+        "GET",
+        "/api/jobs",
+        {"task_id": "task-a", "workspace": "workspace-a"},
+        None,
+    )
+
+
+def test_mcp_write_tools_proxy_etag_confirmation_and_idempotency():
     panel = FakePanelClient()
     server = create_mcp_server(_config(enable_writes=True), panel_client=panel)
 
+    asyncio.run(server.call_tool("scaffold_task_list", {"workspace": "workspace-a"}))
+    assert panel.calls[-1] == ("GET", "/api/tasks", {"workspace": "workspace-a"}, None)
     asyncio.run(server.call_tool("scaffold_task_list", {}))
     assert panel.calls[-1] == ("GET", "/api/tasks", None, None)
+
+    spec = {
+        "task_id": "task-a",
+        "text_fields": ["title"],
+        "primary_label_values": ["yes", "no"],
+    }
+    asyncio.run(
+        server.call_tool(
+            "scaffold_task_draft_create",
+            {"spec": spec, "workspace": "workspace-a"},
+        ),
+    )
+    assert panel.calls[-1] == (
+        "POST",
+        "/api/tasks",
+        {**spec, "workspace": "workspace-a"},
+        None,
+    )
+    asyncio.run(
+        server.call_tool(
+            "scaffold_task_draft_update",
+            {
+                "task_id": "task-a",
+                "spec": spec,
+                "expected_draft_etag": DRAFT_ETAG,
+                "workspace": "workspace-a",
+            },
+        ),
+    )
+    assert panel.calls[-1] == (
+        "PUT",
+        "/api/tasks/task-a",
+        {**spec, "workspace": "workspace-a"},
+        {"If-Match": DRAFT_ETAG},
+    )
 
     asyncio.run(
         server.call_tool(
             "scaffold_task_publish",
             {
                 "task_id": "任务 a",
-                "expected_draft_fingerprint": DRAFT_FINGERPRINT,
+                "expected_draft_etag": DRAFT_ETAG,
+                "workspace": "workspace-a",
+                "reason": "MCP controlled release",
                 "confirm": True,
                 "idempotency_key": "publish-001",
             },
@@ -154,9 +275,33 @@ def test_mcp_write_tools_proxy_fingerprint_confirmation_and_idempotency():
     assert panel.calls[-1] == (
         "POST",
         "/api/tasks/%E4%BB%BB%E5%8A%A1%20a/publish",
-        {"confirm": True, "idempotency_key": "publish-001"},
-        {"If-Match": DRAFT_FINGERPRINT},
+        {
+            "confirm": True,
+            "idempotency_key": "publish-001",
+            "reason": "MCP controlled release",
+            "workspace": "workspace-a",
+        },
+        {"If-Match": DRAFT_ETAG},
     )
+
+    tools = {tool.name: tool for tool in asyncio.run(server.list_tools())}
+    publish_properties = tools["scaffold_task_publish"].inputSchema["properties"]
+    assert "expected_draft_etag" in publish_properties
+    assert "expected_draft_fingerprint" not in publish_properties
+
+    with pytest.raises(ToolError, match="expected_draft_etag"):
+        asyncio.run(
+            server.call_tool(
+                "scaffold_task_publish",
+                {
+                    "task_id": "task-a",
+                    "expected_draft_etag": "a" * 64,
+                    "reason": "invalid etag",
+                    "confirm": True,
+                    "idempotency_key": "publish-invalid-etag",
+                },
+            ),
+        )
 
     with pytest.raises(ToolError, match="confirm=true"):
         asyncio.run(
@@ -165,6 +310,30 @@ def test_mcp_write_tools_proxy_fingerprint_confirmation_and_idempotency():
                 {"task_id": "task_a", "idempotency_key": "import-001"},
             )
         )
+
+    asyncio.run(
+        server.call_tool(
+            "scaffold_data_lake_import_submit",
+            {
+                "task_id": "task-a",
+                "workspace": "workspace-a",
+                "confirm": True,
+                "idempotency_key": "import-001",
+            },
+        ),
+    )
+    assert panel.calls[-1] == (
+        "POST",
+        "/api/import/data_lake",
+        {
+            "task_id": "task-a",
+            "import_id": "",
+            "confirm": True,
+            "idempotency_key": "import-001",
+            "workspace": "workspace-a",
+        },
+        None,
+    )
 
 
 def test_mcp_tools_do_not_serialize_concurrent_panel_requests():
