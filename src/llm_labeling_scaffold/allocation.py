@@ -49,6 +49,11 @@ class OverlapMatrixMode(str, Enum):
     POOL = "pool"
 
 
+class AnnotatorLoadMode(str, Enum):
+    DIRECT_ASSIGNMENT = "direct_assignment"
+    SHARED_QUEUE_ADVISORY = "shared_queue_advisory"
+
+
 @dataclass(frozen=True, slots=True)
 class TaskRevisionRef:
     task_id: str
@@ -175,13 +180,19 @@ class DatasetGroup:
 
 @dataclass(frozen=True, slots=True)
 class AnnotatorLoad:
+    """Separates enforceable assignments from shared-queue capacity advice.
+
+    Advisory shared rows are not per-user assignments and cannot be enforced by Argilla.
+    """
+
     annotator_id: str
     cohort_id: str
+    mode: AnnotatorLoadMode
     capacity: int
     calibration_rows: int
     production_rows: int
     assigned_rows: int
-    reserved_shared_rows: int
+    advisory_reserved_shared_rows: int
     eligible_shared_rows: int
     remaining_capacity: int
 
@@ -774,19 +785,26 @@ def _annotator_loads(
     loads: list[AnnotatorLoad] = []
     for annotator in resolved.request.annotators:
         assigned_rows = calibration_rows[annotator.annotator_id] + production_rows[annotator.annotator_id]
-        reserved_shared_rows = 0
+        advisory_reserved_shared_rows = 0
         if shared:
-            reserved_shared_rows = final_loads[annotator.annotator_id] - calibration_loads[annotator.annotator_id]
-        planned_rows = assigned_rows + reserved_shared_rows
+            advisory_reserved_shared_rows = (
+                final_loads[annotator.annotator_id] - calibration_loads[annotator.annotator_id]
+            )
+        planned_rows = assigned_rows + advisory_reserved_shared_rows
         loads.append(
             AnnotatorLoad(
                 annotator_id=annotator.annotator_id,
                 cohort_id=annotator.cohort_id,
+                mode=(
+                    AnnotatorLoadMode.SHARED_QUEUE_ADVISORY
+                    if shared
+                    else AnnotatorLoadMode.DIRECT_ASSIGNMENT
+                ),
                 capacity=annotator.capacity,
                 calibration_rows=calibration_rows[annotator.annotator_id],
                 production_rows=production_rows[annotator.annotator_id],
                 assigned_rows=assigned_rows,
-                reserved_shared_rows=reserved_shared_rows,
+                advisory_reserved_shared_rows=advisory_reserved_shared_rows,
                 eligible_shared_rows=(len(resolved.production_record_ids) if shared else 0),
                 remaining_capacity=annotator.capacity - planned_rows,
             )

@@ -12,6 +12,7 @@ from llm_labeling_scaffold.allocation import (
     AllocationRequest,
     AllocationStrategy,
     AllocationValidationError,
+    AnnotatorLoadMode,
     AnnotatorSpec,
     AssignmentPhase,
     CalibrationRule,
@@ -112,6 +113,9 @@ def test_randomized_fixed_partition_properties():
         assert plan == reordered
         assert plan.fingerprint == canonical_hash(plan.fingerprint_payload())
         assert len({item.assignment_id for item in plan.assignments}) == len(plan.assignments)
+        assert len({(item.record_id, item.assignee_id) for item in plan.assignments}) == len(
+            plan.assignments
+        )
 
         by_record = defaultdict(list)
         for assignment in plan.assignments:
@@ -126,10 +130,68 @@ def test_randomized_fixed_partition_properties():
         )
 
         assignment_counts = Counter(item.assignee_id for item in plan.assignments)
+        assert sum(item.assigned_rows for item in plan.annotator_loads) == len(plan.assignments)
         for load in plan.annotator_loads:
+            assert load.mode == AnnotatorLoadMode.DIRECT_ASSIGNMENT
             assert load.assigned_rows == assignment_counts[load.annotator_id]
             assert load.assigned_rows <= load.capacity
             assert load.remaining_capacity == load.capacity - load.assigned_rows
+
+
+@pytest.mark.parametrize("record_count", [0, 1, 7, 19])
+@pytest.mark.parametrize("capacities", [(8, 8, 8, 8), (4, 7, 9, 15)])
+@pytest.mark.parametrize("overlap_width", [2, 3])
+@pytest.mark.parametrize("seed", [0, 17, 999])
+def test_fixed_partition_explicit_property_grid(
+    record_count,
+    capacities,
+    overlap_width,
+    seed,
+):
+    overlap_count = min(record_count, record_count // 3)
+    records = _records(record_count, f"grid-{record_count}-{capacities}-{overlap_width}-{seed}")
+    annotators = tuple(
+        AnnotatorSpec(f"annotator-{index}", "cohort-property", capacity)
+        for index, capacity in enumerate(capacities)
+    )
+    request = _request(
+        strategy=AllocationStrategy.FIXED_PARTITION,
+        records=records,
+        annotators=annotators,
+        seed=seed,
+        overlap=OverlapRule(count=overlap_count, assignees_per_record=overlap_width),
+    )
+
+    first = plan_allocation(request)
+    repeated = plan_allocation(request)
+    reversed_input = plan_allocation(
+        replace(
+            request,
+            records=tuple(reversed(records)),
+            annotators=tuple(reversed(annotators)),
+        )
+    )
+
+    assert first.fingerprint == repeated.fingerprint == reversed_input.fingerprint
+    assert first == repeated == reversed_input
+    assert first.fingerprint == canonical_hash(first.fingerprint_payload())
+    assert len({(item.record_id, item.assignee_id) for item in first.assignments}) == len(
+        first.assignments
+    )
+
+    by_record = defaultdict(list)
+    for assignment in first.assignments:
+        by_record[assignment.record_id].append(assignment)
+    assert len(by_record) == record_count
+    assert sum(len(items) == overlap_width for items in by_record.values()) == overlap_count
+    assert all(
+        len({item.assignee_id for item in items}) == len(items) for items in by_record.values()
+    )
+
+    expected_rows = record_count + overlap_count * (overlap_width - 1)
+    assert len(first.assignments) == expected_rows
+    assert sum(item.assigned_rows for item in first.annotator_loads) == expected_rows
+    assert all(item.assigned_rows <= item.capacity for item in first.annotator_loads)
 
 
 @pytest.mark.parametrize(
@@ -161,7 +223,9 @@ def test_shared_queue_rate_boundaries(record_count, rate, expected_overlap_count
     assert len(plan.assignments) == record_count
     assert len({item.record_id for item in plan.assignments}) == record_count
     assert all(item.assignee_id is None for item in plan.assignments)
-    assert sum(item.reserved_shared_rows for item in plan.annotator_loads) == required_rows
+    assert all(item.mode == AnnotatorLoadMode.SHARED_QUEUE_ADVISORY for item in plan.annotator_loads)
+    assert all(item.assigned_rows == 0 for item in plan.annotator_loads)
+    assert sum(item.advisory_reserved_shared_rows for item in plan.annotator_loads) == required_rows
     assert len(plan.overlap_matrix.pool_requirements) == expected_overlap_count
     expected_min_submitted = set()
     if record_count > expected_overlap_count:
@@ -222,6 +286,12 @@ def test_randomized_calibration_properties():
         assert all(item.gate_id == gate.gate_id for item in production_assignments)
         assert len(production_assignments) == production_count + overlap_count * (overlap_width - 1)
         assert sum(item.assigned_rows for item in plan.annotator_loads) == len(plan.assignments)
+        calibration_dataset = next(
+            item for item in plan.dataset_groups if item.phase == AssignmentPhase.CALIBRATION
+        )
+        assert len(calibration_dataset.record_ids) == calibration_count
+        assert len(calibration_dataset.record_ids) == len(set(calibration_dataset.record_ids))
+        assert len(calibration_dataset.assignment_ids) == calibration_count * expected_count
 
 
 def test_plan_manifest_is_frozen_and_json_serializable():
