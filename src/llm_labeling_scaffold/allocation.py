@@ -5,6 +5,7 @@ import json
 import math
 import re
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
 from fractions import Fraction
@@ -13,6 +14,7 @@ from typing import Any, Mapping, Sequence
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SUPPORTED_ALGORITHM_VERSIONS = ("allocation-v1",)
 
 
 class AllocationStrategy(str, Enum):
@@ -87,7 +89,7 @@ class OverlapRule:
     record_ids: tuple[str, ...] = ()
     count: int | None = None
     rate: float | None = None
-    assignees_per_record: int = 2
+    required_submissions: int = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,7 +110,7 @@ class AllocationRequest:
     annotators: tuple[AnnotatorSpec, ...]
     seed: int
     algorithm_version: str
-    overlap: OverlapRule = OverlapRule()
+    overlap_rules: tuple[OverlapRule, ...] = ()
     calibration: CalibrationRule | None = None
 
 
@@ -122,17 +124,18 @@ class ValidationIssue:
 
 @dataclass(frozen=True, slots=True)
 class ValidationReport:
-    issues: tuple[ValidationIssue, ...] = ()
+    blocking_errors: tuple[ValidationIssue, ...] = ()
+    warnings: tuple[ValidationIssue, ...] = ()
 
     @property
     def ok(self) -> bool:
-        return not self.issues
+        return not self.blocking_errors
 
 
 class AllocationValidationError(ValueError):
     def __init__(self, report: ValidationReport):
         self.report = report
-        first = report.issues[0] if report.issues else None
+        first = report.blocking_errors[0] if report.blocking_errors else None
         message = "allocation request is invalid"
         if first is not None:
             message = f"{message}: {first.code} at {first.field}"
@@ -240,6 +243,97 @@ class AllocationGate:
 
 
 @dataclass(frozen=True, slots=True)
+class AnnotatorLoadPreview:
+    annotator_id: str
+    mode: AnnotatorLoadMode
+    capacity: int
+    assigned_rows: int
+    calibration_rows: int
+    production_rows: int
+    advisory_reserved_shared_rows: int
+    remaining_capacity: int
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationSetPreview:
+    record_ids: tuple[str, ...]
+    expected_annotator_ids: tuple[str, ...]
+    expected_assignment_rows: int
+    gate_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class OverlapCellPreview:
+    phase: AssignmentPhase
+    annotator_a: str
+    annotator_b: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class PoolOverlapPreview:
+    phase: AssignmentPhase
+    pool_id: str
+    required_submissions: int
+    record_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class OverlapPreview:
+    mode: OverlapMatrixMode
+    cells: tuple[OverlapCellPreview, ...]
+    pool_requirements: tuple[PoolOverlapPreview, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceRequirementPreview:
+    workspace_group_id: str
+    phase: AssignmentPhase
+    mode: WorkspaceMode
+    cohort_id: str
+    assignee_id: str | None
+    member_annotator_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetRequirementPreview:
+    dataset_group_id: str
+    workspace_group_id: str
+    phase: AssignmentPhase
+    min_submitted: int
+    assignee_id: str | None
+    pool_id: str | None
+    record_count: int
+    batch_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationPreview:
+    schema_version: str
+    strategy: AllocationStrategy | None
+    task_revision: TaskRevisionRef | None
+    source_manifest: SourceManifestRef | None
+    cohort_id: str | None
+    algorithm_version: str | None
+    input_fingerprint: str | None
+    plan_fingerprint: str | None
+    annotator_loads: tuple[AnnotatorLoadPreview, ...]
+    calibration_set: CalibrationSetPreview | None
+    overlap: OverlapPreview
+    workspace_requirements: tuple[WorkspaceRequirementPreview, ...]
+    dataset_requirements: tuple[DatasetRequirementPreview, ...]
+    blocking_errors: tuple[ValidationIssue, ...]
+    warnings: tuple[ValidationIssue, ...]
+
+    @property
+    def ready(self) -> bool:
+        return not self.blocking_errors
+
+    def to_dict(self) -> dict[str, Any]:
+        return canonical_data(self)
+
+
+@dataclass(frozen=True, slots=True)
 class AllocationPlan:
     schema_version: str
     strategy: AllocationStrategy
@@ -255,7 +349,8 @@ class AllocationPlan:
     annotator_loads: tuple[AnnotatorLoad, ...]
     overlap_matrix: OverlapMatrix
     gates: tuple[AllocationGate, ...]
-    unsatisfied_constraints: tuple[ValidationIssue, ...]
+    blocking_errors: tuple[ValidationIssue, ...]
+    warnings: tuple[ValidationIssue, ...]
 
     def fingerprint_payload(self) -> dict[str, Any]:
         payload = canonical_data(self)
@@ -267,6 +362,9 @@ class AllocationPlan:
     def to_dict(self) -> dict[str, Any]:
         return canonical_data(self)
 
+    def to_preview(self) -> AllocationPreview:
+        return _preview_from_plan(self)
+
 
 @dataclass(frozen=True, slots=True)
 class _ResolvedRequest:
@@ -274,7 +372,7 @@ class _ResolvedRequest:
     cohort_id: str
     calibration_record_ids: tuple[str, ...]
     production_record_ids: tuple[str, ...]
-    overlap_record_ids: tuple[str, ...]
+    overlap_requirements: tuple[tuple[str, int], ...]
     expected_calibration_annotator_ids: tuple[str, ...]
     input_fingerprint: str
 
@@ -287,6 +385,22 @@ class _DatasetSpec:
     min_submitted: int
     assignee_id: str | None
     pool_id: str | None
+
+
+@dataclass(slots=True)
+class _FlowEdge:
+    to: int
+    reverse_index: int
+    capacity: int
+    initial_capacity: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ProductionWitness:
+    targets: tuple[tuple[str, tuple[str, ...]], ...]
+    loads: tuple[tuple[str, int], ...]
+    assigned_rows: int
+    required_rows: int
 
 
 def canonical_data(value: Any) -> Any:
@@ -324,14 +438,62 @@ def canonical_hash(value: Any) -> str:
 
 
 def validate_allocation_request(request: AllocationRequest) -> ValidationReport:
-    _, issues = _resolve_request(request)
-    return ValidationReport(issues=issues)
+    resolved, blocking_errors = _resolve_request(request)
+    warnings = _resolved_warnings(resolved) if resolved is not None else ()
+    return ValidationReport(blocking_errors=blocking_errors, warnings=warnings)
+
+
+def preview_allocation(request: AllocationRequest) -> AllocationPreview:
+    resolved, blocking_errors = _resolve_request(request)
+    if resolved is None:
+        strategy = request.strategy if isinstance(request, AllocationRequest) and isinstance(
+            request.strategy, AllocationStrategy
+        ) else None
+        mode = (
+            OverlapMatrixMode.POOL
+            if strategy == AllocationStrategy.SHARED_QUEUE
+            else OverlapMatrixMode.ASSIGNEE
+        )
+        return AllocationPreview(
+            schema_version="allocation_preview_v1",
+            strategy=strategy,
+            task_revision=(
+                request.task_revision
+                if isinstance(request, AllocationRequest)
+                and isinstance(request.task_revision, TaskRevisionRef)
+                else None
+            ),
+            source_manifest=(
+                request.source_manifest
+                if isinstance(request, AllocationRequest)
+                and isinstance(request.source_manifest, SourceManifestRef)
+                else None
+            ),
+            cohort_id=_preview_cohort_id(request),
+            algorithm_version=(
+                _clean(request.algorithm_version)
+                if isinstance(request, AllocationRequest) and _clean(request.algorithm_version)
+                else None
+            ),
+            input_fingerprint=None,
+            plan_fingerprint=None,
+            annotator_loads=_blocked_preview_loads(request, strategy),
+            calibration_set=None,
+            overlap=OverlapPreview(mode=mode, cells=(), pool_requirements=()),
+            workspace_requirements=(),
+            dataset_requirements=(),
+            blocking_errors=blocking_errors,
+            warnings=(),
+        )
+    return plan_allocation(resolved.request).to_preview()
 
 
 def plan_allocation(request: AllocationRequest) -> AllocationPlan:
-    resolved, issues = _resolve_request(request)
+    resolved, blocking_errors = _resolve_request(request)
     if resolved is None:
-        raise AllocationValidationError(ValidationReport(issues=issues))
+        raise AllocationValidationError(
+            ValidationReport(blocking_errors=blocking_errors, warnings=())
+        )
 
     normalized = resolved.request
     records_by_id = {item.record_id: item for item in normalized.records}
@@ -420,12 +582,10 @@ def plan_allocation(request: AllocationRequest) -> AllocationPlan:
                 member_annotator_ids=tuple(annotators_by_id),
             )
         )
-        overlap_ids = set(resolved.overlap_record_ids)
+        overlap_requirements = dict(resolved.overlap_requirements)
         for record_id in resolved.production_record_ids:
             record = records_by_id[record_id]
-            required_submissions = (
-                normalized.overlap.assignees_per_record if record_id in overlap_ids else 1
-            )
+            required_submissions = overlap_requirements.get(record_id, 1)
             dataset_group_id = _stable_id(
                 "dataset",
                 resolved.input_fingerprint,
@@ -465,9 +625,7 @@ def plan_allocation(request: AllocationRequest) -> AllocationPlan:
     else:
         personal_workspaces: dict[str, str] = {}
         for annotator in normalized.annotators:
-            workspace_group_id = _stable_id(
-                "workspace", "personal", resolved.cohort_id, annotator.annotator_id
-            )
+            workspace_group_id = _stable_id("workspace", "personal", annotator.annotator_id)
             personal_workspaces[annotator.annotator_id] = workspace_group_id
             workspace_groups.append(
                 WorkspaceGroup(
@@ -479,7 +637,7 @@ def plan_allocation(request: AllocationRequest) -> AllocationPlan:
                     member_annotator_ids=(annotator.annotator_id,),
                 )
             )
-        overlap_ids = set(resolved.overlap_record_ids)
+        overlap_ids = {record_id for record_id, _ in resolved.overlap_requirements}
         for record_id in resolved.production_record_ids:
             record = records_by_id[record_id]
             target_ids = production_targets[record_id]
@@ -557,146 +715,414 @@ def plan_allocation(request: AllocationRequest) -> AllocationPlan:
         annotator_loads=annotator_loads,
         overlap_matrix=overlap_matrix,
         gates=tuple(gates),
-        unsatisfied_constraints=(),
+        blocking_errors=(),
+        warnings=_resolved_warnings(resolved),
     )
     fingerprint = canonical_hash(plan.fingerprint_payload())
     bound_gates = tuple(replace(item, plan_fingerprint=fingerprint) for item in plan.gates)
     return replace(plan, fingerprint=fingerprint, gates=bound_gates)
 
 
+def _preview_from_plan(plan: AllocationPlan) -> AllocationPreview:
+    calibration_set = None
+    if plan.gates:
+        gate = plan.gates[0]
+        record_ids = tuple(item.record_id for item in gate.expectations)
+        expected_annotator_ids = tuple(
+            sorted(
+                {
+                    annotator_id
+                    for expectation in gate.expectations
+                    for annotator_id in expectation.expected_annotator_ids
+                }
+            )
+        )
+        calibration_set = CalibrationSetPreview(
+            record_ids=record_ids,
+            expected_annotator_ids=expected_annotator_ids,
+            expected_assignment_rows=sum(
+                len(item.expected_annotator_ids) for item in gate.expectations
+            ),
+            gate_id=gate.gate_id,
+        )
+
+    pooled_counts: dict[tuple[AssignmentPhase, str, int], int] = {}
+    for item in plan.overlap_matrix.pool_requirements:
+        key = (item.phase, item.pool_id, item.required_submissions)
+        pooled_counts[key] = pooled_counts.get(key, 0) + 1
+    overlap = OverlapPreview(
+        mode=plan.overlap_matrix.mode,
+        cells=tuple(
+            OverlapCellPreview(
+                phase=item.phase,
+                annotator_a=item.annotator_a,
+                annotator_b=item.annotator_b,
+                count=item.count,
+            )
+            for item in plan.overlap_matrix.cells
+        ),
+        pool_requirements=tuple(
+            PoolOverlapPreview(
+                phase=phase,
+                pool_id=pool_id,
+                required_submissions=required_submissions,
+                record_count=record_count,
+            )
+            for (phase, pool_id, required_submissions), record_count in sorted(
+                pooled_counts.items(),
+                key=lambda item: (item[0][0].value, item[0][1], item[0][2]),
+            )
+        ),
+    )
+    return AllocationPreview(
+        schema_version="allocation_preview_v1",
+        strategy=plan.strategy,
+        task_revision=plan.task_revision,
+        source_manifest=plan.source_manifest,
+        cohort_id=(plan.annotator_loads[0].cohort_id if plan.annotator_loads else None),
+        algorithm_version=plan.algorithm_version,
+        input_fingerprint=plan.input_fingerprint,
+        plan_fingerprint=plan.fingerprint,
+        annotator_loads=tuple(
+            AnnotatorLoadPreview(
+                annotator_id=item.annotator_id,
+                mode=item.mode,
+                capacity=item.capacity,
+                assigned_rows=item.assigned_rows,
+                calibration_rows=item.calibration_rows,
+                production_rows=item.production_rows,
+                advisory_reserved_shared_rows=item.advisory_reserved_shared_rows,
+                remaining_capacity=item.remaining_capacity,
+            )
+            for item in plan.annotator_loads
+        ),
+        calibration_set=calibration_set,
+        overlap=overlap,
+        workspace_requirements=tuple(
+            WorkspaceRequirementPreview(
+                workspace_group_id=item.workspace_group_id,
+                phase=item.phase,
+                mode=item.mode,
+                cohort_id=item.cohort_id,
+                assignee_id=item.assignee_id,
+                member_annotator_ids=item.member_annotator_ids,
+            )
+            for item in plan.workspace_groups
+        ),
+        dataset_requirements=tuple(
+            DatasetRequirementPreview(
+                dataset_group_id=item.dataset_group_id,
+                workspace_group_id=item.workspace_group_id,
+                phase=item.phase,
+                min_submitted=item.min_submitted,
+                assignee_id=item.assignee_id,
+                pool_id=item.pool_id,
+                record_count=len(item.record_ids),
+                batch_count=len(item.batch_ids),
+            )
+            for item in plan.dataset_groups
+        ),
+        blocking_errors=plan.blocking_errors,
+        warnings=plan.warnings,
+    )
+
+
+def _blocked_preview_loads(
+    request: AllocationRequest,
+    strategy: AllocationStrategy | None,
+) -> tuple[AnnotatorLoadPreview, ...]:
+    if not isinstance(request, AllocationRequest) or not isinstance(request.annotators, tuple):
+        return ()
+    mode = (
+        AnnotatorLoadMode.SHARED_QUEUE_ADVISORY
+        if strategy == AllocationStrategy.SHARED_QUEUE
+        else AnnotatorLoadMode.DIRECT_ASSIGNMENT
+    )
+    loads: list[AnnotatorLoadPreview] = []
+    for item in request.annotators:
+        if not isinstance(item, AnnotatorSpec):
+            continue
+        annotator_id = _clean(item.annotator_id)
+        if not annotator_id:
+            continue
+        if isinstance(item.capacity, bool) or not isinstance(item.capacity, int) or item.capacity < 0:
+            continue
+        loads.append(
+            AnnotatorLoadPreview(
+                annotator_id=annotator_id,
+                mode=mode,
+                capacity=item.capacity,
+                assigned_rows=0,
+                calibration_rows=0,
+                production_rows=0,
+                advisory_reserved_shared_rows=0,
+                remaining_capacity=item.capacity,
+            )
+        )
+    return tuple(sorted(loads, key=lambda item: (item.annotator_id, item.capacity)))
+
+
+def _preview_cohort_id(request: AllocationRequest) -> str | None:
+    if not isinstance(request, AllocationRequest) or not isinstance(request.annotators, tuple):
+        return None
+    cohort_ids = {
+        _clean(item.cohort_id)
+        for item in request.annotators
+        if isinstance(item, AnnotatorSpec) and _clean(item.cohort_id)
+    }
+    if len(cohort_ids) != 1:
+        return None
+    return next(iter(cohort_ids))
+
+
 def _allocate_production_targets(
     resolved: _ResolvedRequest,
     initial_loads: Mapping[str, int],
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, int]]:
+    witness = _production_witness(resolved, initial_loads)
+    if (
+        resolved.request.strategy != AllocationStrategy.SHARED_QUEUE
+        and witness.assigned_rows != witness.required_rows
+    ):
+        raise RuntimeError("validated production capacity could not realize the assignment matrix")
+    return dict(witness.targets), dict(witness.loads)
+
+
+def _production_witness(
+    resolved: _ResolvedRequest,
+    initial_loads: Mapping[str, int],
+) -> _ProductionWitness:
     request = resolved.request
+    requirements = dict(resolved.overlap_requirements)
+    demands = {
+        record_id: requirements.get(record_id, 1)
+        for record_id in resolved.production_record_ids
+    }
     capacities = {item.annotator_id: item.capacity for item in request.annotators}
-    loads = {
+    starting_loads = {
         item.annotator_id: int(initial_loads.get(item.annotator_id, 0))
         for item in request.annotators
     }
-    targets: dict[str, tuple[str, ...]] = {}
-    overlap_ids = set(resolved.overlap_record_ids)
-    ordered_overlap = sorted(
-        overlap_ids,
+    record_ids = sorted(
+        demands,
         key=lambda record_id: (
+            -demands[record_id],
             _seed_rank(
                 request.seed,
                 request.algorithm_version,
-                "overlap-record-order",
+                "flow-record",
                 record_id,
             ),
             record_id,
         ),
     )
-    if ordered_overlap:
-        quotas = _overlap_quotas(
-            resolved,
-            loads=loads,
-            capacities=capacities,
-            overlap_count=len(ordered_overlap),
-            overlap_width=request.overlap.assignees_per_record,
-        )
-        remaining_quotas = dict(quotas)
-        for record_id in ordered_overlap:
-            candidates = sorted(
-                (annotator_id for annotator_id, quota in remaining_quotas.items() if quota > 0),
-                key=lambda annotator_id: (
-                    -remaining_quotas[annotator_id],
-                    _seed_rank(
-                        request.seed,
-                        request.algorithm_version,
-                        "overlap-edge",
-                        record_id,
-                        annotator_id,
-                    ),
+    annotator_ids = tuple(item.annotator_id for item in request.annotators)
+    source = 0
+    record_offset = 1
+    annotator_offset = record_offset + len(record_ids)
+    sink = annotator_offset + len(annotator_ids)
+    graph: list[list[_FlowEdge]] = [[] for _ in range(sink + 1)]
+    record_nodes = {record_id: record_offset + index for index, record_id in enumerate(record_ids)}
+    annotator_nodes = {
+        annotator_id: annotator_offset + index
+        for index, annotator_id in enumerate(annotator_ids)
+    }
+    record_edges: dict[str, list[tuple[str, _FlowEdge]]] = {}
+
+    for record_id in record_ids:
+        record_node = record_nodes[record_id]
+        _add_flow_edge(graph, source, record_node, demands[record_id])
+        ordered_annotators = sorted(
+            annotator_ids,
+            key=lambda annotator_id: (
+                _seed_rank(
+                    request.seed,
+                    request.algorithm_version,
+                    "flow-edge",
+                    record_id,
                     annotator_id,
                 ),
+                annotator_id,
+            ),
+        )
+        record_edges[record_id] = []
+        for annotator_id in ordered_annotators:
+            edge = _add_flow_edge(
+                graph,
+                record_node,
+                annotator_nodes[annotator_id],
+                1,
             )
-            selected = candidates[: request.overlap.assignees_per_record]
-            if len(selected) != request.overlap.assignees_per_record:
-                raise RuntimeError("validated overlap degree sequence could not be realized")
-            targets[record_id] = tuple(sorted(selected))
-            for annotator_id in selected:
-                remaining_quotas[annotator_id] -= 1
-                loads[annotator_id] += 1
-        if any(remaining_quotas.values()):
-            raise RuntimeError("validated overlap degree sequence left unused quota")
+            record_edges[record_id].append((annotator_id, edge))
 
-    regular_ids = sorted(
-        (record_id for record_id in resolved.production_record_ids if record_id not in overlap_ids),
-        key=lambda record_id: (
-            _seed_rank(
-                request.seed,
-                request.algorithm_version,
-                "regular-record-order",
-                record_id,
-            ),
-            record_id,
-        ),
+    for annotator_id in annotator_ids:
+        remaining = max(0, capacities[annotator_id] - starting_loads[annotator_id])
+        _add_flow_edge(graph, annotator_nodes[annotator_id], sink, remaining)
+
+    assigned_rows = _dinic_max_flow(graph, source, sink)
+    mutable_targets = {
+        record_id: {
+            annotator_id
+            for annotator_id, edge in edges
+            if edge.initial_capacity - edge.capacity == 1
+        }
+        for record_id, edges in record_edges.items()
+    }
+    mutable_targets = _rebalance_targets(
+        resolved,
+        mutable_targets,
+        starting_loads=starting_loads,
+        capacities=capacities,
     )
-    for record_id in regular_ids:
-        candidates = [
-            annotator_id
-            for annotator_id, capacity in capacities.items()
-            if loads[annotator_id] < capacity
-        ]
-        if not candidates:
-            raise RuntimeError("validated production capacity was exhausted")
-        annotator_id = min(
-            candidates,
-            key=lambda candidate: (
-                Fraction(loads[candidate], capacities[candidate]),
-                loads[candidate],
-                _seed_rank(
-                    request.seed,
-                    request.algorithm_version,
-                    "regular-assignee",
-                    record_id,
-                    candidate,
-                ),
-                candidate,
-            ),
-        )
-        targets[record_id] = (annotator_id,)
-        loads[annotator_id] += 1
-
-    return targets, loads
+    production_counts = {annotator_id: 0 for annotator_id in annotator_ids}
+    for target_ids in mutable_targets.values():
+        for annotator_id in target_ids:
+            production_counts[annotator_id] += 1
+    loads = {
+        annotator_id: starting_loads[annotator_id] + production_counts[annotator_id]
+        for annotator_id in annotator_ids
+    }
+    return _ProductionWitness(
+        targets=tuple(
+            sorted(
+                (record_id, tuple(sorted(target_ids)))
+                for record_id, target_ids in mutable_targets.items()
+            )
+        ),
+        loads=tuple(sorted(loads.items())),
+        assigned_rows=assigned_rows,
+        required_rows=sum(demands.values()),
+    )
 
 
-def _overlap_quotas(
+def _add_flow_edge(
+    graph: list[list[_FlowEdge]],
+    source: int,
+    target: int,
+    capacity: int,
+) -> _FlowEdge:
+    forward = _FlowEdge(
+        to=target,
+        reverse_index=len(graph[target]),
+        capacity=capacity,
+        initial_capacity=capacity,
+    )
+    reverse = _FlowEdge(
+        to=source,
+        reverse_index=len(graph[source]),
+        capacity=0,
+        initial_capacity=0,
+    )
+    graph[source].append(forward)
+    graph[target].append(reverse)
+    return forward
+
+
+def _dinic_max_flow(graph: list[list[_FlowEdge]], source: int, sink: int) -> int:
+    total = 0
+    while True:
+        levels = [-1] * len(graph)
+        levels[source] = 0
+        queue = deque([source])
+        while queue:
+            node = queue.popleft()
+            for edge in graph[node]:
+                if edge.capacity > 0 and levels[edge.to] < 0:
+                    levels[edge.to] = levels[node] + 1
+                    queue.append(edge.to)
+        if levels[sink] < 0:
+            return total
+        next_edge = [0] * len(graph)
+        while True:
+            pushed = _dinic_push(graph, levels, next_edge, source, sink, 10**18)
+            if pushed == 0:
+                break
+            total += pushed
+
+
+def _dinic_push(
+    graph: list[list[_FlowEdge]],
+    levels: Sequence[int],
+    next_edge: list[int],
+    node: int,
+    sink: int,
+    available: int,
+) -> int:
+    if node == sink:
+        return available
+    while next_edge[node] < len(graph[node]):
+        edge = graph[node][next_edge[node]]
+        if edge.capacity > 0 and levels[edge.to] == levels[node] + 1:
+            pushed = _dinic_push(
+                graph,
+                levels,
+                next_edge,
+                edge.to,
+                sink,
+                min(available, edge.capacity),
+            )
+            if pushed:
+                edge.capacity -= pushed
+                graph[edge.to][edge.reverse_index].capacity += pushed
+                return pushed
+        next_edge[node] += 1
+    return 0
+
+
+def _rebalance_targets(
     resolved: _ResolvedRequest,
-    loads: Mapping[str, int],
+    targets: dict[str, set[str]],
+    *,
+    starting_loads: Mapping[str, int],
     capacities: Mapping[str, int],
-    overlap_count: int,
-    overlap_width: int,
-) -> dict[str, int]:
+) -> dict[str, set[str]]:
     request = resolved.request
-    quotas = {annotator_id: 0 for annotator_id in capacities}
-    for slot in range(overlap_count * overlap_width):
-        candidates = [
-            annotator_id
-            for annotator_id, capacity in capacities.items()
-            if quotas[annotator_id] < min(capacity - loads[annotator_id], overlap_count)
-        ]
-        if not candidates:
-            raise RuntimeError("validated overlap capacity was exhausted while building quotas")
-        annotator_id = min(
-            candidates,
-            key=lambda candidate: (
-                Fraction(loads[candidate] + quotas[candidate], capacities[candidate]),
-                loads[candidate] + quotas[candidate],
-                _seed_rank(
-                    request.seed,
-                    request.algorithm_version,
-                    "overlap-quota",
-                    str(slot),
-                    candidate,
-                ),
-                candidate,
-            ),
-        )
-        quotas[annotator_id] += 1
-    return quotas
+    loads = {annotator_id: int(starting_loads[annotator_id]) for annotator_id in capacities}
+    for target_ids in targets.values():
+        for annotator_id in target_ids:
+            loads[annotator_id] += 1
+    while True:
+        moves: list[tuple[Fraction, str, str, str, str]] = []
+        for source_id, source_capacity in capacities.items():
+            if source_capacity <= 0 or loads[source_id] <= starting_loads[source_id]:
+                continue
+            for target_id, target_capacity in capacities.items():
+                if source_id == target_id or target_capacity <= 0 or loads[target_id] >= target_capacity:
+                    continue
+                before = Fraction(loads[source_id], source_capacity) ** 2 + Fraction(
+                    loads[target_id], target_capacity
+                ) ** 2
+                after = Fraction(loads[source_id] - 1, source_capacity) ** 2 + Fraction(
+                    loads[target_id] + 1, target_capacity
+                ) ** 2
+                if after >= before:
+                    continue
+                for record_id, target_ids in targets.items():
+                    if source_id not in target_ids or target_id in target_ids:
+                        continue
+                    moves.append(
+                        (
+                            after - before,
+                            _seed_rank(
+                                request.seed,
+                                request.algorithm_version,
+                                "rebalance",
+                                record_id,
+                                source_id,
+                                target_id,
+                            ),
+                            record_id,
+                            source_id,
+                            target_id,
+                        )
+                    )
+        if not moves:
+            return targets
+        _, _, record_id, source_id, target_id = min(moves)
+        targets[record_id].remove(source_id)
+        targets[record_id].add(target_id)
+        loads[source_id] -= 1
+        loads[target_id] += 1
 
 
 def _assignment(
@@ -901,12 +1327,35 @@ def _resolve_request(
         issues.append(_issue("mutable_collection", "annotators", "annotators must be a tuple"))
     if isinstance(request.seed, bool) or not isinstance(request.seed, int):
         issues.append(_issue("invalid_seed", "seed", "seed must be an integer"))
-    if not _clean(request.algorithm_version):
+    algorithm_version = _clean(request.algorithm_version)
+    if not algorithm_version:
         issues.append(
             _issue("invalid_algorithm_version", "algorithm_version", "algorithm_version must not be blank")
         )
-    if not isinstance(request.overlap, OverlapRule):
-        issues.append(_issue("invalid_overlap_rule", "overlap", "overlap must be an OverlapRule"))
+    elif algorithm_version not in SUPPORTED_ALGORITHM_VERSIONS:
+        issues.append(
+            _issue(
+                "unsupported_algorithm_version",
+                "algorithm_version",
+                "algorithm_version is not supported",
+                supported=",".join(SUPPORTED_ALGORITHM_VERSIONS),
+                value=algorithm_version,
+            )
+        )
+    if not isinstance(request.overlap_rules, tuple):
+        issues.append(
+            _issue("mutable_collection", "overlap_rules", "overlap_rules must be a tuple")
+        )
+    else:
+        for index, rule in enumerate(request.overlap_rules):
+            if not isinstance(rule, OverlapRule):
+                issues.append(
+                    _issue(
+                        "invalid_overlap_rule",
+                        f"overlap_rules[{index}]",
+                        "each overlap rule must be an OverlapRule",
+                    )
+                )
     if request.calibration is not None and not isinstance(request.calibration, CalibrationRule):
         issues.append(
             _issue("invalid_calibration_rule", "calibration", "calibration must be a CalibrationRule or None")
@@ -949,7 +1398,6 @@ def _resolve_request(
 
     normalized_records: list[RecordSpec] = []
     record_ids: dict[str, int] = {}
-    content_hashes: dict[str, int] = {}
     for index, record in enumerate(request.records):
         field = f"records[{index}]"
         if not isinstance(record, RecordSpec):
@@ -979,18 +1427,6 @@ def _resolve_request(
                     "content_hash must be a lowercase SHA-256 digest",
                 )
             )
-        elif record.content_hash in content_hashes:
-            issues.append(
-                _issue(
-                    "duplicate_record_content_hash",
-                    f"{field}.content_hash",
-                    "record content_hash must be unique",
-                    content_hash=record.content_hash,
-                    first_index=content_hashes[record.content_hash],
-                )
-            )
-        else:
-            content_hashes[record.content_hash] = index
         if not batch_id:
             issues.append(_issue("blank_identifier", f"{field}.batch_id", "batch_id must not be blank"))
         if record_id and batch_id and _is_sha256(record.content_hash):
@@ -1059,7 +1495,8 @@ def _resolve_request(
             )
         )
 
-    issues.extend(_selector_shape_issues(request.overlap, "overlap"))
+    for index, rule in enumerate(request.overlap_rules):
+        issues.extend(_selector_shape_issues(rule, f"overlap_rules[{index}]"))
     if request.strategy == AllocationStrategy.CALIBRATION_THEN_PARTITION:
         if request.calibration is None:
             issues.append(
@@ -1103,7 +1540,6 @@ def _resolve_request(
 
     normalized_records.sort(key=lambda item: item.record_id)
     normalized_annotators.sort(key=lambda item: item.annotator_id)
-    records_by_id = {item.record_id: item for item in normalized_records}
     cohort_id = normalized_annotators[0].cohort_id
 
     calibration_ids: tuple[str, ...] = ()
@@ -1134,122 +1570,77 @@ def _resolve_request(
             normalized_annotators,
         )
         issues.extend(expected_issues)
+        selected_cohort = tuple(item.annotator_id for item in normalized_annotators)
+        if expected_annotator_ids and expected_annotator_ids != selected_cohort:
+            issues.append(
+                _issue(
+                    "calibration_cohort_mismatch",
+                    "calibration.expected_annotator_ids",
+                    "every production cohort annotator must participate in calibration",
+                    expected=",".join(selected_cohort),
+                    received=",".join(expected_annotator_ids),
+                )
+            )
 
     excluded = set(calibration_ids) if calibration and calibration.exclude_from_production else set()
     production_records = tuple(item for item in normalized_records if item.record_id not in excluded)
-    overlap_ids, overlap_issues = _resolve_selector(
-        production_records,
-        record_ids=request.overlap.record_ids,
-        count=request.overlap.count,
-        rate=request.overlap.rate,
-        seed=request.seed,
-        algorithm_version=request.algorithm_version,
-        namespace="overlap",
-        field="overlap",
-    )
-    issues.extend(overlap_issues)
-    if overlap_ids and (
-        isinstance(request.overlap.assignees_per_record, bool)
-        or not isinstance(request.overlap.assignees_per_record, int)
-        or request.overlap.assignees_per_record < 2
-    ):
-        issues.append(
-            _issue(
-                "invalid_overlap_width",
-                "overlap.assignees_per_record",
-                "overlap assignees_per_record must be at least 2",
-            )
+    overlap_requirements: dict[str, tuple[int, int]] = {}
+    for index, rule in enumerate(request.overlap_rules):
+        selected_ids, overlap_issues = _resolve_selector(
+            production_records,
+            record_ids=rule.record_ids,
+            count=rule.count,
+            rate=rule.rate,
+            seed=request.seed,
+            algorithm_version=algorithm_version,
+            namespace=f"overlap-rule-{index}",
+            field=f"overlap_rules[{index}]",
         )
-
-    if issues:
-        return None, tuple(issues)
-
-    capacity_by_annotator = {item.annotator_id: item.capacity for item in normalized_annotators}
-    calibration_count = len(calibration_ids)
-    for annotator_id in expected_annotator_ids:
-        if capacity_by_annotator[annotator_id] < calibration_count:
-            issues.append(
-                _issue(
-                    "annotator_capacity_insufficient",
-                    "annotators",
-                    "annotator capacity cannot cover required calibration rows",
-                    annotator_id=annotator_id,
-                    capacity=capacity_by_annotator[annotator_id],
-                    required=calibration_count,
-                )
-            )
-
-    remaining_capacities = {
-        annotator.annotator_id: annotator.capacity
-        - (calibration_count if annotator.annotator_id in expected_annotator_ids else 0)
-        for annotator in normalized_annotators
-    }
-    overlap_count = len(overlap_ids)
-    overlap_width = request.overlap.assignees_per_record if overlap_count else 1
-    required_production_rows = len(production_records) + overlap_count * (overlap_width - 1)
-    available_production_capacity = sum(max(0, value) for value in remaining_capacities.values())
-    if available_production_capacity < required_production_rows:
-        issues.append(
-            _issue(
-                "insufficient_capacity",
-                "annotators",
-                "cohort capacity cannot cover all planned rows",
-                available=available_production_capacity,
-                required=required_production_rows,
-            )
-        )
-    if overlap_count:
-        if overlap_width > len(normalized_annotators):
+        issues.extend(overlap_issues)
+        if selected_ids and rule.required_submissions > len(normalized_annotators):
             issues.append(
                 _issue(
                     "cohort_too_small",
-                    "overlap.assignees_per_record",
-                    "overlap width exceeds cohort size",
+                    f"overlap_rules[{index}].required_submissions",
+                    "required_submissions exceeds cohort size",
                     cohort_size=len(normalized_annotators),
-                    required=overlap_width,
+                    required=rule.required_submissions,
                 )
             )
-        else:
-            for record_prefix_count in range(1, overlap_count + 1):
-                available = sum(
-                    min(max(0, capacity), record_prefix_count)
-                    for capacity in remaining_capacities.values()
-                )
-                required = record_prefix_count * overlap_width
-                if available < required:
-                    issues.append(
-                        _issue(
-                            "overlap_unassignable",
-                            "overlap",
-                            "capacities cannot place every overlap copy on a distinct annotator",
-                            overlap_records=overlap_count,
-                            assignees_per_record=overlap_width,
-                            failing_prefix=record_prefix_count,
-                            available=available,
-                            required=required,
-                        )
+        for record_id in selected_ids:
+            previous = overlap_requirements.get(record_id)
+            if previous is not None:
+                issues.append(
+                    _issue(
+                        "overlap_rule_conflict",
+                        f"overlap_rules[{index}]",
+                        "overlap rules must select disjoint record sets",
+                        record_id=record_id,
+                        first_rule=previous[0],
+                        conflicting_rule=index,
                     )
-                    break
+                )
+                continue
+            overlap_requirements[record_id] = (index, rule.required_submissions)
 
     if issues:
         return None, tuple(issues)
-
-    normalized_overlap = OverlapRule(
-        record_ids=tuple(sorted(_clean(item) for item in request.overlap.record_ids)),
-        count=request.overlap.count,
-        rate=request.overlap.rate,
-        assignees_per_record=request.overlap.assignees_per_record,
+    normalized_overlap_rules = tuple(
+        OverlapRule(
+            record_ids=tuple(sorted(_clean(item) for item in rule.record_ids)),
+            count=rule.count,
+            rate=rule.rate,
+            required_submissions=rule.required_submissions,
+        )
+        for rule in request.overlap_rules
     )
     normalized_calibration = None
     if calibration is not None:
-        normalized_expected = calibration.expected_annotator_ids
-        if normalized_expected is not None:
-            normalized_expected = tuple(sorted(_clean(item) for item in normalized_expected))
         normalized_calibration = CalibrationRule(
             record_ids=tuple(sorted(_clean(item) for item in calibration.record_ids)),
             count=calibration.count,
             rate=calibration.rate,
-            expected_annotator_ids=normalized_expected,
+            expected_annotator_ids=expected_annotator_ids,
             exclude_from_production=calibration.exclude_from_production,
         )
     normalized_request = AllocationRequest(
@@ -1267,8 +1658,8 @@ def _resolve_request(
         records=tuple(normalized_records),
         annotators=tuple(normalized_annotators),
         seed=request.seed,
-        algorithm_version=_clean(request.algorithm_version),
-        overlap=normalized_overlap,
+        algorithm_version=algorithm_version,
+        overlap_rules=normalized_overlap_rules,
         calibration=normalized_calibration,
     )
     resolved = _ResolvedRequest(
@@ -1276,11 +1667,101 @@ def _resolve_request(
         cohort_id=cohort_id,
         calibration_record_ids=calibration_ids,
         production_record_ids=tuple(item.record_id for item in production_records),
-        overlap_record_ids=overlap_ids,
+        overlap_requirements=tuple(
+            sorted(
+                (record_id, required_submissions)
+                for record_id, (_, required_submissions) in overlap_requirements.items()
+            )
+        ),
         expected_calibration_annotator_ids=expected_annotator_ids,
         input_fingerprint=canonical_hash(normalized_request),
     )
+
+    if normalized_request.strategy != AllocationStrategy.SHARED_QUEUE:
+        capacity_by_annotator = {
+            item.annotator_id: item.capacity for item in normalized_request.annotators
+        }
+        calibration_count = len(calibration_ids)
+        for annotator_id in expected_annotator_ids:
+            if capacity_by_annotator[annotator_id] < calibration_count:
+                issues.append(
+                    _issue(
+                        "annotator_capacity_insufficient",
+                        "annotators",
+                        "annotator capacity cannot cover required calibration rows",
+                        annotator_id=annotator_id,
+                        capacity=capacity_by_annotator[annotator_id],
+                        required=calibration_count,
+                    )
+                )
+        if issues:
+            return None, tuple(issues)
+        initial_loads = {
+            item.annotator_id: (
+                calibration_count
+                if item.annotator_id in expected_annotator_ids
+                else 0
+            )
+            for item in normalized_request.annotators
+        }
+        witness = _production_witness(resolved, initial_loads)
+        available = sum(
+            max(0, item.capacity - initial_loads[item.annotator_id])
+            for item in normalized_request.annotators
+        )
+        if available < witness.required_rows:
+            issues.append(
+                _issue(
+                    "insufficient_capacity",
+                    "annotators",
+                    "cohort capacity cannot cover all planned rows",
+                    available=available,
+                    required=witness.required_rows,
+                )
+            )
+        elif witness.assigned_rows < witness.required_rows:
+            issues.append(
+                _issue(
+                    "overlap_unassignable",
+                    "overlap_rules",
+                    "capacities cannot place every required copy on a distinct annotator",
+                    assigned=witness.assigned_rows,
+                    required=witness.required_rows,
+                )
+            )
+    if issues:
+        return None, tuple(issues)
     return resolved, ()
+
+
+def _resolved_warnings(resolved: _ResolvedRequest) -> tuple[ValidationIssue, ...]:
+    if resolved.request.strategy != AllocationStrategy.SHARED_QUEUE:
+        return ()
+    initial_loads = {item.annotator_id: 0 for item in resolved.request.annotators}
+    witness = _production_witness(resolved, initial_loads)
+    total_capacity = sum(item.capacity for item in resolved.request.annotators)
+    warnings: list[ValidationIssue] = []
+    if total_capacity < witness.required_rows:
+        warnings.append(
+            _issue(
+                "shared_advisory_total_capacity_insufficient",
+                "annotators",
+                "advisory cohort capacity is below the requested shared submission rows",
+                advisory_capacity=total_capacity,
+                required=witness.required_rows,
+            )
+        )
+    elif witness.assigned_rows < witness.required_rows:
+        warnings.append(
+            _issue(
+                "shared_advisory_annotator_capacity_insufficient",
+                "annotators",
+                "individual advisory capacities cannot witness all distinct shared submissions",
+                advisory_rows=witness.assigned_rows,
+                required=witness.required_rows,
+            )
+        )
+    return tuple(warnings)
 
 
 def _selector_shape_issues(rule: OverlapRule | CalibrationRule, field: str) -> list[ValidationIssue]:
@@ -1311,15 +1792,15 @@ def _selector_shape_issues(rule: OverlapRule | CalibrationRule, field: str) -> l
     ):
         issues.append(_issue("invalid_selector_rate", f"{field}.rate", "selector rate must be in [0, 1]"))
     if isinstance(rule, OverlapRule) and (
-        isinstance(rule.assignees_per_record, bool)
-        or not isinstance(rule.assignees_per_record, int)
-        or rule.assignees_per_record < 2
+        isinstance(rule.required_submissions, bool)
+        or not isinstance(rule.required_submissions, int)
+        or rule.required_submissions < 2
     ):
         issues.append(
             _issue(
                 "invalid_overlap_width",
-                f"{field}.assignees_per_record",
-                "assignees_per_record must be at least 2",
+                f"{field}.required_submissions",
+                "required_submissions must be at least 2",
             )
         )
     return issues

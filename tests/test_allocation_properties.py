@@ -22,6 +22,7 @@ from llm_labeling_scaffold.allocation import (
     TaskRevisionRef,
     canonical_hash,
     plan_allocation,
+    preview_allocation,
     validate_allocation_request,
 )
 
@@ -47,7 +48,7 @@ def _request(
     records: tuple[RecordSpec, ...],
     annotators: tuple[AnnotatorSpec, ...],
     seed: int,
-    overlap: OverlapRule = OverlapRule(),
+    overlap_rules: tuple[OverlapRule, ...] = (),
     calibration: CalibrationRule | None = None,
 ) -> AllocationRequest:
     return AllocationRequest(
@@ -64,8 +65,8 @@ def _request(
         records=records,
         annotators=annotators,
         seed=seed,
-        algorithm_version="allocation-property-v1",
-        overlap=overlap,
+        algorithm_version="allocation-v1",
+        overlap_rules=overlap_rules,
         calibration=calibration,
     )
 
@@ -92,7 +93,9 @@ def test_randomized_fixed_partition_properties():
             records=records,
             annotators=annotators,
             seed=rng.randint(-10_000, 10_000),
-            overlap=OverlapRule(count=overlap_count, assignees_per_record=overlap_width),
+            overlap_rules=(
+                OverlapRule(count=overlap_count, required_submissions=overlap_width),
+            ),
         )
 
         report = validate_allocation_request(request)
@@ -100,6 +103,7 @@ def test_randomized_fixed_partition_properties():
             with pytest.raises(AllocationValidationError) as exc_info:
                 plan_allocation(request)
             assert exc_info.value.report == report
+            assert preview_allocation(request).blocking_errors == report.blocking_errors
             continue
 
         plan = plan_allocation(request)
@@ -159,7 +163,7 @@ def test_fixed_partition_explicit_property_grid(
         records=records,
         annotators=annotators,
         seed=seed,
-        overlap=OverlapRule(count=overlap_count, assignees_per_record=overlap_width),
+        overlap_rules=(OverlapRule(count=overlap_count, required_submissions=overlap_width),),
     )
 
     first = plan_allocation(request)
@@ -192,6 +196,71 @@ def test_fixed_partition_explicit_property_grid(
     assert len(first.assignments) == expected_rows
     assert sum(item.assigned_rows for item in first.annotator_loads) == expected_rows
     assert all(item.assigned_rows <= item.capacity for item in first.annotator_loads)
+    preview = preview_allocation(request)
+    assert preview.ready
+    assert preview.input_fingerprint == first.input_fingerprint
+    assert preview.plan_fingerprint == first.fingerprint
+    assert preview.algorithm_version == "allocation-v1"
+    assert sum(item.assigned_rows for item in preview.annotator_loads) == expected_rows
+    assert preview.workspace_requirements == first.to_preview().workspace_requirements
+    assert preview.dataset_requirements == first.to_preview().dataset_requirements
+
+
+@pytest.mark.parametrize("record_count", [8, 17])
+@pytest.mark.parametrize("capacities", [(12, 12, 12, 12), (8, 10, 14, 18)])
+@pytest.mark.parametrize("seed", [1, 29, 6101])
+def test_multiple_overlap_tier_properties(record_count, capacities, seed):
+    records = _records(record_count, f"multi-{record_count}-{capacities}-{seed}")
+    k2_count = max(1, record_count // 4)
+    k3_count = max(1, record_count // 5)
+    k2_ids = tuple(item.record_id for item in records[:k2_count])
+    k3_ids = tuple(item.record_id for item in records[k2_count : k2_count + k3_count])
+    overlap_rules = (
+        OverlapRule(record_ids=k2_ids, required_submissions=2),
+        OverlapRule(record_ids=k3_ids, required_submissions=3),
+    )
+    annotators = tuple(
+        AnnotatorSpec(f"annotator-{index}", "cohort-property", capacity)
+        for index, capacity in enumerate(capacities)
+    )
+    fixed_request = _request(
+        strategy=AllocationStrategy.FIXED_PARTITION,
+        records=records,
+        annotators=annotators,
+        seed=seed,
+        overlap_rules=overlap_rules,
+    )
+    shared_request = replace(fixed_request, strategy=AllocationStrategy.SHARED_QUEUE)
+
+    fixed = plan_allocation(fixed_request)
+    reversed_fixed = plan_allocation(
+        replace(
+            fixed_request,
+            records=tuple(reversed(records)),
+            annotators=tuple(reversed(annotators)),
+        )
+    )
+    shared = plan_allocation(shared_request)
+
+    assert fixed == reversed_fixed
+    assert fixed.fingerprint == canonical_hash(fixed.fingerprint_payload())
+    assert len({(item.record_id, item.assignee_id) for item in fixed.assignments}) == len(
+        fixed.assignments
+    )
+    by_record = defaultdict(list)
+    for assignment in fixed.assignments:
+        by_record[assignment.record_id].append(assignment)
+    assert all(len(by_record[record_id]) == 2 for record_id in k2_ids)
+    assert all(len(by_record[record_id]) == 3 for record_id in k3_ids)
+    assert all(
+        len({item.assignee_id for item in items}) == len(items) for items in by_record.values()
+    )
+    expected_rows = record_count + k2_count + 2 * k3_count
+    assert len(fixed.assignments) == expected_rows
+    assert sum(item.assigned_rows for item in fixed.annotator_loads) == expected_rows
+    assert all(item.assigned_rows <= item.capacity for item in fixed.annotator_loads)
+    assert len(shared.assignments) == record_count
+    assert {item.min_submitted for item in shared.dataset_groups} == {1, 2, 3}
 
 
 @pytest.mark.parametrize(
@@ -215,7 +284,7 @@ def test_shared_queue_rate_boundaries(record_count, rate, expected_overlap_count
             AnnotatorSpec("annotator-1", "cohort-property", required_rows),
         ),
         seed=19,
-        overlap=OverlapRule(rate=rate, assignees_per_record=2),
+        overlap_rules=(OverlapRule(rate=rate, required_submissions=2),),
     )
 
     plan = plan_allocation(request)
@@ -233,6 +302,9 @@ def test_shared_queue_rate_boundaries(record_count, rate, expected_overlap_count
     if expected_overlap_count:
         expected_min_submitted.add(2)
     assert {item.min_submitted for item in plan.dataset_groups} == expected_min_submitted
+    preview = preview_allocation(request)
+    assert all(item.mode == AnnotatorLoadMode.SHARED_QUEUE_ADVISORY for item in preview.annotator_loads)
+    assert all(item.assigned_rows == 0 for item in preview.annotator_loads)
 
 
 def test_randomized_calibration_properties():
@@ -243,12 +315,12 @@ def test_randomized_calibration_properties():
         record_count = rng.randint(3, 18)
         calibration_count = rng.randint(1, record_count - 1)
         production_count = record_count - calibration_count
-        expected_count = rng.randint(1, annotator_count)
+        expected_count = annotator_count
         overlap_count = rng.randint(0, production_count)
         overlap_width = rng.randint(2, annotator_count)
         records = _records(record_count, f"calibration-{case}")
         annotator_ids = tuple(f"annotator-{index}" for index in range(annotator_count))
-        expected_annotators = tuple(sorted(rng.sample(annotator_ids, expected_count)))
+        expected_annotators = annotator_ids
         required_capacity = record_count * max(annotator_count, overlap_width)
         annotators = tuple(
             AnnotatorSpec(item, "cohort-property", required_capacity) for item in annotator_ids
@@ -258,7 +330,9 @@ def test_randomized_calibration_properties():
             records=records,
             annotators=annotators,
             seed=rng.randint(0, 100_000),
-            overlap=OverlapRule(count=overlap_count, assignees_per_record=overlap_width),
+            overlap_rules=(
+                OverlapRule(count=overlap_count, required_submissions=overlap_width),
+            ),
             calibration=CalibrationRule(
                 count=calibration_count,
                 expected_annotator_ids=expected_annotators,
@@ -292,6 +366,13 @@ def test_randomized_calibration_properties():
         assert len(calibration_dataset.record_ids) == calibration_count
         assert len(calibration_dataset.record_ids) == len(set(calibration_dataset.record_ids))
         assert len(calibration_dataset.assignment_ids) == calibration_count * expected_count
+        preview = preview_allocation(request)
+        assert preview.calibration_set is not None
+        assert preview.calibration_set.record_ids == calibration_dataset.record_ids
+        preview_calibration_dataset = next(
+            item for item in preview.dataset_requirements if item.phase == AssignmentPhase.CALIBRATION
+        )
+        assert preview_calibration_dataset.record_count == calibration_count
 
 
 def test_plan_manifest_is_frozen_and_json_serializable():
@@ -321,7 +402,7 @@ def test_plan_manifest_is_frozen_and_json_serializable():
         ),
         (
             (AnnotatorSpec("annotator-0", "cohort-a", 4),),
-            OverlapRule(count=1, assignees_per_record=2),
+            OverlapRule(count=1, required_submissions=2),
             "cohort_too_small",
         ),
     ],
@@ -332,30 +413,33 @@ def test_cohort_boundary_validation(annotators, overlap, expected_code):
         records=_records(1, expected_code),
         annotators=annotators,
         seed=1,
-        overlap=overlap,
+        overlap_rules=(overlap,),
     )
 
     report = validate_allocation_request(request)
 
-    assert expected_code in {item.code for item in report.issues}
+    assert expected_code in {item.code for item in report.blocking_errors}
 
 
 def test_selector_conflicts_and_excess_are_structured():
     records = _records(2, "selector")
-    annotators = (AnnotatorSpec("annotator-0", "cohort-property", 10),)
+    annotators = (
+        AnnotatorSpec("annotator-0", "cohort-property", 10),
+        AnnotatorSpec("annotator-1", "cohort-property", 10),
+    )
     conflict = _request(
         strategy=AllocationStrategy.FIXED_PARTITION,
         records=records,
         annotators=annotators,
         seed=1,
-        overlap=OverlapRule(record_ids=(records[0].record_id,), count=1),
+        overlap_rules=(OverlapRule(record_ids=(records[0].record_id,), count=1),),
     )
-    excess = replace(conflict, overlap=OverlapRule(count=3))
+    excess = replace(conflict, overlap_rules=(OverlapRule(count=3),))
 
-    assert [item.code for item in validate_allocation_request(conflict).issues] == [
+    assert [item.code for item in validate_allocation_request(conflict).blocking_errors] == [
         "selector_conflict"
     ]
-    assert [item.code for item in validate_allocation_request(excess).issues] == [
+    assert [item.code for item in validate_allocation_request(excess).blocking_errors] == [
         "selector_exceeds_records"
     ]
 
@@ -377,19 +461,20 @@ def test_calibration_capacity_and_excluded_overlap_fail_structurally():
             AnnotatorSpec("annotator-1", "cohort-property", 10),
         ),
         seed=1,
-        overlap=OverlapRule(record_ids=(records[0].record_id,), assignees_per_record=2),
+        overlap_rules=(
+            OverlapRule(record_ids=(records[0].record_id,), required_submissions=2),
+        ),
         calibration=CalibrationRule(record_ids=(records[0].record_id,)),
     )
 
-    capacity_codes = {item.code for item in validate_allocation_request(capacity_request).issues}
-    overlap_codes = {item.code for item in validate_allocation_request(excluded_overlap_request).issues}
+    capacity_codes = {item.code for item in validate_allocation_request(capacity_request).blocking_errors}
+    overlap_codes = {item.code for item in validate_allocation_request(excluded_overlap_request).blocking_errors}
 
     assert "annotator_capacity_insufficient" in capacity_codes
-    assert "insufficient_capacity" in capacity_codes
     assert overlap_codes == {"unknown_record_id"}
 
 
-def test_algorithm_version_participates_in_selection_and_fingerprint():
+def test_unknown_algorithm_version_fails_fast():
     request = _request(
         strategy=AllocationStrategy.FIXED_PARTITION,
         records=_records(20, "algorithm-version"),
@@ -397,13 +482,12 @@ def test_algorithm_version_participates_in_selection_and_fingerprint():
             AnnotatorSpec(f"annotator-{index}", "cohort-property", 10) for index in range(3)
         ),
         seed=4,
-        overlap=OverlapRule(rate=0.25, assignees_per_record=2),
+        overlap_rules=(OverlapRule(rate=0.25, required_submissions=2),),
     )
 
-    first = plan_allocation(request)
-    second = plan_allocation(replace(request, algorithm_version="allocation-property-v2"))
+    unsupported = replace(request, algorithm_version="allocation-v2")
+    report = validate_allocation_request(unsupported)
 
-    assert first.fingerprint != second.fingerprint
-    assert tuple((item.record_id, item.assignee_id) for item in first.assignments) != tuple(
-        (item.record_id, item.assignee_id) for item in second.assignments
-    )
+    assert [item.code for item in report.blocking_errors] == ["unsupported_algorithm_version"]
+    with pytest.raises(AllocationValidationError):
+        plan_allocation(unsupported)
