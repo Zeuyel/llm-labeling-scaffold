@@ -609,12 +609,23 @@ def _is_loopback_host(host: str) -> bool:
         return False
 
 
-def serve_mcp(config: McpServerConfig, *, transport: str, host: str, port: int) -> None:
+def serve_mcp(
+    config: McpServerConfig,
+    *,
+    transport: str,
+    host: str,
+    port: int,
+    published_host: str | None = None,
+) -> None:
     if transport == "stdio":
         create_mcp_server(config).run(transport="stdio")
         return
     if transport != "streamable-http":
         raise McpConfigurationError(f"不支持的 MCP transport: {transport}")
-    if resolve_mcp_auth_mode(config.auth_mode) == "static_dev" and not _is_loopback_host(host):
-        raise McpConfigurationError("static_dev 模式只能监听回环地址")
+    exposure_host = published_host or host
+    if not _is_loopback_host(exposure_host):
+        mode = resolve_mcp_auth_mode(config.auth_mode)
+        if mode == "static_dev":
+            raise McpConfigurationError("static_dev 模式只能监听回环地址")
+        raise McpConfigurationError("cloudflare_access 模式必须通过 Tunnel-only 回环源站发布 MCP")
     uvicorn.run(create_streamable_http_app(config), host=host, port=port, log_level="info")

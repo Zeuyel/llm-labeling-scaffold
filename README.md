@@ -81,13 +81,13 @@ docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap
 
 脚本会在 `--mlflow` 模式下临时把 `MLFLOW_TRACKING_URI=http://mlflow:5000` 传给控制台；默认模式不会注入这个地址。
 
-需要让 Codex 或其他 MCP client 调用平台时，先在 `.env` 设置外部 bearer token 与内部服务 token，再启用 MCP profile：
+需要让 Codex 或其他 MCP client 调用平台时，为 MCP hostname 配置独立的 Cloudflare Access application 与 Managed OAuth，在 `.env` 设置独立 MCP AUD 和内部 Panel service token，再启用 MCP profile：
 
 ```bash
 ./scripts/stack up --mcp
 ```
 
-MCP endpoint 为 `http://localhost:8766/mcp`。Docker 默认只绑定本机回环地址，应通过 HTTPS 反向代理对外暴露。MCP 使用受限 Panel 服务身份，不持有 Panel 管理员密码，也不直接操作 R2 或本地数据目录。默认只注册只读工具；确需创建草稿、发布任务或提交数据湖导入时，才在受控部署中设置 `LLS_MCP_ENABLE_WRITES=1`。首版不是多用户 OAuth/RBAC，完整边界见 [MCP 接入说明](docs/mcp_integration.md)。
+MCP endpoint 为 `http://localhost:8766/mcp`，生产只通过 Cloudflare Tunnel 暴露对应 HTTPS hostname。Cloudflare Edge 处理 OAuth discovery、动态客户端注册、Authorization Code + PKCE、opaque access token 和 refresh token；源站只验证 `Cf-Access-Jwt-Assertion`，不会实现 `/authorize`、`/token` 或保存 OAuth token/client secret。MCP 使用受限 Panel 服务身份，不持有 Panel 管理员密码，也不直接操作 R2 或本地数据目录。默认只注册只读工具；确需创建草稿、发布任务或提交数据湖导入时，才在受控部署中设置 `LLS_MCP_ENABLE_WRITES=1`。本阶段只建立身份入口与令牌隔离，不实现 Panel RBAC、workspace/tool filtering 或最终审计，完整边界见 [MCP 接入说明](docs/mcp_integration.md)。
 
 ## 平台流程
 
@@ -282,7 +282,9 @@ ARGILLA_WORKSPACE=argilla
 MLFLOW_PORT=5000
 MCP_PORT=8766
 MCP_BIND_HOST=127.0.0.1
-LLS_MCP_BEARER_TOKEN=<由服务器 secret manager 生成的随机值>
+LLS_MCP_AUTH_MODE=cloudflare_access
+LLS_MCP_CF_ACCESS_ISSUER=https://YOUR_TEAM.cloudflareaccess.com
+LLS_MCP_CF_ACCESS_AUD=<独立于 Panel 的 MCP Access application Audience Tag>
 LLS_MCP_INTERNAL_TOKEN=<另一条由服务器 secret manager 生成的随机值>
 LLS_MCP_ENABLE_WRITES=0
 LLS_MCP_TIMEOUT_SECONDS=15
@@ -292,7 +294,7 @@ LLS_DATA_LAKE_R2_PREFIX=r2:YOUR_BUCKET/
 LLS_RCLONE_TIMEOUT_SECONDS=120
 ```
 
-`.env.example` 的 `basic_dev` 只服务于本地快速启动。生产部署必须设置 `LLS_PANEL_AUTH_MODE=cloudflare_access`，保持源站回环/私网绑定，并通过 Cloudflare Tunnel 暴露 Access 应用；不得开放 Panel 公网端口让请求绕过 Access。
+`.env.example` 的 Panel `basic_dev` 和 MCP `static_dev` 只服务于本地快速启动。生产部署必须设置 Panel 与 MCP 的 `cloudflare_access` 模式，并为两者使用不同的 Access application AUD；保持源站回环/私网绑定，通过 Cloudflare Tunnel 暴露 hostname，不得开放 Panel 或 MCP 公网端口让请求绕过 Access。
 
 `LLS_TASK_SOURCE` 可设为 `r2`、`control` 或 `local`。`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。在 `r2` 模式中，`LLS_TASK_REGISTRY_URI` 对应 `task_registry_uri`，应指向数据湖治理登记表，通常是 `data_lake.yaml`；具体任务文件由登记表的 `tasks.<task_id>.task_uri` 指向。在 `control` 模式中，它只作为数据湖 registry 的默认配置，不参与任务单同步。
 

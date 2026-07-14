@@ -182,6 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     mcp = sub.add_parser("mcp")
     mcp.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     mcp.add_argument("--host", default="127.0.0.1")
+    mcp.add_argument("--published-host")
     mcp.add_argument("--port", type=int, default=8766)
     mcp.add_argument("--panel-url")
     mcp.add_argument("--auth-mode", choices=["cloudflare_access", "static_dev"])
@@ -348,7 +349,13 @@ def main(argv: list[str] | None = None) -> None:
             enable_writes=args.enable_writes,
             timeout_seconds=args.timeout,
         )
-        serve_mcp(config, transport=args.transport, host=args.host, port=args.port)
+        serve_mcp(
+            config,
+            transport=args.transport,
+            host=args.host,
+            port=args.port,
+            published_host=args.published_host,
+        )
     elif args.cmd == "db":
         from .db.cli import handle_db_command
 

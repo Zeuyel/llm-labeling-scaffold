@@ -551,8 +551,42 @@ def test_static_dev_rejects_non_loopback_listener(monkeypatch):
     with pytest.raises(McpConfigurationError, match="回环"):
         serve_mcp(_config(), transport="streamable-http", host="0.0.0.0", port=8766)
 
-    serve_mcp(_config(), transport="streamable-http", host="127.0.0.1", port=8766)
-    assert calls == [("app", "127.0.0.1", 8766)]
+    serve_mcp(
+        _config(),
+        transport="streamable-http",
+        host="0.0.0.0",
+        published_host="127.0.0.1",
+        port=8766,
+    )
+    assert calls == [("app", "0.0.0.0", 8766)]
+
+
+def test_cloudflare_access_rejects_non_loopback_origin_publish(monkeypatch):
+    calls: list[tuple[Any, str, int]] = []
+    monkeypatch.setattr(mcp_server, "create_streamable_http_app", lambda config: "app")
+    monkeypatch.setattr(
+        mcp_server.uvicorn,
+        "run",
+        lambda app, *, host, port, log_level: calls.append((app, host, port)),
+    )
+
+    with pytest.raises(McpConfigurationError, match="Tunnel-only"):
+        serve_mcp(
+            _managed_config(),
+            transport="streamable-http",
+            host="0.0.0.0",
+            published_host="0.0.0.0",
+            port=8766,
+        )
+
+    serve_mcp(
+        _managed_config(),
+        transport="streamable-http",
+        host="0.0.0.0",
+        published_host="127.0.0.1",
+        port=8766,
+    )
+    assert calls == [("app", "0.0.0.0", 8766)]
 
 
 def test_sensitive_auth_values_do_not_enter_repr_response_errors_or_logs(
