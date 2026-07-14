@@ -507,6 +507,17 @@ def _record_response_groups(record) -> list[dict[str, Any]]:
     return out
 
 
+def _missing_required_response_names(task: TaskConfig, values: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for label in _all_label_fields(task):
+        if not _question_required(label):
+            continue
+        value = _response_value(values.get(label["name"]))
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing.append(str(label["name"]))
+    return missing
+
+
 def _guidelines_for_task(task: TaskConfig, params: dict[str, Any]) -> str:
     return str(params.get("guidelines") or task.annotation_guidelines or f"Label records for task {task.task_id}.")
 
@@ -687,7 +698,7 @@ def _validate_dataset_resume(
     settings_fingerprint: str,
     desired_record_ids: set[str],
     min_submitted: int,
-) -> None:
+) -> set[str]:
     state = _validate_live_dataset_contract(
         existing,
         push_fingerprint=push_fingerprint,
@@ -697,6 +708,7 @@ def _validate_dataset_resume(
     unexpected_ids = state["record_ids"] - desired_record_ids
     if unexpected_ids:
         raise ValueError("Argilla dataset 包含当前 push contract 之外的 record id，拒绝幂等恢复")
+    return desired_record_ids - state["record_ids"]
 
 
 def _validate_live_dataset_contract(
@@ -736,25 +748,25 @@ def _prepare_dataset(
     if policy not in {"fail", "resume", "append", "replace"}:
         raise ValueError("Argilla 同名数据集策略只能是 fail、resume、append 或 replace")
     if existing is None:
-        return dataset.create(), "created"
+        return dataset.create(), "created", set(desired_record_ids)
     if policy == "fail":
         raise ValueError(f"Argilla 数据集已存在: {_workspace_name(existing.workspace)}/{existing.name}")
 
     if policy in {"resume", "append"}:
-        _validate_dataset_resume(
+        missing_record_ids = _validate_dataset_resume(
             existing,
             push_fingerprint=push_fingerprint,
             settings_fingerprint=settings_fingerprint,
             desired_record_ids=desired_record_ids,
             min_submitted=min_submitted,
         )
-        return existing, "resumed"
+        return existing, "resumed", missing_record_ids
 
     state = _remote_dataset_state(existing)
     if state["has_responses"]:
         raise ValueError("Argilla dataset 已有回答，禁止 replace")
     existing.delete()
-    return dataset.create(), "replaced"
+    return dataset.create(), "replaced", set(desired_record_ids)
 
 
 def _build_contract(
@@ -1195,7 +1207,7 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         raise ValueError("Argilla push 至少需要一条 record，拒绝创建无法验证 contract marker 的空 dataset")
 
     dataset = rg.Dataset(name=dataset_name, workspace=workspace, settings=settings, client=client)
-    dataset, dataset_action = _prepare_dataset(
+    dataset, dataset_action, missing_record_ids = _prepare_dataset(
         dataset,
         existing,
         if_exists,
@@ -1215,7 +1227,9 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         push_fingerprint=push_fingerprint,
     )
 
-    dataset.records.log(records)
+    records_to_log = [record for record in records if str(record.id) in missing_record_ids]
+    if records_to_log:
+        dataset.records.log(records_to_log)
     return {
         "backend": "argilla",
         "workspace": workspace_name,
@@ -1226,6 +1240,8 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         "if_exists": if_exists,
         "min_submitted": min_submitted,
         "records": len(records),
+        "records_logged": len(records_to_log),
+        "records_existing": len(records) - len(records_to_log),
         "suggestions": _record_suggestion_count(records),
         "record_id_policy": record_id_policy,
         "duplicate_record_ids": duplicate_record_ids,
@@ -1386,6 +1402,10 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
             user = users.get(user_id)
             if user is None:
                 raise ValueError("Argilla submitted response user UUID 不属于 manifest workspace")
+            if _missing_required_response_names(task, response_group["values"]):
+                skipped_groups += 1
+                quarantined_groups += 1
+                continue
             human_label = _human_label_from_values(task, response_group["values"])
             if not human_label:
                 skipped_groups += 1

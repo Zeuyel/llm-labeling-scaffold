@@ -330,7 +330,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 
 推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题，并在 annotation manifest 中记录 server/SDK 版本、workspace/dataset UUID、settings schema 与 task/sample/batch/plan fingerprint。拉回时只接受 `submitted` response，并保留回答者 UUID、用户名、角色和 workspace UUID。
 
-如果进程在 `dataset.create()` 后、首批 record 写入前中断，远端空 dataset 没有可验证的 contract marker。平台会拒绝按同名 dataset 自动恢复；确认该 dataset 没有任何回答后，使用 `if_exists=replace` 显式重建。已有回答的 dataset 始终禁止 replace。
+相同 contract 的恢复只补写远端缺失的 record ID，不重传已经存在的记录。完整重复重试不会产生 record 写请求。如果进程在 `dataset.create()` 后、首批 record 写入前中断，远端空 dataset 没有可验证的 contract marker，平台会拒绝按同名 dataset 自动恢复；确认该 dataset 没有任何回答后，使用 `if_exists=replace` 显式重建。已有回答的 dataset 始终禁止 replace。
 
 ## 本地命令开发
 

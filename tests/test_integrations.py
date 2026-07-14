@@ -697,6 +697,20 @@ class _Dataset:
         return self
 
 
+class _RemoteRecords:
+    def __init__(self, records):
+        self.records = list(records)
+        self.logged_batches: list[list] = []
+
+    def __iter__(self):
+        return iter(self.records)
+
+    def log(self, records):
+        batch = list(records)
+        self.logged_batches.append(batch)
+        self.records.extend(batch)
+
+
 class _Datasets:
     def __init__(self, items):
         self._items = items
@@ -775,7 +789,7 @@ def test_argilla_dataset_existing_policy_fail_and_idempotent_resume():
             min_submitted=1,
         )
 
-    dataset, action = _prepare_dataset(
+    dataset, action, missing_record_ids = _prepare_dataset(
         created,
         existing,
         "resume",
@@ -786,6 +800,7 @@ def test_argilla_dataset_existing_policy_fail_and_idempotent_resume():
     )
     assert dataset is existing
     assert action == "resumed"
+    assert missing_record_ids == {"r2"}
     assert existing.records[0].responses == [submitted]
     assert existing.deleted == 0
 
@@ -864,7 +879,7 @@ def test_argilla_dataset_replace_without_responses_creates_new_dataset():
     existing = _Dataset("dataset_a", records=[_remote_record("r1", "a" * 64)])
     created = _Dataset("dataset_a")
 
-    dataset, action = _prepare_dataset(
+    dataset, action, missing_record_ids = _prepare_dataset(
         created,
         existing,
         "replace",
@@ -875,8 +890,92 @@ def test_argilla_dataset_replace_without_responses_creates_new_dataset():
     )
     assert dataset is created
     assert action == "replaced"
+    assert missing_record_ids == {"r1"}
     assert existing.deleted == 1
     assert created.created == 1
+
+
+def _install_push_sample_fakes(monkeypatch, existing: _Dataset):
+    client = _PullClient(existing.workspace, existing, [])
+
+    class CandidateDataset(_Dataset):
+        def __init__(self, name, workspace, settings, client):
+            super().__init__(name, resource_id="00000000-0000-0000-0000-000000000099")
+            self.workspace = workspace
+            self.settings = settings
+            self.records = _RemoteRecords([])
+
+    fake_rg = types.SimpleNamespace(
+        __version__="2.8.0",
+        Record=_Record,
+        Dataset=CandidateDataset,
+        Settings=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        TextField=_Question,
+        LabelQuestion=_Question,
+        TaskDistribution=lambda min_submitted: types.SimpleNamespace(min_submitted=min_submitted),
+    )
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
+    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+    monkeypatch.setattr(
+        argilla,
+        "_push_fingerprints",
+        lambda task, sample_path, params: {"task": "1" * 64, "sample": "2" * 64, "batch": "3" * 64, "plan": "4" * 64},
+    )
+    monkeypatch.setattr(argilla, "_settings_fingerprint", lambda settings: "5" * 64)
+    monkeypatch.setattr(argilla, "_push_fingerprint", lambda **kwargs: "f" * 64)
+
+
+def test_argilla_push_resume_logs_only_missing_records_and_preserves_responses(tmp_path: Path, monkeypatch):
+    submitted = types.SimpleNamespace(status="submitted", value="yes")
+    draft = types.SimpleNamespace(status="draft", value="no")
+    existing_record = _remote_record("r1", "f" * 64, [submitted, draft])
+    existing = _Dataset("dataset", records=[])
+    existing.records = _RemoteRecords([existing_record])
+    _install_push_sample_fakes(monkeypatch, existing)
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "one"},
+            {"record_id": "r2", "title": "two"},
+        ],
+        sample,
+    )
+
+    result = argilla.push_sample(_argilla_push_task(), sample, "dataset", {"workspace": "argilla"})
+
+    assert [[record.id for record in batch] for batch in existing.records.logged_batches] == [["r2"]]
+    assert existing_record.responses == [submitted, draft]
+    assert result["records"] == 2
+    assert result["records_logged"] == 1
+    assert result["records_existing"] == 1
+
+
+def test_argilla_push_full_retry_performs_zero_remote_record_writes(tmp_path: Path, monkeypatch):
+    submitted = types.SimpleNamespace(status="submitted", value="yes")
+    draft = types.SimpleNamespace(status="draft", value="no")
+    remote_records = [
+        _remote_record("r1", "f" * 64, [submitted]),
+        _remote_record("r2", "f" * 64, [draft]),
+    ]
+    existing = _Dataset("dataset", records=[])
+    existing.records = _RemoteRecords(remote_records)
+    _install_push_sample_fakes(monkeypatch, existing)
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "one"},
+            {"record_id": "r2", "title": "two"},
+        ],
+        sample,
+    )
+
+    result = argilla.push_sample(_argilla_push_task(), sample, "dataset", {"workspace": "argilla"})
+
+    assert existing.records.logged_batches == []
+    assert [record.responses for record in remote_records] == [[submitted], [draft]]
+    assert result["records_logged"] == 0
+    assert result["records_existing"] == 2
 
 
 def test_argilla_push_fingerprints_are_stable_and_plan_sensitive(tmp_path: Path):
@@ -970,13 +1069,25 @@ def test_argilla_server_2_8_version_route_contract(monkeypatch):
 
 
 def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(tmp_path: Path, monkeypatch):
-    task = _argilla_push_task()
+    base_task = _argilla_push_task()
+    task = TaskConfig(
+        path=base_task.path,
+        raw={
+            **base_task.raw,
+            "labels": {
+                "primary": base_task.primary_label,
+                "auxiliary": [{"name": "reason", "type": "string", "required": False}],
+            },
+        },
+    )
     push_fingerprint = "f" * 64
     submitted_user = UUID("10000000-0000-0000-0000-000000000001")
     draft_user = UUID("10000000-0000-0000-0000-000000000002")
     discarded_user = UUID("10000000-0000-0000-0000-000000000003")
     mixed_user = UUID("10000000-0000-0000-0000-000000000004")
     unknown_user = UUID("10000000-0000-0000-0000-000000000005")
+    incomplete_user = UUID("10000000-0000-0000-0000-000000000006")
+    duplicate_user = UUID("10000000-0000-0000-0000-000000000007")
     record = types.SimpleNamespace(
         id="r1",
         status="completed",
@@ -989,12 +1100,18 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
             types.SimpleNamespace(question_name="label", value="yes", user_id=mixed_user, status="submitted"),
             types.SimpleNamespace(question_name="reason", value="mixed", user_id=mixed_user, status="draft"),
             types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_user, status="completed"),
+            types.SimpleNamespace(question_name="reason", value="optional only", user_id=incomplete_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=duplicate_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="no", user_id=duplicate_user, status="submitted"),
         ],
     )
     dataset = _Dataset("dataset", records=[record])
     users = [
         types.SimpleNamespace(id=user_id, username=f"user_{index}", role=types.SimpleNamespace(value="annotator"))
-        for index, user_id in enumerate((submitted_user, draft_user, discarded_user, mixed_user, unknown_user), start=1)
+        for index, user_id in enumerate(
+            (submitted_user, draft_user, discarded_user, mixed_user, unknown_user, incomplete_user, duplicate_user),
+            start=1,
+        )
     ]
     client = _PullClient(dataset.workspace, dataset, users)
     contract = _pull_contract(task, dataset, push_fingerprint=push_fingerprint)
@@ -1025,8 +1142,8 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
         }
     ]
     assert result["responses"] == 1
-    assert result["skipped_response_groups"] == 4
-    assert result["quarantined_response_groups"] == 2
+    assert result["skipped_response_groups"] == 6
+    assert result["quarantined_response_groups"] == 4
     assert result["users"] == [
         {
             "uuid": str(submitted_user),
