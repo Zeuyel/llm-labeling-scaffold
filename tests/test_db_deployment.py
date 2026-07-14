@@ -72,6 +72,29 @@ def test_compose_role_initialization_paths_are_explicit():
         in migrate_environment
     )
 
+    materializer = services["materializer"]
+    materializer_environment = set(materializer["environment"])
+    assert materializer["restart"] == "unless-stopped"
+    assert "LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}" in materializer_environment
+    assert (
+        "LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}"
+        in materializer_environment
+    )
+    assert materializer["command"] == [
+        "python",
+        "-m",
+        "llm_labeling_scaffold.cli",
+        "db",
+        "materialize",
+        "--runs-root",
+        "/app/runs",
+        "--tasks-root",
+        "/app/tasks",
+    ]
+    assert materializer["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
+    assert "./runs:/app/runs" in materializer["volumes"]
+    assert "./tasks:/app/tasks" in materializer["volumes"]
+
     first_init = services["scaffold-postgres"]
     assert first_init["environment"]["LLS_RUNTIME_ROLE_SQL_PATH"] == (
         "/usr/local/share/lls/init-runtime-role.sql"
