@@ -679,6 +679,39 @@ def test_actor_context_separates_actor_from_caller_and_mcp_checks_caller():
     assert panel._Handler._is_mcp_request(holder) is True
 
 
+def test_internal_mcp_bearer_only_delegates_to_a_verified_access_actor():
+    private_key, jwk = _signing_key("key-1")
+    token = _assertion(private_key, "key-1")
+    internal_token = "mcp-internal-0123456789-abcdef-012"
+    authenticator = PanelAuthenticator(
+        mode="cloudflare_access",
+        cloudflare_verifier=_verifier(jwk),
+        internal_token=internal_token,
+    )
+
+    service_only = authenticator.authenticate(
+        {
+            "Authorization": f"Bearer {internal_token}",
+            "X-Actor": SUBJECT,
+            "X-User-Email": "alice@example.com",
+        },
+    )
+    delegated = authenticator.authenticate(
+        {
+            "Authorization": f"Bearer {internal_token}",
+            "Cf-Access-Jwt-Assertion": token,
+            "X-Actor": "attacker",
+        },
+    )
+
+    assert service_only.actor is service_only.caller
+    assert service_only.actor.kind == "service"
+    assert delegated.actor.kind == "user"
+    assert delegated.actor.identity.identity_key == (ISSUER, SUBJECT)
+    assert delegated.caller.kind == "service"
+    assert delegated.caller.is_static_mcp_service is True
+
+
 def test_authorization_gate_uses_actor_for_delegated_mcp_context():
     user = Principal(
         kind="user",

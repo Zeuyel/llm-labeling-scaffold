@@ -76,7 +76,7 @@ class PanelAuthenticator:
         parts = authorization.split()
         if len(parts) == 2 and parts[0].lower() == "bearer" and self._internal_token:
             if hmac.compare_digest(parts[1], self._internal_token):
-                principal = Principal(
+                caller = Principal(
                     kind="service",
                     authentication_method="mcp_service_bearer",
                     identity=Identity(
@@ -85,7 +85,10 @@ class PanelAuthenticator:
                         display_name="MCP service",
                     ),
                 )
-                return ActorContext.direct(principal)
+                assertion = str(headers.get("Cf-Access-Jwt-Assertion") or "").strip()
+                if assertion and self.mode == "cloudflare_access":
+                    return ActorContext(actor=self._cloudflare_principal(assertion), caller=caller)
+                return ActorContext.direct(caller)
 
         if self.mode == "basic_dev":
             return self._authenticate_basic(parts)
@@ -136,6 +139,9 @@ class PanelAuthenticator:
                 "Cloudflare Access assertion 缺失",
                 HTTPStatus.UNAUTHORIZED,
             )
+        return ActorContext.direct(self._cloudflare_principal(assertion))
+
+    def _cloudflare_principal(self, assertion: str) -> Principal:
         verifier = self._cloudflare_verifier
         if verifier is None:
             raise PanelAuthenticationError(
@@ -163,12 +169,11 @@ class PanelAuthenticator:
                 "Cloudflare Access assertion 无效",
                 HTTPStatus.UNAUTHORIZED,
             ) from exc
-        principal = Principal(
+        return Principal(
             kind="user",
             authentication_method="cloudflare_access",
             identity=identity,
         )
-        return ActorContext.direct(principal)
 
     @property
     def challenge(self) -> str | None:
