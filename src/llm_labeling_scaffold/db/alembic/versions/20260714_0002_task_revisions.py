@@ -134,7 +134,7 @@ def upgrade() -> None:
             ["workspace_id", "task_id"],
             ["tasks.workspace_id", "tasks.id"],
             name="fk_task_revisions_workspace_task",
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_task_revisions"),
         sa.UniqueConstraint(
@@ -159,8 +159,8 @@ def upgrade() -> None:
         batch_op.create_foreign_key(
             "fk_tasks_current_revision_id_task_revisions",
             "task_revisions",
-            ["current_revision_id"],
-            ["id"],
+            ["workspace_id", "id", "current_revision_id"],
+            ["workspace_id", "task_id", "id"],
             ondelete="RESTRICT",
         )
 
@@ -174,6 +174,7 @@ def upgrade() -> None:
         sa.Column("attempt_count", sa.Integer(), server_default=sa.text("'0'"), nullable=False),
         sa.Column("available_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("claimed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("claimed_by", sa.String(length=255), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("materialized_at", sa.DateTime(timezone=True), nullable=True),

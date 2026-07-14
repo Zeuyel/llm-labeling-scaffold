@@ -14,6 +14,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
 from llm_labeling_scaffold.db import (
+    AuditChannel,
     DatabaseService,
     ExternalIdentity,
     IdempotencyClaimStatus,
@@ -24,13 +25,17 @@ from llm_labeling_scaffold.db import (
 from llm_labeling_scaffold.db import migration as migration_module
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
 from llm_labeling_scaffold.db.database import create_database_engine
+from llm_labeling_scaffold.db.enums import IdempotencyState
 from llm_labeling_scaffold.db.migration import build_alembic_config, upgrade_database
 from llm_labeling_scaffold.db.models import (
     AuditEvent,
+    IdempotencyRecord,
     MigrationRun,
     Principal,
     RoleBinding,
     Task,
+    TaskRevision,
+    Workspace,
     WorkspaceSetting,
 )
 
@@ -71,10 +76,27 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
         assert FORBIDDEN_TABLES.isdisjoint(table_names)
         task_unique_constraints = inspect(engine).get_unique_constraints("tasks")
         assert any(constraint["column_names"] == ["task_key"] for constraint in task_unique_constraints)
+        task_foreign_keys = inspect(engine).get_foreign_keys("tasks")
+        assert any(
+            foreign_key["constrained_columns"] == ["workspace_id", "id", "current_revision_id"]
+            and foreign_key["referred_table"] == "task_revisions"
+            and foreign_key["referred_columns"] == ["workspace_id", "task_id", "id"]
+            for foreign_key in task_foreign_keys
+        )
+        revision_foreign_keys = inspect(engine).get_foreign_keys("task_revisions")
+        assert any(
+            foreign_key["constrained_columns"] == ["workspace_id", "task_id"]
+            and foreign_key["referred_table"] == "tasks"
+            and foreign_key["options"].get("ondelete") == "RESTRICT"
+            for foreign_key in revision_foreign_keys
+        )
         idempotency_columns = {column["name"] for column in inspect(engine).get_columns("idempotency_records")}
         assert "idempotency_key_hash" in idempotency_columns
         assert "idempotency_key" not in idempotency_columns
         assert "current_revision_id" in {column["name"] for column in inspect(engine).get_columns("tasks")}
+        assert "lease_expires_at" in {
+            column["name"] for column in inspect(engine).get_columns("task_revision_materializations")
+        }
         assert first.applied_revision == "20260714_0002"
         assert second.applied_revision == "20260714_0002"
         with Session(engine) as session:
@@ -99,6 +121,83 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
                 connection.execute(
                     delete(AuditEvent).where(AuditEvent.workspace_id == result.workspace_id),
                 )
+    finally:
+        engine.dispose()
+
+
+def test_task_revision_schema_rejects_cross_task_pointer_and_parent_delete(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'task-revision-constraints.db'}"
+    command.upgrade(build_alembic_config(database_url), "head")
+    engine = create_database_engine(database_url)
+    try:
+        with Session(engine) as session:
+            bootstrap = bootstrap_admin(
+                session,
+                issuer="https://task-revision-schema.example",
+                subject="admin",
+                workspace_slug="task-revision-schema",
+                workspace_name="Task Revision Schema",
+            )
+        with Session(engine) as session, session.begin():
+            workspace = session.get(Workspace, bootstrap.workspace_id)
+            task_a = Task(
+                workspace_id=workspace.id,
+                task_key="schema-task-a",
+                name="Schema Task A",
+                created_by_principal_id=bootstrap.principal_id,
+            )
+            task_b = Task(
+                workspace_id=workspace.id,
+                task_key="schema-task-b",
+                name="Schema Task B",
+                created_by_principal_id=bootstrap.principal_id,
+            )
+            session.add_all([task_a, task_b])
+            session.flush()
+            claim = IdempotencyRecord(
+                workspace_id=workspace.id,
+                actor_principal_id=bootstrap.principal_id,
+                caller_principal_id=bootstrap.principal_id,
+                operation="task.publish",
+                idempotency_key_hash="a" * 64,
+                request_fingerprint="b" * 64,
+                state=IdempotencyState.SUCCEEDED,
+                response_status=202,
+                response_body={},
+            )
+            session.add(claim)
+            session.flush()
+            revision = TaskRevision(
+                workspace_id=workspace.id,
+                task_id=task_b.id,
+                revision_number=1,
+                draft_version=1,
+                draft_fingerprint="c" * 64,
+                definition={"task_id": task_b.task_key},
+                rendered_task="task_id: schema-task-b\n",
+                reason="schema constraint test",
+                actor_principal_id=bootstrap.principal_id,
+                caller_principal_id=bootstrap.principal_id,
+                channel=AuditChannel.API,
+                content_hash="d" * 64,
+                idempotency_record_id=claim.id,
+            )
+            session.add(revision)
+            session.flush()
+            task_a_id = task_a.id
+            task_b_id = task_b.id
+            revision_id = revision.id
+
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(
+                    update(Task)
+                    .where(Task.id == task_a_id)
+                    .values(current_revision_id=revision_id),
+                )
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(delete(Task).where(Task.id == task_b_id))
     finally:
         engine.dispose()
 

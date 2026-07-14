@@ -111,6 +111,13 @@ class Workspace(Base):
 class Task(Base):
     __tablename__ = "tasks"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "id", "current_revision_id"],
+            ["task_revisions.workspace_id", "task_revisions.task_id", "task_revisions.id"],
+            name="fk_tasks_current_revision_id_task_revisions",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
         UniqueConstraint("workspace_id", "id", name="uq_tasks_workspace_id_id"),
         UniqueConstraint("task_key", name="uq_tasks_task_key"),
         CheckConstraint("length(trim(task_key)) > 0", name="task_key_not_blank"),
@@ -126,15 +133,7 @@ class Task(Base):
     task_key: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
-    current_revision_id: Mapped[uuid.UUID | None] = mapped_column(
-        Uuid(as_uuid=True),
-        ForeignKey(
-            "task_revisions.id",
-            name="fk_tasks_current_revision_id_task_revisions",
-            ondelete="RESTRICT",
-            use_alter=True,
-        ),
-    )
+    current_revision_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
     created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("principals.id", ondelete="RESTRICT"),
@@ -344,7 +343,7 @@ class TaskRevision(Base):
             ["workspace_id", "task_id"],
             ["tasks.workspace_id", "tasks.id"],
             name="fk_task_revisions_workspace_task",
-            ondelete="CASCADE",
+            ondelete="RESTRICT",
         ),
         ForeignKeyConstraint(
             ["workspace_id", "task_id", "previous_revision_id"],
@@ -458,6 +457,7 @@ class TaskRevisionMaterialization(Base):
         server_default=func.now(),
     )
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     claimed_by: Mapped[str | None] = mapped_column(String(255))
     last_error: Mapped[str | None] = mapped_column(Text)
     materialized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
