@@ -1402,53 +1402,229 @@ class TaskMaterializationWorker:
         activation: ActivationResult | None = None,
         phase: str = "ready_validation",
     ) -> None:
-        with self._session_factory() as session, session.begin():
-            materialization = session.scalar(
-                select(TaskRevisionMaterialization)
-                .where(TaskRevisionMaterialization.id == materialization_id)
-                .with_for_update(),
-            )
-            if materialization is None or materialization.state != TaskMaterializationState.SUCCEEDED:
+        with self._session_factory() as lookup_session:
+            failed_snapshot = lookup_session.get(TaskRevisionMaterialization, materialization_id)
+            if failed_snapshot is None:
                 return
-            task = session.scalar(
-                select(Task).where(Task.id == materialization.task_id).with_for_update(),
+            task_snapshot = lookup_session.get(Task, failed_snapshot.task_id)
+            previous_revision = (
+                lookup_session.get(TaskRevision, activation.previous_revision_id)
+                if activation is not None
+                and activation.changed
+                and activation.previous_revision_id is not None
+                else None
+            )
+            previous_descriptor = (
+                _revision_snapshot(task_snapshot, previous_revision)
+                if task_snapshot is not None
+                and previous_revision is not None
+                and previous_revision.task_id == task_snapshot.id
+                and previous_revision.workspace_id == task_snapshot.workspace_id
+                else None
+            )
+
+        previous_authority: PinnedSnapshotAuthority | None = None
+        previous_validation_error: SnapshotValidationError | None = None
+        restored_revision_id: uuid.UUID | None = None
+        fallback_reason = "not_requested"
+        post_commit_error: SnapshotValidationError | None = None
+        try:
+            with ExitStack() as authority_stack:
+                if activation is not None and activation.changed:
+                    if activation.previous_revision_id is None:
+                        fallback_reason = "no_previous_revision"
+                    elif previous_descriptor is None:
+                        fallback_reason = "previous_revision_missing"
+                        previous_validation_error = SnapshotValidationError(
+                            "previous revision snapshot descriptor is unavailable",
+                        )
+                    else:
+                        try:
+                            previous_authority = authority_stack.enter_context(
+                                self._snapshot_store.pinned(previous_descriptor),
+                            )
+                        except SnapshotValidationError as exc:
+                            previous_validation_error = exc
+                            fallback_reason = "previous_snapshot_invalid"
+
+                with self._session_factory() as session, session.begin():
+                    task, materializations = self._lock_task_materializations(
+                        session,
+                        failed_snapshot.task_id,
+                        tuple(
+                            revision_id
+                            for revision_id in (
+                                failed_snapshot.revision_id,
+                                activation.previous_revision_id if activation is not None else None,
+                            )
+                            if revision_id is not None
+                        ),
+                    )
+                    materialization = materializations.get(failed_snapshot.revision_id)
+                    if (
+                        task is None
+                        or materialization is None
+                        or materialization.id != materialization_id
+                        or materialization.state != TaskMaterializationState.SUCCEEDED
+                    ):
+                        return
+
+                    activation_reverted = task.current_revision_id == materialization.revision_id
+                    if activation_reverted:
+                        previous_materialization = (
+                            materializations.get(activation.previous_revision_id)
+                            if activation is not None
+                            and activation.previous_revision_id is not None
+                            else None
+                        )
+                        if activation is None or not activation.changed:
+                            fallback_reason = "no_proven_previous_revision"
+                        elif (
+                            previous_materialization is not None
+                            and previous_materialization.state == TaskMaterializationState.SUCCEEDED
+                            and previous_authority is not None
+                        ):
+                            try:
+                                _assert_pinned_snapshot_authority(previous_authority)
+                            except SnapshotValidationError as exc:
+                                previous_validation_error = exc
+                                fallback_reason = "previous_snapshot_invalid"
+                            else:
+                                restored_revision_id = activation.previous_revision_id
+                                fallback_reason = "previous_valid"
+                        elif previous_materialization is None:
+                            fallback_reason = "previous_materialization_missing"
+                        elif previous_materialization.state != TaskMaterializationState.SUCCEEDED:
+                            fallback_reason = "previous_not_succeeded"
+
+                        if (
+                            previous_materialization is not None
+                            and previous_materialization.state == TaskMaterializationState.SUCCEEDED
+                            and restored_revision_id is None
+                            and previous_validation_error is not None
+                        ):
+                            self._mark_locked_materialization_failed(
+                                session,
+                                previous_materialization,
+                                previous_validation_error,
+                                phase="fallback_validation",
+                                details={"current_cleared": True},
+                            )
+                        task.current_revision_id = restored_revision_id
+
+                    self._mark_locked_materialization_failed(
+                        session,
+                        materialization,
+                        error,
+                        phase=phase,
+                        details={
+                            "activation_reverted": activation_reverted,
+                            "restored_revision_id": (
+                                str(restored_revision_id)
+                                if restored_revision_id is not None
+                                else None
+                            ),
+                            "fallback_reason": fallback_reason,
+                        },
+                    )
+
+                if restored_revision_id is not None and previous_authority is not None:
+                    _assert_pinned_snapshot_authority(previous_authority)
+        except SnapshotValidationError as exc:
+            post_commit_error = exc
+
+        if post_commit_error is not None and restored_revision_id is not None:
+            self._clear_invalid_restored_current(
+                failed_snapshot.task_id,
+                restored_revision_id,
+                post_commit_error,
+            )
+
+    def _lock_task_materializations(
+        self,
+        session: Session,
+        task_id: uuid.UUID,
+        revision_ids: tuple[uuid.UUID, ...],
+    ) -> tuple[Task | None, dict[uuid.UUID, TaskRevisionMaterialization]]:
+        task = session.scalar(select(Task).where(Task.id == task_id).with_for_update())
+        if task is None:
+            return None, {}
+        materializations = tuple(
+            session.scalars(
+                select(TaskRevisionMaterialization)
+                .where(
+                    TaskRevisionMaterialization.task_id == task_id,
+                    TaskRevisionMaterialization.revision_id.in_(set(revision_ids)),
+                )
+                .order_by(TaskRevisionMaterialization.id)
+                .with_for_update()
+                .execution_options(populate_existing=True),
+            ).all(),
+        )
+        return task, {item.revision_id: item for item in materializations}
+
+    def _mark_locked_materialization_failed(
+        self,
+        session: Session,
+        materialization: TaskRevisionMaterialization,
+        error: BaseException,
+        *,
+        phase: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        materialization.state = TaskMaterializationState.FAILED
+        materialization.last_error = _error_text(error)
+        event_details = {
+            "task_id": str(materialization.task_id),
+            "revision_id": str(materialization.revision_id),
+            "attempt_count": materialization.attempt_count,
+            "worker_id": self.worker_id,
+            "error": materialization.last_error,
+            "phase": phase,
+        }
+        if details is not None:
+            event_details.update(details)
+        append_audit_event(
+            session,
+            workspace_id=materialization.workspace_id,
+            event_type="task.revision_materialization_failed",
+            actor=None,
+            caller=None,
+            channel=AuditChannel.WORKER,
+            resource_type="task_revision_materialization",
+            resource_id=materialization.id,
+            details=event_details,
+        )
+
+    def _clear_invalid_restored_current(
+        self,
+        task_id: uuid.UUID,
+        revision_id: uuid.UUID,
+        error: SnapshotValidationError,
+    ) -> None:
+        with self._session_factory() as session, session.begin():
+            task, materializations = self._lock_task_materializations(
+                session,
+                task_id,
+                (revision_id,),
             )
             if task is None:
                 return
-            activation_reverted = False
-            restored_revision_id: uuid.UUID | None = None
+            current_cleared = task.current_revision_id == revision_id
+            if current_cleared:
+                task.current_revision_id = None
+            materialization = materializations.get(revision_id)
             if (
-                activation is not None
-                and activation.changed
-                and task.current_revision_id == materialization.revision_id
+                materialization is not None
+                and materialization.state == TaskMaterializationState.SUCCEEDED
             ):
-                restored_revision_id = activation.previous_revision_id
-                task.current_revision_id = restored_revision_id
-                activation_reverted = True
-            materialization.state = TaskMaterializationState.FAILED
-            materialization.last_error = _error_text(error)
-            append_audit_event(
-                session,
-                workspace_id=materialization.workspace_id,
-                event_type="task.revision_materialization_failed",
-                actor=None,
-                caller=None,
-                channel=AuditChannel.WORKER,
-                resource_type="task_revision_materialization",
-                resource_id=materialization.id,
-                details={
-                    "task_id": str(materialization.task_id),
-                    "revision_id": str(materialization.revision_id),
-                    "attempt_count": materialization.attempt_count,
-                    "worker_id": self.worker_id,
-                    "error": materialization.last_error,
-                    "phase": phase,
-                    "activation_reverted": activation_reverted,
-                    "restored_revision_id": (
-                        str(restored_revision_id) if restored_revision_id is not None else None
-                    ),
-                },
-            )
+                self._mark_locked_materialization_failed(
+                    session,
+                    materialization,
+                    error,
+                    phase="fallback_validation",
+                    details={"current_cleared": current_cleared},
+                )
 
     def _activate(
         self,
@@ -1457,18 +1633,20 @@ class TaskMaterializationWorker:
     ) -> ActivationResult:
         with self._session_factory() as session, session.begin():
             revision = session.get(TaskRevision, revision_id)
-            materialization = session.scalar(
-                select(TaskRevisionMaterialization)
-                .where(
-                    TaskRevisionMaterialization.revision_id == revision_id,
-                    TaskRevisionMaterialization.state == TaskMaterializationState.SUCCEEDED,
-                )
-                .with_for_update(),
-            )
-            if revision is None or materialization is None:
+            if revision is None:
                 raise MaterializationError("revision is not ready for activation")
-            task = session.scalar(select(Task).where(Task.id == revision.task_id).with_for_update())
-            if task is None or task.workspace_id != revision.workspace_id:
+            task, materializations = self._lock_task_materializations(
+                session,
+                revision.task_id,
+                (revision_id,),
+            )
+            materialization = materializations.get(revision_id)
+            if (
+                task is None
+                or task.workspace_id != revision.workspace_id
+                or materialization is None
+                or materialization.state != TaskMaterializationState.SUCCEEDED
+            ):
                 raise MaterializationError("revision task disappeared before activation")
             _assert_pinned_snapshot_authority(snapshot_authority)
 

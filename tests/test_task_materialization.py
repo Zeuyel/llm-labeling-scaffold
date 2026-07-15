@@ -1313,6 +1313,97 @@ def test_snapshot_replacement_during_activation_fails_closed_and_restores_curren
     assert loader.load("workspace", "controlled-task").raw["marker"] == "activation-v1"
 
 
+@pytest.mark.parametrize(
+    ("previous_case", "fallback_reason"),
+    [
+        ("valid", "previous_valid"),
+        ("failed", "previous_not_succeeded"),
+        ("damaged", "previous_snapshot_invalid"),
+    ],
+)
+def test_after_activation_compensation_only_restores_proven_previous_snapshot(
+    materialization_env,
+    previous_case: str,
+    fallback_reason: str,
+):
+    env = materialization_env
+    v2_draft, v2 = _publish(env, "fallback-v2", f"publish-fallback-v2-{previous_case}")
+    v2_worker = _worker(env, worker_id=f"worker-fallback-v2-{previous_case}")
+    v2_worker.drain(v2.materialization_id, timeout_seconds=1)
+
+    _v3_draft, v3 = _publish(
+        env,
+        "fallback-v3",
+        f"publish-fallback-v3-{previous_case}",
+        if_match=v2_draft.etag,
+    )
+    injected = False
+
+    def inject(point, revision):
+        nonlocal injected
+        if point != "after_activation" or revision.revision_id != v3.revision_id or injected:
+            return
+        injected = True
+        if previous_case == "failed":
+            with Session(env["engine"]) as session, session.begin():
+                previous = session.get(TaskRevisionMaterialization, v2.materialization_id)
+                previous.state = TaskMaterializationState.FAILED
+                previous.last_error = "concurrent previous failure"
+        elif previous_case == "damaged":
+            previous_task = (
+                _snapshot_root(env) / str(v2.revision_id) / v2.content_hash / "task.yaml"
+            )
+            previous_task.unlink()
+            previous_task.write_text("task_id: damaged-previous\n", encoding="utf-8")
+
+        failed_task = (
+            _snapshot_root(env) / str(v3.revision_id) / v3.content_hash / "task.yaml"
+        )
+        failed_task.unlink()
+        failed_task.write_text("task_id: damaged-current\n", encoding="utf-8")
+
+    worker = _worker(
+        env,
+        worker_id=f"worker-fallback-v3-{previous_case}",
+        fault_injector=inject,
+    )
+    result = worker.run_once(v3.materialization_id)
+
+    assert result.action == "failed"
+    with Session(env["engine"]) as session:
+        task = session.get(Task, env["task_id"])
+        previous = session.get(TaskRevisionMaterialization, v2.materialization_id)
+        failed = session.get(TaskRevisionMaterialization, v3.materialization_id)
+        failure_event = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == "task.revision_materialization_failed",
+                AuditEvent.resource_id == str(v3.materialization_id),
+            ),
+        )
+        assert failed.state == TaskMaterializationState.FAILED
+        assert failure_event.details["fallback_reason"] == fallback_reason
+        assert failure_event.details["activation_reverted"] is True
+        if previous_case == "valid":
+            assert task.current_revision_id == v2.revision_id
+            assert previous.state == TaskMaterializationState.SUCCEEDED
+            assert failure_event.details["restored_revision_id"] == str(v2.revision_id)
+        else:
+            assert task.current_revision_id is None
+            assert previous.state == TaskMaterializationState.FAILED
+            assert failure_event.details["restored_revision_id"] is None
+
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
+    if previous_case == "valid":
+        assert loader.load("workspace", "controlled-task").raw["marker"] == "fallback-v2"
+    else:
+        with pytest.raises(SnapshotValidationError):
+            loader.load("workspace", "controlled-task")
+
+
 def test_retryable_failure_returns_to_pending_and_recovers(materialization_env):
     env = materialization_env
     _draft, published = _publish(env, "retry", "publish-retry")

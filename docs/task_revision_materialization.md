@@ -48,7 +48,7 @@ snapshot ready 后，worker 固定 root/revision/content hash 目录和三个 sn
 3. candidate 等于 current 时幂等返回。
 4. candidate 小于 current 时返回 `superseded`，禁止回退。
 
-更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。提交前、提交后以及 pinned authority 退出前都再次复核目录、三个文件 inode、精确长度和 bytes；`before_activation` 或提交窗口内的替换在 current 更新前 fail closed，提交后才检测到时仅在 current 仍指向该 revision 的条件下恢复 previous current，并把损坏 materialization 标记为 `failed`。随后 worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 与 `.task_source.json`；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。
+更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。所有同时涉及 task 与 materialization 的事务统一先锁 task，再按 materialization UUID 顺序锁相关行。提交前、提交后以及 pinned authority 退出前都再次复核目录、三个文件 inode、精确长度和 bytes；`before_activation` 或提交窗口内的替换在 current 更新前 fail closed。提交后才检测到时，仅在 current 仍指向该 revision 时启动补偿，并且 previous materialization 必须在同一锁事务内仍为 `succeeded`、其 task/revision ownership 一致、immutable snapshot authority 当前有效，才能恢复 previous current；任一证明失败都把 current 设为 `NULL`，snapshot 无效时同时把 previous materialization 标记为 `failed`。随后 worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 与 `.task_source.json`；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。
 
 cache root 从文件系统 anchor 开始逐 path component 以 parent directory fd、`O_DIRECTORY | O_NOFOLLOW` 打开，缺失组件只通过 `mkdirat` 语义创建并 fsync 父目录。完整组件链的 fd 与 inode 在锁获取、task 写入、`os.replace` 与文件/目录 fsync 前后持续复核；root、任一祖先组件的 symlink 或运行中交换都 fail closed。
 
@@ -86,6 +86,7 @@ control loader 直接查询数据库 current revision，并在 pinned snapshot f
 | rename 前并发创建空 target | `RENAME_NOREPLACE` 返回冲突 | 校验现有 target；不完整则 fail closed | 空目录 inode 与内容保持不变，不被 staging 覆盖 |
 | validate/read 期间 revision 或文件被交换为 symlink | loader/status 校验失败 | 人工恢复 immutable snapshot | 不按路径重开，不读取 symlink 内容 |
 | `before_activation` 或 activation 提交窗口替换 snapshot file | candidate 进入 `failed`；若已提交则条件恢复 previous current | 调查 immutable snapshot 后重新发布 | 损坏 revision 不保持 `succeeded/current`，旧 active revision 继续执行 |
+| activation 补偿时 previous 已 failed、缺失或 snapshot 损坏 | candidate 与无效 previous 均 fail closed，current 设为 `NULL` | 修复 snapshot 后重新发布有效 revision | current 绝不指向非 `succeeded` 或不可加载 revision；并发 newer current 不被覆盖 |
 | snapshot/cache regular file 被替换为 oversized sparse file | snapshot 校验失败或 cache mismatch 后重建 | snapshot 需人工恢复；cache 自动恢复 | `fstat` 在任何内容读取前拒绝，不按攻击文件长度分配内存 |
 | 激活后兼容缓存刷新崩溃 | DB current 已更新，task/metadata 可能不匹配 | terminal operation 重跑、worker 待修复队列或空闲扫描从 DB current 重建 | loader 始终读取 immutable snapshot |
 | 缓存写入期间 task 目录被交换 | 已固定 fd 仍指向原 inode，路径入口已变化 | inode 复核失败并停止后续替换；恢复时重新打开当前安全目录 | 不跟随 symlink，不向交换后的目录写入 |
