@@ -17,6 +17,7 @@ from ..redaction import sensitive_paths
 
 _ARGILLA_CONTRACT_SCHEMA_VERSION = 1
 _ARGILLA_PUSH_FINGERPRINT_FIELD = "__lls_push_fingerprint"
+_ARGILLA_CONTRACT_INTENT_FIELD = "__lls_contract_intent"
 _ARGILLA_FINGERPRINT_NAMES = ("task", "sample", "batch", "plan", "settings")
 _ARGILLA_SETTINGS_VOLATILE_KEYS = {"id", "dataset_id", "inserted_at", "updated_at"}
 
@@ -100,7 +101,7 @@ def _canonical_settings_value(value: Any) -> Any:
     return value
 
 
-def _settings_fingerprint(settings: Any) -> str:
+def _serialized_settings(settings: Any) -> dict[str, Any]:
     serialize = getattr(settings, "serialize", None)
     if not callable(serialize):
         raise RuntimeError("Argilla 2.8 dataset settings 缺少公开 serialize() API")
@@ -110,7 +111,48 @@ def _settings_fingerprint(settings: Any) -> str:
         raise RuntimeError("无法序列化 Argilla dataset settings") from exc
     if not isinstance(payload, dict):
         raise RuntimeError("Argilla dataset settings serialize() 返回了非 JSON object")
-    return _stable_hash(_canonical_settings_value(payload))
+    return payload
+
+
+def _settings_fingerprint(settings: Any) -> str:
+    payload = _canonical_settings_value(_serialized_settings(settings))
+    metadata = payload.get("metadata")
+    if isinstance(metadata, list):
+        payload["metadata"] = [
+            item
+            for item in metadata
+            if not isinstance(item, dict) or item.get("name") != _ARGILLA_CONTRACT_INTENT_FIELD
+        ]
+    return _stable_hash(payload)
+
+
+def _settings_intent_fingerprint(settings: Any) -> str:
+    payload = _canonical_settings_value(_serialized_settings(settings))
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, list):
+        raise ValueError("Argilla dataset settings 缺少 contract intent metadata")
+    markers = [
+        item
+        for item in metadata
+        if isinstance(item, dict) and item.get("name") == _ARGILLA_CONTRACT_INTENT_FIELD
+    ]
+    if len(markers) != 1:
+        raise ValueError("Argilla dataset settings contract intent metadata 数量无效")
+    marker = markers[0]
+    marker_settings = marker.get("settings")
+    values = marker_settings.get("values") if isinstance(marker_settings, dict) else None
+    if (
+        marker.get("visible_for_annotators") is not False
+        or not isinstance(marker_settings, dict)
+        or marker_settings.get("type") != "terms"
+        or not isinstance(values, list)
+        or len(values) != 1
+    ):
+        raise ValueError("Argilla dataset settings contract intent metadata 结构无效")
+    fingerprint = str(values[0] or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise ValueError("Argilla dataset settings contract intent fingerprint 无效")
+    return fingerprint
 
 
 def _jsonl_fingerprint(path: str | Path) -> str:
@@ -706,12 +748,14 @@ def _validate_dataset_resume(
     settings_fingerprint: str,
     desired_record_ids: set[str],
     min_submitted: int,
+    state: dict[str, Any] | None = None,
 ) -> set[str]:
     state = _validate_live_dataset_contract(
         existing,
         push_fingerprint=push_fingerprint,
         settings_fingerprint=settings_fingerprint,
         min_submitted=min_submitted,
+        state=state,
     )
     unexpected_ids = state["record_ids"] - desired_record_ids
     if unexpected_ids:
@@ -726,18 +770,19 @@ def _validate_live_dataset_contract(
     settings_fingerprint: str,
     min_submitted: int,
     records=None,
+    state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    state = _remote_records_state(records) if records is not None else _remote_dataset_state(dataset)
-    if not state["record_ids"]:
-        raise ValueError(
-            "Argilla dataset 为空且没有可验证的 record contract marker；"
-            "请确认无回答后使用 if_exists='replace' 重建，禁止按同名 dataset 静默恢复"
-        )
+    if state is None:
+        state = _remote_records_state(records) if records is not None else _remote_dataset_state(dataset)
     if _dataset_min_submitted(dataset) != min_submitted:
         raise ValueError("Argilla dataset min_submitted 与当前 push contract 不一致")
     if _settings_fingerprint(dataset.settings) != settings_fingerprint:
         raise ValueError("Argilla dataset live settings/schema 与 push contract 不一致")
-    if state["missing_fingerprint"] or state["fingerprints"] != {push_fingerprint}:
+    if _settings_intent_fingerprint(dataset.settings) != push_fingerprint:
+        raise ValueError("Argilla dataset contract intent fingerprint 与当前 push contract 不一致")
+    if state["record_ids"] and (
+        state["missing_fingerprint"] or state["fingerprints"] != {push_fingerprint}
+    ):
         raise ValueError("Argilla dataset fingerprint 与当前 push contract 不一致，禁止 append/resume 混入")
     return state
 
@@ -760,6 +805,7 @@ def _prepare_dataset(
     if policy == "fail":
         raise ValueError(f"Argilla 数据集已存在: {_workspace_name(existing.workspace)}/{existing.name}")
 
+    state = _remote_dataset_state(existing)
     if policy in {"resume", "append"}:
         missing_record_ids = _validate_dataset_resume(
             existing,
@@ -767,12 +813,27 @@ def _prepare_dataset(
             settings_fingerprint=settings_fingerprint,
             desired_record_ids=desired_record_ids,
             min_submitted=min_submitted,
+            state=state,
         )
-        return existing, "resumed", missing_record_ids
+        action = "recovered_empty" if not state["record_ids"] else "resumed"
+        return existing, action, missing_record_ids
 
-    state = _remote_dataset_state(existing)
-    if state["has_responses"]:
-        raise ValueError("Argilla dataset 已有回答，禁止 replace")
+    try:
+        missing_record_ids = _validate_dataset_resume(
+            existing,
+            push_fingerprint=push_fingerprint,
+            settings_fingerprint=settings_fingerprint,
+            desired_record_ids=desired_record_ids,
+            min_submitted=min_submitted,
+            state=state,
+        )
+    except ValueError as exc:
+        if state["has_responses"]:
+            raise ValueError("Argilla dataset 已有回答，禁止 replace") from exc
+    else:
+        action = "recovered_empty" if not state["record_ids"] else "resumed"
+        return existing, action, missing_record_ids
+
     existing.delete()
     return dataset.create(), "replaced", set(desired_record_ids)
 
@@ -1056,6 +1117,38 @@ def _argilla_text_fields(rg, task: TaskConfig, text_field: str, params: dict[str
     return fields
 
 
+def _dataset_settings(
+    rg,
+    client,
+    task: TaskConfig,
+    text_field: str,
+    params: dict[str, Any],
+    min_submitted: int,
+    *,
+    intent_fingerprint: str | None = None,
+):
+    metadata = []
+    if intent_fingerprint is not None:
+        metadata_property = getattr(rg, "TermsMetadataProperty", None)
+        if metadata_property is None:
+            raise RuntimeError("Argilla 2.8 SDK 缺少 TermsMetadataProperty contract API")
+        metadata.append(metadata_property(
+            name=_ARGILLA_CONTRACT_INTENT_FIELD,
+            title="LLS contract intent",
+            options=[intent_fingerprint],
+            visible_for_annotators=False,
+            client=client,
+        ))
+    return rg.Settings(
+        guidelines=_guidelines_for_task(task, params),
+        fields=_argilla_text_fields(rg, task, text_field, params),
+        questions=_questions_for_task(rg, task),
+        metadata=metadata,
+        distribution=rg.TaskDistribution(min_submitted=min_submitted),
+        allow_extra_metadata=True,
+    )
+
+
 def _record_id_policy(task: TaskConfig, params: dict[str, Any]) -> dict[str, Any]:
     strategy = _record_id_strategy(params)
     policy: dict[str, Any] = {
@@ -1166,15 +1259,16 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         raise ValueError("Argilla min_submitted 必须大于 0")
     if_exists = str(params.get("if_exists") or params.get("dataset_policy") or "resume")
     client = _client(params.get("api_url"))
-    settings = rg.Settings(
-        guidelines=_guidelines_for_task(task, params),
-        fields=_argilla_text_fields(rg, task, text_field, params),
-        questions=_questions_for_task(rg, task),
-        distribution=rg.TaskDistribution(min_submitted=min_submitted),
-        allow_extra_metadata=True,
+    base_settings = _dataset_settings(
+        rg,
+        client,
+        task,
+        text_field,
+        params,
+        min_submitted,
     )
     fingerprints = _push_fingerprints(task, sample_path, params)
-    fingerprints["settings"] = _settings_fingerprint(settings)
+    fingerprints["settings"] = _settings_fingerprint(base_settings)
     requested_record_id_policy = _record_id_policy(task, params)
     push_fingerprint = _push_fingerprint(
         versions=versions,
@@ -1184,6 +1278,19 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         record_id_policy=requested_record_id_policy,
         fingerprints=fingerprints,
     )
+    settings = _dataset_settings(
+        rg,
+        client,
+        task,
+        text_field,
+        params,
+        min_submitted,
+        intent_fingerprint=push_fingerprint,
+    )
+    if _settings_fingerprint(settings) != fingerprints["settings"]:
+        raise RuntimeError("Argilla contract intent 改变了 canonical settings fingerprint")
+    if _settings_intent_fingerprint(settings) != push_fingerprint:
+        raise RuntimeError("Argilla contract intent settings 构造失败")
     expected_contract = _validate_expected_push_contract(
         params.get("expected_contract"),
         versions=versions,
@@ -1227,6 +1334,8 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
     )
     if _settings_fingerprint(dataset.settings) != fingerprints["settings"]:
         raise ValueError("Argilla 创建后的 live settings/schema 与请求 contract 不一致")
+    if _settings_intent_fingerprint(dataset.settings) != push_fingerprint:
+        raise ValueError("Argilla 创建后的 contract intent fingerprint 与请求不一致")
     contract = _build_contract(
         versions=versions,
         workspace=workspace,

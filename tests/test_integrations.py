@@ -11,6 +11,7 @@ import pytest
 from llm_labeling_scaffold.config import TaskConfig, load_task
 from llm_labeling_scaffold.integrations import argilla
 from llm_labeling_scaffold.integrations.argilla import (
+    _ARGILLA_CONTRACT_INTENT_FIELD,
     _ARGILLA_PUSH_FINGERPRINT_FIELD,
     _argilla_text_fields,
     _build_contract,
@@ -24,6 +25,7 @@ from llm_labeling_scaffold.integrations.argilla import (
     _record_response_groups,
     _require_argilla_2_8_version,
     _settings_fingerprint,
+    _settings_intent_fingerprint,
     _server_version,
     _task_fingerprint,
 )
@@ -663,16 +665,29 @@ class _Workspace:
 
 
 class _Settings:
-    def __init__(self, guidelines="guidelines"):
+    def __init__(self, guidelines="guidelines", intent_fingerprint=None):
         self.guidelines = guidelines
+        self.intent_fingerprint = intent_fingerprint
 
     def serialize(self):
+        metadata = []
+        if self.intent_fingerprint is not None:
+            metadata.append({
+                "name": _ARGILLA_CONTRACT_INTENT_FIELD,
+                "title": "LLS contract intent",
+                "settings": {
+                    "visible_for_annotators": True,
+                    "type": "terms",
+                    "values": [self.intent_fingerprint],
+                },
+                "visible_for_annotators": False,
+            })
         return {
             "guidelines": self.guidelines,
             "fields": [{"name": "text", "type": "text"}],
             "questions": [{"name": "label", "type": "label_selection", "labels": ["yes", "no"]}],
             "vectors": [],
-            "metadata": [],
+            "metadata": metadata,
             "allow_extra_metadata": True,
             "distribution": {"strategy": "overlap", "min_submitted": 1},
             "mapping": {},
@@ -711,8 +726,10 @@ class _RemoteRecords:
     def __init__(self, records):
         self.records = list(records)
         self.logged_batches: list[list] = []
+        self.iterations = 0
 
     def __iter__(self):
+        self.iterations += 1
         return iter(self.records)
 
     def log(self, records):
@@ -756,6 +773,7 @@ class _PullClient:
 
 
 def _pull_contract(task: TaskConfig, dataset: _Dataset, *, push_fingerprint="f" * 64) -> dict:
+    dataset.settings.intent_fingerprint = push_fingerprint
     return {
         "schema_version": 1,
         "server_version": "2.8.0",
@@ -793,6 +811,7 @@ def test_argilla_dataset_existing_policy_fail_and_idempotent_resume():
     fingerprint = "a" * 64
     submitted = types.SimpleNamespace(status="submitted")
     existing = _Dataset("dataset_a", records=[_remote_record("r1", fingerprint, [submitted])])
+    existing.settings = _Settings(intent_fingerprint=fingerprint)
     created = _Dataset("dataset_a")
 
     with pytest.raises(ValueError, match="已存在"):
@@ -822,11 +841,36 @@ def test_argilla_dataset_existing_policy_fail_and_idempotent_resume():
     assert existing.deleted == 0
 
 
-def test_argilla_dataset_resume_rejects_empty_unmarked_dataset_with_recovery_path():
+def test_argilla_dataset_resume_recovers_empty_dataset_with_exact_intent():
+    fingerprint = "a" * 64
+    existing = _Dataset("dataset_a", records=[])
+    existing.settings = _Settings(intent_fingerprint=fingerprint)
+    existing.records = _RemoteRecords([])
+    created = _Dataset("dataset_a")
+
+    dataset, action, missing_record_ids = _prepare_dataset(
+        created,
+        existing,
+        "resume",
+        push_fingerprint=fingerprint,
+        settings_fingerprint=_settings_fingerprint(existing.settings),
+        desired_record_ids={"r1"},
+        min_submitted=1,
+    )
+
+    assert dataset is existing
+    assert action == "recovered_empty"
+    assert missing_record_ids == {"r1"}
+    assert existing.records.iterations == 1
+    assert existing.deleted == 0
+    assert created.created == 0
+
+
+def test_argilla_dataset_resume_rejects_empty_unmarked_dataset():
     existing = _Dataset("dataset_a", records=[])
     created = _Dataset("dataset_a")
 
-    with pytest.raises(ValueError, match="为空.*if_exists='replace'"):
+    with pytest.raises(ValueError, match="contract intent"):
         _prepare_dataset(
             created,
             existing,
@@ -841,7 +885,7 @@ def test_argilla_dataset_resume_rejects_empty_unmarked_dataset_with_recovery_pat
 def test_argilla_dataset_resume_rejects_live_settings_drift():
     fingerprint = "a" * 64
     existing = _Dataset("dataset_a", records=[_remote_record("r1", fingerprint)])
-    existing.settings = _Settings("changed guidelines")
+    existing.settings = _Settings("changed guidelines", intent_fingerprint=fingerprint)
     created = _Dataset("dataset_a")
 
     with pytest.raises(ValueError, match="live settings/schema"):
@@ -858,6 +902,7 @@ def test_argilla_dataset_resume_rejects_live_settings_drift():
 
 def test_argilla_dataset_append_rejects_different_plan_fingerprint():
     existing = _Dataset("dataset_a", records=[_remote_record("r1", "a" * 64)])
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
     created = _Dataset("dataset_a")
 
     with pytest.raises(ValueError, match="fingerprint"):
@@ -877,6 +922,7 @@ def test_argilla_dataset_replace_is_blocked_after_any_response():
         "dataset_a",
         records=[_remote_record("r1", "a" * 64, [types.SimpleNamespace(status="draft")])],
     )
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
     created = _Dataset("dataset_a")
 
     with pytest.raises(ValueError, match="已有回答"):
@@ -894,6 +940,7 @@ def test_argilla_dataset_replace_is_blocked_after_any_response():
 
 def test_argilla_dataset_replace_without_responses_creates_new_dataset():
     existing = _Dataset("dataset_a", records=[_remote_record("r1", "a" * 64)])
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
     created = _Dataset("dataset_a")
 
     dataset, action, missing_record_ids = _prepare_dataset(
@@ -910,6 +957,39 @@ def test_argilla_dataset_replace_without_responses_creates_new_dataset():
     assert missing_record_ids == {"r1"}
     assert existing.deleted == 1
     assert created.created == 1
+
+
+def test_argilla_dataset_identical_replace_retry_is_noop_and_preserves_responses():
+    fingerprint = "f" * 64
+    submitted = types.SimpleNamespace(status="submitted", value="yes")
+    draft = types.SimpleNamespace(status="draft", value="no")
+    remote_records = [
+        _remote_record("r1", fingerprint, [submitted]),
+        _remote_record("r2", fingerprint, [draft]),
+    ]
+    existing = _Dataset("dataset_a", records=[])
+    existing.settings = _Settings(intent_fingerprint=fingerprint)
+    existing.records = _RemoteRecords(remote_records)
+    created = _Dataset("dataset_a")
+
+    dataset, action, missing_record_ids = _prepare_dataset(
+        created,
+        existing,
+        "replace",
+        push_fingerprint=fingerprint,
+        settings_fingerprint=_settings_fingerprint(existing.settings),
+        desired_record_ids={"r1", "r2"},
+        min_submitted=1,
+    )
+
+    assert dataset is existing
+    assert action == "resumed"
+    assert missing_record_ids == set()
+    assert existing.id == "00000000-0000-0000-0000-000000000002"
+    assert existing.deleted == 0
+    assert created.created == 0
+    assert existing.records.iterations == 1
+    assert [record.responses for record in remote_records] == [[submitted], [draft]]
 
 
 def _install_push_sample_fakes(monkeypatch, existing: _Dataset):
@@ -929,6 +1009,7 @@ def _install_push_sample_fakes(monkeypatch, existing: _Dataset):
         Settings=lambda **kwargs: types.SimpleNamespace(**kwargs),
         TextField=_Question,
         LabelQuestion=_Question,
+        TermsMetadataProperty=_Question,
         TaskDistribution=lambda min_submitted: types.SimpleNamespace(min_submitted=min_submitted),
     )
     monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
@@ -940,6 +1021,7 @@ def _install_push_sample_fakes(monkeypatch, existing: _Dataset):
         lambda task, sample_path, params: {"task": "1" * 64, "sample": "2" * 64, "batch": "3" * 64, "plan": "4" * 64},
     )
     monkeypatch.setattr(argilla, "_settings_fingerprint", lambda settings: "5" * 64)
+    monkeypatch.setattr(argilla, "_settings_intent_fingerprint", lambda settings: "f" * 64)
     monkeypatch.setattr(argilla, "_push_fingerprint", lambda **kwargs: "f" * 64)
 
 
@@ -949,6 +1031,7 @@ def test_argilla_push_resume_logs_only_missing_records_and_preserves_responses(t
     existing_record = _remote_record("r1", "f" * 64, [submitted, draft])
     existing = _Dataset("dataset", records=[])
     existing.records = _RemoteRecords([existing_record])
+    existing.settings = _Settings(intent_fingerprint="f" * 64)
     _install_push_sample_fakes(monkeypatch, existing)
     sample = tmp_path / "sample.jsonl"
     write_jsonl(
@@ -966,6 +1049,7 @@ def test_argilla_push_resume_logs_only_missing_records_and_preserves_responses(t
     assert result["records"] == 2
     assert result["records_logged"] == 1
     assert result["records_existing"] == 1
+    assert existing.records.iterations == 1
 
 
 def test_argilla_push_full_retry_performs_zero_remote_record_writes(tmp_path: Path, monkeypatch):
@@ -977,6 +1061,7 @@ def test_argilla_push_full_retry_performs_zero_remote_record_writes(tmp_path: Pa
     ]
     existing = _Dataset("dataset", records=[])
     existing.records = _RemoteRecords(remote_records)
+    existing.settings = _Settings(intent_fingerprint="f" * 64)
     _install_push_sample_fakes(monkeypatch, existing)
     sample = tmp_path / "sample.jsonl"
     write_jsonl(
@@ -993,6 +1078,24 @@ def test_argilla_push_full_retry_performs_zero_remote_record_writes(tmp_path: Pa
     assert [record.responses for record in remote_records] == [[submitted], [draft]]
     assert result["records_logged"] == 0
     assert result["records_existing"] == 2
+    assert existing.records.iterations == 1
+
+
+def test_argilla_push_recovers_create_before_first_record_log(tmp_path: Path, monkeypatch):
+    existing = _Dataset("dataset", records=[])
+    existing.records = _RemoteRecords([])
+    existing.settings = _Settings(intent_fingerprint="f" * 64)
+    _install_push_sample_fakes(monkeypatch, existing)
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+
+    result = argilla.push_sample(_argilla_push_task(), sample, "dataset", {"workspace": "argilla"})
+
+    assert result["dataset_action"] == "recovered_empty"
+    assert result["dataset_uuid"] == str(existing.id)
+    assert [[record.id for record in batch] for batch in existing.records.logged_batches] == [["r1"]]
+    assert existing.records.iterations == 1
+    assert existing.deleted == 0
 
 
 def test_argilla_push_fingerprints_are_stable_and_plan_sensitive(tmp_path: Path):
@@ -1069,6 +1172,64 @@ def test_argilla_settings_fingerprint_ignores_server_ids_but_detects_schema_drif
 
     assert _settings_fingerprint(settings(first)) == _settings_fingerprint(settings(same_schema_new_ids))
     assert _settings_fingerprint(settings(first)) != _settings_fingerprint(settings(drifted))
+
+
+def test_argilla_settings_fingerprint_excludes_but_validates_internal_intent():
+    first = _Settings(intent_fingerprint="a" * 64)
+    second = _Settings(intent_fingerprint="b" * 64)
+
+    assert _settings_fingerprint(first) == _settings_fingerprint(second)
+    assert _settings_intent_fingerprint(first) == "a" * 64
+    assert _settings_intent_fingerprint(second) == "b" * 64
+
+
+def test_argilla_2_8_terms_metadata_property_contract_shape():
+    rg = pytest.importorskip("argilla")
+    client = types.SimpleNamespace(api=types.SimpleNamespace(metadata=object()))
+    marker = rg.TermsMetadataProperty(
+        name=_ARGILLA_CONTRACT_INTENT_FIELD,
+        title="LLS contract intent",
+        options=["f" * 64],
+        visible_for_annotators=False,
+        client=client,
+    )
+
+    payload = marker.serialize()
+
+    assert payload["name"] == _ARGILLA_CONTRACT_INTENT_FIELD
+    assert payload["visible_for_annotators"] is False
+    assert payload["settings"]["type"] == "terms"
+    assert payload["settings"]["values"] == ["f" * 64]
+
+
+def test_argilla_2_8_dataset_records_iterator_is_paginated_with_responses():
+    rg = pytest.importorskip("argilla")
+    calls = []
+
+    class RecordsAPI:
+        def list(self, **kwargs):
+            calls.append(kwargs)
+            return []
+
+    client = types.SimpleNamespace(
+        api=types.SimpleNamespace(
+            datasets=types.SimpleNamespace(exists=lambda dataset_id: True),
+            records=RecordsAPI(),
+        )
+    )
+    dataset = types.SimpleNamespace(id=UUID("00000000-0000-0000-0000-000000000002"))
+
+    assert list(rg.DatasetRecords(client=client, dataset=dataset)) == []
+    assert calls == [
+        {
+            "dataset_id": dataset.id,
+            "limit": 100,
+            "offset": 0,
+            "with_responses": True,
+            "with_suggestions": True,
+            "with_vectors": None,
+        }
+    ]
 
 
 def test_argilla_server_2_8_version_route_contract(monkeypatch):
