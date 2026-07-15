@@ -561,6 +561,41 @@ def test_cache_lock_file_exchange_is_detected_before_metadata_write(materializat
     assert (target / CACHE_METADATA_FILE).is_file()
 
 
+@pytest.mark.parametrize("filename", ["task.yaml", CACHE_METADATA_FILE])
+def test_oversized_sparse_cache_file_is_rebuilt_without_reading(
+    materialization_env,
+    monkeypatch,
+    filename: str,
+):
+    env = materialization_env
+    _draft, published = _publish(env, "cache-sparse", "publish-cache-sparse")
+    worker = _worker(env, worker_id=f"worker-cache-sparse-{filename}")
+    worker.drain(published.materialization_id, timeout_seconds=1)
+    target = env["tasks_root"] / "controlled-task"
+    attacked = target / filename
+    sparse_size = 1 << 40
+    os.truncate(attacked, sparse_size)
+    assert attacked.stat().st_size == sparse_size
+
+    original_read = materialization_module.os.read
+
+    def reject_sparse_read(descriptor, size):
+        if os.fstat(descriptor).st_size == sparse_size:
+            raise AssertionError("oversized cache file must be rejected before read")
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(materialization_module.os, "read", reject_sparse_read)
+    repaired = worker.run_once(published.materialization_id)
+
+    assert repaired.action == "cache_reconciled"
+    assert repaired.cache_refreshed is True
+    assert attacked.stat().st_size < sparse_size
+    assert yaml.safe_load((target / "task.yaml").read_text(encoding="utf-8"))["marker"] == "cache-sparse"
+    assert json.loads((target / CACHE_METADATA_FILE).read_text(encoding="utf-8"))["revision_id"] == str(
+        published.revision_id,
+    )
+
+
 def test_compatibility_cache_mismatch_after_crash_is_detected_and_recovered(materialization_env):
     env = materialization_env
     first_draft, first = _publish(env, "cache-v1", "publish-cache-v1")
@@ -1009,6 +1044,42 @@ def test_snapshot_loader_rejects_fifo_snapshot_file(materialization_env):
     assert worker.status(published.materialization_id).snapshot_valid is False
 
 
+def test_snapshot_loader_rejects_oversized_sparse_file_before_read(
+    materialization_env,
+    monkeypatch,
+):
+    env = materialization_env
+    _draft, published = _publish(
+        env,
+        "snapshot-file-sparse",
+        "publish-snapshot-file-sparse",
+    )
+    worker = _worker(env, worker_id="worker-snapshot-file-sparse")
+    worker.drain(published.materialization_id, timeout_seconds=1)
+    snapshot_path = worker.status(published.materialization_id).snapshot_path
+    attacked = snapshot_path / "definition.json"
+    sparse_size = 1 << 40
+    os.truncate(attacked, sparse_size)
+    assert attacked.stat().st_size == sparse_size
+
+    original_read = materialization_module.os.read
+
+    def reject_sparse_read(descriptor, size):
+        if os.fstat(descriptor).st_size == sparse_size:
+            raise AssertionError("oversized snapshot file must be rejected before read")
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(materialization_module.os, "read", reject_sparse_read)
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
+    with pytest.raises(SnapshotValidationError):
+        loader.load("workspace", "controlled-task")
+    assert worker.status(published.materialization_id).snapshot_valid is False
+
+
 @pytest.mark.parametrize("exchange_kind", ["revision", "content_hash"])
 def test_snapshot_validate_detects_directory_exchange_during_fd_read(
     materialization_env,
@@ -1168,6 +1239,76 @@ def test_ready_snapshot_recovers_after_crash_before_activation(materialization_e
     result = recovery.run_once(published.materialization_id)
     assert result.action == "activated"
     assert recovery.status(published.materialization_id).activation_state == "active"
+
+
+@pytest.mark.parametrize(
+    ("exchange_point", "activation_reverted"),
+    [
+        ("before_activation", False),
+        ("after_activation", True),
+    ],
+)
+def test_snapshot_replacement_during_activation_fails_closed_and_restores_current(
+    materialization_env,
+    exchange_point: str,
+    activation_reverted: bool,
+):
+    env = materialization_env
+    first_draft, first = _publish(env, "activation-v1", "publish-activation-v1")
+    first_worker = _worker(env, worker_id="worker-activation-v1")
+    first_worker.drain(first.materialization_id, timeout_seconds=1)
+
+    _second_draft, second = _publish(
+        env,
+        "activation-v2",
+        "publish-activation-v2",
+        if_match=first_draft.etag,
+    )
+    replaced = False
+
+    def inject(point, revision):
+        nonlocal replaced
+        if point == exchange_point and revision.revision_id == second.revision_id and not replaced:
+            replaced = True
+            task_path = (
+                _snapshot_root(env)
+                / str(revision.revision_id)
+                / revision.content_hash
+                / "task.yaml"
+            )
+            task_path.unlink()
+            task_path.write_text("task_id: corrupted\n", encoding="utf-8")
+
+    worker = _worker(
+        env,
+        worker_id=f"worker-{exchange_point}-replacement",
+        fault_injector=inject,
+    )
+    result = worker.run_once(second.materialization_id)
+    status = worker.status(second.materialization_id)
+
+    assert result.action == "failed"
+    assert status.state == TaskMaterializationState.FAILED
+    assert status.activation_state == "not_ready"
+    assert status.snapshot_valid is False
+    with Session(env["engine"]) as session:
+        assert session.get(Task, env["task_id"]).current_revision_id == first.revision_id
+        failure = session.scalar(
+            select(AuditEvent).where(
+                AuditEvent.event_type == "task.revision_materialization_failed",
+                AuditEvent.resource_id == str(second.materialization_id),
+            ),
+        )
+        assert failure is not None
+        assert failure.details["phase"] == "activation_validation"
+        assert failure.details["activation_reverted"] is activation_reverted
+
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
+    assert loader.load("workspace", "controlled-task").raw["marker"] == "activation-v1"
 
 
 def test_retryable_failure_returns_to_pending_and_recovers(materialization_env):

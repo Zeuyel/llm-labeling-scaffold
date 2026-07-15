@@ -152,6 +152,14 @@ class PinnedFileLock:
 
 
 @dataclass(frozen=True)
+class PinnedSnapshotAuthority:
+    root: PinnedRootDirectory
+    directories: tuple[PinnedDirectoryEntry, ...]
+    files: tuple[tuple[PinnedRegularFile, bytes], ...]
+    validated: ValidatedSnapshot
+
+
+@dataclass(frozen=True)
 class PinnedCacheDirectory:
     root: PinnedRootDirectory
     lock: PinnedFileLock
@@ -168,6 +176,7 @@ class ActivationResult:
     revision_id: uuid.UUID
     current_revision_id: uuid.UUID | None
     current_revision_number: int | None
+    previous_revision_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -517,6 +526,68 @@ class TaskSnapshotStore:
         validated = self._validated_snapshot(revision)
         return validated.ref, validated.task_bytes
 
+    @contextmanager
+    def pinned(self, revision: RevisionSnapshot):
+        expected = self._expected_files(revision)
+        target = self.snapshot_path(revision.revision_id, revision.content_hash)
+        revision_name = str(revision.revision_id)
+        _require_safe_segment(revision_name)
+        try:
+            with _pinned_root_directory(
+                self.root,
+                description="task snapshot root",
+                create=False,
+            ) as snapshot_root:
+                with _pinned_directory_at(
+                    snapshot_root.root_fd,
+                    revision_name,
+                    description=f"task snapshot revision directory: {target.parent}",
+                    create=False,
+                ) as revision_directory:
+                    with _pinned_directory_at(
+                        revision_directory.fd,
+                        revision.content_hash,
+                        description=f"task snapshot target: {target}",
+                        create=False,
+                    ) as target_directory:
+                        path_entries = (revision_directory, target_directory)
+                        _require_snapshot_entries(snapshot_root, path_entries, target_directory, target)
+                        with ExitStack() as stack:
+                            pinned_files: list[tuple[PinnedRegularFile, bytes]] = []
+                            for name, expected_bytes in expected.items():
+                                description = f"task snapshot file: {target / name}"
+                                try:
+                                    file = stack.enter_context(
+                                        _pinned_existing_regular_file_at(
+                                            target_directory.fd,
+                                            name,
+                                            description=description,
+                                        ),
+                                    )
+                                except SnapshotValidationError as exc:
+                                    raise SnapshotConflictError(
+                                        f"snapshot file is missing or not regular: {description}",
+                                    ) from exc
+                                pinned_files.append((file, expected_bytes))
+                            validated = self._validated_snapshot_from_bytes(
+                                target,
+                                revision,
+                                expected,
+                            )
+                            authority = PinnedSnapshotAuthority(
+                                root=snapshot_root,
+                                directories=path_entries,
+                                files=tuple(pinned_files),
+                                validated=validated,
+                            )
+                            _assert_pinned_snapshot_authority(authority)
+                            try:
+                                yield authority
+                            finally:
+                                _assert_pinned_snapshot_authority(authority)
+        except FileNotFoundError as exc:
+            raise SnapshotConflictError(f"snapshot target does not exist: {target}") from exc
+
     def _expected_files(self, revision: RevisionSnapshot) -> dict[str, bytes]:
         _validate_revision(revision)
         definition_bytes = (
@@ -551,38 +622,8 @@ class TaskSnapshotStore:
         }
 
     def _validated_snapshot(self, revision: RevisionSnapshot) -> ValidatedSnapshot:
-        expected = self._expected_files(revision)
-        target = self.snapshot_path(revision.revision_id, revision.content_hash)
-        revision_name = str(revision.revision_id)
-        _require_safe_segment(revision_name)
-        try:
-            with _pinned_root_directory(
-                self.root,
-                description="task snapshot root",
-                create=False,
-            ) as snapshot_root:
-                with _pinned_directory_at(
-                    snapshot_root.root_fd,
-                    revision_name,
-                    description=f"task snapshot revision directory: {target.parent}",
-                    create=False,
-                ) as revision_directory:
-                    with _pinned_directory_at(
-                        revision_directory.fd,
-                        revision.content_hash,
-                        description=f"task snapshot target: {target}",
-                        create=False,
-                    ) as target_directory:
-                        return self._validate_snapshot_directory(
-                            snapshot_root,
-                            (revision_directory, target_directory),
-                            target_directory,
-                            target,
-                            revision,
-                            expected,
-                        )
-        except FileNotFoundError as exc:
-            raise SnapshotConflictError(f"snapshot target does not exist: {target}") from exc
+        with self.pinned(revision) as authority:
+            return authority.validated
 
     def _validate_existing_target(
         self,
@@ -625,15 +666,7 @@ class TaskSnapshotStore:
         *,
         lock: PinnedFileLock | None = None,
     ) -> ValidatedSnapshot:
-        _assert_snapshot_path(snapshot_root, path_entries, lock)
-        try:
-            entries = set(os.listdir(directory.fd))
-        except OSError as exc:
-            raise SnapshotConflictError(f"snapshot directory cannot be listed: {path}") from exc
-        if entries != SNAPSHOT_FILES:
-            raise SnapshotConflictError(
-                f"snapshot files differ: expected={sorted(SNAPSHOT_FILES)}, actual={sorted(entries)}",
-            )
+        _require_snapshot_entries(snapshot_root, path_entries, directory, path, lock=lock)
         actual: dict[str, bytes] = {}
         for name, expected_bytes in expected.items():
             actual_bytes = _read_snapshot_regular_file_at(
@@ -642,12 +675,22 @@ class TaskSnapshotStore:
                 directory,
                 name,
                 description=f"task snapshot file: {path / name}",
+                expected_size=len(expected_bytes),
                 lock=lock,
             )
             if actual_bytes != expected_bytes:
                 raise SnapshotConflictError(f"snapshot file content differs: {path / name}")
             actual[name] = actual_bytes
 
+        _assert_snapshot_path(snapshot_root, path_entries, lock)
+        return self._validated_snapshot_from_bytes(path, revision, actual)
+
+    def _validated_snapshot_from_bytes(
+        self,
+        path: Path,
+        revision: RevisionSnapshot,
+        actual: dict[str, bytes],
+    ) -> ValidatedSnapshot:
         try:
             definition = json.loads(actual["definition.json"].decode("utf-8"))
             manifest = json.loads(actual["manifest.json"].decode("utf-8"))
@@ -673,7 +716,6 @@ class TaskSnapshotStore:
             manifest_path=path / "manifest.json",
             content_hash=revision.content_hash,
         )
-        _assert_snapshot_path(snapshot_root, path_entries, lock)
         return ValidatedSnapshot(
             ref=ref,
             task=TaskConfig(path=ref.task_path, raw=task_raw),
@@ -788,12 +830,12 @@ class CompatibilityTaskCache:
         with _pinned_cache_directory(cache_root, cache_lock, revision.task_key) as directory:
             _require_regular_or_missing_at(directory, "task.yaml")
             _require_regular_or_missing_at(directory, CACHE_METADATA_FILE)
-            if _cache_matches_at(directory, metadata, task_bytes):
+            if _cache_matches_at(directory, metadata, metadata_bytes, task_bytes):
                 return False
             _write_bytes_atomic_at(directory, "task.yaml", task_bytes)
             self._inject("after_cache_task_write", revision)
             _write_bytes_atomic_at(directory, CACHE_METADATA_FILE, metadata_bytes)
-            if not _cache_matches_at(directory, metadata, task_bytes):
+            if not _cache_matches_at(directory, metadata, metadata_bytes, task_bytes):
                 raise SnapshotValidationError("compatibility cache verification failed after write")
             return True
 
@@ -1304,18 +1346,33 @@ class TaskMaterializationWorker:
         *,
         action: str,
     ) -> WorkerRunResult:
+        activation: ActivationResult | None = None
+        validation_phase = "ready_validation"
         try:
-            self._snapshot_store.validate(ready.revision)
+            with self._snapshot_store.pinned(ready.revision) as snapshot_authority:
+                validation_phase = "activation_validation"
+                self._inject("before_activation", ready.revision)
+                _assert_pinned_snapshot_authority(snapshot_authority)
+                activation = self._activate(
+                    ready.revision.revision_id,
+                    snapshot_authority,
+                )
+                self._inject("after_activation", ready.revision)
+                _assert_pinned_snapshot_authority(snapshot_authority)
         except SnapshotValidationError as exc:
-            self._record_ready_failure(ready.materialization_id, exc)
+            self._record_ready_failure(
+                ready.materialization_id,
+                exc,
+                activation=activation,
+                phase=validation_phase,
+            )
             return WorkerRunResult(
                 action="failed",
                 materialization_id=ready.materialization_id,
                 error=_error_text(exc),
             )
-        self._inject("before_activation", ready.revision)
-        activation = self._activate(ready.revision.revision_id)
-        self._inject("after_activation", ready.revision)
+        if activation is None:
+            raise MaterializationError("activation completed without a result")
         cache_error: str | None = None
         try:
             cache_refreshed = self._refresh_cache(ready.revision.task_id)
@@ -1341,6 +1398,9 @@ class TaskMaterializationWorker:
         self,
         materialization_id: uuid.UUID,
         error: SnapshotValidationError,
+        *,
+        activation: ActivationResult | None = None,
+        phase: str = "ready_validation",
     ) -> None:
         with self._session_factory() as session, session.begin():
             materialization = session.scalar(
@@ -1353,8 +1413,18 @@ class TaskMaterializationWorker:
             task = session.scalar(
                 select(Task).where(Task.id == materialization.task_id).with_for_update(),
             )
-            if task is None or task.current_revision_id == materialization.revision_id:
+            if task is None:
                 return
+            activation_reverted = False
+            restored_revision_id: uuid.UUID | None = None
+            if (
+                activation is not None
+                and activation.changed
+                and task.current_revision_id == materialization.revision_id
+            ):
+                restored_revision_id = activation.previous_revision_id
+                task.current_revision_id = restored_revision_id
+                activation_reverted = True
             materialization.state = TaskMaterializationState.FAILED
             materialization.last_error = _error_text(error)
             append_audit_event(
@@ -1372,11 +1442,19 @@ class TaskMaterializationWorker:
                     "attempt_count": materialization.attempt_count,
                     "worker_id": self.worker_id,
                     "error": materialization.last_error,
-                    "phase": "ready_validation",
+                    "phase": phase,
+                    "activation_reverted": activation_reverted,
+                    "restored_revision_id": (
+                        str(restored_revision_id) if restored_revision_id is not None else None
+                    ),
                 },
             )
 
-    def _activate(self, revision_id: uuid.UUID) -> ActivationResult:
+    def _activate(
+        self,
+        revision_id: uuid.UUID,
+        snapshot_authority: PinnedSnapshotAuthority,
+    ) -> ActivationResult:
         with self._session_factory() as session, session.begin():
             revision = session.get(TaskRevision, revision_id)
             materialization = session.scalar(
@@ -1392,10 +1470,12 @@ class TaskMaterializationWorker:
             task = session.scalar(select(Task).where(Task.id == revision.task_id).with_for_update())
             if task is None or task.workspace_id != revision.workspace_id:
                 raise MaterializationError("revision task disappeared before activation")
+            _assert_pinned_snapshot_authority(snapshot_authority)
 
             current = session.get(TaskRevision, task.current_revision_id) if task.current_revision_id else None
             current_number = current.revision_number if current is not None else None
             if task.current_revision_id == revision.id:
+                _assert_pinned_snapshot_authority(snapshot_authority)
                 return ActivationResult(
                     state="active",
                     changed=False,
@@ -1404,6 +1484,7 @@ class TaskMaterializationWorker:
                     current_revision_number=revision.revision_number,
                 )
             if current_number is not None and current_number >= revision.revision_number:
+                _assert_pinned_snapshot_authority(snapshot_authority)
                 return ActivationResult(
                     state="superseded",
                     changed=False,
@@ -1435,12 +1516,14 @@ class TaskMaterializationWorker:
                     "worker_id": self.worker_id,
                 },
             )
+            _assert_pinned_snapshot_authority(snapshot_authority)
             return ActivationResult(
                 state="active",
                 changed=True,
                 revision_id=revision.id,
                 current_revision_id=revision.id,
                 current_revision_number=revision.revision_number,
+                previous_revision_id=previous_revision_id,
             )
 
     def _refresh_cache(self, task_id: uuid.UUID) -> bool | None:
@@ -1967,6 +2050,73 @@ def _assert_snapshot_path(
         _assert_pinned_file_lock(lock)
 
 
+def _require_snapshot_entries(
+    root: PinnedRootDirectory,
+    path_entries: tuple[PinnedDirectoryEntry, ...],
+    directory: PinnedDirectoryEntry,
+    path: Path,
+    *,
+    lock: PinnedFileLock | None = None,
+) -> None:
+    _assert_snapshot_path(root, path_entries, lock)
+    try:
+        entries = set(os.listdir(directory.fd))
+    except OSError as exc:
+        raise SnapshotConflictError(f"snapshot directory cannot be listed: {path}") from exc
+    if entries != SNAPSHOT_FILES:
+        raise SnapshotConflictError(
+            f"snapshot files differ: expected={sorted(SNAPSHOT_FILES)}, actual={sorted(entries)}",
+        )
+    _assert_snapshot_path(root, path_entries, lock)
+
+
+def _assert_pinned_snapshot_authority(authority: PinnedSnapshotAuthority) -> None:
+    target_directory = authority.directories[-1]
+    _require_snapshot_entries(
+        authority.root,
+        authority.directories,
+        target_directory,
+        authority.validated.ref.path,
+    )
+    for file, expected_bytes in authority.files:
+        actual = _read_pinned_regular_file_exact(file, len(expected_bytes))
+        if actual != expected_bytes:
+            raise SnapshotConflictError(
+                f"snapshot file content differs: {authority.validated.ref.path / file.name}",
+            )
+        _assert_snapshot_path(authority.root, authority.directories)
+
+
+def _read_pinned_regular_file_exact(file: PinnedRegularFile, expected_size: int) -> bytes:
+    _assert_pinned_regular_file(file)
+    try:
+        opened = os.fstat(file.fd)
+        if opened.st_size != expected_size:
+            raise SnapshotValidationError(
+                f"{file.description} size differs: expected={expected_size}, actual={opened.st_size}",
+            )
+        os.lseek(file.fd, 0, os.SEEK_SET)
+        remaining = expected_size
+        chunks: list[bytes] = []
+        while remaining:
+            chunk = os.read(file.fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise SnapshotValidationError(f"{file.description} ended before expected size")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(file.fd, 1):
+            raise SnapshotValidationError(f"{file.description} exceeds expected size")
+        final = os.fstat(file.fd)
+    except OSError as exc:
+        raise SnapshotValidationError(f"{file.description} could not be read safely") from exc
+    if final.st_size != expected_size:
+        raise SnapshotValidationError(
+            f"{file.description} size changed during read: expected={expected_size}, actual={final.st_size}",
+        )
+    _assert_pinned_regular_file(file)
+    return b"".join(chunks)
+
+
 def _write_new_regular_file_at(
     root: PinnedRootDirectory,
     path_entries: tuple[PinnedDirectoryEntry, ...],
@@ -2026,6 +2176,7 @@ def _read_snapshot_regular_file_at(
     name: str,
     *,
     description: str,
+    expected_size: int,
     lock: PinnedFileLock | None = None,
 ) -> bytes:
     _assert_snapshot_path(root, path_entries, lock)
@@ -2036,15 +2187,9 @@ def _read_snapshot_regular_file_at(
             description=description,
         ) as file:
             _assert_snapshot_path(root, path_entries, lock)
-            chunks: list[bytes] = []
-            while True:
-                chunk = os.read(file.fd, 1024 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            _assert_pinned_regular_file(file)
+            value = _read_pinned_regular_file_exact(file, expected_size)
             _assert_snapshot_path(root, path_entries, lock)
-            return b"".join(chunks)
+            return value
     except SnapshotValidationError as exc:
         raise SnapshotConflictError(f"snapshot file is missing or not regular: {description}") from exc
 
@@ -2139,35 +2284,43 @@ def _assert_pinned_cache_directory(directory: PinnedCacheDirectory) -> None:
 def _cache_matches_at(
     directory: PinnedCacheDirectory,
     metadata: dict[str, Any],
+    metadata_bytes: bytes,
     task_bytes: bytes,
 ) -> bool:
     try:
         _assert_pinned_cache_directory(directory)
-        metadata_bytes = _read_regular_file_at(directory, CACHE_METADATA_FILE)
-        cached_task = _read_regular_file_at(directory, "task.yaml")
-        stored = json.loads(metadata_bytes.decode("utf-8"))
+        cached_metadata = _read_regular_file_at(
+            directory,
+            CACHE_METADATA_FILE,
+            expected_size=len(metadata_bytes),
+        )
+        cached_task = _read_regular_file_at(
+            directory,
+            "task.yaml",
+            expected_size=len(task_bytes),
+        )
+        stored = json.loads(cached_metadata.decode("utf-8"))
         _assert_pinned_cache_directory(directory)
         return stored == metadata and cached_task == task_bytes
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, SnapshotValidationError):
         return False
 
 
-def _read_regular_file_at(directory: PinnedCacheDirectory, name: str) -> bytes:
+def _read_regular_file_at(
+    directory: PinnedCacheDirectory,
+    name: str,
+    *,
+    expected_size: int,
+) -> bytes:
     _assert_pinned_cache_directory(directory)
     with _pinned_existing_regular_file_at(
         directory.task_fd,
         name,
         description=f"compatibility cache file: {name}",
     ) as file:
-        chunks: list[bytes] = []
-        while True:
-            chunk = os.read(file.fd, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        _assert_pinned_regular_file(file)
+        value = _read_pinned_regular_file_exact(file, expected_size)
         _assert_pinned_cache_directory(directory)
-        return b"".join(chunks)
+        return value
 
 
 def _write_bytes_atomic_at(
