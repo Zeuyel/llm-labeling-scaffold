@@ -25,10 +25,10 @@ mlflow = [
   "mlflow>=2.0",
 ]
 argilla = [
-  "argilla>=2.8,<2.9",
+  "argilla==2.8.0",
 ]
 integrations = [
-  "argilla>=2.8,<2.9",
+  "argilla==2.8.0",
   "mlflow>=2.0",
 ]
 mcp = [

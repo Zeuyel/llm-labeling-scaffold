@@ -1593,6 +1593,21 @@ def test_argilla_push_uses_annotation_job_lock(
     assert "annotation-job-job_a" in locked_assets
 
 
+def test_argilla_action_rejects_nested_sensitive_params_before_job_creation(tmp_path: Path):
+    secret = "must-not-enter-job-state"
+
+    with pytest.raises(ValueError, match=r"params\.argilla\.credentials\[0\]\.authorization") as exc_info:
+        pipeline.start_action(
+            tmp_path / "runs",
+            tmp_path / "missing-task.yaml",
+            "argilla_push",
+            {"argilla": {"credentials": [{"authorization": f"Bearer {secret}"}]}},
+        )
+
+    assert secret not in str(exc_info.value)
+    assert not (tmp_path / "runs").exists()
+
+
 def test_annotation_job_archive_does_not_mark_active_manifest_when_move_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

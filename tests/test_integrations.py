@@ -1,5 +1,6 @@
 from pathlib import Path
 import io
+import inspect
 import sys
 import tempfile
 import types
@@ -21,6 +22,7 @@ from llm_labeling_scaffold.integrations.argilla import (
     _push_fingerprints,
     _questions_for_task,
     _record_response_groups,
+    _require_argilla_2_8_version,
     _settings_fingerprint,
     _server_version,
     _task_fingerprint,
@@ -242,6 +244,14 @@ def test_argilla_2_8_public_response_iterable_groups_by_user_and_status():
         }
     ]
     assert "status" not in record.responses.to_dict()["label"][0]
+
+
+def test_argilla_2_8_users_list_accepts_workspace_argument():
+    rg = pytest.importorskip("argilla")
+
+    signature = inspect.signature(rg.client.Users.list)
+
+    assert "workspace" in signature.parameters
 
 
 def test_argilla_response_groups_quarantine_mixed_and_keep_draft_discarded():
@@ -764,6 +774,13 @@ def _pull_contract(task: TaskConfig, dataset: _Dataset, *, push_fingerprint="f" 
     }
 
 
+def _install_pull_runtime(monkeypatch, client) -> None:
+    fake_rg = types.SimpleNamespace(__version__="2.8.0")
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
+    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None: client)
+
+
 def _remote_record(record_id: str, fingerprint: str, responses=None):
     return types.SimpleNamespace(
         id=record_id,
@@ -1068,6 +1085,12 @@ def test_argilla_server_2_8_version_route_contract(monkeypatch):
     assert observed == {"url": "https://argilla.example/api/v1/version", "timeout": 3.0}
 
 
+@pytest.mark.parametrize("version", ["2.8", "2.8.1", "2.8.0.post1", "2.9.0", ""])
+def test_argilla_runtime_requires_exact_2_8_0(version):
+    with pytest.raises(RuntimeError, match="必须是 Argilla 2.8.0"):
+        _require_argilla_2_8_version("Argilla SDK", version)
+
+
 def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(tmp_path: Path, monkeypatch):
     base_task = _argilla_push_task()
     task = TaskConfig(
@@ -1117,14 +1140,13 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
     contract = _pull_contract(task, dataset, push_fingerprint=push_fingerprint)
     manifest = {"task_id": task.task_id, "argilla_dataset": dataset.name, "argilla_contract": contract}
     output = tmp_path / "decisions.jsonl"
-    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
-    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+    _install_pull_runtime(monkeypatch, client)
 
     result = argilla.pull_responses(
         task,
         dataset.name,
         output,
-        {"manifest": manifest, "api_key": "do-not-leak-this-key"},
+        {"manifest": manifest},
     )
 
     rows = read_jsonl(output)
@@ -1152,19 +1174,28 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
             "workspace_uuid": str(dataset.workspace.id),
         }
     ]
-    assert "do-not-leak-this-key" not in str(result)
-    assert "do-not-leak-this-key" not in output.read_text(encoding="utf-8")
-
-
-def test_argilla_pull_requires_complete_manifest_without_leaking_api_key(tmp_path: Path):
+def test_argilla_pull_rejects_sensitive_params_before_loading_sdk(tmp_path: Path, monkeypatch):
     task = _argilla_push_task()
     secret = "sensitive-api-key"
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: pytest.fail("sensitive params must fail before loading Argilla"))
 
-    with pytest.raises(ValueError) as exc_info:
-        argilla.pull_responses(task, "dataset", tmp_path / "out.jsonl", {"api_key": secret})
+    with pytest.raises(ValueError, match=r"params\.credentials\[0\]\.api_key") as exc_info:
+        argilla.pull_responses(
+            task,
+            "dataset",
+            tmp_path / "out.jsonl",
+            {"credentials": [{"api_key": secret}]},
+        )
 
-    assert "manifest" in str(exc_info.value)
     assert secret not in str(exc_info.value)
+
+
+def test_argilla_pull_requires_complete_manifest_without_loading_sdk(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: pytest.fail("manifest validation must not load Argilla"))
+
+    with pytest.raises(ValueError, match="push annotation manifest"):
+        argilla.pull_responses(task, "dataset", tmp_path / "out.jsonl", {})
 
 
 def test_argilla_pull_rejects_manifest_missing_required_fingerprint(tmp_path: Path):
@@ -1190,8 +1221,7 @@ def test_argilla_pull_rejects_same_name_workspace_environment_drift(tmp_path: Pa
     drift_workspace = _Workspace(resource_id="00000000-0000-0000-0000-000000000099")
     client = _PullClient(drift_workspace, dataset, [])
     client.workspaces = _Lookup(by_name={drift_workspace.name: drift_workspace})
-    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
-    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+    _install_pull_runtime(monkeypatch, client)
 
     with pytest.raises(ValueError, match="workspace UUID.*拒绝按同名"):
         argilla.pull_responses(
@@ -1213,8 +1243,7 @@ def test_argilla_pull_rejects_dataset_uuid_mismatch(tmp_path: Path, monkeypatch)
     )
     client = _PullClient(dataset.workspace, wrong_dataset, [])
     client.datasets = _Lookup(by_id={contract["dataset"]["uuid"]: wrong_dataset})
-    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
-    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+    _install_pull_runtime(monkeypatch, client)
 
     with pytest.raises(ValueError, match="dataset 身份"):
         argilla.pull_responses(
@@ -1231,8 +1260,7 @@ def test_argilla_pull_rejects_live_settings_drift(tmp_path: Path, monkeypatch):
     contract = _pull_contract(task, dataset)
     dataset.settings = _Settings("changed after push")
     client = _PullClient(dataset.workspace, dataset, [])
-    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
-    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+    _install_pull_runtime(monkeypatch, client)
 
     with pytest.raises(ValueError, match="live settings/schema"):
         argilla.pull_responses(

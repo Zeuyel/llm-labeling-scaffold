@@ -17,6 +17,7 @@ from .config import load_task, resolve_profile_id, with_runs_root
 from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
 from .jobs import Job, create_job, get_job, run_job
 from .profiles import DEFAULT_PROFILE, list_profile_presets, profile_definition, status_label
+from .redaction import sensitive_paths
 
 try:
     import fcntl
@@ -2026,7 +2027,28 @@ def _truthy_param(value: Any) -> bool:
 
 # --- core object: run + jobs -------------------------------------------------
 
+_ARGILLA_ACTIONS = {
+    "argilla_pull",
+    "argilla_push",
+    "prelabel_export",
+    "prelabel_publish",
+    "prelabel_suggest",
+}
+
+
+def _reject_argilla_sensitive_params(action: str, params: dict[str, Any]) -> None:
+    if action not in _ARGILLA_ACTIONS:
+        return
+    paths = sensitive_paths(params)
+    if paths:
+        raise ValueError(
+            "Argilla 运行凭据只能通过环境变量或 secret 注入，action params 禁止敏感字段: "
+            + ", ".join(paths)
+        )
+
+
 def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> dict:
+    _reject_argilla_sensitive_params(action, params)
     task = with_runs_root(load_task(task_path), runs_root)
     jobs_dir = _jobs_dir(runs_root, task.task_id)
     job = create_job(action, dict(params, task=task_path), jobs_dir)

@@ -12,12 +12,12 @@ from uuid import UUID
 
 from ..config import TaskConfig, build_text
 from ..io import read_json, read_jsonl, write_jsonl
+from ..redaction import sensitive_paths
 
 
 _ARGILLA_CONTRACT_SCHEMA_VERSION = 1
 _ARGILLA_PUSH_FINGERPRINT_FIELD = "__lls_push_fingerprint"
 _ARGILLA_FINGERPRINT_NAMES = ("task", "sample", "batch", "plan", "settings")
-_ARGILLA_VERSION_PATTERN = re.compile(r"^(\d+)\.(\d+)(?:\.(\d+))?")
 _ARGILLA_SETTINGS_VOLATILE_KEYS = {"id", "dataset_id", "inserted_at", "updated_at"}
 
 
@@ -29,11 +29,11 @@ def _load_argilla():
     return rg
 
 
-def _client(api_url: str | None = None, api_key: str | None = None):
+def _client(api_url: str | None = None):
     rg = _load_argilla()
     return rg.Argilla(
         api_url=api_url or os.environ.get("ARGILLA_API_URL", "http://localhost:6900"),
-        api_key=api_key or os.environ.get("ARGILLA_API_KEY", "argilla.apikey"),
+        api_key=os.environ.get("ARGILLA_API_KEY", "argilla.apikey"),
     )
 
 
@@ -43,10 +43,18 @@ def _api_url(api_url: str | None = None) -> str:
 
 def _require_argilla_2_8_version(component: str, value: Any) -> str:
     version = str(value or "").strip()
-    match = _ARGILLA_VERSION_PATTERN.match(version)
-    if not match or (int(match.group(1)), int(match.group(2))) != (2, 8):
-        raise RuntimeError(f"{component} 必须是 Argilla 2.8.x，实际版本: {version or '<missing>'}")
+    if version != "2.8.0":
+        raise RuntimeError(f"{component} 必须是 Argilla 2.8.0，实际版本: {version or '<missing>'}")
     return version
+
+
+def _reject_sensitive_params(params: dict[str, Any]) -> None:
+    paths = sensitive_paths(params)
+    if paths:
+        raise ValueError(
+            "Argilla 运行凭据只能通过环境变量或 secret 注入，params 禁止敏感字段: "
+            + ", ".join(paths)
+        )
 
 
 def _server_version(api_url: str, timeout: float = 5.0) -> str:
@@ -1147,6 +1155,7 @@ def _record_suggestion_count(records: list) -> int:
 
 def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, params: dict[str, Any] | None = None) -> dict:
     params = dict(params or {})
+    _reject_sensitive_params(params)
     rg = _load_argilla()
     api_url = _api_url(params.get("api_url"))
     versions = _runtime_versions(rg, api_url)
@@ -1156,7 +1165,7 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
     if min_submitted < 1:
         raise ValueError("Argilla min_submitted 必须大于 0")
     if_exists = str(params.get("if_exists") or params.get("dataset_policy") or "resume")
-    client = _client(params.get("api_url"), params.get("api_key"))
+    client = _client(params.get("api_url"))
     settings = rg.Settings(
         guidelines=_guidelines_for_task(task, params),
         fields=_argilla_text_fields(rg, task, text_field, params),
@@ -1259,6 +1268,7 @@ def push_suggestions(
     params: dict[str, Any] | None = None,
 ) -> dict:
     params = dict(params or {})
+    _reject_sensitive_params(params)
     params["suggestions_path"] = str(suggestions_path)
     rg = _load_argilla()
     api_url = _api_url(params.get("api_url"))
@@ -1303,7 +1313,7 @@ def push_suggestions(
     if suggestion_count <= 0:
         raise ValueError("没有可写入 Argilla 的 suggestions")
 
-    client = _client(params.get("api_url"), params.get("api_key"))
+    client = _client(params.get("api_url"))
     workspace = _workspace_by_identity(client, workspace_name, expected["workspace"]["uuid"])
     dataset = _dataset_by_identity(client, dataset_name, workspace, expected["dataset"]["uuid"])
     _validate_dataset_resume(
@@ -1368,12 +1378,13 @@ def _workspace_user_identities(client, workspace) -> dict[str, dict[str, str]]:
 
 def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path, params: dict[str, Any] | None = None) -> dict:
     params = dict(params or {})
+    _reject_sensitive_params(params)
     _, contract = _pull_manifest(task, dataset_name, params)
     rg = _load_argilla()
     versions = _runtime_versions(rg, _api_url(params.get("api_url")))
     if versions["server"] != contract["server_version"] or versions["sdk"] != contract["sdk_version"]:
         raise ValueError("Argilla pull runtime version 与 push manifest 不一致")
-    client = _client(params.get("api_url"), params.get("api_key"))
+    client = _client(params.get("api_url"))
     workspace = _workspace_by_identity(client, contract["workspace"]["name"], contract["workspace"]["uuid"])
     dataset = _dataset_by_identity(client, dataset_name, workspace, contract["dataset"]["uuid"])
     records = list(dataset.records)
@@ -1439,8 +1450,9 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
 
 
 def test_connection(params: dict[str, Any] | None = None) -> dict:
-    params = params or {}
-    client = _client(params.get("api_url"), params.get("api_key"))
+    params = dict(params or {})
+    _reject_sensitive_params(params)
+    client = _client(params.get("api_url"))
     workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
     user = client.me
     workspaces = [_workspace_name(item) for item in client.workspaces.list()]
