@@ -959,6 +959,19 @@ def test_task_draft_strong_etag_noop_and_aba_protection(seeded_service, engine):
             channel=AuditChannel.API,
         )
 
+    with pytest.raises(TaskDraftConflict) as missing:
+        service.save_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition=definition_a,
+            rendered_task=rendered_a,
+            if_match="*",
+            channel=AuditChannel.API,
+        )
+    assert missing.value.current_etag is None
+
     first = service.save_task_draft(
         actor_identity=seeded_service["experimenter"],
         caller_identity=seeded_service["experimenter"],
@@ -966,14 +979,29 @@ def test_task_draft_strong_etag_noop_and_aba_protection(seeded_service, engine):
         task_key="shared-key",
         definition=definition_a,
         rendered_task=rendered_a,
-        if_match="*",
+        if_match=None,
         channel=AuditChannel.API,
+        if_none_match="*",
     )
     assert first.changed is True
     assert first.draft.version == 1
     assert first.draft.etag.startswith('"task-draft-v1-')
     assert first.draft.etag.endswith('"')
     assert not first.draft.etag.startswith("W/")
+
+    with pytest.raises(TaskDraftConflict) as existing:
+        service.save_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition=definition_a,
+            rendered_task=rendered_a,
+            if_match=None,
+            channel=AuditChannel.API,
+            if_none_match="*",
+        )
+    assert existing.value.current_etag == first.draft.etag
 
     noop = service.save_task_draft(
         actor_identity=seeded_service["experimenter"],
@@ -982,7 +1010,7 @@ def test_task_draft_strong_etag_noop_and_aba_protection(seeded_service, engine):
         task_key="shared-key",
         definition={"labels": ["yes", "no"], "task_id": "shared-key"},
         rendered_task=rendered_a,
-        if_match=first.draft.etag,
+        if_match="*",
         channel=AuditChannel.API,
     )
     assert noop.changed is False
@@ -1042,8 +1070,9 @@ def test_task_writes_resolve_actor_and_caller_principals(seeded_service, engine)
         task_key="shared-key",
         definition={"task_id": "shared-key"},
         rendered_task="task_id: shared-key\n",
-        if_match="*",
+        if_match=None,
         channel=AuditChannel.MCP,
+        if_none_match="*",
     )
     assert saved.changed is True
     with Session(engine) as session:
@@ -1095,8 +1124,9 @@ def test_task_draft_and_publish_enforce_acl_and_preconditions(seeded_service):
         task_key="shared-key",
         definition={"task_id": "shared-key"},
         rendered_task="task_id: shared-key\n",
-        if_match="*",
+        if_match=None,
         channel=AuditChannel.API,
+        if_none_match="*",
     ).draft
 
     with pytest.raises(AuthorizationDenied):
@@ -1149,8 +1179,9 @@ def test_task_publish_is_atomic_immutable_and_replays_original_snapshot(seeded_s
         task_key="shared-key",
         definition={"task_id": "shared-key", "labels": ["yes", "no"]},
         rendered_task="task_id: shared-key\nlabels:\n  - yes\n  - no\n",
-        if_match="*",
+        if_match=None,
         channel=AuditChannel.MCP,
+        if_none_match="*",
     ).draft
     published = service.publish_task_draft(
         actor_identity=seeded_service["experimenter"],

@@ -434,6 +434,11 @@ class TaskRevisionMaterialization(Base):
             "available_at",
             "created_at",
         ),
+        Index(
+            "ix_task_revision_materializations_workspace_task",
+            "workspace_id",
+            "task_id",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)

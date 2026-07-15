@@ -213,6 +213,11 @@ def upgrade() -> None:
         "task_revision_materializations",
         ["state", "available_at", "created_at"],
     )
+    op.create_index(
+        "ix_task_revision_materializations_workspace_task",
+        "task_revision_materializations",
+        ["workspace_id", "task_id"],
+    )
 
     if op.get_bind().dialect.name == "postgresql":
         op.execute(
@@ -271,6 +276,10 @@ def downgrade() -> None:
         op.execute("DROP TRIGGER IF EXISTS trg_task_revisions_immutable_update")
         op.execute("DROP TRIGGER IF EXISTS trg_task_revisions_immutable_delete")
 
+    op.drop_index(
+        "ix_task_revision_materializations_workspace_task",
+        table_name="task_revision_materializations",
+    )
     op.drop_index(
         "ix_task_revision_materializations_pending",
         table_name="task_revision_materializations",

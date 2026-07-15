@@ -449,6 +449,7 @@ class DatabaseService:
         rendered_task: str,
         if_match: str | None,
         channel: AuditChannel,
+        if_none_match: str | None = None,
         request_id: str | None = None,
     ) -> TaskDraftSaveResult:
         with self.transaction() as transaction:
@@ -461,6 +462,7 @@ class DatabaseService:
                 rendered_task=rendered_task,
                 if_match=if_match,
                 channel=channel,
+                if_none_match=if_none_match,
                 request_id=request_id,
             )
 
@@ -775,10 +777,15 @@ class DatabaseTransaction:
         rendered_task: str,
         if_match: str | None,
         channel: AuditChannel,
+        if_none_match: str | None = None,
         request_id: str | None = None,
     ) -> TaskDraftSaveResult:
-        if if_match is None:
+        if if_match is None and if_none_match is None:
             raise TaskPreconditionRequired()
+        if if_match is not None and if_none_match is not None:
+            raise ValueError("if_match and if_none_match are mutually exclusive")
+        if if_none_match is not None and if_none_match != "*":
+            raise ValueError("if_none_match must be '*'")
         fingerprint = task_definition_fingerprint(definition, rendered_task)
         _require_task_write_channel(channel)
 
@@ -794,7 +801,12 @@ class DatabaseTransaction:
             )
             .with_for_update(),
         )
-        _require_draft_match(draft, if_match)
+        if if_none_match == "*":
+            if draft is not None:
+                raise TaskDraftConflict(current_etag=task_draft_etag(draft.version, draft.fingerprint))
+        else:
+            assert if_match is not None
+            _require_draft_match(draft, if_match)
 
         if draft is not None and draft.fingerprint == fingerprint:
             return TaskDraftSaveResult(draft=_task_draft_ref(draft), changed=False)
@@ -1330,11 +1342,9 @@ def task_draft_etag(version: int, fingerprint: str) -> str:
 
 def _require_draft_match(draft: TaskDraft | None, if_match: str) -> None:
     if draft is None:
-        if if_match != "*":
-            raise TaskDraftConflict(current_etag=None)
-        return
+        raise TaskDraftConflict(current_etag=None)
     current_etag = task_draft_etag(draft.version, draft.fingerprint)
-    if if_match != current_etag:
+    if if_match not in {"*", current_etag}:
         raise TaskDraftConflict(current_etag=current_etag)
 
 

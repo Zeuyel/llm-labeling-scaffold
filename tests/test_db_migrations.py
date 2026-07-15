@@ -99,6 +99,14 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
         assert "lease_expires_at" in {
             column["name"] for column in inspect(engine).get_columns("task_revision_materializations")
         }
+        materialization_indexes = {
+            index["name"]: index["column_names"]
+            for index in inspect(engine).get_indexes("task_revision_materializations")
+        }
+        assert materialization_indexes["ix_task_revision_materializations_workspace_task"] == [
+            "workspace_id",
+            "task_id",
+        ]
         assert first.applied_revision == "20260714_0002"
         assert second.applied_revision == "20260714_0002"
         with Session(engine) as session:
@@ -479,8 +487,9 @@ def test_postgres_task_draft_publish_concurrency_permissions_and_triggers():
                 task_key=task_key,
                 definition={"task_id": task_key, "state": "a"},
                 rendered_task=f"task_id: {task_key}\nstate: a\n",
-                if_match="*",
+                if_match=None,
                 channel=AuditChannel.MCP,
+                if_none_match="*",
             ).draft
         finally:
             app_service.close()
