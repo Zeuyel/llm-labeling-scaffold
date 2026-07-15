@@ -110,6 +110,7 @@ def materialization_env(tmp_path: Path):
 
 def _publish(env: dict, marker: str, key: str, if_match: str = "*"):
     definition = _task_definition("controlled-task", marker)
+    creating = if_match == "*"
     draft = env["service"].save_task_draft(
         actor_identity=env["identity"],
         caller_identity=env["identity"],
@@ -117,7 +118,8 @@ def _publish(env: dict, marker: str, key: str, if_match: str = "*"):
         task_key="controlled-task",
         definition=definition,
         rendered_task=_render_task(definition),
-        if_match=if_match,
+        if_match=None if creating else if_match,
+        if_none_match="*" if creating else None,
         channel=AuditChannel.API,
     ).draft
     published = env["service"].publish_task_draft(
@@ -1496,7 +1498,8 @@ def test_postgres_workers_skip_locked_fence_duplicates_and_activate_monotonicall
                 task_key=task_key,
                 definition=definition_v1,
                 rendered_task=_render_task(definition_v1),
-                if_match="*",
+                if_match=None,
+                if_none_match="*",
                 channel=AuditChannel.API,
             ).draft
             first = service.publish_task_draft(
