@@ -24,7 +24,7 @@ Scaffold 已包含 #44 的 RBAC 数据层，但它尚未接入 Panel 业务授�
 - `/api/health`、`/api/version`、`/api/capabilities`、`/api/session` 可在 assertion 验证通过后访问。
 - 其他业务 API，包括业务数据读取和写操作，统一返回 `503` 与 `code=authorization_unavailable`。
 - `/api/session` 只返回 `authenticated=true`、经过验证的用户显示快照、认证方式和 `authorization.state=unavailable`，不返回角色、workspace、capability、token、claims 或 JWKS。
-- 现有静态 MCP service bearer 继续按受限路由白名单工作。路由判断使用 `ActorContext.caller`；当前静态 MCP 的 actor 和 caller 都是 service。
+- MCP 到 Panel 的内部 service bearer 继续按受限路由白名单工作。路由判断使用 `ActorContext.caller`；本阶段 Panel 看到的 MCP actor 和 caller 都是 service。
 
 `basic_dev` 仅用于本地开发和迁移：
 
@@ -39,10 +39,14 @@ LLS_PANEL_PASSWORD=<local-only-password>
 
 生产源站必须只能通过 Cloudflare Tunnel 到达，不能把 Panel 端口暴露到公网后仅依赖请求头。Compose 默认把 Panel 绑定到 `127.0.0.1`；部署时应保持回环绑定，或让 `cloudflared` 与 Panel 位于同一私有容器网络并移除宿主机端口发布。
 
+MCP 使用独立的 Access application 和 `LLS_MCP_CF_ACCESS_AUD`，不能复用 Panel 的 `LLS_CF_ACCESS_AUD`。Managed OAuth 的 opaque `Authorization` token 只由 Cloudflare Edge 消费；MCP 源站验证 Edge 注入的 `Cf-Access-Jwt-Assertion`，随后在进入 FastMCP 前删除外部 `Authorization` 和 assertion 请求头。MCP 到 Panel 始终使用 `LLS_MCP_INTERNAL_TOKEN`，不会把用户 OAuth token 或 Access assertion 转发给 Panel。完整配置见 [MCP 接入说明](mcp_integration.md)。
+
 主机和云防火墙应拒绝来自公网的 Panel 入站连接，只允许 `cloudflared` 所需的出站连接。部署后同时验证：Access hostname 可以访问；服务器公网 IP 和公开端口不能绕过 Access 直达源站。
 
 Cloudflare 官方参考：
 
 - [Validate JWTs](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/)
 - [Application token](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/application-token/)
+- [Managed OAuth](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/managed-oauth/)
+- [Secure MCP servers](https://developers.cloudflare.com/cloudflare-one/access-controls/ai-controls/secure-mcp-servers/)
 - [Tunnel with firewall](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/tunnel-with-firewall/)
