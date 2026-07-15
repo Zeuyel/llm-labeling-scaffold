@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import logging
 import os
-import shutil
 import socket
 import stat
 import time
 import uuid
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -21,7 +22,7 @@ import yaml
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, aliased
 
-from ..config import TaskConfig, load_task
+from ..config import TaskConfig
 from .audit import append_audit_event
 from .database import create_database_engine, create_session_factory
 from .enums import AuditChannel, TaskMaterializationState
@@ -39,6 +40,7 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_FILES = frozenset({"task.yaml", "definition.json", "manifest.json"})
 CACHE_METADATA_FILE = ".task_source.json"
+RENAME_NOREPLACE = 1
 
 
 class MaterializationError(RuntimeError):
@@ -104,10 +106,59 @@ class SnapshotRef:
 
 
 @dataclass(frozen=True)
-class PinnedCacheDirectory:
+class ValidatedSnapshot:
+    ref: SnapshotRef
+    task: TaskConfig
+    task_bytes: bytes
+
+
+@dataclass(frozen=True)
+class PinnedRootDirectory:
+    parent_fd: int
     root_fd: int
+    basename: str
+    path: Path
+    device: int
+    inode: int
+    description: str
+    path_entries: tuple[PinnedDirectoryEntry, ...]
+
+
+@dataclass(frozen=True)
+class PinnedDirectoryEntry:
+    parent_fd: int
+    fd: int
+    name: str
+    device: int
+    inode: int
+    description: str
+
+
+@dataclass(frozen=True)
+class PinnedRegularFile:
+    parent_fd: int
+    fd: int
+    name: str
+    device: int
+    inode: int
+    description: str
+
+
+@dataclass(frozen=True)
+class PinnedFileLock:
+    root: PinnedRootDirectory
+    directories: tuple[PinnedDirectoryEntry, ...]
+    file: PinnedRegularFile
+
+
+@dataclass(frozen=True)
+class PinnedCacheDirectory:
+    root: PinnedRootDirectory
+    lock: PinnedFileLock
     task_fd: int
     task_key: str
+    device: int
+    inode: int
 
 
 @dataclass(frozen=True)
@@ -211,53 +262,260 @@ class TaskSnapshotStore:
         _require_sha256(content_hash)
         return self.root / str(revision_id) / content_hash
 
+    def snapshot_exists(self, revision: RevisionSnapshot) -> bool:
+        revision_name = str(revision.revision_id)
+        _require_safe_segment(revision_name)
+        _require_sha256(revision.content_hash)
+        try:
+            with _pinned_root_directory(
+                self.root,
+                description="task snapshot root",
+                create=False,
+            ) as snapshot_root:
+                with _pinned_directory_at(
+                    snapshot_root.root_fd,
+                    revision_name,
+                    description="task snapshot revision directory",
+                    create=False,
+                ) as revision_directory:
+                    try:
+                        os.stat(
+                            revision.content_hash,
+                            dir_fd=revision_directory.fd,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        return False
+                    return True
+        except FileNotFoundError:
+            return False
+        except SnapshotValidationError:
+            return True
+
     def materialize(self, revision: RevisionSnapshot) -> SnapshotRef:
         expected = self._expected_files(revision)
         target = self.snapshot_path(revision.revision_id, revision.content_hash)
-        target.parent.mkdir(parents=True, exist_ok=True)
+        revision_name = str(revision.revision_id)
+        _require_safe_segment(revision_name)
+        _require_sha256(revision.content_hash)
 
-        with self._revision_lock(revision.revision_id):
-            if target.exists():
-                return self._validate_path(target, revision, expected)
+        with _pinned_root_directory(
+            self.root,
+            description="task snapshot root",
+        ) as snapshot_root:
+            with self._revision_lock(snapshot_root, revision) as revision_lock:
+                _assert_pinned_file_lock(revision_lock)
+                with _pinned_directory_at(
+                    snapshot_root.root_fd,
+                    revision_name,
+                    description=f"task snapshot revision directory: {target.parent}",
+                ) as revision_directory:
+                    _assert_snapshot_path(
+                        snapshot_root,
+                        (revision_directory,),
+                        revision_lock,
+                    )
+                    existing = self._validate_existing_target(
+                        snapshot_root,
+                        revision_directory,
+                        target,
+                        revision,
+                        expected,
+                        lock=revision_lock,
+                    )
+                    if existing is not None:
+                        return existing.ref
 
-            staging_root = self.root / ".staging"
-            staging_root.mkdir(parents=True, exist_ok=True)
-            staging = staging_root / f"{revision.revision_id}.{os.getpid()}.{uuid.uuid4().hex}"
-            staging.mkdir(parents=False, exist_ok=False)
-            preserve_staging = False
-            try:
-                _write_bytes_fsync(staging / "task.yaml", expected["task.yaml"])
-                self._inject("after_task_write", revision)
-                _write_bytes_fsync(staging / "definition.json", expected["definition.json"])
-                _write_bytes_fsync(staging / "manifest.json", expected["manifest.json"])
-                self._validate_path(staging, revision, expected)
-                _fsync_dir(staging)
-                self._inject("before_snapshot_commit", revision)
+                    _assert_snapshot_path(
+                        snapshot_root,
+                        (revision_directory,),
+                        revision_lock,
+                    )
+                    with _pinned_directory_at(
+                        snapshot_root.root_fd,
+                        ".staging",
+                        description="task snapshot staging root",
+                    ) as staging_root:
+                        _assert_snapshot_path(
+                            snapshot_root,
+                            (revision_directory, staging_root),
+                            revision_lock,
+                        )
+                        staging_name = (
+                            f"{revision.revision_id}.{os.getpid()}.{uuid.uuid4().hex}"
+                        )
+                        staging_path = self.root / ".staging" / staging_name
+                        _assert_snapshot_path(
+                            snapshot_root,
+                            (revision_directory, staging_root),
+                            revision_lock,
+                        )
+                        staging = _create_pinned_directory_at(
+                            staging_root.fd,
+                            staging_name,
+                            description=f"task snapshot staging directory: {staging_path}",
+                            mode=0o755,
+                        )
+                        _assert_snapshot_path(
+                            snapshot_root,
+                            (revision_directory, staging_root, staging),
+                            revision_lock,
+                        )
+                        preserve_staging = False
+                        committed = False
+                        try:
+                            _write_new_regular_file_at(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                staging,
+                                "task.yaml",
+                                expected["task.yaml"],
+                                description=f"task snapshot file: {staging_path / 'task.yaml'}",
+                                lock=revision_lock,
+                            )
+                            self._inject("after_task_write", revision)
+                            _write_new_regular_file_at(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                staging,
+                                "definition.json",
+                                expected["definition.json"],
+                                description=f"task snapshot file: {staging_path / 'definition.json'}",
+                                lock=revision_lock,
+                            )
+                            _write_new_regular_file_at(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                staging,
+                                "manifest.json",
+                                expected["manifest.json"],
+                                description=f"task snapshot file: {staging_path / 'manifest.json'}",
+                                lock=revision_lock,
+                            )
+                            self._validate_snapshot_directory(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                staging,
+                                staging_path,
+                                revision,
+                                expected,
+                                lock=revision_lock,
+                            )
+                            _assert_snapshot_path(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                revision_lock,
+                            )
+                            os.fsync(staging.fd)
+                            _assert_snapshot_path(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                revision_lock,
+                            )
+                            self._inject("before_snapshot_commit", revision)
 
-                if target.exists():
-                    return self._validate_path(target, revision, expected)
-                os.rename(staging, target)
-                _fsync_dir(target.parent)
-                self._inject("after_snapshot_commit", revision)
-                return self._validate_path(target, revision, expected)
-            except MaterializationCrash:
-                preserve_staging = True
-                raise
-            finally:
-                if not preserve_staging and staging.exists():
-                    shutil.rmtree(staging, ignore_errors=True)
+                            existing = self._validate_existing_target(
+                                snapshot_root,
+                                revision_directory,
+                                target,
+                                revision,
+                                expected,
+                                lock=revision_lock,
+                            )
+                            if existing is not None:
+                                return existing.ref
+                            _assert_snapshot_path(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                revision_lock,
+                            )
+                            self._inject("before_snapshot_rename", revision)
+                            _assert_snapshot_path(
+                                snapshot_root,
+                                (revision_directory, staging_root, staging),
+                                revision_lock,
+                            )
+                            try:
+                                _rename_directory_noreplace_at(
+                                    staging_root.fd,
+                                    staging.name,
+                                    revision_directory.fd,
+                                    revision.content_hash,
+                                )
+                            except FileExistsError:
+                                existing = self._validate_existing_target(
+                                    snapshot_root,
+                                    revision_directory,
+                                    target,
+                                    revision,
+                                    expected,
+                                    lock=revision_lock,
+                                )
+                                if existing is None:
+                                    raise SnapshotConflictError(
+                                        f"snapshot target changed during commit: {target}",
+                                    )
+                                return existing.ref
+                            committed = True
+                            committed_directory = PinnedDirectoryEntry(
+                                parent_fd=revision_directory.fd,
+                                fd=staging.fd,
+                                name=revision.content_hash,
+                                device=staging.device,
+                                inode=staging.inode,
+                                description=f"task snapshot target: {target}",
+                            )
+                            _assert_snapshot_path(
+                                snapshot_root,
+                                (revision_directory, staging_root, committed_directory),
+                                revision_lock,
+                            )
+                            os.fsync(revision_directory.fd)
+                            _assert_snapshot_path(
+                                snapshot_root,
+                                (revision_directory, staging_root, committed_directory),
+                                revision_lock,
+                            )
+                            os.fsync(staging_root.fd)
+                            _assert_snapshot_path(
+                                snapshot_root,
+                                (revision_directory, staging_root, committed_directory),
+                                revision_lock,
+                            )
+                            self._inject("after_snapshot_commit", revision)
+                            return self._validate_snapshot_directory(
+                                snapshot_root,
+                                (revision_directory, staging_root, committed_directory),
+                                committed_directory,
+                                target,
+                                revision,
+                                expected,
+                                lock=revision_lock,
+                            ).ref
+                        except MaterializationCrash:
+                            preserve_staging = True
+                            raise
+                        finally:
+                            try:
+                                if not preserve_staging and not committed:
+                                    _cleanup_staging_directory(
+                                        snapshot_root,
+                                        staging_root,
+                                        staging,
+                                        lock=revision_lock,
+                                    )
+                            finally:
+                                os.close(staging.fd)
 
     def validate(self, revision: RevisionSnapshot) -> SnapshotRef:
-        expected = self._expected_files(revision)
-        return self._validate_path(
-            self.snapshot_path(revision.revision_id, revision.content_hash),
-            revision,
-            expected,
-        )
+        return self._validated_snapshot(revision).ref
 
     def load(self, revision: RevisionSnapshot) -> TaskConfig:
-        snapshot = self.validate(revision)
-        return load_task(snapshot.task_path)
+        return self._validated_snapshot(revision).task
+
+    def read_task_bytes(self, revision: RevisionSnapshot) -> tuple[SnapshotRef, bytes]:
+        validated = self._validated_snapshot(revision)
+        return validated.ref, validated.task_bytes
 
     def _expected_files(self, revision: RevisionSnapshot) -> dict[str, bytes]:
         _validate_revision(revision)
@@ -292,30 +550,107 @@ class TaskSnapshotStore:
             "manifest.json": manifest_bytes,
         }
 
-    def _validate_path(
+    def _validated_snapshot(self, revision: RevisionSnapshot) -> ValidatedSnapshot:
+        expected = self._expected_files(revision)
+        target = self.snapshot_path(revision.revision_id, revision.content_hash)
+        revision_name = str(revision.revision_id)
+        _require_safe_segment(revision_name)
+        try:
+            with _pinned_root_directory(
+                self.root,
+                description="task snapshot root",
+                create=False,
+            ) as snapshot_root:
+                with _pinned_directory_at(
+                    snapshot_root.root_fd,
+                    revision_name,
+                    description=f"task snapshot revision directory: {target.parent}",
+                    create=False,
+                ) as revision_directory:
+                    with _pinned_directory_at(
+                        revision_directory.fd,
+                        revision.content_hash,
+                        description=f"task snapshot target: {target}",
+                        create=False,
+                    ) as target_directory:
+                        return self._validate_snapshot_directory(
+                            snapshot_root,
+                            (revision_directory, target_directory),
+                            target_directory,
+                            target,
+                            revision,
+                            expected,
+                        )
+        except FileNotFoundError as exc:
+            raise SnapshotConflictError(f"snapshot target does not exist: {target}") from exc
+
+    def _validate_existing_target(
         self,
+        snapshot_root: PinnedRootDirectory,
+        revision_directory: PinnedDirectoryEntry,
         path: Path,
         revision: RevisionSnapshot,
         expected: dict[str, bytes],
-    ) -> SnapshotRef:
-        if not path.is_dir() or path.is_symlink():
-            raise SnapshotConflictError(f"snapshot target is not an immutable directory: {path}")
-        entries = {entry.name for entry in path.iterdir()}
+        *,
+        lock: PinnedFileLock | None = None,
+    ) -> ValidatedSnapshot | None:
+        _assert_snapshot_path(snapshot_root, (revision_directory,), lock)
+        try:
+            with _pinned_directory_at(
+                revision_directory.fd,
+                revision.content_hash,
+                description=f"task snapshot target: {path}",
+                create=False,
+            ) as target_directory:
+                return self._validate_snapshot_directory(
+                    snapshot_root,
+                    (revision_directory, target_directory),
+                    target_directory,
+                    path,
+                    revision,
+                    expected,
+                    lock=lock,
+                )
+        except FileNotFoundError:
+            return None
+
+    def _validate_snapshot_directory(
+        self,
+        snapshot_root: PinnedRootDirectory,
+        path_entries: tuple[PinnedDirectoryEntry, ...],
+        directory: PinnedDirectoryEntry,
+        path: Path,
+        revision: RevisionSnapshot,
+        expected: dict[str, bytes],
+        *,
+        lock: PinnedFileLock | None = None,
+    ) -> ValidatedSnapshot:
+        _assert_snapshot_path(snapshot_root, path_entries, lock)
+        try:
+            entries = set(os.listdir(directory.fd))
+        except OSError as exc:
+            raise SnapshotConflictError(f"snapshot directory cannot be listed: {path}") from exc
         if entries != SNAPSHOT_FILES:
             raise SnapshotConflictError(
                 f"snapshot files differ: expected={sorted(SNAPSHOT_FILES)}, actual={sorted(entries)}",
             )
+        actual: dict[str, bytes] = {}
         for name, expected_bytes in expected.items():
-            file_path = path / name
-            if not file_path.is_file() or file_path.is_symlink():
-                raise SnapshotConflictError(f"snapshot file is missing or not regular: {file_path}")
-            actual_bytes = file_path.read_bytes()
+            actual_bytes = _read_snapshot_regular_file_at(
+                snapshot_root,
+                path_entries,
+                directory,
+                name,
+                description=f"task snapshot file: {path / name}",
+                lock=lock,
+            )
             if actual_bytes != expected_bytes:
-                raise SnapshotConflictError(f"snapshot file content differs: {file_path}")
+                raise SnapshotConflictError(f"snapshot file content differs: {path / name}")
+            actual[name] = actual_bytes
 
         try:
-            definition = json.loads((path / "definition.json").read_text(encoding="utf-8"))
-            manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+            definition = json.loads(actual["definition.json"].decode("utf-8"))
+            manifest = json.loads(actual["manifest.json"].decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise SnapshotConflictError(f"snapshot JSON is invalid: {path}") from exc
         if definition != revision.definition:
@@ -323,32 +658,44 @@ class TaskSnapshotStore:
         if not isinstance(manifest, dict):
             raise SnapshotConflictError(f"snapshot manifest is not an object: {path}")
 
-        task = load_task(path / "task.yaml")
-        if task.task_id != revision.task_key:
+        try:
+            task_raw = yaml.safe_load(actual["task.yaml"].decode("utf-8"))
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise SnapshotConflictError(f"snapshot task YAML is invalid: {path}") from exc
+        if not isinstance(task_raw, dict) or task_raw.get("task_id") != revision.task_key:
             raise SnapshotConflictError(
-                f"snapshot task_id differs: expected={revision.task_key}, actual={task.task_id}",
+                f"snapshot task_id differs: expected={revision.task_key}, actual={task_raw!r}",
             )
-        return SnapshotRef(
+        ref = SnapshotRef(
             path=path,
             task_path=path / "task.yaml",
             definition_path=path / "definition.json",
             manifest_path=path / "manifest.json",
             content_hash=revision.content_hash,
         )
+        _assert_snapshot_path(snapshot_root, path_entries, lock)
+        return ValidatedSnapshot(
+            ref=ref,
+            task=TaskConfig(path=ref.task_path, raw=task_raw),
+            task_bytes=actual["task.yaml"],
+        )
 
     @contextmanager
-    def _revision_lock(self, revision_id: uuid.UUID):
-        lock_root = self.root / ".locks"
-        lock_root.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_root / f"{revision_id}.lock"
-        with lock_path.open("a+b") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    def _revision_lock(
+        self,
+        snapshot_root: PinnedRootDirectory,
+        revision: RevisionSnapshot,
+    ):
+        revision_name = str(revision.revision_id)
+        _require_safe_segment(revision_name)
+        with _pinned_file_lock(
+            snapshot_root,
+            directories=((".locks", "task snapshot lock directory"),),
+            filename=f"{revision_name}.lock",
+            file_description="task snapshot revision lock file",
+            after_acquired=lambda: self._inject("after_snapshot_lock_acquired", revision),
+        ) as lock:
+            yield lock
 
     def _inject(self, point: str, revision: RevisionSnapshot) -> None:
         if self._fault_injector is not None:
@@ -384,9 +731,19 @@ class CompatibilityTaskCache:
             if revision is None or materialization is None:
                 raise SnapshotValidationError("current revision is not backed by a ready materialization")
             descriptor = _revision_snapshot(task, revision)
-            snapshot = self._snapshot_store.validate(descriptor)
-            with self._task_lock(task.task_key):
-                return self._write_cache(descriptor, snapshot)
+            snapshot, task_bytes = self._snapshot_store.read_task_bytes(descriptor)
+            with _pinned_root_directory(
+                self.root,
+                description="compatibility cache root",
+            ) as cache_root:
+                with self._task_lock(cache_root, descriptor) as cache_lock:
+                    return self._write_cache(
+                        cache_root,
+                        cache_lock,
+                        descriptor,
+                        snapshot,
+                        task_bytes,
+                    )
 
     def recover_all(self, *, failed_task_ids: set[uuid.UUID] | None = None) -> int:
         with self._session_factory() as session:
@@ -406,8 +763,14 @@ class CompatibilityTaskCache:
             failed_task_ids.update(failed)
         return changed
 
-    def _write_cache(self, revision: RevisionSnapshot, snapshot: SnapshotRef) -> bool:
-        task_bytes = snapshot.task_path.read_bytes()
+    def _write_cache(
+        self,
+        cache_root: PinnedRootDirectory,
+        cache_lock: PinnedFileLock,
+        revision: RevisionSnapshot,
+        snapshot: SnapshotRef,
+        task_bytes: bytes,
+    ) -> bool:
         metadata = {
             "source": "database_current_revision",
             "workspace_id": str(revision.workspace_id),
@@ -422,7 +785,7 @@ class CompatibilityTaskCache:
         metadata_bytes = (
             json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
         ).encode("utf-8")
-        with _pinned_cache_directory(self.root, revision.task_key) as directory:
+        with _pinned_cache_directory(cache_root, cache_lock, revision.task_key) as directory:
             _require_regular_or_missing_at(directory, "task.yaml")
             _require_regular_or_missing_at(directory, CACHE_METADATA_FILE)
             if _cache_matches_at(directory, metadata, task_bytes):
@@ -439,19 +802,19 @@ class CompatibilityTaskCache:
             self._fault_injector(point, revision)
 
     @contextmanager
-    def _task_lock(self, task_key: str):
-        _require_safe_segment(task_key)
-        lock_root = self.root / "_locks" / "task_materialization"
-        lock_root.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_root / f"{task_key}.lock"
-        with lock_path.open("a+b") as handle:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    def _task_lock(self, cache_root: PinnedRootDirectory, revision: RevisionSnapshot):
+        _require_safe_segment(revision.task_key)
+        with _pinned_file_lock(
+            cache_root,
+            directories=(
+                ("_locks", "compatibility cache lock directory"),
+                ("task_materialization", "task materialization lock directory"),
+            ),
+            filename=f"{revision.task_key}.lock",
+            file_description="task materialization lock file",
+            after_acquired=lambda: self._inject("after_cache_lock_acquired", revision),
+        ) as lock:
+            yield lock
 
 
 class ControlTaskSnapshotLoader:
@@ -688,7 +1051,7 @@ class TaskMaterializationWorker:
         materialization, revision, task, current = row
         descriptor = _revision_snapshot(task, revision)
         snapshot_path = self._snapshot_store.snapshot_path(revision.id, revision.content_hash)
-        snapshot_exists = snapshot_path.exists()
+        snapshot_exists = self._snapshot_store.snapshot_exists(descriptor)
         snapshot_valid: bool | None = None
         snapshot_error: str | None = None
         if snapshot_exists or materialization.state == TaskMaterializationState.SUCCEEDED:
@@ -1183,67 +1546,592 @@ def _cache_root(tasks_root: str | Path) -> Path:
 
 
 @contextmanager
-def _pinned_cache_directory(root: Path, task_key: str):
-    _require_safe_segment(task_key)
-    root.mkdir(parents=True, exist_ok=True)
-    root_fd = _open_directory_nofollow(root)
-    task_fd: int | None = None
+def _pinned_root_directory(root: Path, *, description: str, create: bool = True):
+    absolute = Path(os.path.abspath(os.fspath(root)))
+    components = absolute.parts[1:]
+    if not components:
+        raise SnapshotValidationError(f"{description} cannot be the filesystem root")
+
     try:
+        current_fd = os.open(absolute.anchor, _directory_open_flags())
+    except OSError as exc:
+        raise SnapshotValidationError(
+            f"{description} anchor is not a safe directory: {absolute.anchor}",
+        ) from exc
+
+    descriptors = [current_fd]
+    path_entries: list[PinnedDirectoryEntry] = []
+    try:
+        current_path = Path(absolute.anchor)
+        for index, component in enumerate(components):
+            current_path /= component
+            component_description = (
+                f"{description}: {absolute}"
+                if index == len(components) - 1
+                else f"{description} path component: {current_path}"
+            )
+            next_fd = (
+                _open_or_create_directory_at(
+                    current_fd,
+                    component,
+                    description=component_description,
+                )
+                if create
+                else _open_existing_directory_at(
+                    current_fd,
+                    component,
+                    description=component_description,
+                )
+            )
+            descriptors.append(next_fd)
+            opened = os.fstat(next_fd)
+            path_entries.append(
+                PinnedDirectoryEntry(
+                    parent_fd=current_fd,
+                    fd=next_fd,
+                    name=component,
+                    device=opened.st_dev,
+                    inode=opened.st_ino,
+                    description=component_description,
+                ),
+            )
+            current_fd = next_fd
+
+        root_entry = path_entries[-1]
+        pinned = PinnedRootDirectory(
+            parent_fd=root_entry.parent_fd,
+            root_fd=root_entry.fd,
+            basename=root_entry.name,
+            path=absolute,
+            device=root_entry.device,
+            inode=root_entry.inode,
+            description=description,
+            path_entries=tuple(path_entries),
+        )
+        _assert_pinned_root(pinned)
         try:
-            os.mkdir(task_key, mode=0o755, dir_fd=root_fd)
-        except FileExistsError:
-            pass
+            yield pinned
+        finally:
+            _assert_pinned_root(pinned)
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+@contextmanager
+def _pinned_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    description: str,
+    create: bool = True,
+):
+    descriptor = (
+        _open_or_create_directory_at(parent_fd, name, description=description)
+        if create
+        else _open_existing_directory_at(parent_fd, name, description=description)
+    )
+    try:
+        opened = os.fstat(descriptor)
+        pinned = PinnedDirectoryEntry(
+            parent_fd=parent_fd,
+            fd=descriptor,
+            name=name,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            description=description,
+        )
+        _assert_pinned_directory(pinned)
+        yield pinned
+        _assert_pinned_directory(pinned)
+    finally:
+        os.close(descriptor)
+
+
+def _create_pinned_directory_at(
+    parent_fd: int,
+    name: str,
+    *,
+    description: str,
+    mode: int,
+) -> PinnedDirectoryEntry:
+    _require_safe_segment(name)
+    try:
+        os.mkdir(name, mode=mode, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise SnapshotValidationError(f"{description} could not be created safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        pinned = PinnedDirectoryEntry(
+            parent_fd=parent_fd,
+            fd=descriptor,
+            name=name,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            description=description,
+        )
+        _assert_pinned_directory(pinned)
+        return pinned
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+@contextmanager
+def _pinned_regular_file_at(parent_fd: int, name: str, *, description: str):
+    flags = (
+        os.O_RDWR
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    created = False
+    try:
+        descriptor = os.open(
+            name,
+            flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        created = True
+    except FileExistsError:
         try:
-            task_fd = os.open(task_key, _directory_open_flags(), dir_fd=root_fd)
+            descriptor = os.open(name, flags, dir_fd=parent_fd)
         except OSError as exc:
-            raise SnapshotValidationError(
-                f"compatibility cache target is not a safe directory: {root / task_key}",
-            ) from exc
+            raise SnapshotValidationError(f"{description} is not a safe regular file") from exc
+    except OSError as exc:
+        raise SnapshotValidationError(f"{description} could not be created safely") from exc
+
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SnapshotValidationError(f"{description} is not a regular file")
+        if created:
+            os.fsync(descriptor)
+            os.fsync(parent_fd)
+        pinned = PinnedRegularFile(
+            parent_fd=parent_fd,
+            fd=descriptor,
+            name=name,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            description=description,
+        )
+        _assert_pinned_regular_file(pinned)
+        yield pinned
+        _assert_pinned_regular_file(pinned)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _pinned_existing_regular_file_at(parent_fd: int, name: str, *, description: str):
+    flags = (
+        os.O_RDONLY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise SnapshotValidationError(f"{description} is not a safe regular file") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SnapshotValidationError(f"{description} is not a regular file")
+        pinned = PinnedRegularFile(
+            parent_fd=parent_fd,
+            fd=descriptor,
+            name=name,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            description=description,
+        )
+        _assert_pinned_regular_file(pinned)
+        yield pinned
+        _assert_pinned_regular_file(pinned)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _pinned_cache_directory(
+    root: PinnedRootDirectory,
+    lock: PinnedFileLock,
+    task_key: str,
+):
+    _require_safe_segment(task_key)
+    _assert_pinned_root(root)
+    _assert_pinned_file_lock(lock)
+    with _pinned_directory_at(
+        root.root_fd,
+        task_key,
+        description=f"compatibility cache target: {root.path / task_key}",
+    ) as task:
         directory = PinnedCacheDirectory(
-            root_fd=root_fd,
-            task_fd=task_fd,
+            root=root,
+            lock=lock,
+            task_fd=task.fd,
             task_key=task_key,
+            device=task.device,
+            inode=task.inode,
         )
         _assert_pinned_cache_directory(directory)
         yield directory
         _assert_pinned_cache_directory(directory)
-    finally:
-        if task_fd is not None:
-            os.close(task_fd)
-        os.close(root_fd)
 
 
-def _open_directory_nofollow(path: Path) -> int:
+def _open_or_create_directory_at(parent_fd: int, name: str, *, description: str) -> int:
     try:
-        return os.open(path, _directory_open_flags())
+        return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        try:
+            os.mkdir(name, mode=0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise SnapshotValidationError(f"{description} could not be created safely") from exc
+        else:
+            try:
+                os.fsync(parent_fd)
+            except OSError as exc:
+                raise SnapshotValidationError(
+                    f"{description} parent directory could not be synced",
+                ) from exc
+        try:
+            return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            raise SnapshotValidationError(f"{description} is not a safe directory") from exc
     except OSError as exc:
-        raise SnapshotValidationError(
-            f"compatibility cache root is not a safe directory: {path}",
-        ) from exc
+        raise SnapshotValidationError(f"{description} is not a safe directory") from exc
+
+
+def _open_existing_directory_at(parent_fd: int, name: str, *, description: str) -> int:
+    try:
+        return os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise SnapshotValidationError(f"{description} is not a safe directory") from exc
 
 
 def _directory_open_flags() -> int:
     if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
-        raise SnapshotValidationError("secure compatibility cache writes require O_DIRECTORY and O_NOFOLLOW")
+        raise SnapshotValidationError("secure directory writes require O_DIRECTORY and O_NOFOLLOW")
     return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
 
 
+def _assert_pinned_root(root: PinnedRootDirectory) -> None:
+    try:
+        for component in root.path_entries:
+            entry = os.stat(
+                component.name,
+                dir_fd=component.parent_fd,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(component.fd)
+            expected = (component.device, component.inode)
+            if (
+                not stat.S_ISDIR(entry.st_mode)
+                or not stat.S_ISDIR(opened.st_mode)
+                or (entry.st_dev, entry.st_ino) != expected
+                or (opened.st_dev, opened.st_ino) != expected
+            ):
+                raise SnapshotValidationError(
+                    f"{root.description} changed during operation: {root.path}",
+                )
+    except OSError as exc:
+        raise SnapshotValidationError(
+            f"{root.description} changed during operation: {root.path}",
+        ) from exc
+
+
+def _assert_pinned_directory(directory: PinnedDirectoryEntry) -> None:
+    try:
+        entry = os.stat(
+            directory.name,
+            dir_fd=directory.parent_fd,
+            follow_symlinks=False,
+        )
+        opened = os.fstat(directory.fd)
+    except OSError as exc:
+        raise SnapshotValidationError(f"{directory.description} changed during operation") from exc
+    expected = (directory.device, directory.inode)
+    if (
+        not stat.S_ISDIR(entry.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or (entry.st_dev, entry.st_ino) != expected
+        or (opened.st_dev, opened.st_ino) != expected
+    ):
+        raise SnapshotValidationError(f"{directory.description} changed during operation")
+
+
+def _assert_pinned_regular_file(file: PinnedRegularFile) -> None:
+    try:
+        entry = os.stat(
+            file.name,
+            dir_fd=file.parent_fd,
+            follow_symlinks=False,
+        )
+        opened = os.fstat(file.fd)
+    except OSError as exc:
+        raise SnapshotValidationError(f"{file.description} changed during operation") from exc
+    expected = (file.device, file.inode)
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or not stat.S_ISREG(opened.st_mode)
+        or (entry.st_dev, entry.st_ino) != expected
+        or (opened.st_dev, opened.st_ino) != expected
+    ):
+        raise SnapshotValidationError(f"{file.description} changed during operation")
+
+
+@contextmanager
+def _pinned_file_lock(
+    root: PinnedRootDirectory,
+    *,
+    directories: tuple[tuple[str, str], ...],
+    filename: str,
+    file_description: str,
+    after_acquired: Callable[[], None] | None = None,
+):
+    _assert_pinned_root(root)
+    with ExitStack() as stack:
+        parent_fd = root.root_fd
+        pinned_directories: list[PinnedDirectoryEntry] = []
+        for name, description in directories:
+            directory = stack.enter_context(
+                _pinned_directory_at(parent_fd, name, description=description),
+            )
+            pinned_directories.append(directory)
+            parent_fd = directory.fd
+            _assert_pinned_lock_path(root, pinned_directories)
+        lock_file = stack.enter_context(
+            _pinned_regular_file_at(
+                parent_fd,
+                filename,
+                description=file_description,
+            ),
+        )
+        lock = PinnedFileLock(
+            root=root,
+            directories=tuple(pinned_directories),
+            file=lock_file,
+        )
+        _assert_pinned_file_lock(lock)
+        locked = False
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fd, fcntl.LOCK_EX)
+                locked = True
+            if after_acquired is not None:
+                after_acquired()
+            _assert_pinned_file_lock(lock)
+            yield lock
+        finally:
+            try:
+                _assert_pinned_file_lock(lock)
+            finally:
+                if locked:
+                    fcntl.flock(lock_file.fd, fcntl.LOCK_UN)
+
+
+def _assert_pinned_lock_path(
+    root: PinnedRootDirectory,
+    directories: tuple[PinnedDirectoryEntry, ...] | list[PinnedDirectoryEntry],
+    lock_file: PinnedRegularFile | None = None,
+) -> None:
+    _assert_pinned_root(root)
+    for directory in directories:
+        _assert_pinned_directory(directory)
+    if lock_file is not None:
+        _assert_pinned_regular_file(lock_file)
+
+
+def _assert_pinned_file_lock(lock: PinnedFileLock) -> None:
+    _assert_pinned_lock_path(lock.root, lock.directories, lock.file)
+
+
+def _assert_snapshot_path(
+    root: PinnedRootDirectory,
+    directories: tuple[PinnedDirectoryEntry, ...],
+    lock: PinnedFileLock | None = None,
+) -> None:
+    _assert_pinned_root(root)
+    for directory in directories:
+        _assert_pinned_directory(directory)
+    if lock is not None:
+        _assert_pinned_file_lock(lock)
+
+
+def _write_new_regular_file_at(
+    root: PinnedRootDirectory,
+    path_entries: tuple[PinnedDirectoryEntry, ...],
+    directory: PinnedDirectoryEntry,
+    name: str,
+    value: bytes,
+    *,
+    description: str,
+    lock: PinnedFileLock | None = None,
+) -> None:
+    _require_safe_segment(name)
+    _assert_snapshot_path(root, path_entries, lock)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(name, flags, 0o644, dir_fd=directory.fd)
+    except OSError as exc:
+        raise SnapshotValidationError(f"{description} could not be created safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise SnapshotValidationError(f"{description} is not a regular file")
+        pinned = PinnedRegularFile(
+            parent_fd=directory.fd,
+            fd=descriptor,
+            name=name,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            description=description,
+        )
+        _assert_pinned_regular_file(pinned)
+        _assert_snapshot_path(root, path_entries, lock)
+        remaining = memoryview(value)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("task snapshot write made no progress")
+            remaining = remaining[written:]
+        _assert_pinned_regular_file(pinned)
+        _assert_snapshot_path(root, path_entries, lock)
+        os.fsync(descriptor)
+        _assert_pinned_regular_file(pinned)
+        _assert_snapshot_path(root, path_entries, lock)
+    finally:
+        os.close(descriptor)
+
+
+def _read_snapshot_regular_file_at(
+    root: PinnedRootDirectory,
+    path_entries: tuple[PinnedDirectoryEntry, ...],
+    directory: PinnedDirectoryEntry,
+    name: str,
+    *,
+    description: str,
+    lock: PinnedFileLock | None = None,
+) -> bytes:
+    _assert_snapshot_path(root, path_entries, lock)
+    try:
+        with _pinned_existing_regular_file_at(
+            directory.fd,
+            name,
+            description=description,
+        ) as file:
+            _assert_snapshot_path(root, path_entries, lock)
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(file.fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            _assert_pinned_regular_file(file)
+            _assert_snapshot_path(root, path_entries, lock)
+            return b"".join(chunks)
+    except SnapshotValidationError as exc:
+        raise SnapshotConflictError(f"snapshot file is missing or not regular: {description}") from exc
+
+
+def _cleanup_staging_directory(
+    root: PinnedRootDirectory,
+    staging_root: PinnedDirectoryEntry,
+    staging: PinnedDirectoryEntry,
+    *,
+    lock: PinnedFileLock | None = None,
+) -> None:
+    _assert_snapshot_path(root, (staging_root, staging), lock)
+    entries = set(os.listdir(staging.fd))
+    unexpected = entries - SNAPSHOT_FILES
+    if unexpected:
+        raise SnapshotValidationError(
+            f"task snapshot staging directory contains unexpected entries: {sorted(unexpected)}",
+        )
+    for name in entries:
+        entry = os.stat(name, dir_fd=staging.fd, follow_symlinks=False)
+        if stat.S_ISDIR(entry.st_mode):
+            raise SnapshotValidationError(
+                f"task snapshot staging entry is an unexpected directory: {name}",
+            )
+        os.unlink(name, dir_fd=staging.fd)
+    _assert_snapshot_path(root, (staging_root, staging), lock)
+    os.fsync(staging.fd)
+    _assert_snapshot_path(root, (staging_root, staging), lock)
+    os.rmdir(staging.name, dir_fd=staging_root.fd)
+    _assert_snapshot_path(root, (staging_root,), lock)
+    os.fsync(staging_root.fd)
+    _assert_snapshot_path(root, (staging_root,), lock)
+
+
+def _rename_directory_noreplace_at(
+    source_parent_fd: int,
+    source_name: str,
+    target_parent_fd: int,
+    target_name: str,
+) -> None:
+    _require_safe_segment(source_name)
+    _require_safe_segment(target_name)
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise SnapshotValidationError("atomic no-replace snapshot commit is unavailable")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        source_parent_fd,
+        os.fsencode(source_name),
+        target_parent_fd,
+        os.fsencode(target_name),
+        RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), target_name)
+    raise OSError(error_number, os.strerror(error_number), target_name)
+
+
 def _assert_pinned_cache_directory(directory: PinnedCacheDirectory) -> None:
+    _assert_pinned_file_lock(directory.lock)
+    _assert_pinned_root(directory.root)
     try:
         entry = os.stat(
             directory.task_key,
-            dir_fd=directory.root_fd,
+            dir_fd=directory.root.root_fd,
             follow_symlinks=False,
         )
-    except FileNotFoundError as exc:
+        opened = os.fstat(directory.task_fd)
+    except OSError as exc:
         raise SnapshotValidationError("compatibility cache directory was removed during write") from exc
-    opened = os.fstat(directory.task_fd)
-    if not stat.S_ISDIR(entry.st_mode) or (
-        entry.st_dev,
-        entry.st_ino,
-    ) != (
-        opened.st_dev,
-        opened.st_ino,
+    expected = (directory.device, directory.inode)
+    if (
+        not stat.S_ISDIR(entry.st_mode)
+        or not stat.S_ISDIR(opened.st_mode)
+        or (entry.st_dev, entry.st_ino) != expected
+        or (opened.st_dev, opened.st_ino) != expected
     ):
         raise SnapshotValidationError("compatibility cache directory changed during write")
 
@@ -1266,20 +2154,20 @@ def _cache_matches_at(
 
 def _read_regular_file_at(directory: PinnedCacheDirectory, name: str) -> bytes:
     _assert_pinned_cache_directory(directory)
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(name, flags, dir_fd=directory.task_fd)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise SnapshotValidationError(f"compatibility cache file is not regular: {name}")
+    with _pinned_existing_regular_file_at(
+        directory.task_fd,
+        name,
+        description=f"compatibility cache file: {name}",
+    ) as file:
         chunks: list[bytes] = []
         while True:
-            chunk = os.read(descriptor, 1024 * 1024)
+            chunk = os.read(file.fd, 1024 * 1024)
             if not chunk:
                 break
             chunks.append(chunk)
+        _assert_pinned_regular_file(file)
+        _assert_pinned_cache_directory(directory)
         return b"".join(chunks)
-    finally:
-        os.close(descriptor)
 
 
 def _write_bytes_atomic_at(
@@ -1300,25 +2188,50 @@ def _write_bytes_atomic_at(
     descriptor: int | None = None
     try:
         descriptor = os.open(temporary, flags, 0o600, dir_fd=directory.task_fd)
+        opened = os.fstat(descriptor)
+        temporary_file = PinnedRegularFile(
+            parent_fd=directory.task_fd,
+            fd=descriptor,
+            name=temporary,
+            device=opened.st_dev,
+            inode=opened.st_ino,
+            description=f"compatibility cache temporary file: {temporary}",
+        )
+        _assert_pinned_regular_file(temporary_file)
         remaining = memoryview(value)
         while remaining:
             written = os.write(descriptor, remaining)
             if written <= 0:
                 raise OSError("compatibility cache write made no progress")
             remaining = remaining[written:]
+        _assert_pinned_cache_directory(directory)
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = None
+        _assert_pinned_regular_file(temporary_file)
         _assert_pinned_cache_directory(directory)
         _require_regular_or_missing_at(directory, name)
+        _assert_pinned_regular_file(temporary_file)
+        _assert_pinned_cache_directory(directory)
         os.replace(
             temporary,
             name,
             src_dir_fd=directory.task_fd,
             dst_dir_fd=directory.task_fd,
         )
-        os.fsync(directory.task_fd)
+        committed_file = PinnedRegularFile(
+            parent_fd=directory.task_fd,
+            fd=descriptor,
+            name=name,
+            device=temporary_file.device,
+            inode=temporary_file.inode,
+            description=f"compatibility cache file: {name}",
+        )
+        _assert_pinned_regular_file(committed_file)
         _assert_pinned_cache_directory(directory)
+        os.fsync(directory.task_fd)
+        _assert_pinned_regular_file(committed_file)
+        _assert_pinned_cache_directory(directory)
+        os.close(descriptor)
+        descriptor = None
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -1329,31 +2242,14 @@ def _write_bytes_atomic_at(
 
 
 def _require_regular_or_missing_at(directory: PinnedCacheDirectory, name: str) -> None:
+    _assert_pinned_cache_directory(directory)
     try:
         file_stat = os.stat(name, dir_fd=directory.task_fd, follow_symlinks=False)
     except FileNotFoundError:
-        return
-    if not stat.S_ISREG(file_stat.st_mode):
+        file_stat = None
+    if file_stat is not None and not stat.S_ISREG(file_stat.st_mode):
         raise SnapshotValidationError(f"compatibility cache file is not regular: {name}")
-
-
-def _write_bytes_fsync(path: Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("xb") as handle:
-        handle.write(value)
-        handle.flush()
-        os.fsync(handle.fileno())
-
-
-def _fsync_dir(path: str | Path) -> None:
-    try:
-        descriptor = os.open(Path(path), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+    _assert_pinned_cache_directory(directory)
 
 
 def _sha256_bytes(value: bytes) -> str:

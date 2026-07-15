@@ -14,6 +14,7 @@ from alembic import command
 from sqlalchemy import func, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
+import llm_labeling_scaffold.db.materialization as materialization_module
 from llm_labeling_scaffold.config import load_task
 from llm_labeling_scaffold.db import AuditChannel, DatabaseService, ExternalIdentity
 from llm_labeling_scaffold.db.base import Base
@@ -22,9 +23,11 @@ from llm_labeling_scaffold.db.database import create_database_engine
 from llm_labeling_scaffold.db.enums import TaskMaterializationState
 from llm_labeling_scaffold.db.materialization import (
     CACHE_METADATA_FILE,
+    SNAPSHOT_FILES,
     ControlTaskSnapshotLoader,
     MaterializationCrash,
     MaterializationLeaseLost,
+    SnapshotValidationError,
     TaskMaterializationWorker,
 )
 from llm_labeling_scaffold.db.migration import build_alembic_config
@@ -139,6 +142,10 @@ def _worker(env: dict, **kwargs) -> TaskMaterializationWorker:
         retry_delay_seconds=0,
         **kwargs,
     )
+
+
+def _snapshot_root(env: dict) -> Path:
+    return env["runs_root"] / "_system" / "task_control" / "task_snapshots"
 
 
 def _expire_lease(env: dict, materialization_id: uuid.UUID) -> None:
@@ -298,6 +305,260 @@ def test_compatibility_cache_rejects_symlinks_and_recovers(materialization_env, 
     assert not target.is_symlink()
     assert not (target / "task.yaml").is_symlink()
     assert not (target / CACHE_METADATA_FILE).is_symlink()
+
+
+@pytest.mark.parametrize("link_kind", ["root", "ancestor", "locks", "lock_file"])
+def test_compatibility_cache_rejects_root_and_lock_path_symlinks(
+    materialization_env,
+    link_kind: str,
+):
+    env = materialization_env
+    configured_root = (
+        env["tasks_root"].parent / "cache-parent" / "tasks"
+        if link_kind == "ancestor"
+        else env["tasks_root"]
+    )
+    outside = env["tasks_root"].parent / f"root-lock-outside-{link_kind}"
+    outside.mkdir()
+    expected_outside: list[str] = []
+
+    if link_kind == "root":
+        attacked_path = configured_root
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    elif link_kind == "ancestor":
+        attacked_path = configured_root.parent
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    elif link_kind == "locks":
+        configured_root.mkdir()
+        attacked_path = configured_root / "_locks"
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    else:
+        lock_directory = configured_root / "_locks" / "task_materialization"
+        lock_directory.mkdir(parents=True)
+        sentinel = outside / "sentinel"
+        sentinel.write_text("sentinel", encoding="utf-8")
+        expected_outside = ["sentinel"]
+        attacked_path = lock_directory / "controlled-task.lock"
+        attacked_path.symlink_to(sentinel)
+
+    _draft, published = _publish(env, f"root-lock-{link_kind}", f"publish-root-lock-{link_kind}")
+    worker = TaskMaterializationWorker(
+        env["factory"],
+        runs_root=env["runs_root"],
+        tasks_root=configured_root,
+        worker_id=f"worker-root-lock-{link_kind}",
+        poll_seconds=0.01,
+        retry_delay_seconds=0,
+    )
+    result = worker.run_once(published.materialization_id)
+    assert result.activation_state == "active"
+    assert result.cache_refreshed is False
+    assert "compatibility cache" in result.error or "lock file" in result.error
+    assert sorted(path.name for path in outside.iterdir()) == expected_outside
+    if link_kind == "lock_file":
+        assert (outside / "sentinel").read_text(encoding="utf-8") == "sentinel"
+
+    attacked_path.unlink()
+    if link_kind == "ancestor":
+        attacked_path.mkdir()
+    repaired = worker.run_once(published.materialization_id)
+    assert repaired.action == "cache_reconciled"
+    assert repaired.cache_refreshed is True
+    assert (configured_root / "controlled-task" / "task.yaml").is_file()
+    assert (configured_root / "controlled-task" / CACHE_METADATA_FILE).is_file()
+
+
+@pytest.mark.parametrize(
+    "exchange_point",
+    ["after_cache_lock_acquired", "after_cache_task_write"],
+)
+def test_cache_root_exchange_is_detected_during_lock_and_write(
+    materialization_env,
+    exchange_point: str,
+):
+    env = materialization_env
+    root = env["tasks_root"]
+    displaced = root.with_name(f"{root.name}.{exchange_point}.displaced")
+    outside = root.with_name(f"{root.name}.{exchange_point}.outside")
+    outside.mkdir()
+    exchange_requested = Event()
+    exchange_finished = Event()
+
+    def exchange_root():
+        assert exchange_requested.wait(timeout=10)
+        root.rename(displaced)
+        root.symlink_to(outside, target_is_directory=True)
+        exchange_finished.set()
+
+    def inject(point, revision):
+        if point == exchange_point and not exchange_requested.is_set():
+            exchange_requested.set()
+            assert exchange_finished.wait(timeout=10)
+
+    _draft, published = _publish(env, exchange_point, f"publish-{exchange_point}")
+    worker = _worker(
+        env,
+        worker_id=f"worker-{exchange_point}",
+        fault_injector=inject,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        exchange = executor.submit(exchange_root)
+        result = worker.run_once(published.materialization_id)
+        exchange.result(timeout=10)
+
+    assert result.activation_state == "active"
+    assert result.cache_refreshed is False
+    assert "cache root changed" in result.error
+    assert list(outside.iterdir()) == []
+    lock_path = displaced / "_locks" / "task_materialization" / "controlled-task.lock"
+    assert lock_path.is_file()
+    task_path = displaced / "controlled-task" / "task.yaml"
+    metadata_path = displaced / "controlled-task" / CACHE_METADATA_FILE
+    if exchange_point == "after_cache_lock_acquired":
+        assert not task_path.exists()
+    else:
+        assert task_path.is_file()
+        assert not metadata_path.exists()
+
+    root.unlink()
+    displaced.rename(root)
+    repaired = worker.run_once(published.materialization_id)
+    assert repaired.action == "cache_reconciled"
+    assert repaired.cache_refreshed is True
+    assert (root / "controlled-task" / CACHE_METADATA_FILE).is_file()
+
+
+def test_cache_locks_exchange_is_detected_while_lock_is_held(materialization_env):
+    env = materialization_env
+    root = env["tasks_root"]
+    locks = root / "_locks"
+    displaced = root / "_locks.displaced"
+    outside = root.with_name("locks-exchange-outside")
+    outside.mkdir()
+    exchange_requested = Event()
+    exchange_finished = Event()
+
+    def exchange_locks():
+        assert exchange_requested.wait(timeout=10)
+        locks.rename(displaced)
+        locks.symlink_to(outside, target_is_directory=True)
+        exchange_finished.set()
+
+    def inject(point, revision):
+        if point == "after_cache_lock_acquired" and not exchange_requested.is_set():
+            exchange_requested.set()
+            assert exchange_finished.wait(timeout=10)
+
+    _draft, published = _publish(env, "locks-exchange", "publish-locks-exchange")
+    worker = _worker(
+        env,
+        worker_id="worker-locks-exchange",
+        fault_injector=inject,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        exchange = executor.submit(exchange_locks)
+        result = worker.run_once(published.materialization_id)
+        exchange.result(timeout=10)
+
+    assert result.activation_state == "active"
+    assert result.cache_refreshed is False
+    assert "lock directory changed" in result.error
+    assert list(outside.iterdir()) == []
+    assert (
+        displaced / "task_materialization" / "controlled-task.lock"
+    ).is_file()
+    assert not (root / "controlled-task").exists()
+
+    locks.unlink()
+    displaced.rename(locks)
+    repaired = worker.run_once(published.materialization_id)
+    assert repaired.action == "cache_reconciled"
+    assert repaired.cache_refreshed is True
+    assert (root / "controlled-task" / CACHE_METADATA_FILE).is_file()
+
+
+def test_cache_root_ancestor_exchange_is_detected_before_metadata_write(materialization_env):
+    env = materialization_env
+    configured_root = env["tasks_root"].parent / "cache-runtime-parent" / "tasks"
+    ancestor = configured_root.parent
+    displaced = ancestor.with_name("cache-runtime-parent.displaced")
+    outside = ancestor.with_name("cache-runtime-parent.outside")
+    outside.mkdir()
+    exchanged = False
+
+    def inject(point, revision):
+        nonlocal exchanged
+        if point == "after_cache_task_write" and not exchanged:
+            exchanged = True
+            ancestor.rename(displaced)
+            ancestor.symlink_to(outside, target_is_directory=True)
+
+    _draft, published = _publish(env, "cache-ancestor-exchange", "publish-cache-ancestor")
+    worker = TaskMaterializationWorker(
+        env["factory"],
+        runs_root=env["runs_root"],
+        tasks_root=configured_root,
+        worker_id="worker-cache-ancestor-exchange",
+        poll_seconds=0.01,
+        retry_delay_seconds=0,
+        fault_injector=inject,
+    )
+    result = worker.run_once(published.materialization_id)
+
+    assert result.activation_state == "active"
+    assert result.cache_refreshed is False
+    assert "cache root changed" in result.error
+    assert list(outside.iterdir()) == []
+    displaced_task = displaced / "tasks" / "controlled-task"
+    assert (displaced_task / "task.yaml").is_file()
+    assert not (displaced_task / CACHE_METADATA_FILE).exists()
+
+    ancestor.unlink()
+    displaced.rename(ancestor)
+    repaired = worker.run_once(published.materialization_id)
+    assert repaired.action == "cache_reconciled"
+    assert repaired.cache_refreshed is True
+    assert (configured_root / "controlled-task" / CACHE_METADATA_FILE).is_file()
+
+
+def test_cache_lock_file_exchange_is_detected_before_metadata_write(materialization_env):
+    env = materialization_env
+    root = env["tasks_root"]
+    lock_path = root / "_locks" / "task_materialization" / "controlled-task.lock"
+    displaced = lock_path.with_name("controlled-task.lock.displaced")
+    sentinel = root.with_name("cache-lock-file-sentinel")
+    sentinel.write_text("sentinel", encoding="utf-8")
+    exchanged = False
+
+    def inject(point, revision):
+        nonlocal exchanged
+        if point == "after_cache_task_write" and not exchanged:
+            exchanged = True
+            lock_path.rename(displaced)
+            lock_path.symlink_to(sentinel)
+
+    _draft, published = _publish(env, "cache-lock-file-exchange", "publish-cache-lock-file")
+    worker = _worker(
+        env,
+        worker_id="worker-cache-lock-file-exchange",
+        fault_injector=inject,
+    )
+    result = worker.run_once(published.materialization_id)
+
+    assert result.activation_state == "active"
+    assert result.cache_refreshed is False
+    assert "lock file changed" in result.error
+    assert sentinel.read_text(encoding="utf-8") == "sentinel"
+    target = root / "controlled-task"
+    assert (target / "task.yaml").is_file()
+    assert not (target / CACHE_METADATA_FILE).exists()
+
+    lock_path.unlink()
+    displaced.rename(lock_path)
+    repaired = worker.run_once(published.materialization_id)
+    assert repaired.action == "cache_reconciled"
+    assert repaired.cache_refreshed is True
+    assert (target / CACHE_METADATA_FILE).is_file()
 
 
 def test_compatibility_cache_mismatch_after_crash_is_detected_and_recovered(materialization_env):
@@ -517,6 +778,312 @@ def test_replaced_lease_failure_reports_lease_lost_not_retry(materialization_env
     recovery = _worker(env, worker_id="worker-after-lease-lost")
     assert recovery.run_once(published.materialization_id).activation_state == "active"
     assert recovery.status(published.materialization_id).attempt_count == 3
+
+
+@pytest.mark.parametrize(
+    "link_kind",
+    ["root", "ancestor", "locks", "staging", "revision", "content_hash", "lock_file"],
+)
+def test_snapshot_store_rejects_symlinked_authority_paths(materialization_env, link_kind: str):
+    env = materialization_env
+    _draft, published = _publish(env, f"snapshot-{link_kind}", f"publish-snapshot-{link_kind}")
+    root = _snapshot_root(env)
+    outside = env["runs_root"].parent / f"snapshot-outside-{link_kind}"
+    outside.mkdir()
+    expected_outside: list[str] = []
+
+    if link_kind == "root":
+        root.parent.mkdir(parents=True)
+        attacked_path = root
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    elif link_kind == "ancestor":
+        root.parent.parent.mkdir(parents=True)
+        attacked_path = root.parent
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    elif link_kind == "locks":
+        root.mkdir(parents=True)
+        attacked_path = root / ".locks"
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    elif link_kind == "staging":
+        root.mkdir(parents=True)
+        attacked_path = root / ".staging"
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    elif link_kind == "revision":
+        root.mkdir(parents=True)
+        attacked_path = root / str(published.revision_id)
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    elif link_kind == "content_hash":
+        revision_directory = root / str(published.revision_id)
+        revision_directory.mkdir(parents=True)
+        attacked_path = revision_directory / published.content_hash
+        attacked_path.symlink_to(outside, target_is_directory=True)
+    else:
+        lock_directory = root / ".locks"
+        lock_directory.mkdir(parents=True)
+        sentinel = outside / "sentinel"
+        sentinel.write_text("sentinel", encoding="utf-8")
+        expected_outside = ["sentinel"]
+        attacked_path = lock_directory / f"{published.revision_id}.lock"
+        attacked_path.symlink_to(sentinel)
+
+    worker = _worker(env, worker_id=f"worker-snapshot-{link_kind}")
+    result = worker.run_once(published.materialization_id)
+    status = worker.status(published.materialization_id)
+    assert result.action == "failed"
+    assert "snapshot" in result.error
+    assert status.state == TaskMaterializationState.FAILED
+    assert status.activation_state == "not_ready"
+    assert sorted(path.name for path in outside.iterdir()) == expected_outside
+    if link_kind == "lock_file":
+        assert (outside / "sentinel").read_text(encoding="utf-8") == "sentinel"
+
+
+@pytest.mark.parametrize(
+    ("exchange_kind", "exchange_point"),
+    [
+        ("ancestor", "after_task_write"),
+        ("root", "after_task_write"),
+        ("locks", "after_snapshot_lock_acquired"),
+        ("staging", "after_task_write"),
+        ("revision", "before_snapshot_commit"),
+        ("content_hash", "after_snapshot_commit"),
+    ],
+)
+def test_snapshot_store_detects_runtime_directory_exchange_without_external_writes(
+    materialization_env,
+    exchange_kind: str,
+    exchange_point: str,
+):
+    env = materialization_env
+    _draft, published = _publish(
+        env,
+        f"snapshot-exchange-{exchange_kind}",
+        f"publish-snapshot-exchange-{exchange_kind}",
+    )
+    root = _snapshot_root(env)
+    outside = env["runs_root"].parent / f"snapshot-exchange-outside-{exchange_kind}"
+    outside.mkdir()
+    exchange_requested = Event()
+    exchange_finished = Event()
+
+    if exchange_kind == "ancestor":
+        attacked_path = env["runs_root"]
+        displaced = attacked_path.with_name("runs.displaced")
+    elif exchange_kind == "root":
+        attacked_path = root
+        displaced = root.with_name("task_snapshots.displaced")
+    elif exchange_kind == "locks":
+        attacked_path = root / ".locks"
+        displaced = root / ".locks.displaced"
+    elif exchange_kind == "staging":
+        attacked_path = root / ".staging"
+        displaced = root / ".staging.displaced"
+    elif exchange_kind == "revision":
+        attacked_path = root / str(published.revision_id)
+        displaced = root / f"{published.revision_id}.displaced"
+    else:
+        revision_directory = root / str(published.revision_id)
+        attacked_path = revision_directory / published.content_hash
+        displaced = revision_directory / f"{published.content_hash}.displaced"
+
+    def exchange_directory():
+        assert exchange_requested.wait(timeout=10)
+        attacked_path.rename(displaced)
+        attacked_path.symlink_to(outside, target_is_directory=True)
+        exchange_finished.set()
+
+    def inject(point, revision):
+        if point == exchange_point and not exchange_requested.is_set():
+            exchange_requested.set()
+            assert exchange_finished.wait(timeout=10)
+
+    worker = _worker(
+        env,
+        worker_id=f"worker-snapshot-exchange-{exchange_kind}",
+        fault_injector=inject,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        exchange = executor.submit(exchange_directory)
+        result = worker.run_once(published.materialization_id)
+        exchange.result(timeout=10)
+
+    status = worker.status(published.materialization_id)
+    assert result.action == "failed"
+    assert status.state == TaskMaterializationState.FAILED
+    assert list(outside.rglob("*")) == []
+    assert attacked_path.is_symlink()
+
+
+def test_snapshot_lock_file_exchange_stops_before_snapshot_commit(materialization_env):
+    env = materialization_env
+    _draft, published = _publish(
+        env,
+        "snapshot-lock-file-exchange",
+        "publish-snapshot-lock-file-exchange",
+    )
+    root = _snapshot_root(env)
+    lock_path = root / ".locks" / f"{published.revision_id}.lock"
+    displaced = lock_path.with_name(f"{published.revision_id}.lock.displaced")
+    sentinel = env["runs_root"].parent / "snapshot-lock-file-sentinel"
+    sentinel.write_text("sentinel", encoding="utf-8")
+    exchanged = False
+
+    def inject(point, revision):
+        nonlocal exchanged
+        if point == "after_task_write" and not exchanged:
+            exchanged = True
+            lock_path.rename(displaced)
+            lock_path.symlink_to(sentinel)
+
+    worker = _worker(
+        env,
+        worker_id="worker-snapshot-lock-file-exchange",
+        fault_injector=inject,
+    )
+    result = worker.run_once(published.materialization_id)
+    target = root / str(published.revision_id) / published.content_hash
+
+    assert result.action == "failed"
+    assert "lock file changed" in result.error
+    assert not target.exists()
+    assert not target.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "sentinel"
+    assert displaced.is_file()
+    assert lock_path.is_symlink()
+
+
+@pytest.mark.parametrize("filename", sorted(SNAPSHOT_FILES))
+def test_snapshot_loader_rejects_symlinked_snapshot_files(
+    materialization_env,
+    filename: str,
+):
+    env = materialization_env
+    _draft, published = _publish(
+        env,
+        f"snapshot-file-{filename}",
+        f"publish-snapshot-file-{filename}",
+    )
+    worker = _worker(env, worker_id=f"worker-snapshot-file-{filename}")
+    worker.drain(published.materialization_id, timeout_seconds=1)
+    snapshot_path = worker.status(published.materialization_id).snapshot_path
+    outside = env["runs_root"].parent / f"snapshot-file-outside-{filename}"
+    outside.write_text("sentinel", encoding="utf-8")
+    file_path = snapshot_path / filename
+    file_path.unlink()
+    file_path.symlink_to(outside)
+
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
+    with pytest.raises(SnapshotValidationError):
+        loader.load("workspace", "controlled-task")
+    status = worker.status(published.materialization_id)
+    assert status.snapshot_valid is False
+    assert outside.read_text(encoding="utf-8") == "sentinel"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO test requires POSIX mkfifo")
+def test_snapshot_loader_rejects_fifo_snapshot_file(materialization_env):
+    env = materialization_env
+    _draft, published = _publish(
+        env,
+        "snapshot-file-fifo",
+        "publish-snapshot-file-fifo",
+    )
+    worker = _worker(env, worker_id="worker-snapshot-file-fifo")
+    worker.drain(published.materialization_id, timeout_seconds=1)
+    snapshot_path = worker.status(published.materialization_id).snapshot_path
+    file_path = snapshot_path / "task.yaml"
+    file_path.unlink()
+    os.mkfifo(file_path)
+
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
+    with pytest.raises(SnapshotValidationError):
+        loader.load("workspace", "controlled-task")
+    assert worker.status(published.materialization_id).snapshot_valid is False
+
+
+@pytest.mark.parametrize("exchange_kind", ["revision", "content_hash"])
+def test_snapshot_validate_detects_directory_exchange_during_fd_read(
+    materialization_env,
+    monkeypatch,
+    exchange_kind: str,
+):
+    env = materialization_env
+    _draft, published = _publish(
+        env,
+        "snapshot-validate-exchange",
+        "publish-snapshot-validate-exchange",
+    )
+    worker = _worker(env, worker_id="worker-snapshot-validate-exchange")
+    worker.drain(published.materialization_id, timeout_seconds=1)
+    snapshot_path = worker.status(published.materialization_id).snapshot_path
+    revision_directory = snapshot_path.parent
+    if exchange_kind == "revision":
+        attacked_path = revision_directory
+        displaced = revision_directory.with_name(f"{revision_directory.name}.displaced")
+    else:
+        attacked_path = snapshot_path
+        displaced = snapshot_path.with_name(f"{snapshot_path.name}.displaced")
+    outside = env["runs_root"].parent / f"snapshot-validate-exchange-outside-{exchange_kind}"
+    outside.mkdir()
+    original_listdir = materialization_module.os.listdir
+    exchanged = False
+
+    def exchange_before_listdir(path):
+        nonlocal exchanged
+        if not exchanged and isinstance(path, int):
+            exchanged = True
+            attacked_path.rename(displaced)
+            attacked_path.symlink_to(outside, target_is_directory=True)
+        return original_listdir(path)
+
+    monkeypatch.setattr(materialization_module.os, "listdir", exchange_before_listdir)
+    loader = ControlTaskSnapshotLoader(
+        env["factory"],
+        env["runs_root"],
+        env["tasks_root"],
+    )
+    with pytest.raises(SnapshotValidationError):
+        loader.load("workspace", "controlled-task")
+    assert list(outside.iterdir()) == []
+
+
+def test_snapshot_commit_never_replaces_concurrent_empty_target(materialization_env):
+    env = materialization_env
+    _draft, published = _publish(
+        env,
+        "snapshot-no-replace",
+        "publish-snapshot-no-replace",
+    )
+    target: Path | None = None
+    target_inode: int | None = None
+
+    def inject(point, revision):
+        nonlocal target, target_inode
+        if point == "before_snapshot_rename" and target is None:
+            target = _snapshot_root(env) / str(revision.revision_id) / revision.content_hash
+            target.mkdir()
+            target_inode = target.stat().st_ino
+
+    worker = _worker(
+        env,
+        worker_id="worker-snapshot-no-replace",
+        fault_injector=inject,
+    )
+    result = worker.run_once(published.materialization_id)
+    status = worker.status(published.materialization_id)
+    assert result.action == "failed"
+    assert status.state == TaskMaterializationState.FAILED
+    assert target is not None
+    assert target.stat().st_ino == target_inode
+    assert list(target.iterdir()) == []
 
 
 def test_crash_before_snapshot_commit_recovers_from_a_new_attempt(materialization_env):

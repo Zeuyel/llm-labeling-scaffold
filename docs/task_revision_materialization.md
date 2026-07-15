@@ -35,7 +35,9 @@ runs/_system/task_control/task_snapshots/<revision_id>/<content_hash>/
 3. 重新计算的 definition/rendered 联合 fingerprint 等于 revision `content_hash`。
 4. manifest 中的 revision、workspace、task、revision number 和各文件 hash 全部一致。
 
-worker 在目标目录同一文件系统内写唯一 staging 目录，fsync 文件和目录后，在 revision 文件锁下执行不可覆盖 rename。目标不存在时提交；目标已存在时只允许逐项校验后幂等复用。任一文件缺失、hash 不同、manifest 不同或内容不同都 fail closed，绝不删除或覆盖目标。
+snapshot root 与 compatibility cache 使用同一 pinned directory capability 模型：从文件系统 anchor 开始逐组件 `openat(O_DIRECTORY | O_NOFOLLOW)`，缺失组件通过父 fd 创建并 fsync。`.locks`、`.staging`、revision UUID、content hash 和唯一 staging 目录都必须是 real directory；revision lock 和三个 snapshot 文件都必须是 regular file。root、锁链和目录 inode 在文件写入、读取、rename 与 fsync 前后持续复核，symlink 或运行中交换均 fail closed。
+
+worker 在同一 snapshot root 内写唯一 staging 目录，三个文件以 `O_CREAT | O_EXCL | O_NOFOLLOW` 创建并 fsync。提交使用 Linux `renameat2(RENAME_NOREPLACE)` 在 pinned `.staging` 与 revision directory fd 之间执行原子不可覆盖 rename；并发出现的空目录、symlink 或不同内容都只会触发一致性校验失败，不会被替换。提交后再次通过目录 fd 枚举精确文件集、打开 regular files 并校验全部 bytes/JSON/YAML，再允许 ready 状态提交。
 
 ## 激活与兼容缓存
 
@@ -46,11 +48,15 @@ snapshot ready 后，worker 开启新的数据库事务并锁定 task 行：
 3. candidate 等于 current 时幂等返回。
 4. candidate 小于 current 时返回 `superseded`，禁止回退。
 
-更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。事务提交后，worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 与 `.task_source.json`；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。缓存根目录和 task 目录以 `O_DIRECTORY | O_NOFOLLOW` 打开并固定 directory fd，所有检查、临时文件创建和 `os.replace` 都相对该 fd 执行；每次提交前后复核目录 inode，目录交换或 symlink 替换会被拒绝。两个目标文件也必须是普通文件或不存在。
+更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。事务提交后，worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 与 `.task_source.json`；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。
+
+cache root 从文件系统 anchor 开始逐 path component 以 parent directory fd、`O_DIRECTORY | O_NOFOLLOW` 打开，缺失组件只通过 `mkdirat` 语义创建并 fsync 父目录。完整组件链的 fd 与 inode 在锁获取、task 写入、`os.replace` 与文件/目录 fsync 前后持续复核；root、任一祖先组件的 symlink 或运行中交换都 fail closed。
+
+`_locks`、`task_materialization` 和 task cache 目录都相对 pinned root/parent fd 创建并固定 inode。lock file 只允许 regular file，以 `O_NOFOLLOW` 打开；其目录链与文件 inode 在 flock 持有期间纳入每次 task/metadata 读写、replace 和 fsync 的路径复核。预置 symlink 或运行中目录交换都不能把 lock、task 或 metadata 写到替代目标。两个 cache 目标文件也必须是普通文件或不存在。
 
 兼容缓存是可恢复缓存，不是原子目录 snapshot。worker 先原子替换 `task.yaml`，再原子替换包含 revision ID、content hash 和 task file hash 的 `.task_source.json`。任一步崩溃都会留下可检测的 file/metadata mismatch；worker 重启、空闲扫描、显式 cache recovery 或对 terminal materialization 的 one-shot/drain 重跑都会从数据库 current snapshot 重建。普通刷新错误进入 worker 的待修复队列，并在下一次可恢复运行中重试。缓存失败不会回退已提交的 activation，也不会阻塞其他 outbox。该过程不替换任务目录，也不删除 `raw/`、prompt 或其他相对路径资源。
 
-control loader 直接查询数据库 current revision 并校验 immutable snapshot，不读取兼容缓存内容。它以 snapshot 中的 YAML 作为 `TaskConfig.raw`，同时把 `TaskConfig.path` 设为调用方提供的稳定逻辑路径 `tasks_root/<task_key>/task.yaml`。因此 `input.path` 及未来相对 task 路径字段继续相对同一任务目录解析；snapshot 物理路径只用于 provenance 和完整性校验，不改变运行时基址。
+control loader 直接查询数据库 current revision，并在 pinned snapshot fd 生命周期内校验 immutable snapshot，不读取兼容缓存内容，也不会在 `validate()` 后按物理路径重新打开文件。它以已验证的内存 YAML 作为 `TaskConfig.raw`，同时把 `TaskConfig.path` 设为调用方提供的稳定逻辑路径 `tasks_root/<task_key>/task.yaml`。因此 `input.path` 及未来相对 task 路径字段继续相对同一任务目录解析；snapshot 物理路径只用于 provenance，不改变运行时基址。
 
 ## Operation/status 契约
 
@@ -75,5 +81,10 @@ control loader 直接查询数据库 current revision 并校验 immutable snapsh
 | 两个 worker 同时领取 | 每行只有一个有效 lease/attempt | `SKIP LOCKED` 领取不同工作；目标锁处理重复写 | 同一 attempt 只有一个数据库完成者 |
 | revision 2 先于 revision 1 ready | revision 2 先激活 | revision 1 后续变为 `superseded` | current revision number 单调递增 |
 | 目标已有不同或不完整内容 | DB 进入 `failed` | 人工调查，不自动覆盖 | 旧 active revision 继续执行 |
+| snapshot root、`.locks`、`.staging` 或 revision/hash 路径是 symlink | DB 进入 `failed` | 人工移除攻击路径后重新发布或受控恢复 | 不向 symlink 目标写 lock、staging 或 snapshot 文件 |
+| snapshot root/lock/staging/revision 在运行中被交换 | inode 复核失败，DB 不进入 ready | 保留旧 active revision并调查文件系统 | pinned fd 不跟随替代路径；外部目标零写入 |
+| rename 前并发创建空 target | `RENAME_NOREPLACE` 返回冲突 | 校验现有 target；不完整则 fail closed | 空目录 inode 与内容保持不变，不被 staging 覆盖 |
+| validate/read 期间 revision 或文件被交换为 symlink | loader/status 校验失败 | 人工恢复 immutable snapshot | 不按路径重开，不读取 symlink 内容 |
 | 激活后兼容缓存刷新崩溃 | DB current 已更新，task/metadata 可能不匹配 | terminal operation 重跑、worker 待修复队列或空闲扫描从 DB current 重建 | loader 始终读取 immutable snapshot |
 | 缓存写入期间 task 目录被交换 | 已固定 fd 仍指向原 inode，路径入口已变化 | inode 复核失败并停止后续替换；恢复时重新打开当前安全目录 | 不跟随 symlink，不向交换后的目录写入 |
+| cache root 或 `_locks` 在锁/写入期间被交换 | pinned fd 指向原 inode，公开路径已变化 | root/lock inode 复核失败并返回 cache refresh failure；移除攻击后 terminal 重跑 | activation 不回退，不向 symlink 目标写 lock/task/metadata，不误报 refreshed |
