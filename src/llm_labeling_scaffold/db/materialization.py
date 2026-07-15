@@ -6,17 +6,19 @@ import logging
 import os
 import shutil
 import socket
+import stat
 import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.orm import Session, aliased
 
 from ..config import TaskConfig, load_task
@@ -59,6 +61,12 @@ class MaterializationCrash(BaseException):
     """Fault-injection exception that models process death without cleanup."""
 
 
+class FailureDisposition(str, Enum):
+    FAILED = "failed"
+    RETRY_SCHEDULED = "retry_scheduled"
+    LEASE_LOST = "lease_lost"
+
+
 @dataclass(frozen=True)
 class RevisionSnapshot:
     workspace_id: uuid.UUID
@@ -93,6 +101,13 @@ class SnapshotRef:
     definition_path: Path
     manifest_path: Path
     content_hash: str
+
+
+@dataclass(frozen=True)
+class PinnedCacheDirectory:
+    root_fd: int
+    task_fd: int
+    task_key: str
 
 
 @dataclass(frozen=True)
@@ -373,30 +388,26 @@ class CompatibilityTaskCache:
             with self._task_lock(task.task_key):
                 return self._write_cache(descriptor, snapshot)
 
-    def recover_all(self) -> int:
+    def recover_all(self, *, failed_task_ids: set[uuid.UUID] | None = None) -> int:
         with self._session_factory() as session:
             task_ids = tuple(
                 session.scalars(select(Task.id).where(Task.current_revision_id.is_not(None))).all(),
             )
         changed = 0
+        failed: set[uuid.UUID] = set()
         for task_id in task_ids:
             try:
                 changed += int(self.refresh(task_id))
             except Exception:
+                failed.add(task_id)
                 logger.exception("task compatibility cache refresh failed", extra={"task_id": str(task_id)})
+        if failed_task_ids is not None:
+            failed_task_ids.clear()
+            failed_task_ids.update(failed)
         return changed
 
     def _write_cache(self, revision: RevisionSnapshot, snapshot: SnapshotRef) -> bool:
-        target = self.root / revision.task_key
-        if target.is_symlink() or (target.exists() and not target.is_dir()):
-            raise SnapshotValidationError(f"compatibility cache target is not a directory: {target}")
-        task_path = target / "task.yaml"
-        metadata_path = target / CACHE_METADATA_FILE
-        for cache_path in (task_path, metadata_path):
-            if cache_path.is_symlink() or (cache_path.exists() and not cache_path.is_file()):
-                raise SnapshotValidationError(
-                    f"compatibility cache file is not a regular file: {cache_path}",
-                )
+        task_bytes = snapshot.task_path.read_bytes()
         metadata = {
             "source": "database_current_revision",
             "workspace_id": str(revision.workspace_id),
@@ -406,24 +417,22 @@ class CompatibilityTaskCache:
             "revision_number": revision.revision_number,
             "content_hash": revision.content_hash,
             "snapshot_path": str(snapshot.path),
-            "task_sha256": _sha256_bytes(snapshot.task_path.read_bytes()),
+            "task_sha256": _sha256_bytes(task_bytes),
         }
-        if _cache_matches(target, metadata, snapshot.task_path):
-            return False
-
-        target.mkdir(parents=True, exist_ok=True)
-        _write_bytes_atomic(task_path, snapshot.task_path.read_bytes())
-        self._inject("after_cache_task_write", revision)
-        _write_bytes_atomic(
-            metadata_path,
-            (json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode(
-                "utf-8",
-            ),
-        )
-        cached = load_task(task_path)
-        if cached.task_id != revision.task_key:
-            raise SnapshotValidationError("compatibility cache task_id differs from current revision")
-        return True
+        metadata_bytes = (
+            json.dumps(metadata, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        with _pinned_cache_directory(self.root, revision.task_key) as directory:
+            _require_regular_or_missing_at(directory, "task.yaml")
+            _require_regular_or_missing_at(directory, CACHE_METADATA_FILE)
+            if _cache_matches_at(directory, metadata, task_bytes):
+                return False
+            _write_bytes_atomic_at(directory, "task.yaml", task_bytes)
+            self._inject("after_cache_task_write", revision)
+            _write_bytes_atomic_at(directory, CACHE_METADATA_FILE, metadata_bytes)
+            if not _cache_matches_at(directory, metadata, task_bytes):
+                raise SnapshotValidationError("compatibility cache verification failed after write")
+            return True
 
     def _inject(self, point: str, revision: RevisionSnapshot) -> None:
         if self._fault_injector is not None:
@@ -539,6 +548,7 @@ class TaskMaterializationWorker:
             if tasks_root is not None
             else None
         )
+        self._pending_cache_repairs: set[uuid.UUID] = set()
         self._engine = engine
 
     @classmethod
@@ -555,6 +565,9 @@ class TaskMaterializationWorker:
             self._engine.dispose()
 
     def run_once(self, materialization_id: uuid.UUID | None = None) -> WorkerRunResult:
+        cache_repair: WorkerRunResult | None = None
+        if materialization_id is None:
+            cache_repair = self._reconcile_queued_cache()
         claim = self._claim(materialization_id)
         if claim is not None:
             self._inject("after_claim", claim.revision)
@@ -567,14 +580,20 @@ class TaskMaterializationWorker:
                 return WorkerRunResult(
                     action="lease_lost",
                     materialization_id=claim.materialization_id,
-                    error=str(exc),
+                    error=_error_text(exc),
                 )
             except Exception as exc:
-                terminal = self._record_failure(claim, exc)
+                disposition = self._record_failure(claim, exc)
+                error = _error_text(exc)
+                if disposition == FailureDisposition.LEASE_LOST:
+                    error = (
+                        f"MaterializationLeaseLost: claim was replaced while recording failure; "
+                        f"original={error}"
+                    )
                 return WorkerRunResult(
-                    action="failed" if terminal else "retry_scheduled",
+                    action=disposition.value,
                     materialization_id=claim.materialization_id,
-                    error=_error_text(exc),
+                    error=error,
                 )
 
             return self._activate_ready(
@@ -585,6 +604,19 @@ class TaskMaterializationWorker:
         ready = self._next_ready_for_activation(materialization_id)
         if ready is not None:
             return self._activate_ready(ready, action="activated")
+        if materialization_id is not None:
+            status = self.status(materialization_id)
+            if status.terminal:
+                return self._reconcile_task_cache(
+                    status.task_id,
+                    materialization_id=materialization_id,
+                )
+        elif self._cache is not None:
+            if cache_repair is not None:
+                return cache_repair
+            changed = self._recover_all_caches()
+            if changed:
+                return WorkerRunResult(action="cache_reconciled", cache_refreshed=True)
         return WorkerRunResult(action="idle", materialization_id=materialization_id)
 
     def drain(
@@ -599,16 +631,26 @@ class TaskMaterializationWorker:
         while True:
             status = self.status(materialization_id)
             if status.terminal:
+                self._reconcile_task_cache(
+                    status.task_id,
+                    materialization_id=materialization_id,
+                )
                 return status
             self.run_once(materialization_id)
             status = self.status(materialization_id)
-            if status.terminal or time.monotonic() >= deadline:
+            if status.terminal:
+                self._reconcile_task_cache(
+                    status.task_id,
+                    materialization_id=materialization_id,
+                )
+                return status
+            if time.monotonic() >= deadline:
                 return status
             time.sleep(min(self.poll_seconds, max(0.0, deadline - time.monotonic())))
 
     def run_forever(self) -> None:
         if self._cache is not None:
-            self._cache.recover_all()
+            self._recover_all_caches()
         while True:
             try:
                 ready = self._next_ready_for_activation(None)
@@ -623,12 +665,12 @@ class TaskMaterializationWorker:
                 logger.exception("task materialization worker iteration failed")
                 if self._cache is not None:
                     try:
-                        self._cache.recover_all()
+                        self._recover_all_caches()
                     except Exception:
                         logger.exception("task compatibility cache recovery failed")
                 time.sleep(self.poll_seconds)
                 continue
-            if result.action == "idle":
+            if result.action in {"idle", "cache_reconcile_failed"}:
                 time.sleep(self.poll_seconds)
 
     def status(self, materialization_id: uuid.UUID) -> TaskMaterializationStatus:
@@ -689,25 +731,65 @@ class TaskMaterializationWorker:
         )
 
     def recover_compatibility_caches(self) -> int:
-        return self._cache.recover_all() if self._cache is not None else 0
+        return self._recover_all_caches()
+
+    def _recover_all_caches(self) -> int:
+        if self._cache is None:
+            return 0
+        return self._cache.recover_all(failed_task_ids=self._pending_cache_repairs)
+
+    def _reconcile_queued_cache(self) -> WorkerRunResult | None:
+        if self._cache is None or not self._pending_cache_repairs:
+            return None
+        task_id = next(iter(self._pending_cache_repairs))
+        return self._reconcile_task_cache(task_id)
+
+    def _reconcile_task_cache(
+        self,
+        task_id: uuid.UUID,
+        *,
+        materialization_id: uuid.UUID | None = None,
+    ) -> WorkerRunResult:
+        if self._cache is None:
+            return WorkerRunResult(action="idle", materialization_id=materialization_id)
+        try:
+            changed = self._cache.refresh(task_id)
+        except Exception as exc:
+            self._pending_cache_repairs.add(task_id)
+            logger.exception(
+                "task compatibility cache reconciliation failed",
+                extra={"task_id": str(task_id)},
+            )
+            return WorkerRunResult(
+                action="cache_reconcile_failed",
+                materialization_id=materialization_id,
+                cache_refreshed=False,
+                error=_error_text(exc),
+            )
+        self._pending_cache_repairs.discard(task_id)
+        return WorkerRunResult(
+            action="cache_reconciled",
+            materialization_id=materialization_id,
+            cache_refreshed=changed,
+        )
 
     def _claim(self, materialization_id: uuid.UUID | None) -> MaterializationClaim | None:
-        now = datetime.now(timezone.utc)
-        lease_expires_at = now + timedelta(seconds=self.lease_seconds)
-        eligible = or_(
-            and_(
-                TaskRevisionMaterialization.state == TaskMaterializationState.PENDING,
-                TaskRevisionMaterialization.available_at <= now,
-            ),
-            and_(
-                TaskRevisionMaterialization.state == TaskMaterializationState.PROCESSING,
-                or_(
-                    TaskRevisionMaterialization.lease_expires_at.is_(None),
-                    TaskRevisionMaterialization.lease_expires_at <= now,
-                ),
-            ),
-        )
         with self._session_factory() as session, session.begin():
+            now = _database_now(session)
+            lease_expires_at = now + timedelta(seconds=self.lease_seconds)
+            eligible = or_(
+                and_(
+                    TaskRevisionMaterialization.state == TaskMaterializationState.PENDING,
+                    TaskRevisionMaterialization.available_at <= now,
+                ),
+                and_(
+                    TaskRevisionMaterialization.state == TaskMaterializationState.PROCESSING,
+                    or_(
+                        TaskRevisionMaterialization.lease_expires_at.is_(None),
+                        TaskRevisionMaterialization.lease_expires_at <= now,
+                    ),
+                ),
+            )
             statement = (
                 select(TaskRevisionMaterialization)
                 .where(eligible)
@@ -756,8 +838,8 @@ class TaskMaterializationWorker:
             )
 
     def _mark_ready(self, claim: MaterializationClaim) -> None:
-        now = datetime.now(timezone.utc)
         with self._session_factory() as session, session.begin():
+            now = _database_now(session)
             materialization = session.scalar(
                 select(TaskRevisionMaterialization)
                 .where(TaskRevisionMaterialization.id == claim.materialization_id)
@@ -772,16 +854,20 @@ class TaskMaterializationWorker:
             materialization.lease_expires_at = None
             materialization.last_error = None
 
-    def _record_failure(self, claim: MaterializationClaim, error: Exception) -> bool:
-        now = datetime.now(timezone.utc)
+    def _record_failure(
+        self,
+        claim: MaterializationClaim,
+        error: Exception,
+    ) -> FailureDisposition:
         with self._session_factory() as session, session.begin():
+            now = _database_now(session)
             materialization = session.scalar(
                 select(TaskRevisionMaterialization)
                 .where(TaskRevisionMaterialization.id == claim.materialization_id)
                 .with_for_update(),
             )
             if not _claim_matches(materialization, claim):
-                return False
+                return FailureDisposition.LEASE_LOST
             terminal = isinstance(error, SnapshotValidationError) or (
                 materialization.attempt_count >= self.max_attempts
             )
@@ -811,7 +897,11 @@ class TaskMaterializationWorker:
                 materialization.available_at = now + timedelta(seconds=self.retry_delay_seconds)
                 materialization.claimed_at = None
                 materialization.claimed_by = None
-            return terminal
+            return (
+                FailureDisposition.FAILED
+                if terminal
+                else FailureDisposition.RETRY_SCHEDULED
+            )
 
     def _next_ready_for_activation(
         self,
@@ -869,10 +959,13 @@ class TaskMaterializationWorker:
         except Exception as exc:
             cache_refreshed = False
             cache_error = _error_text(exc)
+            self._pending_cache_repairs.add(ready.revision.task_id)
             logger.exception(
                 "task compatibility cache refresh failed after activation",
                 extra={"task_id": str(ready.revision.task_id)},
             )
+        else:
+            self._pending_cache_repairs.discard(ready.revision.task_id)
         return WorkerRunResult(
             action=action,
             materialization_id=ready.materialization_id,
@@ -1083,24 +1176,165 @@ def _activation_state(
 def _cache_root(tasks_root: str | Path) -> Path:
     parts: list[str] = []
     for chunk in str(tasks_root).split(os.pathsep):
-        parts.extend(item.strip() for item in chunk.split(","))
-    return Path(parts[-1]) if parts else Path("tasks")
+        parts.extend(item for item in (part.strip() for part in chunk.split(",")) if item)
+    if not parts:
+        raise ValueError("tasks_root must contain at least one non-empty path")
+    return Path(parts[-1])
 
 
-def _cache_matches(target: Path, metadata: dict[str, Any], task_path: Path) -> bool:
+@contextmanager
+def _pinned_cache_directory(root: Path, task_key: str):
+    _require_safe_segment(task_key)
+    root.mkdir(parents=True, exist_ok=True)
+    root_fd = _open_directory_nofollow(root)
+    task_fd: int | None = None
     try:
-        if target.is_symlink() or not target.is_dir():
-            return False
-        metadata_path = target / CACHE_METADATA_FILE
-        cached_task = target / "task.yaml"
-        if metadata_path.is_symlink() or cached_task.is_symlink():
-            return False
-        stored = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if stored != metadata:
-            return False
-        return cached_task.is_file() and cached_task.read_bytes() == task_path.read_bytes()
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        try:
+            os.mkdir(task_key, mode=0o755, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        try:
+            task_fd = os.open(task_key, _directory_open_flags(), dir_fd=root_fd)
+        except OSError as exc:
+            raise SnapshotValidationError(
+                f"compatibility cache target is not a safe directory: {root / task_key}",
+            ) from exc
+        directory = PinnedCacheDirectory(
+            root_fd=root_fd,
+            task_fd=task_fd,
+            task_key=task_key,
+        )
+        _assert_pinned_cache_directory(directory)
+        yield directory
+        _assert_pinned_cache_directory(directory)
+    finally:
+        if task_fd is not None:
+            os.close(task_fd)
+        os.close(root_fd)
+
+
+def _open_directory_nofollow(path: Path) -> int:
+    try:
+        return os.open(path, _directory_open_flags())
+    except OSError as exc:
+        raise SnapshotValidationError(
+            f"compatibility cache root is not a safe directory: {path}",
+        ) from exc
+
+
+def _directory_open_flags() -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise SnapshotValidationError("secure compatibility cache writes require O_DIRECTORY and O_NOFOLLOW")
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _assert_pinned_cache_directory(directory: PinnedCacheDirectory) -> None:
+    try:
+        entry = os.stat(
+            directory.task_key,
+            dir_fd=directory.root_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as exc:
+        raise SnapshotValidationError("compatibility cache directory was removed during write") from exc
+    opened = os.fstat(directory.task_fd)
+    if not stat.S_ISDIR(entry.st_mode) or (
+        entry.st_dev,
+        entry.st_ino,
+    ) != (
+        opened.st_dev,
+        opened.st_ino,
+    ):
+        raise SnapshotValidationError("compatibility cache directory changed during write")
+
+
+def _cache_matches_at(
+    directory: PinnedCacheDirectory,
+    metadata: dict[str, Any],
+    task_bytes: bytes,
+) -> bool:
+    try:
+        _assert_pinned_cache_directory(directory)
+        metadata_bytes = _read_regular_file_at(directory, CACHE_METADATA_FILE)
+        cached_task = _read_regular_file_at(directory, "task.yaml")
+        stored = json.loads(metadata_bytes.decode("utf-8"))
+        _assert_pinned_cache_directory(directory)
+        return stored == metadata and cached_task == task_bytes
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, SnapshotValidationError):
         return False
+
+
+def _read_regular_file_at(directory: PinnedCacheDirectory, name: str) -> bytes:
+    _assert_pinned_cache_directory(directory)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=directory.task_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SnapshotValidationError(f"compatibility cache file is not regular: {name}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _write_bytes_atomic_at(
+    directory: PinnedCacheDirectory,
+    name: str,
+    value: bytes,
+) -> None:
+    _assert_pinned_cache_directory(directory)
+    _require_regular_or_missing_at(directory, name)
+    temporary = f".{name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory.task_fd)
+        remaining = memoryview(value)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("compatibility cache write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        _assert_pinned_cache_directory(directory)
+        _require_regular_or_missing_at(directory, name)
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory.task_fd,
+            dst_dir_fd=directory.task_fd,
+        )
+        os.fsync(directory.task_fd)
+        _assert_pinned_cache_directory(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory.task_fd)
+        except FileNotFoundError:
+            pass
+
+
+def _require_regular_or_missing_at(directory: PinnedCacheDirectory, name: str) -> None:
+    try:
+        file_stat = os.stat(name, dir_fd=directory.task_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise SnapshotValidationError(f"compatibility cache file is not regular: {name}")
 
 
 def _write_bytes_fsync(path: Path, value: bytes) -> None:
@@ -1109,18 +1343,6 @@ def _write_bytes_fsync(path: Path, value: bytes) -> None:
         handle.write(value)
         handle.flush()
         os.fsync(handle.fileno())
-
-
-def _write_bytes_atomic(path: Path, value: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    try:
-        _write_bytes_fsync(temporary, value)
-        os.replace(temporary, path)
-        _fsync_dir(path.parent)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 def _fsync_dir(path: str | Path) -> None:
@@ -1155,6 +1377,20 @@ def _default_worker_id() -> str:
 def _error_text(error: BaseException) -> str:
     text = f"{type(error).__name__}: {error}".strip()
     return text[:4000]
+
+
+def _database_now(session: Session) -> datetime:
+    value = session.scalar(select(func.current_timestamp()))
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise MaterializationError("database clock returned an invalid timestamp") from exc
+    if not isinstance(value, datetime):
+        raise MaterializationError("database clock did not return a timestamp")
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _isoformat(value: datetime | None) -> str | None:

@@ -10,7 +10,7 @@
 
 | 当前状态 | 条件/动作 | 下一状态 | 持久化保证 |
 | --- | --- | --- | --- |
-| `pending` | `available_at <= now`，worker 在事务中领取 | `processing` | PostgreSQL 使用 `FOR UPDATE SKIP LOCKED`；记录 worker、lease，并递增 `attempt_count` fencing token |
+| `pending` | `available_at <= now`，worker 在事务中领取 | `processing` | PostgreSQL 使用 `FOR UPDATE SKIP LOCKED`；`now` 取自数据库时钟，记录 worker、lease，并递增 `attempt_count` fencing token |
 | `processing` | lease 超时后被新 worker 回收 | `processing` | 新 attempt 覆盖 lease；旧 attempt 不能完成数据库状态转换 |
 | `processing` | snapshot 原子提交并复核成功 | `succeeded` | ready 状态单独提交；不依赖 `after_commit` callback |
 | `processing` | 可重试错误且未达上限 | `pending` | 保存 `last_error`，按 `available_at` 延迟重试 |
@@ -18,7 +18,7 @@
 | `succeeded` | 独立事务锁定 task 行，candidate revision 更大 | `succeeded` | 单调更新 `current_revision_id`，同事务追加 activation audit |
 | `succeeded` | current revision 相同或更大 | `succeeded` | 幂等 no-op；较旧 revision 标记为 status 层的 `superseded`，不能回退 current |
 
-`attempt_count` 是 lease fencing token。worker 完成 ready 或失败转换时必须同时匹配 materialization ID、`processing`、`claimed_by` 和领取时的 attempt；过期 worker 即使继续运行，也不能提交数据库状态。
+`attempt_count` 是 lease fencing token。worker 完成 ready 或失败转换时必须同时匹配 materialization ID、`processing`、`claimed_by` 和领取时的 attempt；过期 worker 即使继续运行，也不能提交数据库状态。领取、过期判断、ready 时间和 retry 可用时间均以数据库事务读取的时钟为基准。旧 attempt 丢失 lease 时返回独立的 `lease_lost` 结果，不得误报为 `retry_scheduled`。
 
 ## 文件状态机
 
@@ -46,9 +46,9 @@ snapshot ready 后，worker 开启新的数据库事务并锁定 task 行：
 3. candidate 等于 current 时幂等返回。
 4. candidate 小于 current 时返回 `superseded`，禁止回退。
 
-更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。事务提交后，worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 与 `.task_source.json`；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。缓存目录及两个目标文件都拒绝 symlink。
+更新 `tasks.current_revision_id` 与 `task.revision_activated` audit 在同一事务提交。事务提交后，worker 再从数据库 current revision 对应 snapshot 刷新 `tasks/<task_key>/task.yaml` 与 `.task_source.json`；刷新时再次锁定 task 行，因此乱序 worker 只能写当时数据库 current 对应内容。缓存根目录和 task 目录以 `O_DIRECTORY | O_NOFOLLOW` 打开并固定 directory fd，所有检查、临时文件创建和 `os.replace` 都相对该 fd 执行；每次提交前后复核目录 inode，目录交换或 symlink 替换会被拒绝。两个目标文件也必须是普通文件或不存在。
 
-兼容缓存是可恢复缓存，不是原子目录 snapshot。worker 先原子替换 `task.yaml`，再原子替换包含 revision ID、content hash 和 task file hash 的 `.task_source.json`。任一步崩溃都会留下可检测的 file/metadata mismatch；worker 重启或显式 cache recovery 会从数据库 current snapshot 重建。缓存失败不会回退已提交的 activation，也不会阻塞其他 outbox；坏缓存会记录错误并在后续恢复中重试。该过程不替换任务目录，也不删除 `raw/`、prompt 或其他相对路径资源。
+兼容缓存是可恢复缓存，不是原子目录 snapshot。worker 先原子替换 `task.yaml`，再原子替换包含 revision ID、content hash 和 task file hash 的 `.task_source.json`。任一步崩溃都会留下可检测的 file/metadata mismatch；worker 重启、空闲扫描、显式 cache recovery 或对 terminal materialization 的 one-shot/drain 重跑都会从数据库 current snapshot 重建。普通刷新错误进入 worker 的待修复队列，并在下一次可恢复运行中重试。缓存失败不会回退已提交的 activation，也不会阻塞其他 outbox。该过程不替换任务目录，也不删除 `raw/`、prompt 或其他相对路径资源。
 
 control loader 直接查询数据库 current revision 并校验 immutable snapshot，不读取兼容缓存内容。它以 snapshot 中的 YAML 作为 `TaskConfig.raw`，同时把 `TaskConfig.path` 设为调用方提供的稳定逻辑路径 `tasks_root/<task_key>/task.yaml`。因此 `input.path` 及未来相对 task 路径字段继续相对同一任务目录解析；snapshot 物理路径只用于 provenance 和完整性校验，不改变运行时基址。
 
@@ -75,4 +75,5 @@ control loader 直接查询数据库 current revision 并校验 immutable snapsh
 | 两个 worker 同时领取 | 每行只有一个有效 lease/attempt | `SKIP LOCKED` 领取不同工作；目标锁处理重复写 | 同一 attempt 只有一个数据库完成者 |
 | revision 2 先于 revision 1 ready | revision 2 先激活 | revision 1 后续变为 `superseded` | current revision number 单调递增 |
 | 目标已有不同或不完整内容 | DB 进入 `failed` | 人工调查，不自动覆盖 | 旧 active revision 继续执行 |
-| 激活后兼容缓存刷新崩溃 | DB current 已更新，task/metadata 可能不匹配 | metadata file hash 检出 mismatch，worker 从 DB current 重建 | loader 始终读取 immutable snapshot |
+| 激活后兼容缓存刷新崩溃 | DB current 已更新，task/metadata 可能不匹配 | terminal operation 重跑、worker 待修复队列或空闲扫描从 DB current 重建 | loader 始终读取 immutable snapshot |
+| 缓存写入期间 task 目录被交换 | 已固定 fd 仍指向原 inode，路径入口已变化 | inode 复核失败并停止后续替换；恢复时重新打开当前安全目录 | 不跟随 symlink，不向交换后的目录写入 |
