@@ -1518,8 +1518,8 @@ def _workspace_user_identities(client, workspace) -> dict[str, dict[str, str]]:
         user_uuid = _resource_uuid(user, "user")
         username = str(getattr(user, "username", "") or "").strip()
         role = _response_status_value(getattr(user, "role", None))
-        if not username or not role:
-            raise RuntimeError("Argilla workspace user 缺少公开 username/role identity")
+        if not username:
+            raise RuntimeError("Argilla workspace user 缺少公开 username identity")
         identities[user_uuid] = {
             "uuid": user_uuid,
             "username": username,
@@ -1563,6 +1563,8 @@ def _response_group_reason_codes(
         reasons.append("invalid_user_id")
     elif user_id not in users:
         reasons.append("unknown_workspace_user")
+    elif users[user_id]["role"] != "annotator":
+        reasons.append("unauthorized_user_role")
     missing_required = _missing_required_response_names(task, response_group["values"])
     if missing_required:
         reasons.append("missing_required_question")
