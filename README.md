@@ -332,6 +332,8 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 
 相同 contract 的恢复只补写远端缺失的 record ID，不重传已经存在的记录。完整重复重试不会产生 record 写请求。创建 dataset 时会在 live settings 中写入对 annotator 不可见的 intent fingerprint；如果进程在 `dataset.create()` 后、首批 record 写入前中断，下一次请求只有在 workspace/name、settings、`min_submitted` 和 intent 全部精确匹配时才自动续传。任一项不匹配都会拒绝按同名 dataset 恢复；只有显式使用 `if_exists=replace` 且远端没有任何 responses 时才允许重建，已有回答的 dataset 始终禁止 replace。
 
+标注者账号、稳定个人 workspace 和 membership 的 owner-side 幂等 provisioning 规则见 [Argilla owner-side provisioning](docs/argilla_admin.md)。一次性创建密码只能走该内存内 adapter，不能进入通用 Job/action params。
+
 ## 本地命令开发
 
 下面命令用于开发和排查，不是服务器默认部署路径：
