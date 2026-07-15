@@ -37,9 +37,10 @@ always zero because Argilla's shared task distribution cannot enforce a per-user
 Its `mode` is `shared_queue_advisory`; UI and API consumers must not present it as assigned,
 promised, or enforceable per-user workload.
 
-For `shared_queue`, `required_submissions` above cohort size remains a blocking structural error.
-Total or per-user advisory capacity shortfalls are warnings: the preview remains ready because
-Argilla does not enforce those capacities.
+For every overlap rule, `required_submissions` above cohort size is a blocking structural error,
+even when its selector resolves to zero production records. In `shared_queue`, total or per-user
+advisory capacity shortfalls are warnings: the preview remains ready because Argilla does not
+enforce those capacities.
 
 ## Record materialization
 
