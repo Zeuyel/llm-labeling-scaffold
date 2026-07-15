@@ -45,6 +45,45 @@ Panel、MCP 和后续认证层不直接接收 SQLAlchemy ORM 或 `Session`。公
 
 没有可见 membership/ACL 时，workspace 和 task 判权统一返回 `resource_not_visible`，且不返回 `WorkspaceRef` 或 `TaskRef`，避免枚举资源。未知身份和无 membership 始终是零权限。数据库连接、schema 或事务异常会抛出 `AuthorizationUnavailable`；上层必须 fail closed，不能沿用旧的允许结果。
 
+## Task revision 物化
+
+`20260714_0002` 已提供 task draft、immutable revision、`current_revision_id` 和 materialization outbox。本实现不修改 0002，也不需要 0003：worker 使用已有 `state`、`available_at`、lease、worker 和 `attempt_count` 字段完成领取、超时回收、fencing 与重试。
+
+Compose 中的 `materializer` 服务使用 runtime app role，持续运行：
+
+```bash
+python -m llm_labeling_scaffold.cli db materialize \
+  --runs-root /app/runs \
+  --tasks-root /app/tasks
+```
+
+PostgreSQL 领取使用 `FOR UPDATE SKIP LOCKED`。snapshot 写入同文件系统 staging，校验 definition、rendered task 与联合 `content_hash` 后，以不可覆盖目录提交到：
+
+```text
+runs/_system/task_control/task_snapshots/<revision_id>/<content_hash>/
+```
+
+目标已存在时必须逐文件一致才能幂等复用；缺失、半文件或相异内容会 fail closed。ready 状态先独立提交，随后 worker 在新的事务中锁定 task 行，只允许更大的 `revision_number` 更新 `current_revision_id`，并在同一事务写入 `task.revision_activated` audit。失败或被较新 revision supersede 时不会回退 active revision。
+
+`ControlTaskSnapshotLoader` 从数据库 current revision 对应 snapshot 读取 `TaskConfig.raw`，但使用显式 `tasks_root/<task_key>/task.yaml` 作为稳定逻辑 path，保持所有相对 task 路径的既有解析基址。`tasks/<task_key>/task.yaml` 和 `.task_source.json` 只是兼容缓存；目录和目标文件都拒绝 symlink。
+
+缓存刷新先原子替换 task file，再原子替换包含 task hash 的 metadata。两者不是原子目录 snapshot，中途崩溃会形成可检测 mismatch，worker 启动恢复会按数据库 current snapshot 重建。缓存错误不会回退 activation 或阻塞其他 outbox，恢复扫描会记录并跳过仍不安全的路径。刷新不会删除任务目录中的其他相对资源，loader 也不读取缓存内容决定执行配置；immutable snapshot 始终是唯一执行配置来源。
+
+publish 的 #51 `202 task_publish_v1` 幂等响应不会被 worker 改写。实时状态通过 materialization ID 独立读取：
+
+```bash
+python -m llm_labeling_scaffold.cli db materialization-status <materialization-id> \
+  --runs-root runs
+
+python -m llm_labeling_scaffold.cli db materialize \
+  --materialization-id <materialization-id> \
+  --drain-seconds 1 \
+  --runs-root runs \
+  --tasks-root tasks
+```
+
+短 drain 只协助处理并轮询独立 status，不改变 publish operation 的成功 replay 语义。完整状态机和故障矩阵见 [Task revision 物化状态机](task_revision_materialization.md)。
+
 ## 迁移
 
 Docker Compose 会等待 `scaffold-postgres` 健康，再由一次性 `migrate` 服务执行：
