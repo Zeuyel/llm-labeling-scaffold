@@ -24,7 +24,6 @@ _USER_ID = "00000000-0000-0000-0000-000000000101"
 _OTHER_USER_ID = "00000000-0000-0000-0000-000000000102"
 _WORKSPACE_ID = "00000000-0000-0000-0000-000000000201"
 _OTHER_WORKSPACE_ID = "00000000-0000-0000-0000-000000000202"
-_VERIFIED_AT = "2026-07-14T12:00:00Z"
 
 
 class _FakeUser:
@@ -220,6 +219,11 @@ def _install_sdk(monkeypatch, client):
     sdk = _FakeSDK(client)
     monkeypatch.setenv("ARGILLA_API_KEY", client.api_key)
     monkeypatch.setattr(argilla_admin, "_load_argilla", lambda: sdk)
+    monkeypatch.setattr(
+        argilla_admin,
+        "_client",
+        lambda api_url=None: sdk.Argilla(api_url=api_url or client.api_url, api_key=client.api_key),
+    )
 
     def runtime_versions(rg, api_url):
         client.routes.append("GET /api/v1/version")
@@ -228,7 +232,6 @@ def _install_sdk(monkeypatch, client):
         return {"sdk": "2.8.0", "server": "2.8.0"}
 
     monkeypatch.setattr(argilla_admin, "_runtime_versions", runtime_versions)
-    monkeypatch.setattr(argilla_admin, "_verified_at", lambda: _VERIFIED_AT)
     return sdk
 
 
@@ -268,16 +271,29 @@ def test_adapter_constructor_does_not_accept_api_key():
         ArgillaAdminAdapter(api_key="must-not-be-accepted")
 
 
+def test_adapter_requires_owner_key_before_client_initialization(monkeypatch):
+    client = _FakeClient()
+    sdk = _install_sdk(monkeypatch, client)
+    monkeypatch.delenv("ARGILLA_API_KEY")
+
+    with pytest.raises(ArgillaProvisioningError) as exc_info:
+        ArgillaAdminAdapter(api_url=client.api_url)
+
+    assert exc_info.value.code == "missing_owner_api_key"
+    assert sdk.client_calls == []
+    assert client.routes == ["GET /api/v1/version"]
+
+
 def test_version_validation_failure_prevents_client_initialization(monkeypatch):
     client = _FakeClient()
     sdk = _install_sdk(monkeypatch, client)
 
     def reject_versions(rg, api_url):
-        raise RuntimeError("Argilla SDK 必须是 2.8.x")
+        raise RuntimeError("Argilla SDK 必须是 2.8.0")
 
     monkeypatch.setattr(argilla_admin, "_runtime_versions", reject_versions)
 
-    with pytest.raises(RuntimeError, match="2.8.x"):
+    with pytest.raises(RuntimeError, match="2.8.0"):
         ArgillaAdminAdapter(api_url=client.api_url)
 
     assert sdk.client_calls == []
@@ -298,7 +314,7 @@ def test_adapter_rejects_non_owner_operator(monkeypatch, operator_role):
 def test_create_routes_and_whitelist_dto(monkeypatch):
     secret = "one-time-password"
     owner_key = "owner-key-must-not-leak"
-    issuer, subject, username, workspace_name = _identity()
+    issuer, subject, username, _ = _identity()
     client = _FakeClient(api_key=owner_key)
     _install_sdk(monkeypatch, client)
     adapter = ArgillaAdminAdapter(api_url=client.api_url)
@@ -322,18 +338,13 @@ def test_create_routes_and_whitelist_dto(monkeypatch):
         f"POST /api/v1/workspaces/{_WORKSPACE_ID}/users",
         f"GET /api/v1/workspaces/{_WORKSPACE_ID}/users",
     ]
-    assert result.action.to_dict() == {"user": "created", "workspace": "created", "membership": "created"}
-    assert result.verification_state == "verified"
-    assert result.verified_at == _VERIFIED_AT
-    assert result.user.username == username
-    assert result.workspace.name == workspace_name
+    assert result.uuid == _USER_ID
+    assert result.username == username
+    assert result.role == "annotator"
     assert client.attempted_users[0].password is None
 
     payload = result.to_dict()
-    assert list(payload) == ["user", "workspace", "verification_state", "verified_at", "action"]
-    assert list(payload["user"]) == ["uuid", "username", "role"]
-    assert list(payload["workspace"]) == ["uuid", "name"]
-    assert list(payload["action"]) == ["user", "workspace", "membership"]
+    assert payload == {"uuid": _USER_ID, "username": username, "role": "annotator"}
     serialized = json.dumps(payload, ensure_ascii=False)
     for sensitive in (
         secret,
@@ -344,6 +355,10 @@ def test_create_routes_and_whitelist_dto(monkeypatch):
         "last_name",
         "status",
         "active",
+        "workspace",
+        "verified_at",
+        "verification_state",
+        "action",
     ):
         assert sensitive not in serialized
 
@@ -368,7 +383,7 @@ def test_expected_ids_are_authoritative_and_existing_membership_performs_zero_po
         expected_workspace_uuid=_WORKSPACE_ID,
     )
 
-    assert result.action.to_dict() == {"user": "reused", "workspace": "reused", "membership": "reused"}
+    assert result.to_dict() == {"uuid": _USER_ID, "username": username, "role": "annotator"}
     assert client.routes == [
         "GET /api/v1/version",
         "GET /api/v1/me",
@@ -393,7 +408,7 @@ def test_name_based_retry_reuses_all_resources_without_posts(monkeypatch):
 
     result = adapter.ensure_annotator(principal_issuer=issuer, principal_subject=subject)
 
-    assert result.action.to_dict() == {"user": "reused", "workspace": "reused", "membership": "reused"}
+    assert result.to_dict() == {"uuid": _USER_ID, "username": username, "role": "annotator"}
     assert not any(route.startswith("POST ") for route in client.routes)
 
 
@@ -416,8 +431,8 @@ def test_membership_verification_ignores_mutable_name_snapshots(monkeypatch):
         expected_workspace_uuid=_WORKSPACE_ID,
     )
 
-    assert result.action.membership == "reused"
-    assert not hasattr(result.user, "first_name")
+    assert result.to_dict() == {"uuid": _USER_ID, "username": username, "role": "annotator"}
+    assert not hasattr(result, "first_name")
     assert "Current" not in repr(result)
     assert "Older" not in repr(result)
     assert client.routes.count(f"POST /api/v1/workspaces/{_WORKSPACE_ID}/users") == 0
@@ -558,7 +573,7 @@ def test_create_timeout_and_membership_conflict_recover_by_reread(monkeypatch):
         password="one-time-password",
     )
 
-    assert result.action.to_dict() == {"user": "recovered", "workspace": "recovered", "membership": "recovered"}
+    assert result.role == "annotator"
     assert client.attempted_users[0].password is None
     assert client.routes.count("POST /api/v1/users") == 1
     assert client.routes.count("POST /api/v1/workspaces") == 1
@@ -626,7 +641,6 @@ def test_create_only_names_matching_password_do_not_leak_through_dto_repr_or_log
         [
             json.dumps(result.to_dict(), ensure_ascii=False),
             repr(result),
-            repr(result.user),
             caplog.text,
         ]
     )

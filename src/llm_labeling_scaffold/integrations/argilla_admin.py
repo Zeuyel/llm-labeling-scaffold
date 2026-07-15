@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -9,7 +8,7 @@ import re
 from typing import Any
 from uuid import UUID
 
-from .argilla import _api_url, _load_argilla, _runtime_versions
+from .argilla import _api_url, _client, _load_argilla, _runtime_versions
 
 
 _ARGILLA_ANNOTATOR_ROLE = "annotator"
@@ -36,47 +35,6 @@ class ArgillaUserDTO:
             "uuid": self.uuid,
             "username": self.username,
             "role": self.role,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ArgillaWorkspaceDTO:
-    uuid: str
-    name: str
-
-    def to_dict(self) -> dict[str, str]:
-        return {"uuid": self.uuid, "name": self.name}
-
-
-@dataclass(frozen=True, slots=True)
-class ArgillaProvisioningAction:
-    user: str
-    workspace: str
-    membership: str
-
-    def to_dict(self) -> dict[str, str]:
-        return {
-            "user": self.user,
-            "workspace": self.workspace,
-            "membership": self.membership,
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ArgillaProvisioningDTO:
-    user: ArgillaUserDTO
-    workspace: ArgillaWorkspaceDTO
-    verification_state: str
-    verified_at: str
-    action: ArgillaProvisioningAction
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "user": self.user.to_dict(),
-            "workspace": self.workspace.to_dict(),
-            "verification_state": self.verification_state,
-            "verified_at": self.verified_at,
-            "action": self.action.to_dict(),
         }
 
 
@@ -148,10 +106,6 @@ def _text_or_none(value: Any) -> str | None:
     return str(value)
 
 
-def _verified_at() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def _clear_sdk_password(resource: Any) -> bool:
     if resource is None:
         return True
@@ -162,9 +116,8 @@ def _clear_sdk_password(resource: Any) -> bool:
         return False
 
 
-def _new_client_from_env(rg: Any, api_url: str) -> Any:
-    api_key = os.environ.get("ARGILLA_API_KEY")
-    if not api_key:
+def _owner_client(api_url: str) -> Any:
+    if not os.environ.get("ARGILLA_API_KEY"):
         raise ArgillaProvisioningError(
             "missing_owner_api_key",
             "owner API key 必须通过 ARGILLA_API_KEY secret/env 提供",
@@ -173,11 +126,9 @@ def _new_client_from_env(rg: Any, api_url: str) -> Any:
     client = None
     failed = False
     try:
-        client = rg.Argilla(api_url=api_url, api_key=api_key)
+        client = _client(api_url)
     except Exception:
         failed = True
-    finally:
-        api_key = None
 
     if failed or client is None:
         raise ArgillaProvisioningError(
@@ -192,7 +143,7 @@ class ArgillaAdminAdapter:
         self._rg = _load_argilla()
         resolved_api_url = _api_url(api_url)
         _runtime_versions(self._rg, resolved_api_url)
-        self._client = _new_client_from_env(self._rg, resolved_api_url)
+        self._client = _owner_client(resolved_api_url)
 
         me = self._read_operator()
         self._operator_role = _role_value(getattr(me, "role", None))
@@ -216,7 +167,7 @@ class ArgillaAdminAdapter:
         last_name: str | None = None,
         expected_user_uuid: UUID | str | None = None,
         expected_workspace_uuid: UUID | str | None = None,
-    ) -> ArgillaProvisioningDTO:
+    ) -> ArgillaUserDTO:
         create_input = _EphemeralUserCreateInput(password, first_name, last_name)
         password = None
         first_name = None
@@ -227,37 +178,22 @@ class ArgillaAdminAdapter:
             expected_user_id = _expected_uuid(expected_user_uuid, "expected_user_uuid")
             expected_workspace_id = _expected_uuid(expected_workspace_uuid, "expected_workspace_uuid")
 
-            user, user_action = self._ensure_user(
+            user = self._ensure_user(
                 username=username,
                 expected_uuid=expected_user_id,
                 create_input=create_input,
             )
             user_dto = self._user_dto(user, username=username, expected_uuid=expected_user_id)
-            workspace, workspace_action = self._ensure_workspace(
+            workspace = self._ensure_workspace(
                 name=workspace_name,
                 expected_uuid=expected_workspace_id,
             )
-            workspace_dto = self._workspace_dto(
-                workspace,
-                name=workspace_name,
-                expected_uuid=expected_workspace_id,
-            )
-            membership_action = self._ensure_membership(
+            self._ensure_membership(
                 workspace=workspace,
                 user=user,
                 user_dto=user_dto,
             )
-            return ArgillaProvisioningDTO(
-                user=user_dto,
-                workspace=workspace_dto,
-                verification_state="verified",
-                verified_at=_verified_at(),
-                action=ArgillaProvisioningAction(
-                    user=user_action,
-                    workspace=workspace_action,
-                    membership=membership_action,
-                ),
-            )
+            return user_dto
         finally:
             create_input.clear()
 
@@ -281,7 +217,7 @@ class ArgillaAdminAdapter:
         username: str,
         expected_uuid: str | None,
         create_input: _EphemeralUserCreateInput,
-    ) -> tuple[Any, str]:
+    ) -> Any:
         if expected_uuid is not None:
             create_input.clear()
             user = self._user_by_uuid(expected_uuid)
@@ -291,13 +227,13 @@ class ArgillaAdminAdapter:
                     "expected Argilla user UUID 不存在；拒绝按同名 username 回退",
                 )
             self._user_dto(user, username=username, expected_uuid=expected_uuid)
-            return user, "reused"
+            return user
 
         existing = self._user_by_username(username)
         if existing is not None:
             create_input.clear()
             self._user_dto(existing, username=username)
-            return existing, "reused"
+            return existing
 
         password, first_name, last_name = create_input.take()
         if not isinstance(password, str) or not 8 <= len(password) <= 100:
@@ -364,12 +300,12 @@ class ArgillaAdminAdapter:
                     f"Argilla annotator 创建失败且重读未发现资源: {username}",
                 ) from None
             self._user_dto(recovered, username=username)
-            return recovered, "recovered"
+            return recovered
 
         self._user_dto(created, username=username)
-        return created, "created"
+        return created
 
-    def _ensure_workspace(self, *, name: str, expected_uuid: str | None) -> tuple[Any, str]:
+    def _ensure_workspace(self, *, name: str, expected_uuid: str | None) -> Any:
         if expected_uuid is not None:
             workspace = self._workspace_by_uuid(expected_uuid)
             if workspace is None:
@@ -377,13 +313,13 @@ class ArgillaAdminAdapter:
                     "expected_workspace_missing",
                     "expected Argilla workspace UUID 不存在；拒绝按同名 workspace 回退",
                 )
-            self._workspace_dto(workspace, name=name, expected_uuid=expected_uuid)
-            return workspace, "reused"
+            self._validate_workspace(workspace, name=name, expected_uuid=expected_uuid)
+            return workspace
 
         existing = self._workspace_by_name(name)
         if existing is not None:
-            self._workspace_dto(existing, name=name)
-            return existing, "reused"
+            self._validate_workspace(existing, name=name)
+            return existing
 
         candidate = None
         construction_failed = False
@@ -411,11 +347,11 @@ class ArgillaAdminAdapter:
                     "workspace_visibility_conflict",
                     f"personal workspace 创建失败且同名资源重读不可见: {name}",
                 ) from None
-            self._workspace_dto(recovered, name=name)
-            return recovered, "recovered"
+            self._validate_workspace(recovered, name=name)
+            return recovered
 
-        self._workspace_dto(created, name=name)
-        return created, "created"
+        self._validate_workspace(created, name=name)
+        return created
 
     def _ensure_membership(
         self,
@@ -423,10 +359,10 @@ class ArgillaAdminAdapter:
         workspace: Any,
         user: Any,
         user_dto: ArgillaUserDTO,
-    ) -> str:
+    ) -> None:
         members = self._workspace_members(workspace)
         if self._verified_member(members, user_dto) is not None:
-            return "reused"
+            return
 
         add_failed = False
         try:
@@ -436,7 +372,7 @@ class ArgillaAdminAdapter:
 
         members = self._workspace_members(workspace)
         if self._verified_member(members, user_dto) is not None:
-            return "recovered" if add_failed else "created"
+            return
         if add_failed:
             raise ArgillaProvisioningError(
                 "membership_creation_failed",
@@ -608,13 +544,13 @@ class ArgillaAdminAdapter:
             role=role,
         )
 
-    def _workspace_dto(
+    def _validate_workspace(
         self,
         workspace: Any,
         *,
         name: str,
         expected_uuid: str | None = None,
-    ) -> ArgillaWorkspaceDTO:
+    ) -> None:
         workspace_uuid = _canonical_uuid(getattr(workspace, "id", None), "workspace")
         actual_name = _text_or_none(getattr(workspace, "name", None)) or ""
         if expected_uuid is not None and workspace_uuid != expected_uuid:
@@ -632,16 +568,12 @@ class ArgillaAdminAdapter:
                 "workspace_name_invalid",
                 f"Argilla personal workspace name 包含非法字符: {workspace_uuid}",
             )
-        return ArgillaWorkspaceDTO(uuid=workspace_uuid, name=actual_name)
 
 
 __all__ = [
     "ArgillaAdminAdapter",
-    "ArgillaProvisioningAction",
-    "ArgillaProvisioningDTO",
     "ArgillaProvisioningError",
     "ArgillaUserDTO",
-    "ArgillaWorkspaceDTO",
     "derive_argilla_username",
     "derive_personal_workspace_name",
 ]

@@ -4,10 +4,10 @@
 
 ## 运行边界
 
-- SDK 和 server 都必须通过现有 Argilla contract 的 2.8.x 校验；项目依赖由 #59 固定到受支持的 2.8 版本。
+- SDK 和 server 都必须通过现有 Argilla contract 的精确 2.8.0 校验；项目依赖由 #59 固定为 `argilla==2.8.0`。
 - owner API key 只从 `ARGILLA_API_KEY` secret/env 读取。adapter 构造函数不接受 `api_key` 参数。
 - Argilla Server 2.8 的 provisioning policy 是 owner-only，`client.me.role` 必须是 `owner`；`admin` 和 `annotator` 均会被拒绝。目标用户必须是独立的 `annotator`，owner 账号不会作为 annotator 返回。
-- Argilla 2.8 public SDK 不暴露 user active/status，也不支持回读 API key、校验现有密码或安全地完成密码轮换。成功结果只返回 `verification_state=verified`，表示 UUID/name/role/resource visibility/membership 已重读验证，不表示 active。
+- Argilla 2.8 public SDK 不暴露 user active/status，也不支持回读 API key、校验现有密码或安全地完成密码轮换。adapter 只把可读取且已通过 UUID/username/role、workspace 和 membership 校验的用户返回给调用方，不伪造 active/status。
 
 ## 稳定身份
 
@@ -44,14 +44,14 @@ result = adapter.ensure_annotator(
 payload = result.to_dict()
 ```
 
-首次成功后，调用方可在后续内存内同步中把 DTO 的 UUID 作为 `expected_user_uuid` 和 `expected_workspace_uuid` 传回，以启用 ID 权威校验。
+首次成功后，调用方可在后续内存内同步中把 user DTO 的 UUID 作为 `expected_user_uuid` 传回，并从上层控制面 workspace 模型传入 `expected_workspace_uuid`，以启用 ID 权威校验。
 
 不得把密码放入通用 Job/action params、job JSON、数据库、manifest、日志或异常。adapter 将 password、first name 和 last name 作为 create-only 内存输入，在构造 `User` resource 后清除本地引用，并在 `User.create()` 成功或失败返回后立即通过 public `password` 属性清空 SDK resource。已有用户不会消费或校验这些创建字段。未来的敏感同步入口由 #64 单独提供。
 
 ## 幂等与返回值
 
 - 已存在的 user、workspace 和 membership 会复用；已存在 membership 不发送 POST。
-- user/workspace 创建异常后会按稳定名称重读；确认资源已出现时 action 为 `recovered`。
-- membership 添加超时或冲突后会重读 `workspace.users`；确认目标 UUID 已存在时 action 为 `recovered`。
+- user/workspace 创建异常后会按稳定名称重读；确认资源已出现时继续完成校验。
+- membership 添加超时或冲突后会重读 `workspace.users`；确认目标 UUID 已存在时视为成功。
 - membership 是增量 ensure，不删除 workspace 中的额外成员。
-- 返回 DTO 只包含 user `uuid/username/role`、workspace `uuid/name`、`verification_state`、`verified_at` 和 user/workspace/membership action。不会返回 first name、last name、SDK resource、raw params、password、API key、status 或 active。
+- adapter 返回的 `ArgillaUserDTO` 只包含 `uuid/username/role`。workspace 身份和最近验证时间由上层控制面模型单独表达；adapter 不返回 first name、last name、workspace、验证时间、SDK resource、raw params、password、API key、status 或 active。
