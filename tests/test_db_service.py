@@ -23,6 +23,9 @@ from llm_labeling_scaffold.db import (
     Permission,
     PrincipalType,
     Role,
+    TaskDraftConflict,
+    TaskPreconditionRequired,
+    TaskMaterializationState,
 )
 from llm_labeling_scaffold.db.base import Base
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
@@ -35,6 +38,9 @@ from llm_labeling_scaffold.db.models import (
     Principal,
     RoleBinding,
     Task,
+    TaskDraft,
+    TaskRevision,
+    TaskRevisionMaterialization,
     Workspace,
 )
 
@@ -934,6 +940,395 @@ def test_audit_facade_rejects_cross_workspace_system_spoof_and_unknown_caller(se
     assert user_caller.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
     with Session(engine) as session:
         assert session.scalar(select(func.count()).select_from(AuditEvent)) == initial_count
+
+
+def test_task_draft_strong_etag_noop_and_aba_protection(seeded_service, engine):
+    service = seeded_service["service"]
+    definition_a = {"task_id": "shared-key", "labels": ["yes", "no"]}
+    rendered_a = "task_id: shared-key\nlabels:\n  - yes\n  - no\n"
+
+    with pytest.raises(TaskPreconditionRequired):
+        service.save_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition=definition_a,
+            rendered_task=rendered_a,
+            if_match=None,
+            channel=AuditChannel.API,
+        )
+
+    with pytest.raises(TaskDraftConflict) as missing:
+        service.save_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition=definition_a,
+            rendered_task=rendered_a,
+            if_match="*",
+            channel=AuditChannel.API,
+        )
+    assert missing.value.current_etag is None
+
+    first = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition=definition_a,
+        rendered_task=rendered_a,
+        if_match=None,
+        channel=AuditChannel.API,
+        if_none_match="*",
+    )
+    assert first.changed is True
+    assert first.draft.version == 1
+    assert first.draft.etag.startswith('"task-draft-v1-')
+    assert first.draft.etag.endswith('"')
+    assert not first.draft.etag.startswith("W/")
+
+    with pytest.raises(TaskDraftConflict) as existing:
+        service.save_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition=definition_a,
+            rendered_task=rendered_a,
+            if_match=None,
+            channel=AuditChannel.API,
+            if_none_match="*",
+        )
+    assert existing.value.current_etag == first.draft.etag
+
+    noop = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition={"labels": ["yes", "no"], "task_id": "shared-key"},
+        rendered_task=rendered_a,
+        if_match="*",
+        channel=AuditChannel.API,
+    )
+    assert noop.changed is False
+    assert noop.draft == first.draft
+
+    second = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition={"task_id": "shared-key", "labels": ["yes", "no", "review"]},
+        rendered_task="task_id: shared-key\nlabels:\n  - yes\n  - no\n  - review\n",
+        if_match=first.draft.etag,
+        channel=AuditChannel.API,
+    )
+    third = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition=definition_a,
+        rendered_task=rendered_a,
+        if_match=second.draft.etag,
+        channel=AuditChannel.API,
+    )
+    assert third.draft.version == 3
+    assert third.draft.fingerprint == first.draft.fingerprint
+    assert third.draft.etag != first.draft.etag
+
+    with pytest.raises(TaskDraftConflict) as stale:
+        service.save_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition=definition_a,
+            rendered_task=rendered_a,
+            if_match=first.draft.etag,
+            channel=AuditChannel.API,
+        )
+    assert stale.value.current_etag == third.draft.etag
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(TaskDraft)) == 1
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.event_type.in_(["task.draft_created", "task.draft_updated"]),
+            )
+        ) == 3
+
+
+def test_task_writes_resolve_actor_and_caller_principals(seeded_service, engine):
+    service = seeded_service["service"]
+    saved = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition={"task_id": "shared-key"},
+        rendered_task="task_id: shared-key\n",
+        if_match=None,
+        channel=AuditChannel.MCP,
+        if_none_match="*",
+    )
+    assert saved.changed is True
+    with Session(engine) as session:
+        event_row = session.scalar(
+            select(AuditEvent).where(AuditEvent.event_type == "task.draft_created"),
+        )
+        actor = session.get(Principal, event_row.actor_principal_id)
+        caller = session.get(Principal, event_row.caller_principal_id)
+        assert (actor.issuer, actor.subject) == (
+            seeded_service["experimenter"].issuer,
+            seeded_service["experimenter"].subject,
+        )
+        assert (caller.issuer, caller.subject) == (
+            seeded_service["mcp"].issuer,
+            seeded_service["mcp"].subject,
+        )
+        assert event_row.channel == AuditChannel.MCP
+
+    with pytest.raises(AuthorizationDenied):
+        service.save_task_draft(
+            actor_identity=ExternalIdentity("untrusted", "principal-id-string"),
+            caller_identity=seeded_service["mcp"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition={"task_id": "shared-key", "version": 2},
+            rendered_task="task_id: shared-key\nversion: 2\n",
+            if_match=saved.draft.etag,
+            channel=AuditChannel.MCP,
+        )
+    with pytest.raises(AuthorizationDenied):
+        service.save_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["viewer"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            definition={"task_id": "shared-key", "version": 2},
+            rendered_task="task_id: shared-key\nversion: 2\n",
+            if_match=saved.draft.etag,
+            channel=AuditChannel.MCP,
+        )
+
+
+def test_task_draft_and_publish_enforce_acl_and_preconditions(seeded_service):
+    service = seeded_service["service"]
+    draft = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition={"task_id": "shared-key"},
+        rendered_task="task_id: shared-key\n",
+        if_match=None,
+        channel=AuditChannel.API,
+        if_none_match="*",
+    ).draft
+
+    with pytest.raises(AuthorizationDenied):
+        service.get_task_draft(
+            identity=seeded_service["viewer"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+        )
+    with pytest.raises(AuthorizationDenied):
+        service.publish_task_draft(
+            actor_identity=seeded_service["viewer"],
+            caller_identity=seeded_service["viewer"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            if_match=draft.etag,
+            reason="Unauthorized release",
+            idempotency_key="viewer-publish",
+            channel=AuditChannel.API,
+        )
+    with pytest.raises(TaskPreconditionRequired):
+        service.publish_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            if_match=None,
+            reason="Missing precondition",
+            idempotency_key="missing-precondition",
+            channel=AuditChannel.API,
+        )
+    with pytest.raises(ValueError, match="reason"):
+        service.publish_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            if_match=draft.etag,
+            reason="   ",
+            idempotency_key="missing-reason",
+            channel=AuditChannel.API,
+        )
+
+
+def test_task_publish_is_atomic_immutable_and_replays_original_snapshot(seeded_service, engine):
+    service = seeded_service["service"]
+    first_draft = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition={"task_id": "shared-key", "labels": ["yes", "no"]},
+        rendered_task="task_id: shared-key\nlabels:\n  - yes\n  - no\n",
+        if_match=None,
+        channel=AuditChannel.MCP,
+        if_none_match="*",
+    ).draft
+    published = service.publish_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        if_match=first_draft.etag,
+        reason="Initial controlled release",
+        idempotency_key="publish-shared-key-v1",
+        channel=AuditChannel.MCP,
+        request_id="request-1",
+    )
+    assert published.response_status == 202
+    assert published.replayed is False
+    assert published.draft_version == 1
+    assert published.draft_fingerprint == first_draft.fingerprint
+    assert published.materialization_state == TaskMaterializationState.PENDING
+
+    revision = service.get_task_revision(
+        identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        revision_id=published.revision_id,
+    )
+    assert revision is not None
+    assert revision.definition == first_draft.definition
+    assert revision.rendered_task == first_draft.rendered_task
+    assert revision.reason == "Initial controlled release"
+    assert revision.channel == AuditChannel.MCP
+    assert revision.previous_revision_id is None
+    assert revision.content_hash == first_draft.fingerprint
+
+    with Session(engine) as session:
+        task = session.get(Task, published.task_id)
+        persisted_revision = session.get(TaskRevision, published.revision_id)
+        materialization = session.get(TaskRevisionMaterialization, published.materialization_id)
+        claim = session.get(IdempotencyRecord, persisted_revision.idempotency_record_id)
+        actor = session.get(Principal, persisted_revision.actor_principal_id)
+        caller = session.get(Principal, persisted_revision.caller_principal_id)
+        assert task.current_revision_id is None
+        assert materialization.state == TaskMaterializationState.PENDING
+        assert materialization.claimed_at is None
+        assert materialization.lease_expires_at is None
+        assert claim.idempotency_key_hash == hashlib.sha256(b"publish-shared-key-v1").hexdigest()
+        assert "publish-shared-key-v1" not in str(claim.response_body)
+        assert actor.subject == seeded_service["experimenter"].subject
+        assert caller.subject == seeded_service["mcp"].subject
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.event_type == "task.revision_published",
+            )
+        ) == 1
+
+    second_draft = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition={"task_id": "shared-key", "labels": ["yes", "no", "review"]},
+        rendered_task="task_id: shared-key\nlabels:\n  - yes\n  - no\n  - review\n",
+        if_match=first_draft.etag,
+        channel=AuditChannel.API,
+    ).draft
+    assert second_draft.version == 2
+
+    with pytest.raises(TaskDraftConflict):
+        service.publish_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["mcp"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            if_match=first_draft.etag,
+            reason="Stale draft release",
+            idempotency_key="stale-publish-attempt",
+            channel=AuditChannel.MCP,
+        )
+    with Session(engine) as session:
+        assert session.scalar(
+            select(func.count()).select_from(IdempotencyRecord).where(
+                IdempotencyRecord.idempotency_key_hash
+                == hashlib.sha256(b"stale-publish-attempt").hexdigest(),
+            )
+        ) == 0
+
+    replay = service.publish_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        if_match=first_draft.etag,
+        reason="Initial controlled release",
+        idempotency_key="publish-shared-key-v1",
+        channel=AuditChannel.MCP,
+        request_id="request-2",
+    )
+    assert replay.replayed is True
+    assert replay.revision_id == published.revision_id
+    assert replay.materialization_id == published.materialization_id
+    assert replay.draft_version == published.draft_version
+    assert replay.draft_fingerprint == published.draft_fingerprint
+
+    with pytest.raises(IdempotencyConflict):
+        service.publish_task_draft(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["mcp"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            if_match=first_draft.etag,
+            reason="Different reason",
+            idempotency_key="publish-shared-key-v1",
+            channel=AuditChannel.MCP,
+        )
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(TaskRevision)) == 1
+        assert session.scalar(select(func.count()).select_from(TaskRevisionMaterialization)) == 1
+
+    with Session(engine) as session, session.begin():
+        task = session.get(Task, published.task_id)
+        task.current_revision_id = published.revision_id
+    second_publish = service.publish_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        if_match=second_draft.etag,
+        reason="Second controlled release",
+        idempotency_key="publish-shared-key-v2",
+        channel=AuditChannel.API,
+    )
+    assert second_publish.previous_revision_id == published.revision_id
+    with Session(engine) as session:
+        task = session.get(Task, published.task_id)
+        assert task.current_revision_id == published.revision_id
+        assert task.current_revision_id != second_publish.revision_id
+        assert session.scalar(select(func.count()).select_from(TaskRevision)) == 2
+        assert session.scalar(select(func.count()).select_from(TaskRevisionMaterialization)) == 2
+
+    with pytest.raises(DBAPIError):
+        with Session(engine) as session, session.begin():
+            session.execute(
+                update(TaskRevision)
+                .where(TaskRevision.id == published.revision_id)
+                .values(reason="overwritten"),
+            )
+    with pytest.raises(DBAPIError):
+        with Session(engine) as session, session.begin():
+            session.execute(delete(TaskRevision).where(TaskRevision.id == published.revision_id))
 
 
 def test_audit_events_are_append_only_in_orm(engine):

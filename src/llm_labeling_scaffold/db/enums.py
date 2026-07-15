@@ -21,6 +21,13 @@ class IdempotencyState(str, Enum):
     FAILED = "failed"
 
 
+class TaskMaterializationState(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class AuditActorType(str, Enum):
     PRINCIPAL = "principal"
     SYSTEM = "system"

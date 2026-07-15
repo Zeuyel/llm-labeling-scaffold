@@ -1,4 +1,4 @@
-from .enums import AuditChannel, PrincipalType, Role
+from .enums import AuditChannel, PrincipalType, Role, TaskMaterializationState
 from .rbac import Permission, role_allows
 from .service import (
     AuditEventRef,
@@ -16,9 +16,19 @@ from .service import (
     PrincipalRef,
     TaskAccess,
     TaskAccessPage,
+    TaskDraftConflict,
+    TaskDraftNotFound,
+    TaskDraftRef,
+    TaskDraftSaveResult,
+    TaskPreconditionRequired,
+    TaskPublishInProgress,
+    TaskPublishResult,
     TaskRef,
+    TaskRevisionRef,
     WorkspaceAccess,
     WorkspaceRef,
+    task_definition_fingerprint,
+    task_draft_etag,
 )
 
 __all__ = [
@@ -41,8 +51,19 @@ __all__ = [
     "Role",
     "TaskAccess",
     "TaskAccessPage",
+    "TaskDraftConflict",
+    "TaskDraftNotFound",
+    "TaskDraftRef",
+    "TaskDraftSaveResult",
+    "TaskMaterializationState",
+    "TaskPreconditionRequired",
+    "TaskPublishInProgress",
+    "TaskPublishResult",
     "TaskRef",
+    "TaskRevisionRef",
     "WorkspaceAccess",
     "WorkspaceRef",
     "role_allows",
+    "task_definition_fingerprint",
+    "task_draft_etag",
 ]

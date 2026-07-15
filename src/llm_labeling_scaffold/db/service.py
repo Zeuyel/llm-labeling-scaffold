@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import Engine, and_, or_, select
+from sqlalchemy import Engine, and_, func, or_, select
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -18,8 +18,18 @@ from sqlalchemy.orm import Session
 
 from .audit import append_audit_event
 from .database import create_database_engine, create_session_factory
-from .enums import AuditChannel, IdempotencyState, PrincipalType, Role
-from .models import AuditEvent, IdempotencyRecord, Principal, RoleBinding, Task, Workspace
+from .enums import AuditChannel, IdempotencyState, PrincipalType, Role, TaskMaterializationState
+from .models import (
+    AuditEvent,
+    IdempotencyRecord,
+    Principal,
+    RoleBinding,
+    Task,
+    TaskDraft,
+    TaskRevision,
+    TaskRevisionMaterialization,
+    Workspace,
+)
 from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS, Permission, role_allows
 
 
@@ -144,6 +154,59 @@ class IdempotencyClaim:
     response_body: dict[str, Any] | None
 
 
+@dataclass(frozen=True)
+class TaskDraftRef:
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    task_id: uuid.UUID
+    version: int
+    fingerprint: str
+    etag: str
+    definition: dict[str, Any]
+    rendered_task: str
+
+
+@dataclass(frozen=True)
+class TaskDraftSaveResult:
+    draft: TaskDraftRef
+    changed: bool
+
+
+@dataclass(frozen=True)
+class TaskRevisionRef:
+    id: uuid.UUID
+    workspace_id: uuid.UUID
+    task_id: uuid.UUID
+    revision_number: int
+    draft_version: int
+    draft_fingerprint: str
+    definition: dict[str, Any]
+    rendered_task: str
+    reason: str
+    actor_principal_id: uuid.UUID
+    caller_principal_id: uuid.UUID
+    channel: AuditChannel
+    previous_revision_id: uuid.UUID | None
+    content_hash: str
+    idempotency_record_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class TaskPublishResult:
+    workspace_id: uuid.UUID
+    task_id: uuid.UUID
+    revision_id: uuid.UUID
+    revision_number: int
+    previous_revision_id: uuid.UUID | None
+    draft_version: int
+    draft_fingerprint: str
+    content_hash: str
+    materialization_id: uuid.UUID
+    materialization_state: TaskMaterializationState
+    response_status: int
+    replayed: bool
+
+
 class AuthorizationUnavailable(RuntimeError):
     pass
 
@@ -160,6 +223,35 @@ class IdentityTypeConflict(RuntimeError):
 
 class IdempotencyConflict(RuntimeError):
     code = "idempotency_conflict"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
+class TaskPreconditionRequired(RuntimeError):
+    code = "task_precondition_required"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
+class TaskDraftConflict(RuntimeError):
+    code = "task_draft_conflict"
+
+    def __init__(self, current_etag: str | None):
+        self.current_etag = current_etag
+        super().__init__(self.code)
+
+
+class TaskDraftNotFound(RuntimeError):
+    code = "task_draft_not_found"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
+class TaskPublishInProgress(RuntimeError):
+    code = "task_publish_in_progress"
 
     def __init__(self):
         super().__init__(self.code)
@@ -330,6 +422,90 @@ class DatabaseService:
                 task_key=task_key,
                 request_id=request_id,
                 details=details,
+            )
+
+    def get_task_draft(
+        self,
+        *,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+    ) -> TaskDraftRef | None:
+        with self.transaction() as transaction:
+            return transaction.get_task_draft(
+                identity=identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+            )
+
+    def save_task_draft(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        definition: dict[str, Any],
+        rendered_task: str,
+        if_match: str | None,
+        channel: AuditChannel,
+        if_none_match: str | None = None,
+        request_id: str | None = None,
+    ) -> TaskDraftSaveResult:
+        with self.transaction() as transaction:
+            return transaction.save_task_draft(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+                definition=definition,
+                rendered_task=rendered_task,
+                if_match=if_match,
+                channel=channel,
+                if_none_match=if_none_match,
+                request_id=request_id,
+            )
+
+    def get_task_revision(
+        self,
+        *,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        revision_id: uuid.UUID,
+    ) -> TaskRevisionRef | None:
+        with self.transaction() as transaction:
+            return transaction.get_task_revision(
+                identity=identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+                revision_id=revision_id,
+            )
+
+    def publish_task_draft(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        if_match: str | None,
+        reason: str,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> TaskPublishResult:
+        with self.transaction() as transaction:
+            return transaction.publish_task_draft(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+                if_match=if_match,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=request_id,
             )
 
 
@@ -573,6 +749,252 @@ class DatabaseTransaction:
         if not decision.allowed:
             raise AuthorizationDenied(decision)
 
+    def get_task_draft(
+        self,
+        *,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+    ) -> TaskDraftRef | None:
+        decision = self.authorize_task(identity, workspace_slug, task_key, Permission.TASK_EDIT)
+        self.require(decision)
+        draft = self._session.scalar(
+            select(TaskDraft).where(
+                TaskDraft.workspace_id == decision.workspace.id,
+                TaskDraft.task_id == decision.task.id,
+            ),
+        )
+        return _task_draft_ref(draft) if draft is not None else None
+
+    def save_task_draft(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        definition: dict[str, Any],
+        rendered_task: str,
+        if_match: str | None,
+        channel: AuditChannel,
+        if_none_match: str | None = None,
+        request_id: str | None = None,
+    ) -> TaskDraftSaveResult:
+        if if_match is None and if_none_match is None:
+            raise TaskPreconditionRequired()
+        if if_match is not None and if_none_match is not None:
+            raise ValueError("if_match and if_none_match are mutually exclusive")
+        if if_none_match is not None and if_none_match != "*":
+            raise ValueError("if_none_match must be '*'")
+        fingerprint = task_definition_fingerprint(definition, rendered_task)
+        _require_task_write_channel(channel)
+
+        decision = self.authorize_task(actor_identity, workspace_slug, task_key, Permission.TASK_EDIT)
+        self.require(decision)
+        caller = self._require_caller(caller_identity, decision.principal.id, Permission.TASK_EDIT)
+        task = self._lock_task(decision.task.id)
+        draft = self._session.scalar(
+            select(TaskDraft)
+            .where(
+                TaskDraft.workspace_id == task.workspace_id,
+                TaskDraft.task_id == task.id,
+            )
+            .with_for_update(),
+        )
+        if if_none_match == "*":
+            if draft is not None:
+                raise TaskDraftConflict(current_etag=task_draft_etag(draft.version, draft.fingerprint))
+        else:
+            assert if_match is not None
+            _require_draft_match(draft, if_match)
+
+        if draft is not None and draft.fingerprint == fingerprint:
+            return TaskDraftSaveResult(draft=_task_draft_ref(draft), changed=False)
+
+        event_type = "task.draft_created"
+        if draft is None:
+            draft = TaskDraft(
+                workspace_id=task.workspace_id,
+                task_id=task.id,
+                version=1,
+                fingerprint=fingerprint,
+                definition=definition,
+                rendered_task=rendered_task,
+            )
+            self._session.add(draft)
+        else:
+            event_type = "task.draft_updated"
+            draft.version += 1
+            draft.fingerprint = fingerprint
+            draft.definition = definition
+            draft.rendered_task = rendered_task
+        self._session.flush()
+
+        actor = self._session.get(Principal, decision.principal.id)
+        if actor is None:
+            raise AuthorizationUnavailable("draft actor disappeared during transaction")
+        append_audit_event(
+            self._session,
+            workspace_id=task.workspace_id,
+            event_type=event_type,
+            actor=actor,
+            caller=caller,
+            channel=channel,
+            resource_type="task",
+            resource_id=task.id,
+            request_id=request_id,
+            details={
+                "task_key": task.task_key,
+                "draft_version": draft.version,
+                "draft_fingerprint": draft.fingerprint,
+            },
+        )
+        self._session.flush()
+        return TaskDraftSaveResult(draft=_task_draft_ref(draft), changed=True)
+
+    def get_task_revision(
+        self,
+        *,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        revision_id: uuid.UUID,
+    ) -> TaskRevisionRef | None:
+        decision = self.authorize_task(identity, workspace_slug, task_key, Permission.TASK_EDIT)
+        self.require(decision)
+        revision = self._session.scalar(
+            select(TaskRevision).where(
+                TaskRevision.workspace_id == decision.workspace.id,
+                TaskRevision.task_id == decision.task.id,
+                TaskRevision.id == revision_id,
+            ),
+        )
+        return _task_revision_ref(revision) if revision is not None else None
+
+    def publish_task_draft(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        if_match: str | None,
+        reason: str,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> TaskPublishResult:
+        if if_match is None:
+            raise TaskPreconditionRequired()
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise ValueError("reason must not be blank")
+        if not idempotency_key.strip():
+            raise ValueError("idempotency_key must not be blank")
+        _require_task_write_channel(channel)
+
+        claim = self.claim_idempotency(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            required_permission=Permission.TASK_PUBLISH,
+            operation="task.publish",
+            idempotency_key=idempotency_key,
+            request_payload={
+                "workspace": workspace_slug,
+                "task": task_key,
+                "draft_etag": if_match,
+                "reason": normalized_reason,
+                "channel": channel.value,
+            },
+            task_key=task_key,
+        )
+        if claim.status == IdempotencyClaimStatus.REPLAY:
+            if claim.state != IdempotencyState.SUCCEEDED:
+                raise IdempotencyConflict()
+            return _task_publish_result_from_claim(claim, replayed=True)
+        if claim.status == IdempotencyClaimStatus.PENDING:
+            raise TaskPublishInProgress()
+
+        task = self._lock_task_by_id(claim.workspace_id, task_key)
+        draft = self._session.scalar(
+            select(TaskDraft)
+            .where(
+                TaskDraft.workspace_id == task.workspace_id,
+                TaskDraft.task_id == task.id,
+            )
+            .with_for_update(),
+        )
+        if draft is None:
+            raise TaskDraftNotFound()
+        _require_draft_match(draft, if_match)
+
+        revision_number = self._session.scalar(
+            select(func.coalesce(func.max(TaskRevision.revision_number), 0)).where(
+                TaskRevision.task_id == task.id,
+            ),
+        ) + 1
+        revision = TaskRevision(
+            workspace_id=task.workspace_id,
+            task_id=task.id,
+            revision_number=revision_number,
+            draft_version=draft.version,
+            draft_fingerprint=draft.fingerprint,
+            definition=draft.definition,
+            rendered_task=draft.rendered_task,
+            reason=normalized_reason,
+            actor_principal_id=claim.actor_principal_id,
+            caller_principal_id=claim.caller_principal_id,
+            channel=channel,
+            previous_revision_id=task.current_revision_id,
+            content_hash=task_definition_fingerprint(draft.definition, draft.rendered_task),
+            idempotency_record_id=claim.record_id,
+        )
+        self._session.add(revision)
+        self._session.flush()
+        materialization = TaskRevisionMaterialization(
+            workspace_id=task.workspace_id,
+            task_id=task.id,
+            revision_id=revision.id,
+        )
+        self._session.add(materialization)
+        self._session.flush()
+
+        actor = self._session.get(Principal, claim.actor_principal_id)
+        caller = self._session.get(Principal, claim.caller_principal_id)
+        if actor is None or caller is None:
+            raise AuthorizationUnavailable("publish principals disappeared during transaction")
+        append_audit_event(
+            self._session,
+            workspace_id=task.workspace_id,
+            event_type="task.revision_published",
+            actor=actor,
+            caller=caller,
+            channel=channel,
+            resource_type="task_revision",
+            resource_id=revision.id,
+            request_id=request_id,
+            details={
+                "task_id": str(task.id),
+                "task_key": task.task_key,
+                "revision_number": revision.revision_number,
+                "draft_version": revision.draft_version,
+                "draft_fingerprint": revision.draft_fingerprint,
+                "content_hash": revision.content_hash,
+                "previous_revision_id": (
+                    str(revision.previous_revision_id) if revision.previous_revision_id is not None else None
+                ),
+                "materialization_id": str(materialization.id),
+            },
+        )
+        response_body = _task_publish_response(revision, materialization)
+        completed = self.complete_idempotency(
+            claim,
+            response_status=202,
+            response_body=response_body,
+        )
+        return _task_publish_result_from_claim(completed, replayed=False)
+
     def claim_idempotency(
         self,
         *,
@@ -730,6 +1152,24 @@ class DatabaseTransaction:
             ),
         )
 
+    def _lock_task(self, task_id: uuid.UUID) -> Task:
+        task = self._session.scalar(
+            select(Task).where(Task.id == task_id).with_for_update(),
+        )
+        if task is None:
+            raise AuthorizationUnavailable("authorized task disappeared during transaction")
+        return task
+
+    def _lock_task_by_id(self, workspace_id: uuid.UUID, task_key: str) -> Task:
+        task = self._session.scalar(
+            select(Task)
+            .where(Task.workspace_id == workspace_id, Task.task_key == task_key)
+            .with_for_update(),
+        )
+        if task is None:
+            raise AuthorizationUnavailable("authorized task disappeared during publish")
+        return task
+
     def _require_caller(
         self,
         identity: ExternalIdentity,
@@ -879,6 +1319,123 @@ def _audit_event_ref(event: AuditEvent) -> AuditEventRef:
         channel=event.channel,
         event_type=event.event_type,
     )
+
+
+def task_definition_fingerprint(definition: dict[str, Any], rendered_task: str) -> str:
+    if not isinstance(definition, dict):
+        raise ValueError("definition must be a JSON object")
+    if not isinstance(rendered_task, str) or not rendered_task.strip():
+        raise ValueError("rendered_task must not be blank")
+    return canonical_request_fingerprint(
+        {
+            "definition": definition,
+            "rendered_task": rendered_task,
+        }
+    )
+
+
+def task_draft_etag(version: int, fingerprint: str) -> str:
+    if version < 1 or len(fingerprint) != 64:
+        raise ValueError("invalid task draft version or fingerprint")
+    return f'"task-draft-v{version}-{fingerprint}"'
+
+
+def _require_draft_match(draft: TaskDraft | None, if_match: str) -> None:
+    if draft is None:
+        raise TaskDraftConflict(current_etag=None)
+    current_etag = task_draft_etag(draft.version, draft.fingerprint)
+    if if_match not in {"*", current_etag}:
+        raise TaskDraftConflict(current_etag=current_etag)
+
+
+def _require_task_write_channel(channel: AuditChannel) -> None:
+    if channel == AuditChannel.SYSTEM:
+        raise ValueError("system channel cannot be used for task writes")
+
+
+def _task_draft_ref(draft: TaskDraft) -> TaskDraftRef:
+    return TaskDraftRef(
+        id=draft.id,
+        workspace_id=draft.workspace_id,
+        task_id=draft.task_id,
+        version=draft.version,
+        fingerprint=draft.fingerprint,
+        etag=task_draft_etag(draft.version, draft.fingerprint),
+        definition=draft.definition,
+        rendered_task=draft.rendered_task,
+    )
+
+
+def _task_revision_ref(revision: TaskRevision) -> TaskRevisionRef:
+    return TaskRevisionRef(
+        id=revision.id,
+        workspace_id=revision.workspace_id,
+        task_id=revision.task_id,
+        revision_number=revision.revision_number,
+        draft_version=revision.draft_version,
+        draft_fingerprint=revision.draft_fingerprint,
+        definition=revision.definition,
+        rendered_task=revision.rendered_task,
+        reason=revision.reason,
+        actor_principal_id=revision.actor_principal_id,
+        caller_principal_id=revision.caller_principal_id,
+        channel=revision.channel,
+        previous_revision_id=revision.previous_revision_id,
+        content_hash=revision.content_hash,
+        idempotency_record_id=revision.idempotency_record_id,
+    )
+
+
+def _task_publish_response(
+    revision: TaskRevision,
+    materialization: TaskRevisionMaterialization,
+) -> dict[str, Any]:
+    return {
+        "kind": "task_publish_v1",
+        "workspace_id": str(revision.workspace_id),
+        "task_id": str(revision.task_id),
+        "revision_id": str(revision.id),
+        "revision_number": revision.revision_number,
+        "previous_revision_id": (
+            str(revision.previous_revision_id) if revision.previous_revision_id is not None else None
+        ),
+        "draft_version": revision.draft_version,
+        "draft_fingerprint": revision.draft_fingerprint,
+        "content_hash": revision.content_hash,
+        "materialization_id": str(materialization.id),
+        "materialization_state": materialization.state.value,
+    }
+
+
+def _task_publish_result_from_claim(
+    claim: IdempotencyClaim,
+    *,
+    replayed: bool,
+) -> TaskPublishResult:
+    body = claim.response_body
+    if claim.response_status != 202 or body is None or body.get("kind") != "task_publish_v1":
+        raise AuthorizationUnavailable("task publish idempotency response is invalid")
+    try:
+        return TaskPublishResult(
+            workspace_id=uuid.UUID(body["workspace_id"]),
+            task_id=uuid.UUID(body["task_id"]),
+            revision_id=uuid.UUID(body["revision_id"]),
+            revision_number=int(body["revision_number"]),
+            previous_revision_id=(
+                uuid.UUID(body["previous_revision_id"])
+                if body.get("previous_revision_id") is not None
+                else None
+            ),
+            draft_version=int(body["draft_version"]),
+            draft_fingerprint=body["draft_fingerprint"],
+            content_hash=body["content_hash"],
+            materialization_id=uuid.UUID(body["materialization_id"]),
+            materialization_state=TaskMaterializationState(body["materialization_state"]),
+            response_status=claim.response_status,
+            replayed=replayed,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuthorizationUnavailable("task publish idempotency response is invalid") from exc
 
 
 def canonical_request_fingerprint(request_payload: Any) -> str:
