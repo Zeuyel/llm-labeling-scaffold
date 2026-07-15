@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
+from llm_labeling_scaffold import allocation as allocation_module
 from llm_labeling_scaffold.allocation import (
     AllocationRequest,
     AllocationStrategy,
@@ -491,3 +492,58 @@ def test_unknown_algorithm_version_fails_fast():
     assert [item.code for item in report.blocking_errors] == ["unsupported_algorithm_version"]
     with pytest.raises(AllocationValidationError):
         plan_allocation(unsupported)
+
+
+def test_large_plan_uses_linearithmic_seed_rank_budget_and_is_order_independent(monkeypatch):
+    records = _records(2_000, "performance")
+    capacities = (220, 240, 260, 280, 300, 320, 340, 360, 380, 400)
+    annotators = tuple(
+        AnnotatorSpec(f"annotator-{index}", "cohort-performance", capacity)
+        for index, capacity in enumerate(capacities)
+    )
+    request = _request(
+        strategy=AllocationStrategy.FIXED_PARTITION,
+        records=records,
+        annotators=annotators,
+        seed=67,
+        overlap_rules=(
+            OverlapRule(
+                record_ids=tuple(item.record_id for item in records[:200]),
+                required_submissions=2,
+            ),
+            OverlapRule(
+                record_ids=tuple(item.record_id for item in records[200:400]),
+                required_submissions=3,
+            ),
+        ),
+    )
+    original_seed_rank = allocation_module._seed_rank
+    calls = 0
+
+    def seed_rank_spy(seed, algorithm_version, namespace, *parts):
+        nonlocal calls
+        calls += 1
+        return original_seed_rank(seed, algorithm_version, namespace, *parts)
+
+    monkeypatch.setattr(allocation_module, "_seed_rank", seed_rank_spy)
+
+    plan = plan_allocation(request)
+    plan_seed_calls = calls
+    calls = 0
+    preview = preview_allocation(request)
+    preview_seed_calls = calls
+    calls = 0
+    reversed_plan = plan_allocation(
+        replace(
+            request,
+            records=tuple(reversed(records)),
+            annotators=tuple(reversed(annotators)),
+        )
+    )
+
+    assert plan == reversed_plan
+    assert plan.fingerprint == canonical_hash(plan.fingerprint_payload())
+    assert preview.plan_fingerprint == plan.fingerprint
+    assert len(plan.assignments) == 2_600
+    assert plan_seed_calls < 4_000
+    assert preview_seed_calls < 4_000

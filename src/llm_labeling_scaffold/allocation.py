@@ -1,14 +1,14 @@
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import math
 import re
 import unicodedata
-from collections import deque
+from bisect import bisect_right
 from dataclasses import dataclass, fields, is_dataclass, replace
 from enum import Enum
-from fractions import Fraction
 from itertools import combinations
 from typing import Any, Mapping, Sequence
 
@@ -387,20 +387,13 @@ class _DatasetSpec:
     pool_id: str | None
 
 
-@dataclass(slots=True)
-class _FlowEdge:
-    to: int
-    reverse_index: int
-    capacity: int
-    initial_capacity: int
-
-
 @dataclass(frozen=True, slots=True)
-class _ProductionWitness:
+class _ProductionAllocation:
     targets: tuple[tuple[str, tuple[str, ...]], ...]
     loads: tuple[tuple[str, int], ...]
     assigned_rows: int
     required_rows: int
+    heap_operations: int
 
 
 def canonical_data(value: Any) -> Any:
@@ -485,7 +478,8 @@ def preview_allocation(request: AllocationRequest) -> AllocationPreview:
             blocking_errors=blocking_errors,
             warnings=(),
         )
-    return plan_allocation(resolved.request).to_preview()
+    warnings = _resolved_warnings(resolved)
+    return _plan_resolved(resolved, warnings).to_preview()
 
 
 def plan_allocation(request: AllocationRequest) -> AllocationPlan:
@@ -494,6 +488,14 @@ def plan_allocation(request: AllocationRequest) -> AllocationPlan:
         raise AllocationValidationError(
             ValidationReport(blocking_errors=blocking_errors, warnings=())
         )
+    warnings = _resolved_warnings(resolved)
+    return _plan_resolved(resolved, warnings)
+
+
+def _plan_resolved(
+    resolved: _ResolvedRequest,
+    warnings: tuple[ValidationIssue, ...],
+) -> AllocationPlan:
 
     normalized = resolved.request
     records_by_id = {item.record_id: item for item in normalized.records}
@@ -641,19 +643,21 @@ def plan_allocation(request: AllocationRequest) -> AllocationPlan:
         for record_id in resolved.production_record_ids:
             record = records_by_id[record_id]
             target_ids = production_targets[record_id]
-            primary_id = min(
-                target_ids,
-                key=lambda annotator_id: (
-                    _seed_rank(
-                        normalized.seed,
-                        normalized.algorithm_version,
-                        "primary",
-                        record_id,
+            primary_id = target_ids[0]
+            if len(target_ids) > 1:
+                primary_id = min(
+                    target_ids,
+                    key=lambda annotator_id: (
+                        _seed_rank(
+                            normalized.seed,
+                            normalized.algorithm_version,
+                            "primary",
+                            record_id,
+                            annotator_id,
+                        ),
                         annotator_id,
                     ),
-                    annotator_id,
-                ),
-            )
+                )
             for annotator_id in target_ids:
                 workspace_group_id = personal_workspaces[annotator_id]
                 dataset_group_id = _stable_id(
@@ -716,7 +720,7 @@ def plan_allocation(request: AllocationRequest) -> AllocationPlan:
         overlap_matrix=overlap_matrix,
         gates=tuple(gates),
         blocking_errors=(),
-        warnings=_resolved_warnings(resolved),
+        warnings=warnings,
     )
     fingerprint = canonical_hash(plan.fingerprint_payload())
     bound_gates = tuple(replace(item, plan_fingerprint=fingerprint) for item in plan.gates)
@@ -879,30 +883,183 @@ def _allocate_production_targets(
     resolved: _ResolvedRequest,
     initial_loads: Mapping[str, int],
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, int]]:
-    witness = _production_witness(resolved, initial_loads)
+    allocation = _production_allocation(
+        resolved,
+        initial_loads,
+        allow_partial=resolved.request.strategy == AllocationStrategy.SHARED_QUEUE,
+    )
     if (
         resolved.request.strategy != AllocationStrategy.SHARED_QUEUE
-        and witness.assigned_rows != witness.required_rows
+        and allocation.assigned_rows != allocation.required_rows
     ):
         raise RuntimeError("validated production capacity could not realize the assignment matrix")
-    return dict(witness.targets), dict(witness.loads)
+    return dict(allocation.targets), dict(allocation.loads)
 
 
-def _production_witness(
-    resolved: _ResolvedRequest,
-    initial_loads: Mapping[str, int],
-) -> _ProductionWitness:
-    request = resolved.request
+def _production_demands(resolved: _ResolvedRequest) -> dict[str, int]:
     requirements = dict(resolved.overlap_requirements)
-    demands = {
+    return {
         record_id: requirements.get(record_id, 1)
         for record_id in resolved.production_record_ids
     }
+
+
+def _remaining_capacities(
+    resolved: _ResolvedRequest,
+    initial_loads: Mapping[str, int],
+) -> dict[str, int]:
+    return {
+        item.annotator_id: max(
+            0,
+            item.capacity - int(initial_loads.get(item.annotator_id, 0)),
+        )
+        for item in resolved.request.annotators
+    }
+
+
+def _degree_sequence_feasible(
+    demands: Sequence[int],
+    capacities: Sequence[int],
+) -> bool:
+    ordered_demands = sorted(demands, reverse=True)
+    ordered_capacities = sorted(max(0, capacity) for capacity in capacities)
+    if sum(ordered_demands) > sum(ordered_capacities):
+        return False
+    capacity_prefix = [0]
+    for capacity in ordered_capacities:
+        capacity_prefix.append(capacity_prefix[-1] + capacity)
+    demand_prefix = 0
+    for record_count, demand in enumerate(ordered_demands, start=1):
+        demand_prefix += demand
+        split = bisect_right(ordered_capacities, record_count)
+        available = capacity_prefix[split] + (
+            len(ordered_capacities) - split
+        ) * record_count
+        if demand_prefix > available:
+            return False
+    return True
+
+
+def _production_allocation(
+    resolved: _ResolvedRequest,
+    initial_loads: Mapping[str, int],
+    *,
+    allow_partial: bool,
+) -> _ProductionAllocation:
+    request = resolved.request
+    demands = _production_demands(resolved)
     capacities = {item.annotator_id: item.capacity for item in request.annotators}
     starting_loads = {
         item.annotator_id: int(initial_loads.get(item.annotator_id, 0))
         for item in request.annotators
     }
+    record_count = len(demands)
+    remaining_capacities = {
+        annotator_id: min(capacity, record_count)
+        for annotator_id, capacity in _remaining_capacities(
+            resolved,
+            starting_loads,
+        ).items()
+    }
+    required_rows = sum(demands.values())
+    quota_rows = min(required_rows, sum(remaining_capacities.values()))
+    if not allow_partial:
+        quota_rows = required_rows
+    quotas, quota_operations = _balanced_annotator_quotas(
+        request,
+        starting_loads=starting_loads,
+        remaining_capacities=remaining_capacities,
+        rows=quota_rows,
+    )
+    targets: dict[str, tuple[str, ...]] = {}
+    realization_operations = 0
+    if not allow_partial:
+        targets, realization_operations = _realize_assignment_degrees(
+            request,
+            demands=demands,
+            quotas=quotas,
+        )
+    loads = {
+        annotator_id: starting_loads[annotator_id] + quotas[annotator_id]
+        for annotator_id in capacities
+    }
+    return _ProductionAllocation(
+        targets=tuple(sorted(targets.items())),
+        loads=tuple(sorted(loads.items())),
+        assigned_rows=quota_rows,
+        required_rows=required_rows,
+        heap_operations=quota_operations + realization_operations,
+    )
+
+
+def _balanced_annotator_quotas(
+    request: AllocationRequest,
+    *,
+    starting_loads: Mapping[str, int],
+    remaining_capacities: Mapping[str, int],
+    rows: int,
+) -> tuple[dict[str, int], int]:
+    quotas = {annotator_id: 0 for annotator_id in remaining_capacities}
+    tie_ranks = {
+        annotator_id: _seed_rank(
+            request.seed,
+            request.algorithm_version,
+            "quota-annotator",
+            annotator_id,
+        )
+        for annotator_id in remaining_capacities
+    }
+    heap = [
+        (starting_loads[annotator_id], tie_ranks[annotator_id], annotator_id)
+        for annotator_id, capacity in remaining_capacities.items()
+        if capacity > 0
+    ]
+    heapq.heapify(heap)
+    operations = 0
+    for _ in range(rows):
+        if not heap:
+            raise RuntimeError("validated capacity was exhausted while building quotas")
+        _, _, annotator_id = heapq.heappop(heap)
+        operations += 1
+        quotas[annotator_id] += 1
+        if quotas[annotator_id] < remaining_capacities[annotator_id]:
+            heapq.heappush(
+                heap,
+                (
+                    starting_loads[annotator_id] + quotas[annotator_id],
+                    tie_ranks[annotator_id],
+                    annotator_id,
+                ),
+            )
+            operations += 1
+    return quotas, operations
+
+
+def _realize_assignment_degrees(
+    request: AllocationRequest,
+    *,
+    demands: Mapping[str, int],
+    quotas: Mapping[str, int],
+) -> tuple[dict[str, tuple[str, ...]], int]:
+    if not _degree_sequence_feasible(tuple(demands.values()), tuple(quotas.values())):
+        raise RuntimeError("balanced assignment quotas are not graphically realizable")
+    annotator_ranks = {
+        annotator_id: _seed_rank(
+            request.seed,
+            request.algorithm_version,
+            "assignment-annotator",
+            annotator_id,
+        )
+        for annotator_id in quotas
+    }
+    heap = [
+        (-quota, annotator_ranks[annotator_id], annotator_id)
+        for annotator_id, quota in quotas.items()
+        if quota > 0
+    ]
+    heapq.heapify(heap)
+    targets: dict[str, tuple[str, ...]] = {}
+    operations = 0
     record_ids = sorted(
         demands,
         key=lambda record_id: (
@@ -910,219 +1067,30 @@ def _production_witness(
             _seed_rank(
                 request.seed,
                 request.algorithm_version,
-                "flow-record",
+                "assignment-record",
                 record_id,
             ),
             record_id,
         ),
     )
-    annotator_ids = tuple(item.annotator_id for item in request.annotators)
-    source = 0
-    record_offset = 1
-    annotator_offset = record_offset + len(record_ids)
-    sink = annotator_offset + len(annotator_ids)
-    graph: list[list[_FlowEdge]] = [[] for _ in range(sink + 1)]
-    record_nodes = {record_id: record_offset + index for index, record_id in enumerate(record_ids)}
-    annotator_nodes = {
-        annotator_id: annotator_offset + index
-        for index, annotator_id in enumerate(annotator_ids)
-    }
-    record_edges: dict[str, list[tuple[str, _FlowEdge]]] = {}
-
     for record_id in record_ids:
-        record_node = record_nodes[record_id]
-        _add_flow_edge(graph, source, record_node, demands[record_id])
-        ordered_annotators = sorted(
-            annotator_ids,
-            key=lambda annotator_id: (
-                _seed_rank(
-                    request.seed,
-                    request.algorithm_version,
-                    "flow-edge",
-                    record_id,
-                    annotator_id,
-                ),
-                annotator_id,
-            ),
-        )
-        record_edges[record_id] = []
-        for annotator_id in ordered_annotators:
-            edge = _add_flow_edge(
-                graph,
-                record_node,
-                annotator_nodes[annotator_id],
-                1,
-            )
-            record_edges[record_id].append((annotator_id, edge))
-
-    for annotator_id in annotator_ids:
-        remaining = max(0, capacities[annotator_id] - starting_loads[annotator_id])
-        _add_flow_edge(graph, annotator_nodes[annotator_id], sink, remaining)
-
-    assigned_rows = _dinic_max_flow(graph, source, sink)
-    mutable_targets = {
-        record_id: {
-            annotator_id
-            for annotator_id, edge in edges
-            if edge.initial_capacity - edge.capacity == 1
-        }
-        for record_id, edges in record_edges.items()
-    }
-    mutable_targets = _rebalance_targets(
-        resolved,
-        mutable_targets,
-        starting_loads=starting_loads,
-        capacities=capacities,
-    )
-    production_counts = {annotator_id: 0 for annotator_id in annotator_ids}
-    for target_ids in mutable_targets.values():
-        for annotator_id in target_ids:
-            production_counts[annotator_id] += 1
-    loads = {
-        annotator_id: starting_loads[annotator_id] + production_counts[annotator_id]
-        for annotator_id in annotator_ids
-    }
-    return _ProductionWitness(
-        targets=tuple(
-            sorted(
-                (record_id, tuple(sorted(target_ids)))
-                for record_id, target_ids in mutable_targets.items()
-            )
-        ),
-        loads=tuple(sorted(loads.items())),
-        assigned_rows=assigned_rows,
-        required_rows=sum(demands.values()),
-    )
-
-
-def _add_flow_edge(
-    graph: list[list[_FlowEdge]],
-    source: int,
-    target: int,
-    capacity: int,
-) -> _FlowEdge:
-    forward = _FlowEdge(
-        to=target,
-        reverse_index=len(graph[target]),
-        capacity=capacity,
-        initial_capacity=capacity,
-    )
-    reverse = _FlowEdge(
-        to=source,
-        reverse_index=len(graph[source]),
-        capacity=0,
-        initial_capacity=0,
-    )
-    graph[source].append(forward)
-    graph[target].append(reverse)
-    return forward
-
-
-def _dinic_max_flow(graph: list[list[_FlowEdge]], source: int, sink: int) -> int:
-    total = 0
-    while True:
-        levels = [-1] * len(graph)
-        levels[source] = 0
-        queue = deque([source])
-        while queue:
-            node = queue.popleft()
-            for edge in graph[node]:
-                if edge.capacity > 0 and levels[edge.to] < 0:
-                    levels[edge.to] = levels[node] + 1
-                    queue.append(edge.to)
-        if levels[sink] < 0:
-            return total
-        next_edge = [0] * len(graph)
-        while True:
-            pushed = _dinic_push(graph, levels, next_edge, source, sink, 10**18)
-            if pushed == 0:
-                break
-            total += pushed
-
-
-def _dinic_push(
-    graph: list[list[_FlowEdge]],
-    levels: Sequence[int],
-    next_edge: list[int],
-    node: int,
-    sink: int,
-    available: int,
-) -> int:
-    if node == sink:
-        return available
-    while next_edge[node] < len(graph[node]):
-        edge = graph[node][next_edge[node]]
-        if edge.capacity > 0 and levels[edge.to] == levels[node] + 1:
-            pushed = _dinic_push(
-                graph,
-                levels,
-                next_edge,
-                edge.to,
-                sink,
-                min(available, edge.capacity),
-            )
-            if pushed:
-                edge.capacity -= pushed
-                graph[edge.to][edge.reverse_index].capacity += pushed
-                return pushed
-        next_edge[node] += 1
-    return 0
-
-
-def _rebalance_targets(
-    resolved: _ResolvedRequest,
-    targets: dict[str, set[str]],
-    *,
-    starting_loads: Mapping[str, int],
-    capacities: Mapping[str, int],
-) -> dict[str, set[str]]:
-    request = resolved.request
-    loads = {annotator_id: int(starting_loads[annotator_id]) for annotator_id in capacities}
-    for target_ids in targets.values():
-        for annotator_id in target_ids:
-            loads[annotator_id] += 1
-    while True:
-        moves: list[tuple[Fraction, str, str, str, str]] = []
-        for source_id, source_capacity in capacities.items():
-            if source_capacity <= 0 or loads[source_id] <= starting_loads[source_id]:
-                continue
-            for target_id, target_capacity in capacities.items():
-                if source_id == target_id or target_capacity <= 0 or loads[target_id] >= target_capacity:
-                    continue
-                before = Fraction(loads[source_id], source_capacity) ** 2 + Fraction(
-                    loads[target_id], target_capacity
-                ) ** 2
-                after = Fraction(loads[source_id] - 1, source_capacity) ** 2 + Fraction(
-                    loads[target_id] + 1, target_capacity
-                ) ** 2
-                if after >= before:
-                    continue
-                for record_id, target_ids in targets.items():
-                    if source_id not in target_ids or target_id in target_ids:
-                        continue
-                    moves.append(
-                        (
-                            after - before,
-                            _seed_rank(
-                                request.seed,
-                                request.algorithm_version,
-                                "rebalance",
-                                record_id,
-                                source_id,
-                                target_id,
-                            ),
-                            record_id,
-                            source_id,
-                            target_id,
-                        )
-                    )
-        if not moves:
-            return targets
-        _, _, record_id, source_id, target_id = min(moves)
-        targets[record_id].remove(source_id)
-        targets[record_id].add(target_id)
-        loads[source_id] -= 1
-        loads[target_id] += 1
+        selected: list[tuple[int, str, str]] = []
+        for _ in range(demands[record_id]):
+            if not heap:
+                raise RuntimeError("validated degree sequence could not be realized")
+            remaining, rank, annotator_id = heapq.heappop(heap)
+            operations += 1
+            if remaining >= 0:
+                raise RuntimeError("validated degree sequence exhausted an annotator quota")
+            selected.append((remaining + 1, rank, annotator_id))
+        targets[record_id] = tuple(sorted(item[2] for item in selected))
+        for remaining, rank, annotator_id in selected:
+            if remaining < 0:
+                heapq.heappush(heap, (remaining, rank, annotator_id))
+                operations += 1
+    if heap:
+        raise RuntimeError("validated degree sequence left unused annotator quota")
+    return targets, operations
 
 
 def _assignment(
@@ -1552,7 +1520,7 @@ def _resolve_request(
             count=calibration.count,
             rate=calibration.rate,
             seed=request.seed,
-            algorithm_version=request.algorithm_version,
+            algorithm_version=algorithm_version,
             namespace="calibration",
             field="calibration",
         )
@@ -1704,29 +1672,32 @@ def _resolve_request(
             )
             for item in normalized_request.annotators
         }
-        witness = _production_witness(resolved, initial_loads)
-        available = sum(
-            max(0, item.capacity - initial_loads[item.annotator_id])
-            for item in normalized_request.annotators
+        demands = tuple(_production_demands(resolved).values())
+        raw_remaining_capacities = _remaining_capacities(resolved, initial_loads)
+        remaining_capacities = tuple(
+            min(capacity, len(resolved.production_record_ids))
+            for capacity in raw_remaining_capacities.values()
         )
-        if available < witness.required_rows:
+        required_rows = sum(demands)
+        available = sum(raw_remaining_capacities.values())
+        if available < required_rows:
             issues.append(
                 _issue(
                     "insufficient_capacity",
                     "annotators",
                     "cohort capacity cannot cover all planned rows",
                     available=available,
-                    required=witness.required_rows,
+                    required=required_rows,
                 )
             )
-        elif witness.assigned_rows < witness.required_rows:
+        elif not _degree_sequence_feasible(demands, remaining_capacities):
             issues.append(
                 _issue(
                     "overlap_unassignable",
                     "overlap_rules",
                     "capacities cannot place every required copy on a distinct annotator",
-                    assigned=witness.assigned_rows,
-                    required=witness.required_rows,
+                    available=available,
+                    required=required_rows,
                 )
             )
     if issues:
@@ -1738,27 +1709,33 @@ def _resolved_warnings(resolved: _ResolvedRequest) -> tuple[ValidationIssue, ...
     if resolved.request.strategy != AllocationStrategy.SHARED_QUEUE:
         return ()
     initial_loads = {item.annotator_id: 0 for item in resolved.request.annotators}
-    witness = _production_witness(resolved, initial_loads)
-    total_capacity = sum(item.capacity for item in resolved.request.annotators)
+    demands = tuple(_production_demands(resolved).values())
+    raw_capacities = _remaining_capacities(resolved, initial_loads)
+    capacities = tuple(
+        min(capacity, len(resolved.production_record_ids))
+        for capacity in raw_capacities.values()
+    )
+    required_rows = sum(demands)
+    total_capacity = sum(raw_capacities.values())
     warnings: list[ValidationIssue] = []
-    if total_capacity < witness.required_rows:
+    if total_capacity < required_rows:
         warnings.append(
             _issue(
                 "shared_advisory_total_capacity_insufficient",
                 "annotators",
                 "advisory cohort capacity is below the requested shared submission rows",
                 advisory_capacity=total_capacity,
-                required=witness.required_rows,
+                required=required_rows,
             )
         )
-    elif witness.assigned_rows < witness.required_rows:
+    elif not _degree_sequence_feasible(demands, capacities):
         warnings.append(
             _issue(
                 "shared_advisory_annotator_capacity_insufficient",
                 "annotators",
                 "individual advisory capacities cannot witness all distinct shared submissions",
-                advisory_rows=witness.assigned_rows,
-                required=witness.required_rows,
+                advisory_capacity=total_capacity,
+                required=required_rows,
             )
         )
     return tuple(warnings)

@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from llm_labeling_scaffold import allocation as allocation_module
 from llm_labeling_scaffold.allocation import (
     AllocationValidationError,
     AllocationRequest,
@@ -78,6 +79,39 @@ def test_canonical_hash_is_mapping_order_independent_and_unicode_normalized():
     decomposed = {"nested": {"a": 1, "b": 2}, "label": "cafe\u0301"}
 
     assert canonical_hash(composed) == canonical_hash(decomposed)
+
+
+def test_algorithm_version_whitespace_is_canonical_across_plan_and_preview():
+    records = tuple(
+        RecordSpec(record_id=f"record-{index}", content_hash=_hash(f"canonical-{index}"))
+        for index in range(20)
+    )
+    normalized = _request(
+        strategy=AllocationStrategy.CALIBRATION_THEN_PARTITION,
+        records=records,
+        annotators=tuple(
+            AnnotatorSpec(f"annotator-{index}", "cohort-a", 20) for index in range(3)
+        ),
+        overlap_rules=(OverlapRule(count=4, required_submissions=2),),
+        calibration=CalibrationRule(count=5),
+        seed=901,
+    )
+    raw = replace(normalized, algorithm_version=" allocation-v1 ")
+
+    normalized_plan = plan_allocation(normalized)
+    raw_plan = plan_allocation(raw)
+    raw_preview = preview_allocation(raw)
+
+    assert raw_plan == normalized_plan
+    assert raw_plan.input_fingerprint == normalized_plan.input_fingerprint
+    assert raw_preview.plan_fingerprint == raw_plan.fingerprint
+    assert raw_preview.input_fingerprint == raw_plan.input_fingerprint
+    assert raw_preview.algorithm_version == "allocation-v1"
+    assert raw_preview.calibration_set is not None
+    assert raw_preview.calibration_set.record_ids == tuple(
+        item.record_id for item in raw_plan.gates[0].expectations
+    )
+    assert raw_preview.calibration_set.record_ids == normalized_plan.to_preview().calibration_set.record_ids
 
 
 def test_validation_accepts_empty_record_set_with_a_valid_cohort():
@@ -156,7 +190,7 @@ def test_validation_returns_structured_overlap_capacity_failures():
     assert not report.ok
     assert {issue.code for issue in report.blocking_errors} == {"overlap_unassignable"}
     overlap_issue = next(issue for issue in report.blocking_errors if issue.code == "overlap_unassignable")
-    assert dict(overlap_issue.context) == {"assigned": "3", "required": "4"}
+    assert dict(overlap_issue.context) == {"available": "11", "required": "4"}
 
 
 def test_validation_rejects_insufficient_total_capacity():
@@ -434,6 +468,44 @@ def test_plan_allocation_fails_before_emitting_a_partial_plan():
     assert preview.dataset_requirements == ()
     assert preview.annotator_loads[0].capacity == 1
     assert preview.annotator_loads[0].assigned_rows == 0
+
+
+def test_validate_plan_and_preview_do_not_repeat_assignment_generation(monkeypatch):
+    request = _request(
+        records=tuple(
+            RecordSpec(record_id=f"record-{index}", content_hash=_hash(f"single-pass-{index}"))
+            for index in range(30)
+        ),
+        annotators=tuple(
+            AnnotatorSpec(f"annotator-{index}", "cohort-a", 20) for index in range(3)
+        ),
+        overlap_rules=(OverlapRule(count=6, required_submissions=2),),
+    )
+    original_resolve = allocation_module._resolve_request
+    original_allocate = allocation_module._allocate_production_targets
+    calls = {"resolve": 0, "allocate": 0}
+
+    def resolve_spy(value):
+        calls["resolve"] += 1
+        return original_resolve(value)
+
+    def allocate_spy(resolved, initial_loads):
+        calls["allocate"] += 1
+        return original_allocate(resolved, initial_loads)
+
+    monkeypatch.setattr(allocation_module, "_resolve_request", resolve_spy)
+    monkeypatch.setattr(allocation_module, "_allocate_production_targets", allocate_spy)
+
+    validate_allocation_request(request)
+    assert calls == {"resolve": 1, "allocate": 0}
+
+    calls.update(resolve=0, allocate=0)
+    plan_allocation(request)
+    assert calls == {"resolve": 1, "allocate": 1}
+
+    calls.update(resolve=0, allocate=0)
+    preview_allocation(request)
+    assert calls == {"resolve": 1, "allocate": 1}
 
 
 def test_calibration_rejects_a_partial_production_cohort():
