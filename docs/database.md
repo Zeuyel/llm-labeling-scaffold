@@ -39,11 +39,14 @@ Panel、MCP 和后续认证层不直接接收 SQLAlchemy ORM 或 `Session`。公
 - `list_authorized_tasks`：按 workspace 和 task ACL 延迟加载任务，必须显式传入 `limit`，单页上限 100，并使用 `after_task_key` cursor 翻页。
 - `authorize_workspace`、`authorize_task`：每次从数据库读取角色，不缓存放行结果。
 - `claim_idempotency`、`complete_idempotency`：原子 claim/pending/replay，唯一范围固定为 workspace + operation + key hash；actor、caller 或 request fingerprint 任一不一致即返回稳定 conflict，绝不返回其他主体的 response。
+- `grant_workspace_membership`、`change_workspace_membership`、`revoke_workspace_membership`：先通过标准 workspace 授权入口保持 `resource_not_visible` 语义，再按 role binding → workspace 顺序加锁并重新校验 `WORKSPACE_MANAGE`；原子修改 binding 并追加审计，重复操作返回稳定的 unchanged 结果。
 - `transaction`、`append_audit`：在 façade 事务内组合授权和追加审计，不向调用方暴露 ORM session。
 
 `TASK_CREATE` 是 workspace-scoped 权限，只授予 `experimenter` 和 `admin`。其他 task 权限只能传给 task 授权入口；`AUDIT_VIEW`、`WORKSPACE_MANAGE` 和 `TASK_CREATE` 不能通过 task role 获得。actor 与 caller 不同时，caller 必须是 active service principal；普通用户不能伪装成另一用户的调用方。
 
 没有可见 membership/ACL 时，workspace 和 task 判权统一返回 `resource_not_visible`，且不返回 `WorkspaceRef` 或 `TaskRef`，避免枚举资源。未知身份和无 membership 始终是零权限。数据库连接、schema 或事务异常会抛出 `AuthorizationUnavailable`；上层必须 fail closed，不能沿用旧的允许结果。
+
+membership grant/change/revoke 在取得 workspace 锁后重新读取 actor 权限；已有 binding 的变更统一使用 role binding → workspace 锁序，首次 grant 初读不存在 binding 时以 workspace 锁串行化并锁后重读。grant/change 要求 target principal 仍为 active；revoke 允许清理 inactive target。最后管理员只统计 active principal 的 workspace-scoped `admin`，服务层和 SQLite/PostgreSQL 触发器都会拒绝删除或降级最后一个 active admin，直接 SQL 也不能绕过。存在 role binding 的 principal 不能直接删除，必须先通过 revoke 解除成员关系。mutation 与对应审计事件在同一事务内提交；unchanged 不追加事件。task-scoped ACL 独立存在，撤销 workspace membership 不会隐式删除显式 task ACL。
 
 ## 迁移
 

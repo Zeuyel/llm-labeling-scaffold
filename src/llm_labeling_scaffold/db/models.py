@@ -179,7 +179,7 @@ class RoleBinding(Base):
     )
     principal_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("principals.id", ondelete="CASCADE"),
+        ForeignKey("principals.id", ondelete="RESTRICT"),
         nullable=False,
     )
     task_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
@@ -358,6 +358,153 @@ class MigrationRun(Base):
 
 class ImmutableAuditEventError(RuntimeError):
     pass
+
+
+event.listen(
+    RoleBinding.__table__,
+    "before_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION lls_enforce_last_workspace_admin()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF OLD.task_id IS NOT NULL OR OLD.role::text <> 'admin' THEN
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                END IF;
+                RETURN NEW;
+            END IF;
+            PERFORM 1 FROM workspaces WHERE id = OLD.workspace_id FOR UPDATE;
+            IF NOT FOUND THEN
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                END IF;
+                RETURN NEW;
+            END IF;
+            IF EXISTS (
+                SELECT 1 FROM principals
+                WHERE id = OLD.principal_id AND NOT is_active
+            ) THEN
+                IF TG_OP = 'DELETE' THEN
+                    RETURN OLD;
+                END IF;
+                RETURN NEW;
+            END IF;
+            IF TG_OP = 'UPDATE'
+               AND NEW.workspace_id = OLD.workspace_id
+               AND NEW.task_id IS NULL
+               AND NEW.role::text = 'admin'
+               AND EXISTS (
+                   SELECT 1 FROM principals
+                   WHERE id = NEW.principal_id AND is_active
+               )
+            THEN
+                RETURN NEW;
+            END IF;
+            IF NOT EXISTS (
+                SELECT 1
+                FROM role_bindings AS binding
+                JOIN principals AS principal ON principal.id = binding.principal_id
+                WHERE binding.workspace_id = OLD.workspace_id
+                  AND binding.task_id IS NULL
+                  AND binding.role::text = 'admin'
+                  AND binding.id <> OLD.id
+                  AND principal.is_active
+            ) THEN
+                RAISE EXCEPTION 'the last workspace admin cannot be removed'
+                    USING ERRCODE = '23000';
+            END IF;
+            IF TG_OP = 'DELETE' THEN
+                RETURN OLD;
+            END IF;
+            RETURN NEW;
+        END;
+        $$
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    RoleBinding.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_role_bindings_last_workspace_admin
+        BEFORE UPDATE OR DELETE ON role_bindings
+        FOR EACH ROW EXECUTE FUNCTION lls_enforce_last_workspace_admin()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    RoleBinding.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_role_bindings_last_workspace_admin_update
+        BEFORE UPDATE OF workspace_id, principal_id, task_id, role ON role_bindings
+        WHEN OLD.task_id IS NULL
+          AND OLD.role = 'admin'
+          AND NOT EXISTS (
+              SELECT 1 FROM principals
+              WHERE id = OLD.principal_id AND is_active = 0
+          )
+          AND NOT (
+              NEW.workspace_id = OLD.workspace_id
+              AND NEW.task_id IS NULL
+              AND NEW.role = 'admin'
+              AND EXISTS (
+                  SELECT 1 FROM principals
+                  WHERE id = NEW.principal_id AND is_active = 1
+              )
+          )
+          AND EXISTS (SELECT 1 FROM workspaces WHERE id = OLD.workspace_id)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM role_bindings AS binding
+              JOIN principals AS principal ON principal.id = binding.principal_id
+              WHERE binding.workspace_id = OLD.workspace_id
+                AND binding.task_id IS NULL
+                AND binding.role = 'admin'
+                AND binding.id <> OLD.id
+                AND principal.is_active = 1
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'the last workspace admin cannot be removed');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    RoleBinding.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_role_bindings_last_workspace_admin_delete
+        BEFORE DELETE ON role_bindings
+        WHEN OLD.task_id IS NULL
+          AND OLD.role = 'admin'
+          AND NOT EXISTS (
+              SELECT 1 FROM principals
+              WHERE id = OLD.principal_id AND is_active = 0
+          )
+          AND EXISTS (SELECT 1 FROM workspaces WHERE id = OLD.workspace_id)
+          AND NOT EXISTS (
+              SELECT 1
+              FROM role_bindings AS binding
+              JOIN principals AS principal ON principal.id = binding.principal_id
+              WHERE binding.workspace_id = OLD.workspace_id
+                AND binding.task_id IS NULL
+                AND binding.role = 'admin'
+                AND binding.id <> OLD.id
+                AND principal.is_active = 1
+          )
+        BEGIN
+            SELECT RAISE(ABORT, 'the last workspace admin cannot be removed');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
 
 
 event.listen(
