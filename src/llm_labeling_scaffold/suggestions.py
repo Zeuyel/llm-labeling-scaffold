@@ -85,10 +85,21 @@ def _provider_results(task: TaskConfig, rows: list[dict], provider_name: str) ->
 
 def _argilla_publish_params(annotation_manifest: dict[str, Any], params: dict[str, Any] | None) -> dict[str, Any]:
     out = dict(params or {})
+    contract = annotation_manifest.get("argilla_contract")
+    if not isinstance(contract, dict):
+        raise ValueError("标注任务 manifest 缺少 Argilla identity contract")
+    out["expected_contract"] = contract
     record_id_policy = annotation_manifest.get("record_id_policy")
     if isinstance(record_id_policy, dict) and record_id_policy.get("strategy"):
         out.setdefault("record_id_strategy", record_id_policy["strategy"])
-    for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path"):
+    for key in (
+        "dispatch_mode",
+        "sample_path",
+        "batch_plan_id",
+        "batch_manifest_path",
+        "batch_ids",
+        "batch_files",
+    ):
         value = annotation_manifest.get(key)
         if value not in (None, "", [], {}):
             out.setdefault(key, value)

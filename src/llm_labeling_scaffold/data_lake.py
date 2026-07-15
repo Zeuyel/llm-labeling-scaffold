@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import yaml
 
 from .config import TaskConfig
-from .io import read_jsonl
+from .io import read_jsonl, resolve_committed_jsonl_path
 
 
 DEFAULT_REGISTRY_URI = "r2:ai-innovation-data-lake/governance/data_lake/v1/current/data_lake.yaml"
@@ -696,6 +696,11 @@ def _publish_artifact_location(task: TaskConfig, runs_root: str | Path, kind: st
         identity = {"model_id": model_id}
         required_manifest = local
 
+    if kind == "decisions":
+        try:
+            local = resolve_committed_jsonl_path(local)
+        except RuntimeError as exc:
+            raise DataLakeError("本地 decisions 产物没有完整 committed generation") from exc
     if not local.is_file():
         raise DataLakeError(f"本地产物不存在: {local}")
     if required_manifest is not None and not required_manifest.is_file():

@@ -1,20 +1,36 @@
 from pathlib import Path
+import io
+import inspect
 import sys
 import tempfile
 import types
+from uuid import UUID
 
 import pytest
 
+import llm_labeling_scaffold.io as scaffold_io
 from llm_labeling_scaffold.config import TaskConfig, load_task
 from llm_labeling_scaffold.integrations import argilla
 from llm_labeling_scaffold.integrations.argilla import (
+    _ARGILLA_CONTRACT_INTENT_FIELD,
+    _ARGILLA_PUSH_FINGERPRINT_FIELD,
+    _api_url,
     _argilla_text_fields,
+    _build_contract,
     _guidelines_for_task,
     _human_label_from_values,
     _make_suggestion,
+    _missing_required_response_names,
     _prepare_dataset,
     _prepare_records_for_push,
+    _push_fingerprints,
     _questions_for_task,
+    _record_response_groups,
+    _require_argilla_2_8_version,
+    _settings_fingerprint,
+    _settings_intent_fingerprint,
+    _server_version,
+    _task_fingerprint,
 )
 from llm_labeling_scaffold.integrations.mlflow import log_training_result
 from llm_labeling_scaffold.io import read_json, read_jsonl, write_json, write_jsonl
@@ -208,6 +224,97 @@ def test_argilla_pull_expands_all_response_fields():
     assert human_label["reason"] == "claims describe a new product application"
     assert human_label["confidence"] == 88
     assert human_label["evidence_product_application"] == "new remote monitoring product"
+
+
+def test_argilla_2_8_public_response_iterable_groups_by_user_and_status():
+    rg = pytest.importorskip("argilla")
+    user_id = UUID("10000000-0000-0000-0000-000000000001")
+    record = rg.Record(
+        id="r1",
+        fields={"text": "one"},
+        responses=[
+            rg.Response(question_name="label", value="yes", user_id=user_id, status=rg.ResponseStatus.submitted),
+            rg.Response(question_name="reason", value="evidence", user_id=user_id, status=rg.ResponseStatus.submitted),
+        ],
+    )
+
+    groups = _record_response_groups(record)
+
+    assert groups == [
+        {
+            "user_id": str(user_id),
+            "raw_user_id": str(user_id),
+            "invalid_user_id": False,
+            "values": {"label": {"value": "yes"}, "reason": {"value": "evidence"}},
+            "status": "submitted",
+            "observed_statuses": ["submitted"],
+        }
+    ]
+    assert "status" not in record.responses.to_dict()["label"][0]
+
+
+def test_argilla_2_8_users_list_accepts_workspace_argument():
+    rg = pytest.importorskip("argilla")
+
+    signature = inspect.signature(rg.client.Users.list)
+
+    assert "workspace" in signature.parameters
+
+
+def test_argilla_response_groups_quarantine_mixed_and_keep_draft_discarded():
+    user_mixed = UUID("10000000-0000-0000-0000-000000000001")
+    user_draft = UUID("10000000-0000-0000-0000-000000000002")
+    user_discarded = UUID("10000000-0000-0000-0000-000000000003")
+    record = types.SimpleNamespace(
+        responses=[
+            types.SimpleNamespace(question_name="label", value="yes", user_id=user_mixed, status="submitted"),
+            types.SimpleNamespace(question_name="reason", value="mixed", user_id=user_mixed, status="draft"),
+            types.SimpleNamespace(question_name="label", value="no", user_id=user_draft, status="draft"),
+            types.SimpleNamespace(question_name="label", value="no", user_id=user_discarded, status="discarded"),
+        ]
+    )
+
+    groups = {group["user_id"]: group for group in _record_response_groups(record)}
+
+    assert groups[str(user_mixed)]["status"] == "mixed"
+    assert groups[str(user_mixed)]["observed_statuses"] == ["draft", "submitted"]
+    assert groups[str(user_draft)]["status"] == "draft"
+    assert groups[str(user_discarded)]["status"] == "discarded"
+
+
+def test_argilla_response_groups_preserve_invalid_user_and_empty_status():
+    valid_user = UUID("10000000-0000-0000-0000-000000000001")
+    record = types.SimpleNamespace(
+        responses=[
+            types.SimpleNamespace(question_name="label", value="yes", user_id=valid_user, status="submitted"),
+            types.SimpleNamespace(question_name="reason", value="evidence", user_id=valid_user, status=None),
+            types.SimpleNamespace(question_name="label", value="no", user_id="not-a-uuid", status="submitted"),
+        ]
+    )
+
+    groups = _record_response_groups(record)
+    valid_group = next(group for group in groups if group["user_id"] == str(valid_user))
+    invalid_group = next(group for group in groups if group["invalid_user_id"])
+
+    assert valid_group["status"] == "mixed"
+    assert valid_group["observed_statuses"] == ["submitted", "unknown"]
+    assert invalid_group["user_id"] is None
+    assert invalid_group["raw_user_id"] == "not-a-uuid"
+    assert invalid_group["status"] == "submitted"
+
+
+@pytest.mark.parametrize("empty_value", [[], (), {}, set()])
+def test_argilla_required_questions_treat_empty_collections_as_missing(empty_value):
+    task = _argilla_push_task()
+
+    assert _missing_required_response_names(task, {"label": {"value": empty_value}}) == ["label"]
+
+
+@pytest.mark.parametrize("value", [0, False])
+def test_argilla_required_questions_accept_zero_and_false(value):
+    task = _argilla_push_task()
+
+    assert _missing_required_response_names(task, {"label": {"value": value}}) == []
 
 
 def test_argilla_guidelines_use_task_annotation_by_default():
@@ -569,25 +676,6 @@ def test_argilla_suggestion_fallback_drops_agent_before_score():
     assert suggestion.kwargs == {"question_name": "label", "value": "yes", "score": 0.7}
 
 
-def test_argilla_pull_ignores_suggestions_without_human_responses(tmp_path: Path, monkeypatch):
-    task = _argilla_push_task()
-    output = tmp_path / "decisions.jsonl"
-    record = types.SimpleNamespace(
-        id="r1",
-        metadata={"record_id": "r1"},
-        suggestions=[types.SimpleNamespace(values={"label": "yes"})],
-        responses=[],
-    )
-    dataset = types.SimpleNamespace(records=[record])
-    client = types.SimpleNamespace(datasets=lambda name, workspace=None: dataset)
-    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
-
-    result = argilla.pull_responses(task, "dataset", output, {"workspace": "argilla"})
-
-    assert result["responses"] == 0
-    assert read_jsonl(output) == []
-
-
 def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp_path: Path):
     task = _argilla_push_task()
     sample = tmp_path / "bad_batch.jsonl"
@@ -611,13 +699,55 @@ def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp
 
 
 class _Workspace:
-    name = "argilla"
+    def __init__(self, name="argilla", resource_id="00000000-0000-0000-0000-000000000001"):
+        self.name = name
+        self.id = resource_id
+
+
+class _Settings:
+    def __init__(self, guidelines="guidelines", intent_fingerprint=None):
+        self.guidelines = guidelines
+        self.intent_fingerprint = intent_fingerprint
+
+    def serialize(self):
+        metadata = []
+        if self.intent_fingerprint is not None:
+            metadata.append({
+                "name": _ARGILLA_CONTRACT_INTENT_FIELD,
+                "title": "LLS contract intent",
+                "settings": {
+                    "visible_for_annotators": True,
+                    "type": "terms",
+                    "values": [self.intent_fingerprint],
+                },
+                "visible_for_annotators": False,
+            })
+        return {
+            "guidelines": self.guidelines,
+            "fields": [{"name": "text", "type": "text"}],
+            "questions": [{"name": "label", "type": "label_selection", "labels": ["yes", "no"]}],
+            "vectors": [],
+            "metadata": metadata,
+            "allow_extra_metadata": True,
+            "distribution": {"strategy": "overlap", "min_submitted": 1},
+            "mapping": {},
+        }
 
 
 class _Dataset:
-    def __init__(self, name="dataset_a"):
+    def __init__(
+        self,
+        name="dataset_a",
+        resource_id="00000000-0000-0000-0000-000000000002",
+        records=None,
+        min_submitted=1,
+    ):
         self.name = name
         self.workspace = _Workspace()
+        self.id = resource_id
+        self.records = list(records or [])
+        self.distribution = types.SimpleNamespace(min_submitted=min_submitted)
+        self.settings = _Settings()
         self.created = 0
         self.deleted = 0
 
@@ -628,6 +758,25 @@ class _Dataset:
     def delete(self):
         self.deleted += 1
 
+    def get(self):
+        return self
+
+
+class _RemoteRecords:
+    def __init__(self, records):
+        self.records = list(records)
+        self.logged_batches: list[list] = []
+        self.iterations = 0
+
+    def __iter__(self):
+        self.iterations += 1
+        return iter(self.records)
+
+    def log(self, records):
+        batch = list(records)
+        self.logged_batches.append(batch)
+        self.records.extend(batch)
+
 
 class _Datasets:
     def __init__(self, items):
@@ -637,32 +786,893 @@ class _Datasets:
         return self._items
 
 
-class _Client:
-    def __init__(self, datasets):
-        self.datasets = _Datasets(datasets)
+class _Lookup:
+    def __init__(self, *, by_id=None, by_name=None):
+        self.by_id = dict(by_id or {})
+        self.by_name = dict(by_name or {})
+
+    def __call__(self, name=None, id=None, workspace=None):
+        if id is not None:
+            return self.by_id.get(str(id))
+        return self.by_name.get(str(name))
 
 
-def test_argilla_dataset_existing_policy_fail_append_replace():
-    existing = _Dataset("dataset_a")
+class _Users:
+    def __init__(self, users):
+        self._users = list(users)
+
+    def list(self, workspace=None):
+        return list(self._users)
+
+
+class _PullClient:
+    def __init__(self, workspace, dataset, users):
+        self.workspaces = _Lookup(by_id={str(workspace.id): workspace}, by_name={workspace.name: workspace})
+        self.datasets = _Lookup(by_id={str(dataset.id): dataset}, by_name={dataset.name: dataset})
+        self.users = _Users(users)
+
+
+def _pull_contract(task: TaskConfig, dataset: _Dataset, *, push_fingerprint="f" * 64) -> dict:
+    dataset.settings.intent_fingerprint = push_fingerprint
+    return {
+        "schema_version": 1,
+        "server_version": "2.8.0",
+        "sdk_version": "2.8.0",
+        "workspace": {"uuid": str(dataset.workspace.id), "name": dataset.workspace.name},
+        "dataset": {"uuid": str(dataset.id), "name": dataset.name},
+        "min_submitted": int(dataset.distribution.min_submitted),
+        "fingerprints": {
+            "task": _task_fingerprint(task),
+            "sample": "2" * 64,
+            "batch": "3" * 64,
+            "plan": "4" * 64,
+            "settings": _settings_fingerprint(dataset.settings),
+            "push": push_fingerprint,
+        },
+    }
+
+
+def _install_pull_runtime(monkeypatch, client) -> None:
+    fake_rg = types.SimpleNamespace(__version__="2.8.0")
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
+    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None: client)
+
+
+def _remote_record(record_id: str, fingerprint: str, responses=None):
+    return types.SimpleNamespace(
+        id=record_id,
+        metadata={_ARGILLA_PUSH_FINGERPRINT_FIELD: fingerprint},
+        responses=list(responses or []),
+    )
+
+
+def test_argilla_dataset_existing_policy_fail_and_idempotent_resume():
+    fingerprint = "a" * 64
+    submitted = types.SimpleNamespace(status="submitted")
+    existing = _Dataset("dataset_a", records=[_remote_record("r1", fingerprint, [submitted])])
+    existing.settings = _Settings(intent_fingerprint=fingerprint)
     created = _Dataset("dataset_a")
-    client = _Client([existing])
 
-    try:
-        _prepare_dataset(client, created, "dataset_a", "argilla", "fail")
-    except ValueError as exc:
-        assert "已存在" in str(exc)
-    else:
-        raise AssertionError("existing dataset should fail by default")
+    with pytest.raises(ValueError, match="已存在"):
+        _prepare_dataset(
+            created,
+            existing,
+            "fail",
+            push_fingerprint=fingerprint,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
 
-    dataset, action = _prepare_dataset(client, created, "dataset_a", "argilla", "append")
+    dataset, action, missing_record_ids = _prepare_dataset(
+        created,
+        existing,
+        "resume",
+        push_fingerprint=fingerprint,
+        settings_fingerprint=_settings_fingerprint(existing.settings),
+        desired_record_ids={"r1", "r2"},
+        min_submitted=1,
+    )
     assert dataset is existing
-    assert action == "appended"
+    assert action == "resumed"
+    assert missing_record_ids == {"r2"}
+    assert existing.records[0].responses == [submitted]
+    assert existing.deleted == 0
 
-    dataset, action = _prepare_dataset(client, created, "dataset_a", "argilla", "replace")
-    assert dataset is created
-    assert action == "replaced"
-    assert existing.deleted == 1
-    assert created.created == 1
+
+def test_argilla_dataset_resume_recovers_empty_dataset_with_exact_intent():
+    fingerprint = "a" * 64
+    existing = _Dataset("dataset_a", records=[])
+    existing.settings = _Settings(intent_fingerprint=fingerprint)
+    existing.records = _RemoteRecords([])
+    created = _Dataset("dataset_a")
+
+    dataset, action, missing_record_ids = _prepare_dataset(
+        created,
+        existing,
+        "resume",
+        push_fingerprint=fingerprint,
+        settings_fingerprint=_settings_fingerprint(existing.settings),
+        desired_record_ids={"r1"},
+        min_submitted=1,
+    )
+
+    assert dataset is existing
+    assert action == "recovered_empty"
+    assert missing_record_ids == {"r1"}
+    assert existing.records.iterations == 1
+    assert existing.deleted == 0
+    assert created.created == 0
+
+
+def test_argilla_dataset_resume_rejects_empty_unmarked_dataset():
+    existing = _Dataset("dataset_a", records=[])
+    created = _Dataset("dataset_a")
+
+    with pytest.raises(ValueError, match="contract intent"):
+        _prepare_dataset(
+            created,
+            existing,
+            "resume",
+            push_fingerprint="a" * 64,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+
+
+def test_argilla_dataset_resume_rejects_live_settings_drift():
+    fingerprint = "a" * 64
+    existing = _Dataset("dataset_a", records=[_remote_record("r1", fingerprint)])
+    existing.settings = _Settings("changed guidelines", intent_fingerprint=fingerprint)
+    created = _Dataset("dataset_a")
+
+    with pytest.raises(ValueError, match="live settings/schema"):
+        _prepare_dataset(
+            created,
+            existing,
+            "resume",
+            push_fingerprint=fingerprint,
+            settings_fingerprint=_settings_fingerprint(_Settings("expected guidelines")),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+
+
+def test_argilla_dataset_append_rejects_different_plan_fingerprint():
+    existing = _Dataset("dataset_a", records=[_remote_record("r1", "a" * 64)])
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
+    created = _Dataset("dataset_a")
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        _prepare_dataset(
+            created,
+            existing,
+            "append",
+            push_fingerprint="b" * 64,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+
+
+def test_argilla_dataset_replace_is_blocked_after_any_response():
+    existing = _Dataset(
+        "dataset_a",
+        records=[_remote_record("r1", "a" * 64, [types.SimpleNamespace(status="draft")])],
+    )
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
+    created = _Dataset("dataset_a")
+
+    with pytest.raises(ValueError, match="已有回答"):
+        _prepare_dataset(
+            created,
+            existing,
+            "replace",
+            push_fingerprint="b" * 64,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+    assert existing.deleted == 0
+
+
+def test_argilla_dataset_replace_without_responses_never_deletes_existing_dataset():
+    existing = _Dataset("dataset_a", records=[_remote_record("r1", "a" * 64)])
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
+    created = _Dataset("dataset_a")
+
+    with pytest.raises(ValueError, match="不会自动删除既有 dataset"):
+        _prepare_dataset(
+            created,
+            existing,
+            "replace",
+            push_fingerprint="b" * 64,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+
+    assert existing.deleted == 0
+    assert created.created == 0
+
+
+def test_argilla_dataset_replace_fails_closed_when_response_arrives_after_scan():
+    record = _remote_record("r1", "a" * 64)
+    submitted = types.SimpleNamespace(status="submitted")
+
+    class RacingRecords:
+        def __iter__(self):
+            yield record
+            record.responses.append(submitted)
+
+    existing = _Dataset("dataset_a", records=[])
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
+    existing.records = RacingRecords()
+    created = _Dataset("dataset_a")
+
+    with pytest.raises(ValueError, match="不会自动删除既有 dataset"):
+        _prepare_dataset(
+            created,
+            existing,
+            "replace",
+            push_fingerprint="b" * 64,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+
+    assert record.responses == [submitted]
+    assert existing.deleted == 0
+    assert created.created == 0
+
+
+def test_argilla_dataset_identical_replace_retry_is_noop_and_preserves_responses():
+    fingerprint = "f" * 64
+    submitted = types.SimpleNamespace(status="submitted", value="yes")
+    draft = types.SimpleNamespace(status="draft", value="no")
+    remote_records = [
+        _remote_record("r1", fingerprint, [submitted]),
+        _remote_record("r2", fingerprint, [draft]),
+    ]
+    existing = _Dataset("dataset_a", records=[])
+    existing.settings = _Settings(intent_fingerprint=fingerprint)
+    existing.records = _RemoteRecords(remote_records)
+    created = _Dataset("dataset_a")
+
+    dataset, action, missing_record_ids = _prepare_dataset(
+        created,
+        existing,
+        "replace",
+        push_fingerprint=fingerprint,
+        settings_fingerprint=_settings_fingerprint(existing.settings),
+        desired_record_ids={"r1", "r2"},
+        min_submitted=1,
+    )
+
+    assert dataset is existing
+    assert action == "resumed"
+    assert missing_record_ids == set()
+    assert existing.id == "00000000-0000-0000-0000-000000000002"
+    assert existing.deleted == 0
+    assert created.created == 0
+    assert existing.records.iterations == 1
+    assert [record.responses for record in remote_records] == [[submitted], [draft]]
+
+
+def _install_push_sample_fakes(monkeypatch, existing: _Dataset):
+    client = _PullClient(existing.workspace, existing, [])
+
+    class CandidateDataset(_Dataset):
+        def __init__(self, name, workspace, settings, client):
+            super().__init__(name, resource_id="00000000-0000-0000-0000-000000000099")
+            self.workspace = workspace
+            self.settings = settings
+            self.records = _RemoteRecords([])
+
+    fake_rg = types.SimpleNamespace(
+        __version__="2.8.0",
+        Record=_Record,
+        Dataset=CandidateDataset,
+        Settings=lambda **kwargs: types.SimpleNamespace(**kwargs),
+        TextField=_Question,
+        LabelQuestion=_Question,
+        TermsMetadataProperty=_Question,
+        TaskDistribution=lambda min_submitted: types.SimpleNamespace(min_submitted=min_submitted),
+    )
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
+    monkeypatch.setattr(argilla, "_runtime_versions", lambda rg, api_url: {"sdk": "2.8.0", "server": "2.8.0"})
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+    monkeypatch.setattr(
+        argilla,
+        "_push_fingerprints",
+        lambda task, sample_path, params: {"task": "1" * 64, "sample": "2" * 64, "batch": "3" * 64, "plan": "4" * 64},
+    )
+    monkeypatch.setattr(argilla, "_settings_fingerprint", lambda settings: "5" * 64)
+    monkeypatch.setattr(argilla, "_settings_intent_fingerprint", lambda settings: "f" * 64)
+    monkeypatch.setattr(argilla, "_push_fingerprint", lambda **kwargs: "f" * 64)
+
+
+def test_argilla_push_resume_logs_only_missing_records_and_preserves_responses(tmp_path: Path, monkeypatch):
+    submitted = types.SimpleNamespace(status="submitted", value="yes")
+    draft = types.SimpleNamespace(status="draft", value="no")
+    existing_record = _remote_record("r1", "f" * 64, [submitted, draft])
+    existing = _Dataset("dataset", records=[])
+    existing.records = _RemoteRecords([existing_record])
+    existing.settings = _Settings(intent_fingerprint="f" * 64)
+    _install_push_sample_fakes(monkeypatch, existing)
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "one"},
+            {"record_id": "r2", "title": "two"},
+        ],
+        sample,
+    )
+
+    result = argilla.push_sample(_argilla_push_task(), sample, "dataset", {"workspace": "argilla"})
+
+    assert [[record.id for record in batch] for batch in existing.records.logged_batches] == [["r2"]]
+    assert existing_record.responses == [submitted, draft]
+    assert result["records"] == 2
+    assert result["records_logged"] == 1
+    assert result["records_existing"] == 1
+    assert existing.records.iterations == 1
+
+
+def test_argilla_push_full_retry_performs_zero_remote_record_writes(tmp_path: Path, monkeypatch):
+    submitted = types.SimpleNamespace(status="submitted", value="yes")
+    draft = types.SimpleNamespace(status="draft", value="no")
+    remote_records = [
+        _remote_record("r1", "f" * 64, [submitted]),
+        _remote_record("r2", "f" * 64, [draft]),
+    ]
+    existing = _Dataset("dataset", records=[])
+    existing.records = _RemoteRecords(remote_records)
+    existing.settings = _Settings(intent_fingerprint="f" * 64)
+    _install_push_sample_fakes(monkeypatch, existing)
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r1", "title": "one"},
+            {"record_id": "r2", "title": "two"},
+        ],
+        sample,
+    )
+
+    result = argilla.push_sample(_argilla_push_task(), sample, "dataset", {"workspace": "argilla"})
+
+    assert existing.records.logged_batches == []
+    assert [record.responses for record in remote_records] == [[submitted], [draft]]
+    assert result["records_logged"] == 0
+    assert result["records_existing"] == 2
+    assert existing.records.iterations == 1
+
+
+def test_argilla_push_recovers_create_before_first_record_log(tmp_path: Path, monkeypatch):
+    existing = _Dataset("dataset", records=[])
+    existing.records = _RemoteRecords([])
+    existing.settings = _Settings(intent_fingerprint="f" * 64)
+    _install_push_sample_fakes(monkeypatch, existing)
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+
+    result = argilla.push_sample(_argilla_push_task(), sample, "dataset", {"workspace": "argilla"})
+
+    assert result["dataset_action"] == "recovered_empty"
+    assert result["dataset_uuid"] == str(existing.id)
+    assert [[record.id for record in batch] for batch in existing.records.logged_batches] == [["r1"]]
+    assert existing.records.iterations == 1
+    assert existing.deleted == 0
+
+
+def test_argilla_push_fingerprints_are_stable_and_plan_sensitive(tmp_path: Path):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    batch = tmp_path / "batch_00001.jsonl"
+    plan = tmp_path / "manifest.json"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+    write_jsonl([{"record_id": "r1", "title": "one"}], batch)
+    write_json({"schema_version": 2, "sample": str(sample), "plan_id": "plan_a"}, plan)
+    params = {
+        "dispatch_mode": "batch_plan",
+        "sample_path": str(sample),
+        "batch_files": [str(batch)],
+        "batch_ids": [batch.name],
+        "batch_manifest_path": str(plan),
+    }
+
+    first = _push_fingerprints(task, batch, params)
+    second = _push_fingerprints(task, batch, params)
+    write_json({"schema_version": 2, "sample": str(sample), "plan_id": "plan_b"}, plan)
+    changed = _push_fingerprints(task, batch, params)
+
+    assert first == second
+    assert set(first) == {"task", "sample", "batch", "plan"}
+    assert all(len(value) == 64 for value in first.values())
+    assert changed["task"] == first["task"]
+    assert changed["sample"] == first["sample"]
+    assert changed["batch"] == first["batch"]
+    assert changed["plan"] != first["plan"]
+
+
+def test_argilla_contract_contains_versions_uuids_and_all_fingerprints():
+    workspace = _Workspace()
+    dataset = _Dataset()
+    fingerprints = {
+        name: str(index) * 64
+        for index, name in enumerate(("task", "sample", "batch", "plan", "settings"), start=1)
+    }
+
+    contract = _build_contract(
+        versions={"server": "2.8.0", "sdk": "2.8.0"},
+        workspace=workspace,
+        dataset=dataset,
+        min_submitted=2,
+        fingerprints=fingerprints,
+        push_fingerprint="f" * 64,
+    )
+
+    assert contract["server_version"] == "2.8.0"
+    assert contract["sdk_version"] == "2.8.0"
+    assert contract["workspace"] == {"uuid": str(workspace.id), "name": "argilla"}
+    assert contract["dataset"] == {"uuid": str(dataset.id), "name": "dataset_a"}
+    assert contract["min_submitted"] == 2
+    assert contract["fingerprints"] == {**fingerprints, "push": "f" * 64}
+
+
+def test_argilla_settings_fingerprint_ignores_server_ids_but_detects_schema_drift():
+    def settings(payload):
+        return types.SimpleNamespace(serialize=lambda: payload)
+
+    first = {
+        "guidelines": "label carefully",
+        "fields": [{"id": "10000000-0000-0000-0000-000000000001", "name": "text", "type": "text"}],
+        "questions": [{"id": "20000000-0000-0000-0000-000000000001", "name": "label", "type": "label"}],
+        "distribution": {"strategy": "overlap", "min_submitted": 1},
+    }
+    same_schema_new_ids = {
+        **first,
+        "fields": [{"id": "10000000-0000-0000-0000-000000000099", "name": "text", "type": "text"}],
+        "questions": [{"id": "20000000-0000-0000-0000-000000000099", "name": "label", "type": "label"}],
+    }
+    drifted = {**same_schema_new_ids, "guidelines": "changed"}
+
+    assert _settings_fingerprint(settings(first)) == _settings_fingerprint(settings(same_schema_new_ids))
+    assert _settings_fingerprint(settings(first)) != _settings_fingerprint(settings(drifted))
+
+
+def test_argilla_settings_fingerprint_excludes_but_validates_internal_intent():
+    first = _Settings(intent_fingerprint="a" * 64)
+    second = _Settings(intent_fingerprint="b" * 64)
+
+    assert _settings_fingerprint(first) == _settings_fingerprint(second)
+    assert _settings_intent_fingerprint(first) == "a" * 64
+    assert _settings_intent_fingerprint(second) == "b" * 64
+
+
+def test_argilla_2_8_terms_metadata_property_contract_shape():
+    rg = pytest.importorskip("argilla")
+    client = types.SimpleNamespace(api=types.SimpleNamespace(metadata=object()))
+    marker = rg.TermsMetadataProperty(
+        name=_ARGILLA_CONTRACT_INTENT_FIELD,
+        title="LLS contract intent",
+        options=["f" * 64],
+        visible_for_annotators=False,
+        client=client,
+    )
+
+    payload = marker.serialize()
+
+    assert payload["name"] == _ARGILLA_CONTRACT_INTENT_FIELD
+    assert payload["visible_for_annotators"] is False
+    assert payload["settings"]["type"] == "terms"
+    assert payload["settings"]["values"] == ["f" * 64]
+
+
+def test_argilla_2_8_dataset_records_iterator_is_paginated_with_responses():
+    rg = pytest.importorskip("argilla")
+    calls = []
+
+    class RecordsAPI:
+        def list(self, **kwargs):
+            calls.append(kwargs)
+            return []
+
+    client = types.SimpleNamespace(
+        api=types.SimpleNamespace(
+            datasets=types.SimpleNamespace(exists=lambda dataset_id: True),
+            records=RecordsAPI(),
+        )
+    )
+    dataset = types.SimpleNamespace(id=UUID("00000000-0000-0000-0000-000000000002"))
+
+    assert list(rg.DatasetRecords(client=client, dataset=dataset)) == []
+    assert calls == [
+        {
+            "dataset_id": dataset.id,
+            "limit": 100,
+            "offset": 0,
+            "with_responses": True,
+            "with_suggestions": True,
+            "with_vectors": None,
+        }
+    ]
+
+
+def test_argilla_server_2_8_version_route_contract(monkeypatch):
+    observed = {}
+
+    def fake_urlopen(request, timeout):
+        observed["url"] = request.full_url
+        observed["timeout"] = timeout
+        return io.BytesIO(b'{"version":"2.8.0"}')
+
+    monkeypatch.setattr(argilla.urllib.request, "urlopen", fake_urlopen)
+
+    assert _server_version("https://argilla.example/", timeout=3.0) == "2.8.0"
+    assert observed == {"url": "https://argilla.example/api/v1/version", "timeout": 3.0}
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:password@argilla.example",
+        "https://argilla.example?access_token=secret-token",
+        "https://argilla.example/#/oauth?refresh_token=secret-token",
+        "https://[invalid-host?access_token=secret-token",
+    ],
+)
+def test_argilla_api_url_rejects_embedded_credentials(url):
+    with pytest.raises(ValueError, match="userinfo 或敏感 query/fragment") as exc_info:
+        _api_url(url)
+
+    assert "secret-token" not in str(exc_info.value)
+    assert "password" not in str(exc_info.value)
+
+
+@pytest.mark.parametrize("version", ["2.8", "2.8.1", "2.8.0.post1", "2.9.0", ""])
+def test_argilla_runtime_requires_exact_2_8_0(version):
+    with pytest.raises(RuntimeError, match="必须是 Argilla 2.8.0"):
+        _require_argilla_2_8_version("Argilla SDK", version)
+
+
+def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(tmp_path: Path, monkeypatch):
+    base_task = _argilla_push_task()
+    task = TaskConfig(
+        path=base_task.path,
+        raw={
+            **base_task.raw,
+            "labels": {
+                "primary": base_task.primary_label,
+                "auxiliary": [{"name": "reason", "type": "string", "required": False}],
+            },
+        },
+    )
+    push_fingerprint = "f" * 64
+    submitted_user = UUID("10000000-0000-0000-0000-000000000001")
+    draft_user = UUID("10000000-0000-0000-0000-000000000002")
+    discarded_user = UUID("10000000-0000-0000-0000-000000000003")
+    mixed_user = UUID("10000000-0000-0000-0000-000000000004")
+    unknown_status_user = UUID("10000000-0000-0000-0000-000000000005")
+    incomplete_user = UUID("10000000-0000-0000-0000-000000000006")
+    duplicate_user = UUID("10000000-0000-0000-0000-000000000007")
+    unknown_workspace_user = UUID("10000000-0000-0000-0000-000000000008")
+    owner_user = UUID("10000000-0000-0000-0000-000000000009")
+    admin_user = UUID("10000000-0000-0000-0000-000000000010")
+    unknown_role_user = UUID("10000000-0000-0000-0000-000000000011")
+    record = types.SimpleNamespace(
+        id="r1",
+        status="completed",
+        metadata={"record_id": "r1", _ARGILLA_PUSH_FINGERPRINT_FIELD: push_fingerprint},
+        suggestions=[types.SimpleNamespace(value="yes")],
+        responses=[
+            types.SimpleNamespace(question_name="label", value="yes", user_id=submitted_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="no", user_id=draft_user, status="draft"),
+            types.SimpleNamespace(question_name="label", value="no", user_id=discarded_user, status="discarded"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=mixed_user, status="submitted"),
+            types.SimpleNamespace(question_name="reason", value="mixed", user_id=mixed_user, status="draft"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_status_user, status="completed"),
+            types.SimpleNamespace(question_name="reason", value="optional only", user_id=incomplete_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=duplicate_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="no", user_id=duplicate_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_workspace_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id="not-a-uuid", status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=owner_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=admin_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_role_user, status="submitted"),
+        ],
+    )
+    dataset = _Dataset("dataset", records=[])
+    dataset.records = _RemoteRecords([record])
+    users = [
+        types.SimpleNamespace(id=user_id, username=f"user_{index}", role=types.SimpleNamespace(value="annotator"))
+        for index, user_id in enumerate(
+            (
+                submitted_user,
+                draft_user,
+                discarded_user,
+                mixed_user,
+                unknown_status_user,
+                incomplete_user,
+                duplicate_user,
+            ),
+            start=1,
+        )
+    ]
+    users.extend([
+        types.SimpleNamespace(id=owner_user, username="owner_user", role=types.SimpleNamespace(value="owner")),
+        types.SimpleNamespace(id=admin_user, username="admin_user", role=types.SimpleNamespace(value="admin")),
+        types.SimpleNamespace(id=unknown_role_user, username="unknown_role_user", role="reviewer"),
+    ])
+    client = _PullClient(dataset.workspace, dataset, users)
+    contract = _pull_contract(task, dataset, push_fingerprint=push_fingerprint)
+    manifest = {"task_id": task.task_id, "argilla_dataset": dataset.name, "argilla_contract": contract}
+    output = tmp_path / "decisions.jsonl"
+    _install_pull_runtime(monkeypatch, client)
+
+    result = argilla.pull_responses(
+        task,
+        dataset.name,
+        output,
+        {"manifest": manifest},
+    )
+
+    rows = read_jsonl(output)
+    assert rows == [
+        {
+            "record_id": "r1",
+            "human_label": {"label": "yes"},
+            "source": "argilla",
+            "user_id": str(submitted_user),
+            "user_username": "user_1",
+            "user_role": "annotator",
+            "workspace_uuid": str(dataset.workspace.id),
+            "status": "submitted",
+            "response_status": "submitted",
+        }
+    ]
+    assert result["responses"] == 1
+    assert result["accepted_response_groups"] == 1
+    assert result["skipped_response_groups"] == 11
+    assert result["quarantined_response_groups"] == 9
+    assert result["quarantine_artifact"] == str(tmp_path / "decisions.quarantine.jsonl")
+    assert len(result["artifact_generation"]) == 32
+    assert Path(result["artifact_commit_marker"]).is_file()
+    assert Path(result["accepted_generation_artifact"]).is_file()
+    assert Path(result["quarantine_generation_artifact"]).is_file()
+    assert result["quarantine_reason_codes"] == [
+        "duplicate_question",
+        "invalid_user_id",
+        "missing_required_question",
+        "mixed_response_status",
+        "unauthorized_user_role",
+        "unknown_response_status",
+        "unknown_workspace_user",
+    ]
+    assert result["quarantine_reason_counts"] == {
+        "duplicate_question": 1,
+        "invalid_user_id": 1,
+        "missing_required_question": 1,
+        "mixed_response_status": 1,
+        "unauthorized_user_role": 3,
+        "unknown_response_status": 1,
+        "unknown_workspace_user": 1,
+    }
+    assert result["users"] == [
+        {
+            "uuid": str(submitted_user),
+            "username": "user_1",
+            "role": "annotator",
+            "workspace_uuid": str(dataset.workspace.id),
+        }
+    ]
+    assert "active" not in result["users"][0]
+    assert "status" not in result["users"][0]
+    assert dataset.records.iterations == 1
+
+    quarantine_rows = read_jsonl(result["quarantine_artifact"])
+    quarantine_by_user = {row["user_id"]: row for row in quarantine_rows}
+    assert quarantine_by_user[str(mixed_user)]["reason_codes"] == ["mixed_response_status"]
+    assert quarantine_by_user[str(mixed_user)]["observed_statuses"] == ["draft", "submitted"]
+    assert quarantine_by_user[str(unknown_status_user)]["reason_codes"] == ["unknown_response_status"]
+    assert quarantine_by_user[str(incomplete_user)]["missing_required_questions"] == ["label"]
+    assert quarantine_by_user[str(duplicate_user)]["duplicate_questions"] == ["label"]
+    assert quarantine_by_user[str(unknown_workspace_user)]["reason_codes"] == ["unknown_workspace_user"]
+    assert quarantine_by_user["not-a-uuid"]["reason_codes"] == ["invalid_user_id"]
+    assert quarantine_by_user[str(owner_user)]["reason_codes"] == ["unauthorized_user_role"]
+    assert quarantine_by_user[str(admin_user)]["reason_codes"] == ["unauthorized_user_role"]
+    assert quarantine_by_user[str(unknown_role_user)]["reason_codes"] == ["unauthorized_user_role"]
+    assert all(row["record_id"] == "r1" for row in quarantine_rows)
+    assert str(draft_user) not in quarantine_by_user
+    assert str(discarded_user) not in quarantine_by_user
+    serialized_quarantine = Path(result["quarantine_artifact"]).read_text(encoding="utf-8").lower()
+    assert "api_key" not in serialized_quarantine
+    assert "password" not in serialized_quarantine
+
+
+@pytest.mark.parametrize("failure_point", ["quarantine_snapshot", "commit_marker"])
+def test_jsonl_pair_publish_recovers_previous_generation_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+):
+    accepted_path = tmp_path / "decisions.jsonl"
+    quarantine_path = tmp_path / "decisions.quarantine.jsonl"
+    original_accepted = [{"record_id": "r1", "human_label": {"label": "yes"}}]
+    original_quarantine = [{"record_id": "r2", "reason": "unknown_workspace_user"}]
+    first = scaffold_io.publish_jsonl_pair(
+        original_accepted,
+        accepted_path,
+        original_quarantine,
+        quarantine_path,
+    )
+
+    if failure_point == "quarantine_snapshot":
+        original_write_jsonl = scaffold_io.write_jsonl
+
+        def fail_second_snapshot(rows, path):
+            if Path(path).resolve() == quarantine_path.resolve():
+                raise OSError("simulated quarantine snapshot failure")
+            return original_write_jsonl(rows, path)
+
+        monkeypatch.setattr(scaffold_io, "write_jsonl", fail_second_snapshot)
+    else:
+        original_write_json = scaffold_io.write_json
+        commit_marker = Path(first["commit_marker"])
+
+        def fail_commit(obj, path, *, indent=2):
+            if Path(path).resolve() == commit_marker.resolve():
+                raise OSError("simulated commit marker failure")
+            return original_write_json(obj, path, indent=indent)
+
+        monkeypatch.setattr(scaffold_io, "write_json", fail_commit)
+
+    with pytest.raises(OSError, match="simulated"):
+        scaffold_io.publish_jsonl_pair(
+            [{"record_id": "r1", "human_label": {"label": "no"}}],
+            accepted_path,
+            [{"record_id": "r3", "reason": "invalid_user_id"}],
+            quarantine_path,
+        )
+
+    assert scaffold_io.read_jsonl(accepted_path) == original_accepted
+    assert scaffold_io.read_jsonl(quarantine_path) == original_quarantine
+    assert read_json(first["commit_marker"])["generation"] == first["generation"]
+
+
+def test_jsonl_pair_first_publish_failure_has_no_readable_generation(tmp_path: Path, monkeypatch):
+    accepted_path = tmp_path / "decisions.jsonl"
+    quarantine_path = tmp_path / "decisions.quarantine.jsonl"
+    original_write_jsonl = scaffold_io.write_jsonl
+
+    def fail_second_snapshot(rows, path):
+        if Path(path).resolve() == quarantine_path.resolve():
+            raise OSError("simulated quarantine snapshot failure")
+        return original_write_jsonl(rows, path)
+
+    monkeypatch.setattr(scaffold_io, "write_jsonl", fail_second_snapshot)
+
+    with pytest.raises(OSError, match="simulated"):
+        scaffold_io.publish_jsonl_pair(
+            [{"record_id": "r1"}],
+            accepted_path,
+            [{"record_id": "r2"}],
+            quarantine_path,
+        )
+
+    with pytest.raises(RuntimeError, match="尚无完整 committed generation"):
+        scaffold_io.read_jsonl(accepted_path)
+
+
+def test_jsonl_pair_commit_rejects_generation_path_traversal(tmp_path: Path):
+    accepted_path = tmp_path / "decisions.jsonl"
+    quarantine_path = tmp_path / "decisions.quarantine.jsonl"
+    publication = scaffold_io.publish_jsonl_pair([], accepted_path, [], quarantine_path)
+    marker = read_json(publication["commit_marker"])
+    marker["generation"] = "../" + "a" * 29
+    write_json(marker, publication["commit_marker"])
+
+    with pytest.raises(RuntimeError, match="commit marker 无法验证"):
+        scaffold_io.read_jsonl(accepted_path)
+
+
+def test_argilla_pull_rejects_sensitive_params_before_loading_sdk(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    secret = "sensitive-api-key"
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: pytest.fail("sensitive params must fail before loading Argilla"))
+
+    with pytest.raises(ValueError, match=r"params\.credentials\[0\]\.api_key") as exc_info:
+        argilla.pull_responses(
+            task,
+            "dataset",
+            tmp_path / "out.jsonl",
+            {"credentials": [{"api_key": secret}]},
+        )
+
+    assert secret not in str(exc_info.value)
+
+
+def test_argilla_pull_requires_complete_manifest_without_loading_sdk(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: pytest.fail("manifest validation must not load Argilla"))
+
+    with pytest.raises(ValueError, match="push annotation manifest"):
+        argilla.pull_responses(task, "dataset", tmp_path / "out.jsonl", {})
+
+
+def test_argilla_pull_rejects_manifest_missing_required_fingerprint(tmp_path: Path):
+    task = _argilla_push_task()
+    dataset = _Dataset("dataset", records=[_remote_record("r1", "f" * 64)])
+    contract = _pull_contract(task, dataset)
+    contract["fingerprints"].pop("settings")
+
+    with pytest.raises(ValueError, match="settings fingerprint"):
+        argilla.pull_responses(
+            task,
+            dataset.name,
+            tmp_path / "out.jsonl",
+            {"manifest": {"task_id": task.task_id, "argilla_dataset": dataset.name, "argilla_contract": contract}},
+        )
+
+
+def test_argilla_pull_rejects_same_name_workspace_environment_drift(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    record = _remote_record("r1", "f" * 64)
+    dataset = _Dataset("dataset", records=[record])
+    contract = _pull_contract(task, dataset)
+    drift_workspace = _Workspace(resource_id="00000000-0000-0000-0000-000000000099")
+    client = _PullClient(drift_workspace, dataset, [])
+    client.workspaces = _Lookup(by_name={drift_workspace.name: drift_workspace})
+    _install_pull_runtime(monkeypatch, client)
+
+    with pytest.raises(ValueError, match="workspace UUID.*拒绝按同名"):
+        argilla.pull_responses(
+            task,
+            dataset.name,
+            tmp_path / "out.jsonl",
+            {"manifest": {"task_id": task.task_id, "argilla_dataset": dataset.name, "argilla_contract": contract}},
+        )
+
+
+def test_argilla_pull_rejects_dataset_uuid_mismatch(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    dataset = _Dataset("dataset", records=[_remote_record("r1", "f" * 64)])
+    contract = _pull_contract(task, dataset)
+    wrong_dataset = _Dataset(
+        "dataset",
+        resource_id="00000000-0000-0000-0000-000000000099",
+        records=dataset.records,
+    )
+    client = _PullClient(dataset.workspace, wrong_dataset, [])
+    client.datasets = _Lookup(by_id={contract["dataset"]["uuid"]: wrong_dataset})
+    _install_pull_runtime(monkeypatch, client)
+
+    with pytest.raises(ValueError, match="dataset 身份"):
+        argilla.pull_responses(
+            task,
+            dataset.name,
+            tmp_path / "out.jsonl",
+            {"manifest": {"task_id": task.task_id, "argilla_dataset": dataset.name, "argilla_contract": contract}},
+        )
+
+
+def test_argilla_pull_rejects_live_settings_drift(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    dataset = _Dataset("dataset", records=[_remote_record("r1", "f" * 64)])
+    contract = _pull_contract(task, dataset)
+    dataset.settings = _Settings("changed after push")
+    client = _PullClient(dataset.workspace, dataset, [])
+    _install_pull_runtime(monkeypatch, client)
+
+    with pytest.raises(ValueError, match="live settings/schema"):
+        argilla.pull_responses(
+            task,
+            dataset.name,
+            tmp_path / "out.jsonl",
+            {"manifest": {"task_id": task.task_id, "argilla_dataset": dataset.name, "argilla_contract": contract}},
+        )
 
 
 def test_argilla_connection_status_uses_client_me_and_workspaces(monkeypatch):

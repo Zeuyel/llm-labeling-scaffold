@@ -93,6 +93,43 @@ def test_basic_auth_roundtrip():
     assert not hmac.compare_digest(pw, "wrong")
 
 
+def test_action_api_redacts_sensitive_url_from_errors(tmp_path: Path, monkeypatch):
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    created = pipeline.create_task(
+        tasks_root,
+        {
+            "task_id": "argilla_url_error_task",
+            "id_field": "record_id",
+            "text_fields": ["text"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    api_url = "https://api-user:api-password@argilla.example?access_token=api-secret"
+
+    def fail_action(*args, **kwargs):
+        raise RuntimeError(f"upstream rejected {api_url}")
+
+    monkeypatch.setattr(pipeline, "start_action", fail_action)
+
+    with _panel_server(runs_root, tasks_root) as base_url:
+        status, payload = _request(
+            base_url,
+            "/api/action",
+            method="POST",
+            body={"task": created["path"], "action": "argilla_pull", "params": {"api_url": api_url}},
+        )
+
+    assert status == 400
+    serialized = json.dumps(payload, ensure_ascii=False)
+    assert "api-user" not in serialized
+    assert "api-password" not in serialized
+    assert "api-secret" not in serialized
+    assert "argilla.example" in serialized
+    assert "[REDACTED]" in serialized
+
+
 def test_task_source_mode_defaults_to_local(monkeypatch):
     monkeypatch.delenv("LLS_TASK_SOURCE", raising=False)
     assert panel._task_source_mode() == "local"

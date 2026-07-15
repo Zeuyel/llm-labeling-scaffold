@@ -17,6 +17,7 @@ from .config import load_task, resolve_profile_id, with_runs_root
 from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
 from .jobs import Job, create_job, get_job, run_job
 from .profiles import DEFAULT_PROFILE, list_profile_presets, profile_definition, status_label
+from .redaction import sensitive_paths
 
 try:
     import fcntl
@@ -1919,32 +1920,55 @@ def _materialize_argilla_dispatch(dispatch: dict[str, Any], annotation_dir: Path
     return str(dispatch["dispatch_path"])
 
 
-def _argilla_push_params(params: dict[str, Any], dispatch: dict[str, Any]) -> dict[str, Any]:
+def _argilla_push_params(
+    params: dict[str, Any],
+    dispatch: dict[str, Any],
+    existing_manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     out = dict(params.get("argilla") or {})
-    if dispatch.get("dispatch_mode") == "sample":
-        return out
     if dispatch.get("dispatch_mode") == "batch_plan":
         out.setdefault("record_id_strategy", "batch_scoped")
-    for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path"):
+    for key in (
+        "dispatch_mode",
+        "sample_path",
+        "batch_plan_id",
+        "batch_manifest_path",
+        "batch_ids",
+        "batch_files",
+    ):
         value = dispatch.get(key)
         if value not in (None, "", [], {}):
             out.setdefault(key, value)
+    if existing_manifest is not None:
+        contract = existing_manifest.get("argilla_contract")
+        if not isinstance(contract, dict):
+            raise ValueError("既有 Argilla annotation manifest 缺少 argilla_contract，拒绝覆盖")
+        out["expected_contract"] = contract
     return out
 
 
 def _argilla_lineage_for_pull(runs_root: str | Path, task_id: str, params: dict[str, Any], dataset: str) -> dict[str, Any]:
     annotation_manifest: dict[str, Any] = {}
+    annotation_manifest_path: Path | None = None
     annotation_id = str(params.get("annotation_id") or params.get("job_id") or "").strip()
     if annotation_id and _safe_segment(annotation_id):
         manifest_path = Path(runs_root) / task_id / "annotation_jobs" / annotation_id / "manifest.json"
         if manifest_path.exists():
             annotation_manifest = read_json(manifest_path)
+            annotation_manifest_path = manifest_path
     if not annotation_manifest:
-        for item in list_annotation_jobs(Path(runs_root), task_id):
-            if item.get("argilla_dataset") == dataset or item.get("dataset") == dataset:
-                annotation_manifest = item
-                annotation_id = str(item.get("annotation_id") or annotation_id)
-                break
+        matches = [
+            item
+            for item in list_annotation_jobs(Path(runs_root), task_id)
+            if item.get("argilla_dataset") == dataset or item.get("dataset") == dataset
+        ]
+        if len(matches) > 1:
+            raise ValueError("多个 annotation manifest 使用同名 Argilla dataset；pull 必须显式提供 annotation_id")
+        if matches:
+            annotation_manifest = matches[0]
+            annotation_id = str(annotation_manifest.get("annotation_id") or annotation_id)
+            manifest_value = annotation_manifest.get("manifest_path")
+            annotation_manifest_path = Path(manifest_value) if manifest_value else None
 
     lineage: dict[str, Any] = {}
     for key in (
@@ -1968,6 +1992,10 @@ def _argilla_lineage_for_pull(runs_root: str | Path, task_id: str, params: dict[
     if annotation_id:
         lineage["annotation_id"] = annotation_id
         lineage["source_annotation_id"] = annotation_id
+    if annotation_manifest:
+        lineage["_annotation_manifest"] = annotation_manifest
+    if annotation_manifest_path:
+        lineage["annotation_manifest_path"] = str(annotation_manifest_path)
     return lineage
 
 
@@ -1999,7 +2027,28 @@ def _truthy_param(value: Any) -> bool:
 
 # --- core object: run + jobs -------------------------------------------------
 
+_ARGILLA_ACTIONS = {
+    "argilla_pull",
+    "argilla_push",
+    "prelabel_export",
+    "prelabel_publish",
+    "prelabel_suggest",
+}
+
+
+def _reject_argilla_sensitive_params(action: str, params: dict[str, Any]) -> None:
+    if action not in _ARGILLA_ACTIONS:
+        return
+    paths = sensitive_paths(params)
+    if paths:
+        raise ValueError(
+            "Argilla 运行凭据只能通过环境变量或 secret 注入，action params 禁止敏感字段: "
+            + ", ".join(paths)
+        )
+
+
 def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> dict:
+    _reject_argilla_sensitive_params(action, params)
     task = with_runs_root(load_task(task_path), runs_root)
     jobs_dir = _jobs_dir(runs_root, task.task_id)
     job = create_job(action, dict(params, task=task_path), jobs_dir)
@@ -2032,9 +2081,14 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                 annotation_dir = _annotation_job_dir(runs_root, task.task_id, annotation_id)
                 if not annotation_dir.exists() and _archived_annotation_job_exists(runs_root, task.task_id, annotation_id):
                     raise ValueError(f"标注任务编号已归档，不能复用: {annotation_id}。请使用新的标注任务编号。")
+                manifest_path = annotation_dir / "manifest.json"
+                existing_manifest = read_json(manifest_path) if manifest_path.is_file() else None
                 dispatch_path = _materialize_argilla_dispatch(dispatch, annotation_dir)
-                argilla_params = _argilla_push_params(params, dispatch)
+                argilla_params = _argilla_push_params(params, dispatch, existing_manifest)
                 result = push_sample(task, dispatch_path, dataset, argilla_params)
+                contract = result.get("contract")
+                if not isinstance(contract, dict):
+                    raise RuntimeError("Argilla push 未返回 identity contract")
                 manifest = {
                     "task_id": task.task_id,
                     "annotation_id": annotation_id,
@@ -2053,11 +2107,12 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                     "rows": result.get("records", 0),
                     "record_id_policy": result.get("record_id_policy"),
                     "duplicate_record_ids": result.get("duplicate_record_ids"),
+                    "argilla_contract": contract,
                     "status": "已分发",
                     "created_at": _now(),
                     "result": result,
                 }
-                write_json(manifest, annotation_dir / "manifest.json")
+                write_json(manifest, manifest_path)
             return {
                 "kind": "annotation_job",
                 "annotation_id": annotation_id,
@@ -2077,10 +2132,18 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
             dataset = params.get("dataset") or lineage.get("argilla_dataset") or _default_argilla_dataset(task.task_id, sample_id)
             if not lineage or lineage.get("argilla_dataset") != dataset:
                 lineage = _argilla_lineage_for_pull(runs_root, task.task_id, params, dataset)
+            annotation_manifest = lineage.get("_annotation_manifest")
+            if not isinstance(annotation_manifest, dict):
+                raise ValueError("Argilla pull 缺少对应 annotation push manifest")
             decision_id = params.get("decision_id") or dataset
             decision_dir = Path(runs_root) / task.task_id / "decisions" / decision_id
             output = Path(params.get("output") or decision_dir / "decisions.jsonl")
-            result = pull_responses(task, dataset, output, params.get("argilla", {}))
+            pull_params = dict(params.get("argilla") or {})
+            pull_params["manifest"] = annotation_manifest
+            result = pull_responses(task, dataset, output, pull_params)
+            contract = result.get("contract")
+            if not isinstance(contract, dict):
+                raise RuntimeError("Argilla pull 未返回 identity contract")
             manifest = {
                 "task_id": task.task_id,
                 "decision_id": decision_id,
@@ -2090,10 +2153,16 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                 "sample_path": lineage.get("sample_path") or params.get("sample"),
                 "path": str(output),
                 "rows": result.get("responses", 0),
+                "quarantine_path": result.get("quarantine_artifact"),
+                "quarantined_rows": result.get("quarantined_response_groups", 0),
+                "skipped_response_groups": result.get("skipped_response_groups", 0),
+                "artifact_generation": result.get("artifact_generation"),
+                "artifact_commit_marker": result.get("artifact_commit_marker"),
+                "argilla_contract": contract,
                 "created_at": _now(),
                 "result": result,
             }
-            for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path", "batch_ids", "batch_files", "overlap_item_ids", "annotation_id", "source_annotation_id"):
+            for key in ("dispatch_mode", "batch_plan_id", "batch_manifest_path", "batch_ids", "batch_files", "overlap_item_ids", "annotation_id", "source_annotation_id", "annotation_manifest_path"):
                 if lineage.get(key) not in (None, "", [], {}):
                     manifest[key] = lineage[key]
             write_json(manifest, decision_dir / "manifest.json")
