@@ -12,7 +12,7 @@ from uuid import UUID
 
 from ..config import TaskConfig, build_text
 from ..io import read_json, read_jsonl, write_jsonl
-from ..redaction import sensitive_paths
+from ..redaction import redact_text, sensitive_paths
 
 
 _ARGILLA_CONTRACT_SCHEMA_VERSION = 1
@@ -331,6 +331,17 @@ def _response_value(raw):
     return raw
 
 
+def _response_value_missing(raw: Any) -> bool:
+    value = _response_value(raw)
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict, set)):
+        return len(value) == 0
+    return False
+
+
 def _suggestion_entries(params: dict[str, Any]) -> list[dict[str, Any]]:
     entries = params.get("suggestions")
     if entries is None and params.get("suggestions_path"):
@@ -494,7 +505,7 @@ def _human_label_from_values(task: TaskConfig, values: dict) -> dict:
     for label in _all_label_fields(task):
         name = label["name"]
         raw_value = _response_value(values.get(name))
-        if raw_value is None:
+        if _response_value_missing(raw_value):
             continue
         try:
             value = _cast_value(label, raw_value)
@@ -510,11 +521,12 @@ def _response_status_value(value: Any) -> str:
     return str(normalized or "").strip().lower()
 
 
-def _response_user_uuid(value: Any) -> str:
+def _response_user_identity(value: Any) -> tuple[str | None, str | None]:
+    raw_user_id = str(value).strip() if value is not None else ""
     try:
-        return str(UUID(str(value)))
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise RuntimeError("Argilla 2.8 Response.user_id 缺少有效 UUID") from exc
+        return str(UUID(raw_user_id)), raw_user_id
+    except (TypeError, ValueError, AttributeError):
+        return None, raw_user_id or None
 
 
 def _record_response_groups(record) -> list[dict[str, Any]]:
@@ -529,31 +541,52 @@ def _record_response_groups(record) -> list[dict[str, Any]]:
     grouped: dict[str, dict[str, Any]] = {}
     for response in iterator:
         question_name = str(getattr(response, "question_name", "") or "").strip()
-        if not question_name or not hasattr(response, "value") or not hasattr(response, "status"):
+        if (
+            not question_name
+            or not hasattr(response, "value")
+            or not hasattr(response, "user_id")
+            or not hasattr(response, "status")
+        ):
             raise RuntimeError(
                 "Argilla 2.8 Response 必须公开 question_name、value、user_id、status；"
                 "不能使用 Record.status 或 RecordResponses.to_dict() 推断"
             )
-        user_id = _response_user_uuid(getattr(response, "user_id", None))
+        user_id, raw_user_id = _response_user_identity(response.user_id)
+        group_key = f"uuid:{user_id}" if user_id is not None else f"invalid:{raw_user_id!r}"
         group = grouped.setdefault(
-            user_id,
-            {"user_id": user_id, "values": {}, "statuses": set(), "duplicate_question": False},
+            group_key,
+            {
+                "user_id": user_id,
+                "raw_user_id": raw_user_id,
+                "invalid_user_id": user_id is None,
+                "values": {},
+                "normalized_statuses": set(),
+                "observed_statuses": set(),
+                "duplicate_questions": set(),
+            },
         )
         if question_name in group["values"]:
-            group["duplicate_question"] = True
+            group["duplicate_questions"].add(question_name)
         group["values"][question_name] = {"value": response.value}
-        group["statuses"].add(_response_status_value(response.status))
+        observed_status = _response_status_value(response.status)
+        group["observed_statuses"].add(observed_status or "unknown")
+        group["normalized_statuses"].add(
+            observed_status if observed_status in {"submitted", "draft", "discarded"} else "unknown"
+        )
 
     out: list[dict[str, Any]] = []
     for group in grouped.values():
-        statuses = sorted(status for status in group.pop("statuses") if status)
-        if group.pop("duplicate_question") or len(statuses) != 1:
+        normalized_statuses = sorted(group.pop("normalized_statuses"))
+        observed_statuses = sorted(group.pop("observed_statuses"))
+        duplicate_questions = sorted(group.pop("duplicate_questions"))
+        if len(normalized_statuses) != 1:
             status = "mixed"
-        elif statuses[0] in {"submitted", "draft", "discarded"}:
-            status = statuses[0]
         else:
-            status = "unknown"
-        out.append({**group, "status": status, "observed_statuses": statuses})
+            status = normalized_statuses[0]
+        item = {**group, "status": status, "observed_statuses": observed_statuses}
+        if duplicate_questions:
+            item["duplicate_questions"] = duplicate_questions
+        out.append(item)
     return out
 
 
@@ -562,8 +595,7 @@ def _missing_required_response_names(task: TaskConfig, values: dict[str, Any]) -
     for label in _all_label_fields(task):
         if not _question_required(label):
             continue
-        value = _response_value(values.get(label["name"]))
-        if value is None or (isinstance(value, str) and not value.strip()):
+        if _response_value_missing(values.get(label["name"])):
             missing.append(str(label["name"]))
     return missing
 
@@ -705,26 +737,38 @@ def _collection_has_items(value: Any) -> bool:
         return any(True for _ in value)
 
 
-def _remote_records_state(records) -> dict[str, Any]:
-    record_ids: set[str] = set()
-    fingerprints: set[str] = set()
-    missing_fingerprint = False
-    has_responses = False
-    for record in records:
-        record_ids.add(str(getattr(record, "id", "")))
-        fingerprint = str(_record_metadata_dict(record).get(_ARGILLA_PUSH_FINGERPRINT_FIELD) or "").strip()
-        if fingerprint:
-            fingerprints.add(fingerprint)
-        else:
-            missing_fingerprint = True
-        if _collection_has_items(getattr(record, "responses", None)):
-            has_responses = True
+def _empty_remote_records_state() -> dict[str, Any]:
     return {
-        "record_ids": record_ids,
-        "fingerprints": fingerprints,
-        "missing_fingerprint": missing_fingerprint,
-        "has_responses": has_responses,
+        "record_ids": set(),
+        "fingerprints": set(),
+        "missing_fingerprint": False,
+        "has_responses": False,
     }
+
+
+def _accumulate_remote_record_state(
+    state: dict[str, Any],
+    record: Any,
+    *,
+    has_responses: bool | None = None,
+) -> None:
+    state["record_ids"].add(str(getattr(record, "id", "")))
+    fingerprint = str(_record_metadata_dict(record).get(_ARGILLA_PUSH_FINGERPRINT_FIELD) or "").strip()
+    if fingerprint:
+        state["fingerprints"].add(fingerprint)
+    else:
+        state["missing_fingerprint"] = True
+    if has_responses is None:
+        has_responses = _collection_has_items(getattr(record, "responses", None))
+    if has_responses:
+        state["has_responses"] = True
+
+
+def _remote_records_state(records) -> dict[str, Any]:
+    state = _empty_remote_records_state()
+    for record in records:
+        _accumulate_remote_record_state(state, record)
+    return state
 
 
 def _remote_dataset_state(dataset) -> dict[str, Any]:
@@ -1485,6 +1529,70 @@ def _workspace_user_identities(client, workspace) -> dict[str, dict[str, str]]:
     return identities
 
 
+def _quarantine_artifact_path(output_path: str | Path, params: dict[str, Any]) -> Path:
+    explicit = str(params.get("quarantine_path") or "").strip()
+    if explicit:
+        path = Path(explicit)
+    else:
+        output = Path(output_path)
+        path = output.with_name(f"{output.stem}.quarantine{output.suffix or '.jsonl'}")
+    if path.absolute() == Path(output_path).absolute():
+        raise ValueError("Argilla quarantine artifact 不能覆盖 accepted output")
+    return path
+
+
+def _response_group_reason_codes(
+    task: TaskConfig,
+    response_group: dict[str, Any],
+    users: dict[str, dict[str, str]],
+) -> tuple[list[str], list[str]]:
+    status = response_group["status"]
+    if status in {"draft", "discarded"}:
+        return [], []
+    reasons: list[str] = []
+    if status == "mixed":
+        reasons.append("mixed_response_status")
+    elif status == "unknown":
+        reasons.append("unknown_response_status")
+    elif status != "submitted":
+        reasons.append("unknown_response_status")
+    if response_group.get("duplicate_questions"):
+        reasons.append("duplicate_question")
+    user_id = response_group.get("user_id")
+    if user_id is None:
+        reasons.append("invalid_user_id")
+    elif user_id not in users:
+        reasons.append("unknown_workspace_user")
+    missing_required = _missing_required_response_names(task, response_group["values"])
+    if missing_required:
+        reasons.append("missing_required_question")
+    return reasons, missing_required
+
+
+def _quarantine_response_group(
+    record_id: str,
+    response_group: dict[str, Any],
+    reason_codes: list[str],
+    missing_required: list[str],
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "record_id": record_id,
+        "reason": reason_codes[0],
+        "reason_codes": reason_codes,
+        "response_status": response_group["status"],
+        "observed_statuses": list(response_group.get("observed_statuses") or []),
+        "question_names": sorted(response_group["values"]),
+    }
+    raw_user_id = response_group.get("raw_user_id")
+    if raw_user_id not in (None, ""):
+        row["user_id"] = redact_text(raw_user_id)
+    if response_group.get("duplicate_questions"):
+        row["duplicate_questions"] = list(response_group["duplicate_questions"])
+    if missing_required:
+        row["missing_required_questions"] = missing_required
+    return row
+
+
 def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path, params: dict[str, Any] | None = None) -> dict:
     params = dict(params or {})
     _reject_sensitive_params(params)
@@ -1496,39 +1604,42 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
     client = _client(params.get("api_url"))
     workspace = _workspace_by_identity(client, contract["workspace"]["name"], contract["workspace"]["uuid"])
     dataset = _dataset_by_identity(client, dataset_name, workspace, contract["dataset"]["uuid"])
-    records = list(dataset.records)
-    _validate_live_dataset_contract(
-        dataset,
-        push_fingerprint=contract["fingerprints"]["push"],
-        settings_fingerprint=contract["fingerprints"]["settings"],
-        min_submitted=contract["min_submitted"],
-        records=records,
-    )
     users = _workspace_user_identities(client, workspace)
-    rows = []
+    rows: list[dict[str, Any]] = []
+    quarantine_rows: list[dict[str, Any]] = []
     skipped_groups = 0
-    quarantined_groups = 0
     used_users: dict[str, dict[str, str]] = {}
-    for record in records:
+    state = _empty_remote_records_state()
+    for record in dataset.records:
         record_id = _record_source_id(record, task)
-        for response_group in _record_response_groups(record):
+        response_groups = _record_response_groups(record)
+        _accumulate_remote_record_state(state, record, has_responses=bool(response_groups))
+        for response_group in response_groups:
             status = response_group["status"]
-            if status != "submitted":
+            if status in {"draft", "discarded"}:
                 skipped_groups += 1
-                if status not in {"draft", "discarded"}:
-                    quarantined_groups += 1
+                continue
+            reason_codes, missing_required = _response_group_reason_codes(task, response_group, users)
+            if reason_codes:
+                skipped_groups += 1
+                quarantine_rows.append(_quarantine_response_group(
+                    record_id,
+                    response_group,
+                    reason_codes,
+                    missing_required,
+                ))
                 continue
             user_id = response_group["user_id"]
-            user = users.get(user_id)
-            if user is None:
-                raise ValueError("Argilla submitted response user UUID 不属于 manifest workspace")
-            if _missing_required_response_names(task, response_group["values"]):
-                skipped_groups += 1
-                quarantined_groups += 1
-                continue
+            user = users[user_id]
             human_label = _human_label_from_values(task, response_group["values"])
             if not human_label:
                 skipped_groups += 1
+                quarantine_rows.append(_quarantine_response_group(
+                    record_id,
+                    response_group,
+                    ["empty_human_label"],
+                    [],
+                ))
                 continue
             used_users[user_id] = user
             rows.append({
@@ -1542,7 +1653,20 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
                 "status": "submitted",
                 "response_status": "submitted",
             })
+    _validate_live_dataset_contract(
+        dataset,
+        push_fingerprint=contract["fingerprints"]["push"],
+        settings_fingerprint=contract["fingerprints"]["settings"],
+        min_submitted=contract["min_submitted"],
+        state=state,
+    )
+    quarantine_path = _quarantine_artifact_path(output_path, params)
     write_jsonl(rows, output_path)
+    write_jsonl(quarantine_rows, quarantine_path)
+    reason_counts: dict[str, int] = {}
+    for row in quarantine_rows:
+        for reason in row["reason_codes"]:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
     return {
         "backend": "argilla",
         "workspace": contract["workspace"]["name"],
@@ -1550,11 +1674,15 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
         "dataset": dataset_name,
         "dataset_uuid": contract["dataset"]["uuid"],
         "responses": len(rows),
+        "accepted_response_groups": len(rows),
         "skipped_response_groups": skipped_groups,
-        "quarantined_response_groups": quarantined_groups,
+        "quarantined_response_groups": len(quarantine_rows),
+        "quarantine_reason_codes": sorted(reason_counts),
+        "quarantine_reason_counts": dict(sorted(reason_counts.items())),
         "users": [used_users[user_id] for user_id in sorted(used_users)],
         "contract": contract,
         "artifact": str(output_path),
+        "quarantine_artifact": str(quarantine_path),
     }
 
 

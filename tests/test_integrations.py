@@ -18,6 +18,7 @@ from llm_labeling_scaffold.integrations.argilla import (
     _guidelines_for_task,
     _human_label_from_values,
     _make_suggestion,
+    _missing_required_response_names,
     _prepare_dataset,
     _prepare_records_for_push,
     _push_fingerprints,
@@ -240,6 +241,8 @@ def test_argilla_2_8_public_response_iterable_groups_by_user_and_status():
     assert groups == [
         {
             "user_id": str(user_id),
+            "raw_user_id": str(user_id),
+            "invalid_user_id": False,
             "values": {"label": {"value": "yes"}, "reason": {"value": "evidence"}},
             "status": "submitted",
             "observed_statuses": ["submitted"],
@@ -275,6 +278,41 @@ def test_argilla_response_groups_quarantine_mixed_and_keep_draft_discarded():
     assert groups[str(user_mixed)]["observed_statuses"] == ["draft", "submitted"]
     assert groups[str(user_draft)]["status"] == "draft"
     assert groups[str(user_discarded)]["status"] == "discarded"
+
+
+def test_argilla_response_groups_preserve_invalid_user_and_empty_status():
+    valid_user = UUID("10000000-0000-0000-0000-000000000001")
+    record = types.SimpleNamespace(
+        responses=[
+            types.SimpleNamespace(question_name="label", value="yes", user_id=valid_user, status="submitted"),
+            types.SimpleNamespace(question_name="reason", value="evidence", user_id=valid_user, status=None),
+            types.SimpleNamespace(question_name="label", value="no", user_id="not-a-uuid", status="submitted"),
+        ]
+    )
+
+    groups = _record_response_groups(record)
+    valid_group = next(group for group in groups if group["user_id"] == str(valid_user))
+    invalid_group = next(group for group in groups if group["invalid_user_id"])
+
+    assert valid_group["status"] == "mixed"
+    assert valid_group["observed_statuses"] == ["submitted", "unknown"]
+    assert invalid_group["user_id"] is None
+    assert invalid_group["raw_user_id"] == "not-a-uuid"
+    assert invalid_group["status"] == "submitted"
+
+
+@pytest.mark.parametrize("empty_value", [[], (), {}, set()])
+def test_argilla_required_questions_treat_empty_collections_as_missing(empty_value):
+    task = _argilla_push_task()
+
+    assert _missing_required_response_names(task, {"label": {"value": empty_value}}) == ["label"]
+
+
+@pytest.mark.parametrize("value", [0, False])
+def test_argilla_required_questions_accept_zero_and_false(value):
+    task = _argilla_push_task()
+
+    assert _missing_required_response_names(task, {"label": {"value": value}}) == []
 
 
 def test_argilla_guidelines_use_task_annotation_by_default():
@@ -1269,9 +1307,10 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
     draft_user = UUID("10000000-0000-0000-0000-000000000002")
     discarded_user = UUID("10000000-0000-0000-0000-000000000003")
     mixed_user = UUID("10000000-0000-0000-0000-000000000004")
-    unknown_user = UUID("10000000-0000-0000-0000-000000000005")
+    unknown_status_user = UUID("10000000-0000-0000-0000-000000000005")
     incomplete_user = UUID("10000000-0000-0000-0000-000000000006")
     duplicate_user = UUID("10000000-0000-0000-0000-000000000007")
+    unknown_workspace_user = UUID("10000000-0000-0000-0000-000000000008")
     record = types.SimpleNamespace(
         id="r1",
         status="completed",
@@ -1283,17 +1322,28 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
             types.SimpleNamespace(question_name="label", value="no", user_id=discarded_user, status="discarded"),
             types.SimpleNamespace(question_name="label", value="yes", user_id=mixed_user, status="submitted"),
             types.SimpleNamespace(question_name="reason", value="mixed", user_id=mixed_user, status="draft"),
-            types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_user, status="completed"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_status_user, status="completed"),
             types.SimpleNamespace(question_name="reason", value="optional only", user_id=incomplete_user, status="submitted"),
             types.SimpleNamespace(question_name="label", value="yes", user_id=duplicate_user, status="submitted"),
             types.SimpleNamespace(question_name="label", value="no", user_id=duplicate_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_workspace_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id="not-a-uuid", status="submitted"),
         ],
     )
-    dataset = _Dataset("dataset", records=[record])
+    dataset = _Dataset("dataset", records=[])
+    dataset.records = _RemoteRecords([record])
     users = [
         types.SimpleNamespace(id=user_id, username=f"user_{index}", role=types.SimpleNamespace(value="annotator"))
         for index, user_id in enumerate(
-            (submitted_user, draft_user, discarded_user, mixed_user, unknown_user, incomplete_user, duplicate_user),
+            (
+                submitted_user,
+                draft_user,
+                discarded_user,
+                mixed_user,
+                unknown_status_user,
+                incomplete_user,
+                duplicate_user,
+            ),
             start=1,
         )
     ]
@@ -1325,8 +1375,26 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
         }
     ]
     assert result["responses"] == 1
-    assert result["skipped_response_groups"] == 6
-    assert result["quarantined_response_groups"] == 4
+    assert result["accepted_response_groups"] == 1
+    assert result["skipped_response_groups"] == 8
+    assert result["quarantined_response_groups"] == 6
+    assert result["quarantine_artifact"] == str(tmp_path / "decisions.quarantine.jsonl")
+    assert result["quarantine_reason_codes"] == [
+        "duplicate_question",
+        "invalid_user_id",
+        "missing_required_question",
+        "mixed_response_status",
+        "unknown_response_status",
+        "unknown_workspace_user",
+    ]
+    assert result["quarantine_reason_counts"] == {
+        "duplicate_question": 1,
+        "invalid_user_id": 1,
+        "missing_required_question": 1,
+        "mixed_response_status": 1,
+        "unknown_response_status": 1,
+        "unknown_workspace_user": 1,
+    }
     assert result["users"] == [
         {
             "uuid": str(submitted_user),
@@ -1335,6 +1403,25 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
             "workspace_uuid": str(dataset.workspace.id),
         }
     ]
+    assert dataset.records.iterations == 1
+
+    quarantine_rows = read_jsonl(result["quarantine_artifact"])
+    quarantine_by_user = {row["user_id"]: row for row in quarantine_rows}
+    assert quarantine_by_user[str(mixed_user)]["reason_codes"] == ["mixed_response_status"]
+    assert quarantine_by_user[str(mixed_user)]["observed_statuses"] == ["draft", "submitted"]
+    assert quarantine_by_user[str(unknown_status_user)]["reason_codes"] == ["unknown_response_status"]
+    assert quarantine_by_user[str(incomplete_user)]["missing_required_questions"] == ["label"]
+    assert quarantine_by_user[str(duplicate_user)]["duplicate_questions"] == ["label"]
+    assert quarantine_by_user[str(unknown_workspace_user)]["reason_codes"] == ["unknown_workspace_user"]
+    assert quarantine_by_user["not-a-uuid"]["reason_codes"] == ["invalid_user_id"]
+    assert all(row["record_id"] == "r1" for row in quarantine_rows)
+    assert str(draft_user) not in quarantine_by_user
+    assert str(discarded_user) not in quarantine_by_user
+    serialized_quarantine = Path(result["quarantine_artifact"]).read_text(encoding="utf-8").lower()
+    assert "api_key" not in serialized_quarantine
+    assert "password" not in serialized_quarantine
+
+
 def test_argilla_pull_rejects_sensitive_params_before_loading_sdk(tmp_path: Path, monkeypatch):
     task = _argilla_push_task()
     secret = "sensitive-api-key"

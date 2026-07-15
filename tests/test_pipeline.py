@@ -2513,8 +2513,17 @@ def test_argilla_pull_uses_annotation_manifest_contract_and_persists_identity(tm
     def fake_pull(task_arg, dataset, output, argilla_params):
         captured["dataset"] = dataset
         captured["params"] = dict(argilla_params)
+        quarantine = Path(output).with_name("decisions.quarantine.jsonl")
         write_jsonl([], output)
-        return {"responses": 0, "artifact": str(output), "contract": contract}
+        write_jsonl([{"record_id": "r1", "reason": "unknown_workspace_user"}], quarantine)
+        return {
+            "responses": 0,
+            "artifact": str(output),
+            "quarantine_artifact": str(quarantine),
+            "quarantined_response_groups": 1,
+            "skipped_response_groups": 1,
+            "contract": contract,
+        }
 
     with patch("llm_labeling_scaffold.integrations.argilla.pull_responses", side_effect=fake_pull):
         job = pipeline.start_action(
@@ -2532,6 +2541,11 @@ def test_argilla_pull_uses_annotation_manifest_contract_and_persists_identity(tm
     assert decision_manifest["annotation_id"] == "round_1"
     assert decision_manifest["argilla_contract"] == contract
     assert decision_manifest["annotation_manifest_path"] == str(annotation_dir / "manifest.json")
+    assert decision_manifest["quarantine_path"] == str(
+        tmp_path / "runs" / task.task_id / "decisions" / "decision_1" / "decisions.quarantine.jsonl"
+    )
+    assert decision_manifest["quarantined_rows"] == 1
+    assert decision_manifest["skipped_response_groups"] == 1
 
 
 def test_argilla_push_batch_plan_fails_on_same_batch_duplicate_original_id(tmp_path: Path):
