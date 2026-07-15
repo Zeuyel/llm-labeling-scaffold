@@ -8,11 +8,13 @@ from uuid import UUID
 
 import pytest
 
+import llm_labeling_scaffold.io as scaffold_io
 from llm_labeling_scaffold.config import TaskConfig, load_task
 from llm_labeling_scaffold.integrations import argilla
 from llm_labeling_scaffold.integrations.argilla import (
     _ARGILLA_CONTRACT_INTENT_FIELD,
     _ARGILLA_PUSH_FINGERPRINT_FIELD,
+    _api_url,
     _argilla_text_fields,
     _build_contract,
     _guidelines_for_task,
@@ -976,25 +978,54 @@ def test_argilla_dataset_replace_is_blocked_after_any_response():
     assert existing.deleted == 0
 
 
-def test_argilla_dataset_replace_without_responses_creates_new_dataset():
+def test_argilla_dataset_replace_without_responses_never_deletes_existing_dataset():
     existing = _Dataset("dataset_a", records=[_remote_record("r1", "a" * 64)])
     existing.settings = _Settings(intent_fingerprint="a" * 64)
     created = _Dataset("dataset_a")
 
-    dataset, action, missing_record_ids = _prepare_dataset(
-        created,
-        existing,
-        "replace",
-        push_fingerprint="b" * 64,
-        settings_fingerprint=_settings_fingerprint(existing.settings),
-        desired_record_ids={"r1"},
-        min_submitted=1,
-    )
-    assert dataset is created
-    assert action == "replaced"
-    assert missing_record_ids == {"r1"}
-    assert existing.deleted == 1
-    assert created.created == 1
+    with pytest.raises(ValueError, match="不会自动删除既有 dataset"):
+        _prepare_dataset(
+            created,
+            existing,
+            "replace",
+            push_fingerprint="b" * 64,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+
+    assert existing.deleted == 0
+    assert created.created == 0
+
+
+def test_argilla_dataset_replace_fails_closed_when_response_arrives_after_scan():
+    record = _remote_record("r1", "a" * 64)
+    submitted = types.SimpleNamespace(status="submitted")
+
+    class RacingRecords:
+        def __iter__(self):
+            yield record
+            record.responses.append(submitted)
+
+    existing = _Dataset("dataset_a", records=[])
+    existing.settings = _Settings(intent_fingerprint="a" * 64)
+    existing.records = RacingRecords()
+    created = _Dataset("dataset_a")
+
+    with pytest.raises(ValueError, match="不会自动删除既有 dataset"):
+        _prepare_dataset(
+            created,
+            existing,
+            "replace",
+            push_fingerprint="b" * 64,
+            settings_fingerprint=_settings_fingerprint(existing.settings),
+            desired_record_ids={"r1"},
+            min_submitted=1,
+        )
+
+    assert record.responses == [submitted]
+    assert existing.deleted == 0
+    assert created.created == 0
 
 
 def test_argilla_dataset_identical_replace_retry_is_noop_and_preserves_responses():
@@ -1284,6 +1315,23 @@ def test_argilla_server_2_8_version_route_contract(monkeypatch):
     assert observed == {"url": "https://argilla.example/api/v1/version", "timeout": 3.0}
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:password@argilla.example",
+        "https://argilla.example?access_token=secret-token",
+        "https://argilla.example/#/oauth?refresh_token=secret-token",
+        "https://[invalid-host?access_token=secret-token",
+    ],
+)
+def test_argilla_api_url_rejects_embedded_credentials(url):
+    with pytest.raises(ValueError, match="userinfo 或敏感 query/fragment") as exc_info:
+        _api_url(url)
+
+    assert "secret-token" not in str(exc_info.value)
+    assert "password" not in str(exc_info.value)
+
+
 @pytest.mark.parametrize("version", ["2.8", "2.8.1", "2.8.0.post1", "2.9.0", ""])
 def test_argilla_runtime_requires_exact_2_8_0(version):
     with pytest.raises(RuntimeError, match="必须是 Argilla 2.8.0"):
@@ -1390,6 +1438,10 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
     assert result["skipped_response_groups"] == 11
     assert result["quarantined_response_groups"] == 9
     assert result["quarantine_artifact"] == str(tmp_path / "decisions.quarantine.jsonl")
+    assert len(result["artifact_generation"]) == 32
+    assert Path(result["artifact_commit_marker"]).is_file()
+    assert Path(result["accepted_generation_artifact"]).is_file()
+    assert Path(result["quarantine_generation_artifact"]).is_file()
     assert result["quarantine_reason_codes"] == [
         "duplicate_question",
         "invalid_user_id",
@@ -1438,6 +1490,92 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
     serialized_quarantine = Path(result["quarantine_artifact"]).read_text(encoding="utf-8").lower()
     assert "api_key" not in serialized_quarantine
     assert "password" not in serialized_quarantine
+
+
+@pytest.mark.parametrize("failure_point", ["quarantine_snapshot", "commit_marker"])
+def test_jsonl_pair_publish_recovers_previous_generation_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+):
+    accepted_path = tmp_path / "decisions.jsonl"
+    quarantine_path = tmp_path / "decisions.quarantine.jsonl"
+    original_accepted = [{"record_id": "r1", "human_label": {"label": "yes"}}]
+    original_quarantine = [{"record_id": "r2", "reason": "unknown_workspace_user"}]
+    first = scaffold_io.publish_jsonl_pair(
+        original_accepted,
+        accepted_path,
+        original_quarantine,
+        quarantine_path,
+    )
+
+    if failure_point == "quarantine_snapshot":
+        original_write_jsonl = scaffold_io.write_jsonl
+
+        def fail_second_snapshot(rows, path):
+            if Path(path).resolve() == quarantine_path.resolve():
+                raise OSError("simulated quarantine snapshot failure")
+            return original_write_jsonl(rows, path)
+
+        monkeypatch.setattr(scaffold_io, "write_jsonl", fail_second_snapshot)
+    else:
+        original_write_json = scaffold_io.write_json
+        commit_marker = Path(first["commit_marker"])
+
+        def fail_commit(obj, path, *, indent=2):
+            if Path(path).resolve() == commit_marker.resolve():
+                raise OSError("simulated commit marker failure")
+            return original_write_json(obj, path, indent=indent)
+
+        monkeypatch.setattr(scaffold_io, "write_json", fail_commit)
+
+    with pytest.raises(OSError, match="simulated"):
+        scaffold_io.publish_jsonl_pair(
+            [{"record_id": "r1", "human_label": {"label": "no"}}],
+            accepted_path,
+            [{"record_id": "r3", "reason": "invalid_user_id"}],
+            quarantine_path,
+        )
+
+    assert scaffold_io.read_jsonl(accepted_path) == original_accepted
+    assert scaffold_io.read_jsonl(quarantine_path) == original_quarantine
+    assert read_json(first["commit_marker"])["generation"] == first["generation"]
+
+
+def test_jsonl_pair_first_publish_failure_has_no_readable_generation(tmp_path: Path, monkeypatch):
+    accepted_path = tmp_path / "decisions.jsonl"
+    quarantine_path = tmp_path / "decisions.quarantine.jsonl"
+    original_write_jsonl = scaffold_io.write_jsonl
+
+    def fail_second_snapshot(rows, path):
+        if Path(path).resolve() == quarantine_path.resolve():
+            raise OSError("simulated quarantine snapshot failure")
+        return original_write_jsonl(rows, path)
+
+    monkeypatch.setattr(scaffold_io, "write_jsonl", fail_second_snapshot)
+
+    with pytest.raises(OSError, match="simulated"):
+        scaffold_io.publish_jsonl_pair(
+            [{"record_id": "r1"}],
+            accepted_path,
+            [{"record_id": "r2"}],
+            quarantine_path,
+        )
+
+    with pytest.raises(RuntimeError, match="尚无完整 committed generation"):
+        scaffold_io.read_jsonl(accepted_path)
+
+
+def test_jsonl_pair_commit_rejects_generation_path_traversal(tmp_path: Path):
+    accepted_path = tmp_path / "decisions.jsonl"
+    quarantine_path = tmp_path / "decisions.quarantine.jsonl"
+    publication = scaffold_io.publish_jsonl_pair([], accepted_path, [], quarantine_path)
+    marker = read_json(publication["commit_marker"])
+    marker["generation"] = "../" + "a" * 29
+    write_json(marker, publication["commit_marker"])
+
+    with pytest.raises(RuntimeError, match="commit marker 无法验证"):
+        scaffold_io.read_jsonl(accepted_path)
 
 
 def test_argilla_pull_rejects_sensitive_params_before_loading_sdk(tmp_path: Path, monkeypatch):

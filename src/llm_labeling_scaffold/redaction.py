@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
 
 REDACTED = "[REDACTED]"
@@ -25,6 +26,8 @@ _SECRET_TEXT_PATTERN = re.compile(
     r"(\s*[:=]\s*)([^\s,;]+)"
 )
 _BEARER_PATTERN = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_URL_USERINFO_PATTERN = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/@\s]+)@")
+_URL_PARAMETER_PATTERN = re.compile(r"(?i)(^|[?&#;])([^=&#;\s]+)=([^&#;\s\"'<>]*)")
 
 
 def _normalized_key(value: Any) -> str:
@@ -49,6 +52,39 @@ def is_sensitive_key(value: Any) -> bool:
     )
 
 
+def _sensitive_parameter_keys(value: str) -> list[str]:
+    keys = {
+        str(key)
+        for key, _ in parse_qsl(value.lstrip("?#"), keep_blank_values=True)
+        if is_sensitive_key(key)
+    }
+    for match in _URL_PARAMETER_PATTERN.finditer(value):
+        key = unquote_plus(match.group(2))
+        if is_sensitive_key(key):
+            keys.add(key)
+    return sorted(keys)
+
+
+def sensitive_url_reasons(value: Any) -> list[str]:
+    text = str(value or "").strip()
+    if "://" not in text:
+        return []
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        parsed = None
+    reasons: list[str] = []
+    if parsed is not None and parsed.scheme and parsed.netloc:
+        if parsed.username is not None or parsed.password is not None:
+            reasons.append("userinfo")
+        reasons.extend(f"query:{key}" for key in _sensitive_parameter_keys(parsed.query))
+        reasons.extend(f"fragment:{key}" for key in _sensitive_parameter_keys(parsed.fragment))
+    elif _URL_USERINFO_PATTERN.search(text):
+        reasons.append("userinfo")
+    reasons.extend(f"url:{key}" for key in _sensitive_parameter_keys(text))
+    return sorted(set(reasons))
+
+
 def sensitive_paths(value: Any, *, prefix: str = "params") -> list[str]:
     paths: list[str] = []
     if isinstance(value, dict):
@@ -61,6 +97,8 @@ def sensitive_paths(value: Any, *, prefix: str = "params") -> list[str]:
     elif isinstance(value, (list, tuple, set)):
         for index, item in enumerate(value):
             paths.extend(sensitive_paths(item, prefix=f"{prefix}[{index}]"))
+    elif isinstance(value, str) and sensitive_url_reasons(value):
+        paths.append(prefix)
     return paths
 
 
@@ -86,6 +124,15 @@ def redact_text(value: Any, *, secrets: set[str] | None = None) -> str:
     for secret in sorted(secrets or set(), key=len, reverse=True):
         if secret:
             text = text.replace(secret, REDACTED)
+    text = _URL_USERINFO_PATTERN.sub(lambda match: f"{match.group(1)}{REDACTED}@", text)
+    text = _URL_PARAMETER_PATTERN.sub(
+        lambda match: (
+            f"{match.group(1)}{match.group(2)}={REDACTED}"
+            if is_sensitive_key(unquote_plus(match.group(2)))
+            else match.group(0)
+        ),
+        text,
+    )
     text = _SECRET_TEXT_PATTERN.sub(lambda match: f"{match.group(1)}{match.group(2)}{REDACTED}", text)
     return _BEARER_PATTERN.sub(f"Bearer {REDACTED}", text)
 

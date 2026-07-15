@@ -9,7 +9,7 @@ from llm_labeling_scaffold import data_lake
 from llm_labeling_scaffold.cli import build_parser
 from llm_labeling_scaffold.cli import main as cli_main
 from llm_labeling_scaffold.config import load_task
-from llm_labeling_scaffold.io import read_json, write_json, write_jsonl
+from llm_labeling_scaffold.io import publish_jsonl_pair, read_json, write_json, write_jsonl
 
 
 def _sha256(path: Path) -> str:
@@ -97,6 +97,29 @@ def test_publish_plan_parses_supported_artifacts_without_writes(
     assert artifact["sha256"] == _sha256(local_path)
     assert artifact["manifest"]["dry_run"] is True
     assert artifact["manifest"]["storage_uri"] == artifact["target_uri"]
+
+
+def test_publish_plan_uses_committed_decision_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("LLS_DATA_LAKE_R2_PREFIX", "r2:test-lake/")
+    task, runs_root = _write_task(tmp_path)
+    decisions_dir = runs_root / task.task_id / "decisions" / "round_1"
+    accepted_path = decisions_dir / "decisions.jsonl"
+    quarantine_path = decisions_dir / "decisions.quarantine.jsonl"
+    committed = publish_jsonl_pair(
+        [{"record_id": "r1", "human_label": {"label": "yes"}}],
+        accepted_path,
+        [],
+        quarantine_path,
+    )
+    write_json({"task_id": task.task_id, "decision_id": "round_1", "rows": 1}, decisions_dir / "manifest.json")
+    write_jsonl([{"record_id": "r1", "human_label": {"label": "uncommitted"}}], accepted_path)
+
+    plan = data_lake.plan_artifact_publish(task, runs_root, "decisions", "round_1")
+
+    artifact = plan["artifacts"][0]
+    assert artifact["local_path"] == committed["accepted_generation_path"]
+    assert artifact["rows"] == 1
+    assert artifact["sha256"] == _sha256(Path(committed["accepted_generation_path"]))
 
 
 def test_publish_submit_requires_confirm_and_idempotency_key_before_writes(

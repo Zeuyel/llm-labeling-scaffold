@@ -11,8 +11,8 @@ import urllib.request
 from uuid import UUID
 
 from ..config import TaskConfig, build_text
-from ..io import read_json, read_jsonl, write_jsonl
-from ..redaction import redact_text, sensitive_paths
+from ..io import publish_jsonl_pair, read_json, read_jsonl
+from ..redaction import redact_text, sensitive_paths, sensitive_url_reasons
 
 
 _ARGILLA_CONTRACT_SCHEMA_VERSION = 1
@@ -31,15 +31,19 @@ def _load_argilla():
 
 
 def _client(api_url: str | None = None):
+    resolved_api_url = _api_url(api_url)
     rg = _load_argilla()
     return rg.Argilla(
-        api_url=api_url or os.environ.get("ARGILLA_API_URL", "http://localhost:6900"),
+        api_url=resolved_api_url,
         api_key=os.environ.get("ARGILLA_API_KEY", "argilla.apikey"),
     )
 
 
 def _api_url(api_url: str | None = None) -> str:
-    return api_url or os.environ.get("ARGILLA_API_URL", "http://localhost:6900")
+    resolved = str(api_url or os.environ.get("ARGILLA_API_URL", "http://localhost:6900")).strip()
+    if sensitive_url_reasons(resolved):
+        raise ValueError("Argilla api_url 禁止包含 URL userinfo 或敏感 query/fragment")
+    return resolved
 
 
 def _require_argilla_2_8_version(component: str, value: Any) -> str:
@@ -874,12 +878,12 @@ def _prepare_dataset(
     except ValueError as exc:
         if state["has_responses"]:
             raise ValueError("Argilla dataset 已有回答，禁止 replace") from exc
+        raise ValueError(
+            "Argilla replace 不会自动删除既有 dataset；请使用新 dataset name 或恢复原 contract"
+        ) from exc
     else:
         action = "recovered_empty" if not state["record_ids"] else "resumed"
         return existing, action, missing_record_ids
-
-    existing.delete()
-    return dataset.create(), "replaced", set(desired_record_ids)
 
 
 def _build_contract(
@@ -1663,8 +1667,7 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
         state=state,
     )
     quarantine_path = _quarantine_artifact_path(output_path, params)
-    write_jsonl(rows, output_path)
-    write_jsonl(quarantine_rows, quarantine_path)
+    publication = publish_jsonl_pair(rows, output_path, quarantine_rows, quarantine_path)
     reason_counts: dict[str, int] = {}
     for row in quarantine_rows:
         for reason in row["reason_codes"]:
@@ -1685,6 +1688,10 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
         "contract": contract,
         "artifact": str(output_path),
         "quarantine_artifact": str(quarantine_path),
+        "artifact_generation": publication["generation"],
+        "artifact_commit_marker": publication["commit_marker"],
+        "accepted_generation_artifact": publication["accepted_generation_path"],
+        "quarantine_generation_artifact": publication["quarantine_generation_path"],
     }
 
 

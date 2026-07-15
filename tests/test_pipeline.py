@@ -1608,6 +1608,28 @@ def test_argilla_action_rejects_nested_sensitive_params_before_job_creation(tmp_
     assert not (tmp_path / "runs").exists()
 
 
+@pytest.mark.parametrize(
+    "api_url",
+    [
+        "https://user:password@argilla.example",
+        "https://argilla.example?access_token=must-not-enter-job-state",
+        "https://argilla.example/#/oauth?refresh_token=must-not-enter-job-state",
+    ],
+)
+def test_argilla_action_rejects_sensitive_api_url_before_job_creation(tmp_path: Path, api_url: str):
+    with pytest.raises(ValueError, match=r"params\.api_url") as exc_info:
+        pipeline.start_action(
+            tmp_path / "runs",
+            tmp_path / "missing-task.yaml",
+            "argilla_pull",
+            {"api_url": api_url},
+        )
+
+    assert "must-not-enter-job-state" not in str(exc_info.value)
+    assert "password" not in str(exc_info.value)
+    assert not (tmp_path / "runs").exists()
+
+
 def test_annotation_job_archive_does_not_mark_active_manifest_when_move_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

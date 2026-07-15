@@ -2156,6 +2156,8 @@ def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> 
                 "quarantine_path": result.get("quarantine_artifact"),
                 "quarantined_rows": result.get("quarantined_response_groups", 0),
                 "skipped_response_groups": result.get("skipped_response_groups", 0),
+                "artifact_generation": result.get("artifact_generation"),
+                "artifact_commit_marker": result.get("artifact_commit_marker"),
                 "argilla_contract": contract,
                 "created_at": _now(),
                 "result": result,
