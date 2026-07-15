@@ -197,6 +197,7 @@ def test_panel_api_client_uses_scoped_bearer_auth_and_json_queries():
                 panel_url="http://panel:8765",
                 bearer_token=MCP_TOKEN,
                 internal_token=INTERNAL_TOKEN,
+                auth_mode="static_dev",
             ),
             transport=httpx.MockTransport(handler),
         )
@@ -253,6 +254,26 @@ def test_panel_api_client_forwards_only_request_scoped_access_assertion():
         "authorization": f"Bearer {INTERNAL_TOKEN}",
         "access_assertion": assertion,
     }
+
+
+def test_managed_panel_api_client_requires_request_scoped_access_assertion():
+    requested = False
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal requested
+        requested = True
+        return httpx.Response(200, json={"ok": True})
+
+    async def run():
+        client = PanelApiClient(_managed_config(), transport=httpx.MockTransport(handler))
+        try:
+            await client.get("/api/health")
+        finally:
+            await client.aclose()
+
+    with pytest.raises(PanelApiError, match="request-scoped Access assertion"):
+        asyncio.run(run())
+    assert requested is False
 
 
 def test_mcp_server_is_read_only_by_default_and_declares_annotations():
@@ -382,6 +403,23 @@ def test_task_scoped_mcp_tools_require_workspace(tool_name: str, arguments: dict
     server = create_mcp_server(_config(), panel_client=FakePanelClient())
 
     with pytest.raises(ToolError, match="workspace"):
+        asyncio.run(server.call_tool(tool_name, arguments))
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments"),
+    [
+        ("scaffold_task_list", {"workspace": "."}),
+        ("scaffold_import_list", {"task_id": ".", "workspace": "workspace-a"}),
+    ],
+)
+def test_task_scoped_mcp_tools_reject_collapsing_path_segments(
+    tool_name: str,
+    arguments: dict[str, Any],
+):
+    server = create_mcp_server(_config(), panel_client=FakePanelClient())
+
+    with pytest.raises(ToolError, match="单段安全标识符"):
         asyncio.run(server.call_tool(tool_name, arguments))
 
 

@@ -15,6 +15,8 @@ import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -40,10 +42,9 @@ from llm_labeling_scaffold.db.enums import AuditChannel
 from llm_labeling_scaffold.db.migration import upgrade_database
 from llm_labeling_scaffold.db.models import AuditEvent, Principal, RoleBinding, Task, Workspace
 from llm_labeling_scaffold.mcp_server import (
-    McpAuthenticationMiddleware,
     McpServerConfig,
     PanelApiClient,
-    create_mcp_server,
+    create_streamable_http_app,
 )
 
 
@@ -666,34 +667,36 @@ def test_mcp_asgi_tool_to_panel_http_preserves_delegated_actor_and_independent_a
             enable_writes=True,
         )
         panel_client = PanelApiClient(config)
-        server = create_mcp_server(config, panel_client=panel_client)
-
-        async def downstream(scope, receive, send):
-            await server.call_tool(
-                "scaffold_task_draft_create",
-                {"spec": _draft_spec(), "workspace": "workspace-a"},
-            )
-            await send({"type": "http.response.start", "status": 204, "headers": []})
-            await send({"type": "http.response.body", "body": b""})
-
-        app = McpAuthenticationMiddleware(
-            downstream,
+        app = create_streamable_http_app(
             config,
+            panel_client=panel_client,
             cloudflare_verifier=_access_verifier(jwk, MCP_AUDIENCE),
         )
 
         async def run_asgi_requests():
             transport = httpx.ASGITransport(app=app)
             try:
-                async with httpx.AsyncClient(transport=transport, base_url="http://mcp") as client:
-                    valid = await client.post(
-                        "/mcp",
+                async with app.app.router.lifespan_context(app.app):
+                    async with httpx.AsyncClient(
+                        transport=transport,
+                        base_url="http://localhost:8766",
                         headers={"Cf-Access-Jwt-Assertion": mcp_assertion},
-                    )
-                    wrong_audience = await client.post(
-                        "/mcp",
-                        headers={"Cf-Access-Jwt-Assertion": panel_assertion},
-                    )
+                    ) as client:
+                        async with streamable_http_client(
+                            "http://localhost:8766/mcp",
+                            http_client=client,
+                            terminate_on_close=False,
+                        ) as streams:
+                            async with ClientSession(streams[0], streams[1]) as session:
+                                await session.initialize()
+                                valid = await session.call_tool(
+                                    "scaffold_task_draft_create",
+                                    {"spec": _draft_spec(), "workspace": "workspace-a"},
+                                )
+                        wrong_audience = await client.post(
+                            "/mcp",
+                            headers={"Cf-Access-Jwt-Assertion": panel_assertion},
+                        )
                 return valid, wrong_audience
             finally:
                 await panel_client.aclose()
@@ -718,7 +721,7 @@ def test_mcp_asgi_tool_to_panel_http_preserves_delegated_actor_and_independent_a
             },
         )
 
-    assert valid.status_code == 204
+    assert valid.isError is False
     assert (wrong_audience.status_code, wrong_audience.json()["code"]) == (
         403,
         "access_assertion_not_for_application",
@@ -866,6 +869,9 @@ def test_control_runtime_reads_require_task_acl_and_isolate_workspace_paths(
     assert same_key_a == tmp_path / "runs" / "workspace-a" / "same-task"
     assert same_key_b == tmp_path / "runs" / "workspace-b" / "same-task"
     assert same_key_a != same_key_b
+    with pytest.raises(panel._PanelRouteError) as exc_info:
+        panel._Handler._workspace_runs_root(handler, ".")
+    assert exc_info.value.code == "invalid_workspace"
 
     with _panel_server(
         tmp_path,

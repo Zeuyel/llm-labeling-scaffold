@@ -218,6 +218,12 @@ class PanelApiClient:
         request_headers.pop("Cf-Access-Jwt-Assertion", None)
         context = current_mcp_request_context()
         access_assertion = context.access_assertion if context is not None else None
+        if resolve_mcp_auth_mode(self.config.auth_mode) == "cloudflare_access" and (
+            context is None
+            or context.authentication_method != "cloudflare_access"
+            or not access_assertion
+        ):
+            raise PanelApiError("Managed MCP 请求缺少 request-scoped Access assertion")
         if access_assertion:
             request_headers["Cf-Access-Jwt-Assertion"] = access_assertion
         try:
@@ -395,7 +401,14 @@ async def _send_auth_error(
 
 def _safe_segment(value: str, label: str) -> str:
     text = str(value or "").strip()
-    if not text or ".." in text or "/" in text or "\\" in text or any(ord(char) < 32 for char in text):
+    if (
+        not text
+        or text == "."
+        or ".." in text
+        or "/" in text
+        or "\\" in text
+        or any(ord(char) < 32 for char in text)
+    ):
         raise ValueError(f"{label} 必须是单段安全标识符")
     return text
 

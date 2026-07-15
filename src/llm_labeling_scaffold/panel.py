@@ -54,7 +54,14 @@ _DEFAULT_TASK_REGISTRY_SYNC_TTL_SECONDS = 5.0
 
 
 def _safe_segment(value: str) -> bool:
-    return bool(value) and ".." not in value and "/" not in value and "\\" not in value
+    return (
+        bool(value)
+        and value != "."
+        and ".." not in value
+        and "/" not in value
+        and "\\" not in value
+        and not any(ord(char) < 32 for char in value)
+    )
 
 
 def _truthy_env(name: str) -> bool:
