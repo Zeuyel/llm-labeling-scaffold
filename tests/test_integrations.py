@@ -1311,6 +1311,9 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
     incomplete_user = UUID("10000000-0000-0000-0000-000000000006")
     duplicate_user = UUID("10000000-0000-0000-0000-000000000007")
     unknown_workspace_user = UUID("10000000-0000-0000-0000-000000000008")
+    owner_user = UUID("10000000-0000-0000-0000-000000000009")
+    admin_user = UUID("10000000-0000-0000-0000-000000000010")
+    unknown_role_user = UUID("10000000-0000-0000-0000-000000000011")
     record = types.SimpleNamespace(
         id="r1",
         status="completed",
@@ -1328,6 +1331,9 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
             types.SimpleNamespace(question_name="label", value="no", user_id=duplicate_user, status="submitted"),
             types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_workspace_user, status="submitted"),
             types.SimpleNamespace(question_name="label", value="yes", user_id="not-a-uuid", status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=owner_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=admin_user, status="submitted"),
+            types.SimpleNamespace(question_name="label", value="yes", user_id=unknown_role_user, status="submitted"),
         ],
     )
     dataset = _Dataset("dataset", records=[])
@@ -1347,6 +1353,11 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
             start=1,
         )
     ]
+    users.extend([
+        types.SimpleNamespace(id=owner_user, username="owner_user", role=types.SimpleNamespace(value="owner")),
+        types.SimpleNamespace(id=admin_user, username="admin_user", role=types.SimpleNamespace(value="admin")),
+        types.SimpleNamespace(id=unknown_role_user, username="unknown_role_user", role="reviewer"),
+    ])
     client = _PullClient(dataset.workspace, dataset, users)
     contract = _pull_contract(task, dataset, push_fingerprint=push_fingerprint)
     manifest = {"task_id": task.task_id, "argilla_dataset": dataset.name, "argilla_contract": contract}
@@ -1376,14 +1387,15 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
     ]
     assert result["responses"] == 1
     assert result["accepted_response_groups"] == 1
-    assert result["skipped_response_groups"] == 8
-    assert result["quarantined_response_groups"] == 6
+    assert result["skipped_response_groups"] == 11
+    assert result["quarantined_response_groups"] == 9
     assert result["quarantine_artifact"] == str(tmp_path / "decisions.quarantine.jsonl")
     assert result["quarantine_reason_codes"] == [
         "duplicate_question",
         "invalid_user_id",
         "missing_required_question",
         "mixed_response_status",
+        "unauthorized_user_role",
         "unknown_response_status",
         "unknown_workspace_user",
     ]
@@ -1392,6 +1404,7 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
         "invalid_user_id": 1,
         "missing_required_question": 1,
         "mixed_response_status": 1,
+        "unauthorized_user_role": 3,
         "unknown_response_status": 1,
         "unknown_workspace_user": 1,
     }
@@ -1403,6 +1416,8 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
             "workspace_uuid": str(dataset.workspace.id),
         }
     ]
+    assert "active" not in result["users"][0]
+    assert "status" not in result["users"][0]
     assert dataset.records.iterations == 1
 
     quarantine_rows = read_jsonl(result["quarantine_artifact"])
@@ -1414,6 +1429,9 @@ def test_argilla_pull_accepts_only_submitted_groups_and_preserves_user_identity(
     assert quarantine_by_user[str(duplicate_user)]["duplicate_questions"] == ["label"]
     assert quarantine_by_user[str(unknown_workspace_user)]["reason_codes"] == ["unknown_workspace_user"]
     assert quarantine_by_user["not-a-uuid"]["reason_codes"] == ["invalid_user_id"]
+    assert quarantine_by_user[str(owner_user)]["reason_codes"] == ["unauthorized_user_role"]
+    assert quarantine_by_user[str(admin_user)]["reason_codes"] == ["unauthorized_user_role"]
+    assert quarantine_by_user[str(unknown_role_user)]["reason_codes"] == ["unauthorized_user_role"]
     assert all(row["record_id"] == "r1" for row in quarantine_rows)
     assert str(draft_user) not in quarantine_by_user
     assert str(discarded_user) not in quarantine_by_user
