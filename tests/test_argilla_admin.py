@@ -47,7 +47,10 @@ class _FakeUser:
         self._client = client
 
     def __repr__(self):
-        return f"_FakeUser(username={self.username!r}, password={self.password!r})"
+        return (
+            f"_FakeUser(username={self.username!r}, first_name={self.first_name!r}, "
+            f"last_name={self.last_name!r}, password={self.password!r})"
+        )
 
     def create(self):
         return self._client.create_user(self)
@@ -247,9 +250,9 @@ def test_principal_helpers_are_stable_and_workspace_name_is_url_safe():
     assert "@" not in workspace_name
 
 
-def test_adapter_uses_env_owner_key_validates_versions_and_accepts_admin(monkeypatch):
+def test_adapter_uses_env_owner_key_and_validates_versions(monkeypatch):
     secret = "owner-secret-from-env"
-    client = _FakeClient(operator_role="admin", api_key=secret)
+    client = _FakeClient(operator_role="owner", api_key=secret)
     sdk = _install_sdk(monkeypatch, client)
     monkeypatch.setenv("ARGILLA_API_KEY", secret)
 
@@ -281,8 +284,9 @@ def test_version_validation_failure_prevents_client_initialization(monkeypatch):
     assert client.routes == []
 
 
-def test_adapter_rejects_annotator_operator(monkeypatch):
-    client = _FakeClient(operator_role="annotator")
+@pytest.mark.parametrize("operator_role", ["admin", "annotator"])
+def test_adapter_rejects_non_owner_operator(monkeypatch, operator_role):
+    client = _FakeClient(operator_role=operator_role)
     _install_sdk(monkeypatch, client)
 
     with pytest.raises(ArgillaProvisioningError) as exc_info:
@@ -327,11 +331,20 @@ def test_create_routes_and_whitelist_dto(monkeypatch):
 
     payload = result.to_dict()
     assert list(payload) == ["user", "workspace", "verification_state", "verified_at", "action"]
-    assert list(payload["user"]) == ["uuid", "username", "role", "first_name", "last_name"]
+    assert list(payload["user"]) == ["uuid", "username", "role"]
     assert list(payload["workspace"]) == ["uuid", "name"]
     assert list(payload["action"]) == ["user", "workspace", "membership"]
     serialized = json.dumps(payload, ensure_ascii=False)
-    for sensitive in (secret, owner_key, "api_key", "password", "status", "active"):
+    for sensitive in (
+        secret,
+        owner_key,
+        "api_key",
+        "password",
+        "first_name",
+        "last_name",
+        "status",
+        "active",
+    ):
         assert sensitive not in serialized
 
 
@@ -404,7 +417,9 @@ def test_membership_verification_ignores_mutable_name_snapshots(monkeypatch):
     )
 
     assert result.action.membership == "reused"
-    assert result.user.first_name == "Current"
+    assert not hasattr(result.user, "first_name")
+    assert "Current" not in repr(result)
+    assert "Older" not in repr(result)
     assert client.routes.count(f"POST /api/v1/workspaces/{_WORKSPACE_ID}/users") == 0
 
 
@@ -558,7 +573,7 @@ def test_membership_same_username_different_uuid_fails_closed(monkeypatch):
     workspace = _workspace(client, _WORKSPACE_ID, workspace_name)
     client.user_items.append(user)
     client.workspace_items.append(workspace)
-    client.memberships[_WORKSPACE_ID] = [imposter]
+    client.memberships[_WORKSPACE_ID] = [user, imposter]
     _install_sdk(monkeypatch, client)
     adapter = ArgillaAdminAdapter(api_url=client.api_url)
 
@@ -592,6 +607,35 @@ def test_identity_conflict_sorting_is_stable_across_sdk_list_order(monkeypatch):
     assert ascending.index(_USER_ID) < ascending.index(_OTHER_USER_ID)
 
 
+def test_create_only_names_matching_password_do_not_leak_through_dto_repr_or_logs(monkeypatch, caplog):
+    secret = "shared-create-secret"
+    issuer, subject, _, _ = _identity()
+    client = _FakeClient()
+    _install_sdk(monkeypatch, client)
+    adapter = ArgillaAdminAdapter(api_url=client.api_url)
+
+    result = adapter.ensure_annotator(
+        principal_issuer=issuer,
+        principal_subject=subject,
+        password=secret,
+        first_name=secret,
+        last_name=secret,
+    )
+
+    observed = "\n".join(
+        [
+            json.dumps(result.to_dict(), ensure_ascii=False),
+            repr(result),
+            repr(result.user),
+            caplog.text,
+        ]
+    )
+    assert secret not in observed
+    assert client.attempted_users[0].first_name == secret
+    assert client.attempted_users[0].last_name == secret
+    assert client.attempted_users[0].password is None
+
+
 def test_password_and_owner_key_do_not_leak_through_errors_repr_logs_or_dto(monkeypatch, caplog):
     password = "password-must-not-leak"
     owner_key = "owner-key-must-not-leak"
@@ -607,6 +651,8 @@ def test_password_and_owner_key_do_not_leak_through_errors_repr_logs_or_dto(monk
             principal_issuer=issuer,
             principal_subject=subject,
             password=password,
+            first_name=password,
+            last_name=password,
         )
 
     rendered = "".join(traceback.format_exception(exc_info.value))
@@ -617,7 +663,6 @@ def test_password_and_owner_key_do_not_leak_through_errors_repr_logs_or_dto(monk
             rendered,
             repr(adapter),
             caplog.text,
-            repr(client.attempted_users[0]),
         ]
     )
     assert password not in observed

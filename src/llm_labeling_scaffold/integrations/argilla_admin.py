@@ -13,7 +13,7 @@ from .argilla import _api_url, _load_argilla, _runtime_versions
 
 
 _ARGILLA_ANNOTATOR_ROLE = "annotator"
-_ARGILLA_OPERATOR_ROLES = {"admin", "owner"}
+_ARGILLA_OPERATOR_ROLE = "owner"
 _ARGILLA_WORKSPACE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _ARGILLA_USERNAME_PREFIX = "lls_u_"
 _ARGILLA_WORKSPACE_PREFIX = "lls_personal_"
@@ -30,16 +30,12 @@ class ArgillaUserDTO:
     uuid: str
     username: str
     role: str
-    first_name: str | None
-    last_name: str | None
 
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, str]:
         return {
             "uuid": self.uuid,
             "username": self.username,
             "role": self.role,
-            "first_name": self.first_name,
-            "last_name": self.last_name,
         }
 
 
@@ -84,22 +80,26 @@ class ArgillaProvisioningDTO:
         }
 
 
-class _EphemeralPassword:
-    __slots__ = ("_value",)
+class _EphemeralUserCreateInput:
+    __slots__ = ("_password", "_first_name", "_last_name")
 
-    def __init__(self, value: str | None) -> None:
-        self._value = value
+    def __init__(self, password: str | None, first_name: str | None, last_name: str | None) -> None:
+        self._password = password
+        self._first_name = first_name
+        self._last_name = last_name
 
     def __repr__(self) -> str:
-        return "_EphemeralPassword(<redacted>)"
+        return "_EphemeralUserCreateInput(<redacted>)"
 
-    def take(self) -> str | None:
-        value = self._value
-        self._value = None
-        return value
+    def take(self) -> tuple[str | None, str | None, str | None]:
+        values = (self._password, self._first_name, self._last_name)
+        self.clear()
+        return values
 
     def clear(self) -> None:
-        self._value = None
+        self._password = None
+        self._first_name = None
+        self._last_name = None
 
 
 def _principal_digest(issuer: str, subject: str) -> str:
@@ -196,12 +196,12 @@ class ArgillaAdminAdapter:
 
         me = self._read_operator()
         self._operator_role = _role_value(getattr(me, "role", None))
-        self._operator_uuid = _canonical_uuid(getattr(me, "id", None), "operator user")
-        if self._operator_role not in _ARGILLA_OPERATOR_ROLES:
+        if self._operator_role != _ARGILLA_OPERATOR_ROLE:
             raise ArgillaProvisioningError(
                 "insufficient_operator_role",
-                "Argilla provisioning client.me role 必须是 admin 或 owner",
+                "Argilla provisioning client.me role 必须是 owner",
             )
+        self._operator_uuid = _canonical_uuid(getattr(me, "id", None), "operator user")
 
     def __repr__(self) -> str:
         return f"ArgillaAdminAdapter(operator_role={self._operator_role!r})"
@@ -217,8 +217,10 @@ class ArgillaAdminAdapter:
         expected_user_uuid: UUID | str | None = None,
         expected_workspace_uuid: UUID | str | None = None,
     ) -> ArgillaProvisioningDTO:
-        secret = _EphemeralPassword(password)
+        create_input = _EphemeralUserCreateInput(password, first_name, last_name)
         password = None
+        first_name = None
+        last_name = None
         try:
             username = derive_argilla_username(principal_issuer, principal_subject)
             workspace_name = derive_personal_workspace_name(principal_issuer, principal_subject)
@@ -227,10 +229,8 @@ class ArgillaAdminAdapter:
 
             user, user_action = self._ensure_user(
                 username=username,
-                first_name=first_name,
-                last_name=last_name,
                 expected_uuid=expected_user_id,
-                secret=secret,
+                create_input=create_input,
             )
             user_dto = self._user_dto(user, username=username, expected_uuid=expected_user_id)
             workspace, workspace_action = self._ensure_workspace(
@@ -259,7 +259,7 @@ class ArgillaAdminAdapter:
                 ),
             )
         finally:
-            secret.clear()
+            create_input.clear()
 
     def _read_operator(self) -> Any:
         operator = None
@@ -279,13 +279,11 @@ class ArgillaAdminAdapter:
         self,
         *,
         username: str,
-        first_name: str | None,
-        last_name: str | None,
         expected_uuid: str | None,
-        secret: _EphemeralPassword,
+        create_input: _EphemeralUserCreateInput,
     ) -> tuple[Any, str]:
         if expected_uuid is not None:
-            secret.clear()
+            create_input.clear()
             user = self._user_by_uuid(expected_uuid)
             if user is None:
                 raise ArgillaProvisioningError(
@@ -297,13 +295,15 @@ class ArgillaAdminAdapter:
 
         existing = self._user_by_username(username)
         if existing is not None:
-            secret.clear()
+            create_input.clear()
             self._user_dto(existing, username=username)
             return existing, "reused"
 
-        password = secret.take()
+        password, first_name, last_name = create_input.take()
         if not isinstance(password, str) or not 8 <= len(password) <= 100:
             password = None
+            first_name = None
+            last_name = None
             raise ArgillaProvisioningError(
                 "creation_password_required",
                 "首次创建 Argilla annotator 需要 8 到 100 字符的一次性密码",
@@ -326,6 +326,10 @@ class ArgillaAdminAdapter:
             construction_failed = True
         finally:
             password = None
+            first_name = None
+            last_name = None
+            normalized_first_name = None
+            normalized_last_name = None
 
         if construction_failed or candidate is None:
             raise ArgillaProvisioningError(
@@ -539,6 +543,20 @@ class ArgillaAdminAdapter:
         return members
 
     def _verified_member(self, members: list[Any], expected: ArgillaUserDTO) -> Any | None:
+        same_name_other_ids = set()
+        for member in members:
+            if _text_or_none(getattr(member, "username", None)) != expected.username:
+                continue
+            member_uuid = _canonical_uuid(getattr(member, "id", None), "workspace member")
+            if member_uuid != expected.uuid:
+                same_name_other_ids.add(member_uuid)
+        if same_name_other_ids:
+            ids = ",".join(sorted(same_name_other_ids))
+            raise ArgillaProvisioningError(
+                "membership_identity_conflict",
+                f"workspace 已包含同名异 UUID 成员，拒绝继续: {expected.username} [{ids}]",
+            )
+
         matching_id = [
             member
             for member in members
@@ -552,20 +570,6 @@ class ArgillaAdminAdapter:
                 expected_uuid=expected.uuid,
             )
             return matching_id[0]
-
-        same_name = [
-            member
-            for member in members
-            if _text_or_none(getattr(member, "username", None)) == expected.username
-        ]
-        if same_name:
-            ids = ",".join(
-                sorted(_canonical_uuid(getattr(member, "id", None), "workspace member") for member in same_name)
-            )
-            raise ArgillaProvisioningError(
-                "membership_identity_conflict",
-                f"workspace 已包含同名异 UUID 成员，拒绝添加: {expected.username} [{ids}]",
-            )
         return None
 
     def _user_dto(
@@ -602,8 +606,6 @@ class ArgillaAdminAdapter:
             uuid=user_uuid,
             username=actual_username,
             role=role,
-            first_name=_text_or_none(getattr(user, "first_name", None)),
-            last_name=_text_or_none(getattr(user, "last_name", None)),
         )
 
     def _workspace_dto(
