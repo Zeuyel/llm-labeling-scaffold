@@ -1,0 +1,6 @@
+services:
+  panel:
+    ports:
+      - "127.0.0.1:${PANEL_PORT:-8765}:8765"
+    environment:
+      LLS_PANEL_DEPLOYMENT_MODE: docker_loopback

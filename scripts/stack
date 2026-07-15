@@ -40,6 +40,7 @@ usage() {
 用法：scripts/stack [up|down|logs|ps|restart] [--mlflow] [--mcp]
 
 默认启动 light panel 和 Argilla 标注服务。
+必须在 .env 设置 LLS_DEPLOYMENT_MODE=loopback 或 tunnel。
 如需可选模型记录服务，使用：scripts/stack up --mlflow
 如需 MCP companion service，使用：scripts/stack up --mcp
 EOF
@@ -97,8 +98,18 @@ if [ "$enable_mcp" -eq 1 ] && [ "$apply_config" -eq 1 ]; then
   fi
 fi
 
+deployment_mode="$(env_value LLS_DEPLOYMENT_MODE "")"
+case "${deployment_mode,,}" in
+  loopback|tunnel)
+    deployment_mode="${deployment_mode,,}"
+    ;;
+  *)
+    echo "LLS_DEPLOYMENT_MODE 只能是 loopback 或 tunnel。" >&2
+    exit 2
+    ;;
+esac
+
 panel_auth_mode="$(env_value LLS_PANEL_AUTH_MODE cloudflare_access)"
-panel_bind_host="$(env_value PANEL_BIND_HOST 127.0.0.1)"
 if [ "$apply_config" -eq 1 ]; then
   case "${panel_auth_mode,,}" in
     basic_dev)
@@ -106,17 +117,10 @@ if [ "$apply_config" -eq 1 ]; then
         echo "basic_dev 模式必须设置 LLS_PANEL_PASSWORD。" >&2
         exit 2
       fi
-      case "$panel_bind_host" in
-        127.0.0.1|::1)
-          ;;
-        localhost)
-          panel_bind_host="127.0.0.1"
-          ;;
-        *)
-          echo "basic_dev 模式只允许 PANEL_BIND_HOST 使用 127.0.0.1、localhost 或 ::1。" >&2
-          exit 2
-          ;;
-      esac
+      if [ "$deployment_mode" != "loopback" ]; then
+        echo "basic_dev 模式只能使用 LLS_DEPLOYMENT_MODE=loopback。" >&2
+        exit 2
+      fi
       ;;
     cloudflare_access)
       if [ -z "$(env_value LLS_CF_ACCESS_ISSUER "")" ] || [ -z "$(env_value LLS_CF_ACCESS_AUD "")" ]; then
@@ -129,7 +133,6 @@ if [ "$apply_config" -eq 1 ]; then
       exit 2
       ;;
   esac
-  export PANEL_BIND_HOST="$panel_bind_host"
 fi
 
 if [ "$apply_config" -eq 1 ]; then
@@ -147,6 +150,9 @@ fi
 
 task_source="$(env_value LLS_TASK_SOURCE control)"
 compose=(docker compose -f docker-compose.yml)
+if [ "$deployment_mode" = "loopback" ]; then
+  compose+=(-f docker-compose.loopback.yml)
+fi
 case "${task_source,,}" in
   local)
     ;;
@@ -169,7 +175,11 @@ print_urls() {
   local data_lake_prefix
 
   echo
-  echo "light panel： http://localhost:$(env_value PANEL_PORT 8765)"
+  if [ "$deployment_mode" = "loopback" ]; then
+    echo "light panel： http://localhost:$(env_value PANEL_PORT 8765)"
+  else
+    echo "light panel： Cloudflare Access hostname（Panel 未发布宿主端口）"
+  fi
   echo "Argilla：     http://localhost:$(env_value ARGILLA_PORT 6900)"
   if [ "$enable_mlflow" -eq 1 ]; then
     echo "模型记录服务： http://localhost:$(env_value MLFLOW_PORT 5000)"

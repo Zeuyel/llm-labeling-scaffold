@@ -4,10 +4,6 @@ import base64
 import json
 import threading
 import time
-import urllib.error
-import urllib.request
-from contextlib import contextmanager
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import jwt
@@ -508,7 +504,6 @@ def test_jwks_cache_rejects_more_than_the_configured_key_bound():
     ],
 )
 def test_panel_returns_stable_status_for_invalid_access_assertions(
-    tmp_path: Path,
     claims: dict,
     expected_status: int,
     expected_code: str,
@@ -519,85 +514,47 @@ def test_panel_returns_stable_status_for_invalid_access_assertions(
         cloudflare_verifier=_verifier(jwk),
     )
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
-        status, body = _request(
-            base_url,
-            "/api/session",
-            headers={"Cf-Access-Jwt-Assertion": _assertion(private_key, "key-1", claims=claims)},
-        )
+    status, body, _ = _panel_request(
+        authenticator,
+        "/api/session",
+        headers={"Cf-Access-Jwt-Assertion": _assertion(private_key, "key-1", claims=claims)},
+    )
 
     assert (status, body["code"]) == (expected_status, expected_code)
 
 
-@contextmanager
-def _panel_server(runs_root: Path, tasks_root: Path, authenticator: PanelAuthenticator):
-    old = {
-        "runs_root": panel._Handler.runs_root,
-        "tasks_root": panel._Handler.tasks_root,
-        "static_dir": panel._Handler.static_dir,
-        "authenticator": panel._Handler.authenticator,
-    }
-    panel._Handler.runs_root = runs_root
-    panel._Handler.tasks_root = tasks_root
-    panel._Handler.static_dir = None
-    panel._Handler.authenticator = authenticator
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), panel._Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"http://127.0.0.1:{httpd.server_address[1]}"
-    finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
-        for key, value in old.items():
-            setattr(panel._Handler, key, value)
-
-
-def _request(
-    base_url: str,
+def _panel_request(
+    authenticator: PanelAuthenticator,
     path: str,
     *,
     method: str = "GET",
-    body: dict | None = None,
     headers: dict[str, str] | None = None,
-) -> tuple[int, dict]:
-    status, payload, _ = _request_with_headers(
-        base_url,
-        path,
-        method=method,
-        body=body,
-        headers=headers,
-    )
-    return status, payload
-
-
-def _request_with_headers(
-    base_url: str,
-    path: str,
-    *,
-    method: str = "GET",
-    body: dict | None = None,
-    headers: dict[str, str] | None = None,
+    runs_root: Path | None = None,
+    tasks_root: Path | None = None,
 ) -> tuple[int, dict, dict[str, str]]:
-    request_headers = {"Content-Type": "application/json", **(headers or {})}
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    request = urllib.request.Request(base_url + path, data=data, headers=request_headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            return response.status, json.loads(response.read().decode("utf-8")), dict(response.headers)
-    except urllib.error.HTTPError as exc:
-        return exc.code, json.loads(exc.read().decode("utf-8")), dict(exc.headers)
+    handler = object.__new__(panel._Handler)
+    handler.authenticator = authenticator
+    handler.headers = headers or {}
+    handler.path = path
+    handler.command = method
+    handler.runs_root = runs_root or Path("runs")
+    handler.tasks_root = tasks_root or Path("tasks")
+    handler.static_dir = None
+    response: dict[str, object] = {}
 
+    def capture(body: dict, status: int = 200, headers: dict[str, str] | None = None) -> None:
+        response.update(body=body, status=status, headers=headers or {})
 
-def _draft_spec() -> dict:
-    return {
-        "task_id": "access_actor_task",
-        "id_field": "record_id",
-        "text_fields": ["title"],
-        "primary_label_name": "decision",
-        "primary_label_values": ["accept", "reject"],
-    }
+    handler._json = capture
+    if method == "GET":
+        panel._Handler.do_GET(handler)
+    else:
+        panel._Handler._require_auth(handler)
+    return (
+        int(response["status"]),
+        response["body"],
+        response["headers"],
+    )
 
 
 def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_path: Path, monkeypatch):
@@ -615,19 +572,29 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
         "X-User-Email": "attacker@example.com",
     }
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
-        status, session, session_headers = _request_with_headers(base_url, "/api/session", headers=headers)
-        health_status, health = _request(base_url, "/api/health", headers=headers)
-        capabilities_status, capabilities = _request(base_url, "/api/capabilities", headers=headers)
-        settings_status, settings_body = _request(base_url, "/api/settings/public", headers=headers)
-        read_status, read_body = _request(base_url, "/api/tasks", headers=headers)
-        create_status, create_body = _request(
-            base_url,
-            "/api/tasks",
-            method="POST",
-            body=_draft_spec(),
-            headers=headers,
-        )
+    roots = {"runs_root": tmp_path / "runs", "tasks_root": tmp_path / "tasks"}
+    status, session, session_headers = _panel_request(authenticator, "/api/session", headers=headers, **roots)
+    health_status, health, _ = _panel_request(authenticator, "/api/health", headers=headers, **roots)
+    capabilities_status, capabilities, _ = _panel_request(
+        authenticator,
+        "/api/capabilities",
+        headers=headers,
+        **roots,
+    )
+    settings_status, settings_body, _ = _panel_request(
+        authenticator,
+        "/api/settings/public",
+        headers=headers,
+        **roots,
+    )
+    read_status, read_body, _ = _panel_request(authenticator, "/api/tasks", headers=headers, **roots)
+    create_status, create_body, _ = _panel_request(
+        authenticator,
+        "/api/tasks",
+        method="POST",
+        headers=headers,
+        **roots,
+    )
 
     assert status == 200
     assert session == {
@@ -719,7 +686,7 @@ def test_authorization_gate_uses_actor_for_delegated_mcp_context():
     assert static_service._request_context == ActorContext.direct(service)
 
 
-def test_cloudflare_mode_rejects_missing_assertion_and_does_not_fall_back_to_basic(tmp_path: Path):
+def test_cloudflare_mode_rejects_missing_assertion_and_does_not_fall_back_to_basic():
     _, jwk = _signing_key("key-1")
     authenticator = PanelAuthenticator(
         mode="cloudflare_access",
@@ -727,15 +694,18 @@ def test_cloudflare_mode_rejects_missing_assertion_and_does_not_fall_back_to_bas
     )
     basic = "Basic " + base64.b64encode(b"admin:secret").decode("ascii")
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
-        missing_status, missing = _request(base_url, "/api/session")
-        basic_status, basic_body = _request(base_url, "/api/session", headers={"Authorization": basic})
+    missing_status, missing, _ = _panel_request(authenticator, "/api/session")
+    basic_status, basic_body, _ = _panel_request(
+        authenticator,
+        "/api/session",
+        headers={"Authorization": basic},
+    )
 
     assert (missing_status, missing["code"]) == (401, "missing_access_assertion")
     assert (basic_status, basic_body["code"]) == (401, "missing_access_assertion")
 
 
-def test_basic_auth_remains_available_only_in_explicit_development_mode(tmp_path: Path):
+def test_basic_auth_remains_available_only_in_explicit_development_mode():
     authenticator = PanelAuthenticator(
         mode="basic_dev",
         basic_user="admin",
@@ -743,8 +713,11 @@ def test_basic_auth_remains_available_only_in_explicit_development_mode(tmp_path
     )
     basic = "Basic " + base64.b64encode(b"admin:secret").decode("ascii")
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
-        status, session = _request(base_url, "/api/session", headers={"Authorization": basic})
+    status, session, _ = _panel_request(
+        authenticator,
+        "/api/session",
+        headers={"Authorization": basic},
+    )
 
     assert status == 200
     assert session == {

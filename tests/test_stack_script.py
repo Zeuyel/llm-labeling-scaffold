@@ -27,15 +27,15 @@ def _run_stack(tmp_path: Path, values: dict[str, str], *args: str) -> tuple[subp
     docker = bin_dir / "docker"
     docker.write_text(
         "#!/usr/bin/env bash\n"
-        "printf 'PANEL_BIND_HOST=%s;MLFLOW_TRACKING_URI=%s|%s\\n' "
-        "\"${PANEL_BIND_HOST:-}\" \"${MLFLOW_TRACKING_URI:-}\" \"$*\" >> \"$DOCKER_LOG\"\n",
+        "printf 'MLFLOW_TRACKING_URI=%s|%s\\n' "
+        "\"${MLFLOW_TRACKING_URI:-}\" \"$*\" >> \"$DOCKER_LOG\"\n",
         encoding="utf-8",
     )
     docker.chmod(0o755)
 
     env = os.environ.copy()
     for name in list(env):
-        if name.startswith("LLS_") or name in {"PANEL_BIND_HOST", "MLFLOW_TRACKING_URI"}:
+        if name.startswith("LLS_") or name == "MLFLOW_TRACKING_URI":
             env.pop(name)
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["DOCKER_LOG"] = str(docker_log)
@@ -51,32 +51,47 @@ def _run_stack(tmp_path: Path, values: dict[str, str], *args: str) -> tuple[subp
     return result, lines
 
 
-@pytest.mark.parametrize("command", ["up", "restart"])
-def test_stack_rejects_non_loopback_basic_dev_for_config_applying_commands(tmp_path: Path, command: str):
+def test_stack_requires_explicit_deployment_mode(tmp_path: Path):
     result, calls = _run_stack(
         tmp_path,
         {
             "LLS_PANEL_AUTH_MODE": "basic_dev",
             "LLS_PANEL_PASSWORD": "secret",
-            "PANEL_BIND_HOST": "0.0.0.0",
+            "LLS_TASK_SOURCE": "local",
+        },
+        "up",
+    )
+
+    assert result.returncode == 2
+    assert "LLS_DEPLOYMENT_MODE 只能是 loopback 或 tunnel" in result.stderr
+    assert calls == ["MLFLOW_TRACKING_URI=|compose version"]
+
+
+@pytest.mark.parametrize("command", ["up", "restart"])
+def test_stack_rejects_basic_dev_tunnel_mode(tmp_path: Path, command: str):
+    result, calls = _run_stack(
+        tmp_path,
+        {
+            "LLS_DEPLOYMENT_MODE": "tunnel",
+            "LLS_PANEL_AUTH_MODE": "basic_dev",
+            "LLS_PANEL_PASSWORD": "secret",
             "LLS_TASK_SOURCE": "local",
         },
         command,
     )
 
     assert result.returncode == 2
-    assert "basic_dev 模式只允许 PANEL_BIND_HOST" in result.stderr
-    assert calls == ["PANEL_BIND_HOST=;MLFLOW_TRACKING_URI=|compose version"]
+    assert "basic_dev 模式只能使用 LLS_DEPLOYMENT_MODE=loopback" in result.stderr
+    assert calls == ["MLFLOW_TRACKING_URI=|compose version"]
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
-def test_stack_accepts_basic_dev_loopback_bind_hosts(tmp_path: Path, host: str):
+def test_stack_accepts_basic_dev_loopback_mode(tmp_path: Path):
     result, calls = _run_stack(
         tmp_path,
         {
+            "LLS_DEPLOYMENT_MODE": "loopback",
             "LLS_PANEL_AUTH_MODE": "basic_dev",
             "LLS_PANEL_PASSWORD": "secret",
-            "PANEL_BIND_HOST": host,
             "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
             "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
             "LLS_TASK_SOURCE": "local",
@@ -85,8 +100,7 @@ def test_stack_accepts_basic_dev_loopback_bind_hosts(tmp_path: Path, host: str):
     )
 
     assert result.returncode == 0
-    expected_host = "127.0.0.1" if host == "localhost" else host
-    assert calls[-1].startswith(f"PANEL_BIND_HOST={expected_host};")
+    assert "compose -f docker-compose.yml -f docker-compose.loopback.yml" in calls[-1]
     assert "up -d --force-recreate" in calls[-1]
 
 
@@ -109,9 +123,9 @@ def test_stack_validates_database_passwords_for_up_and_restart(
     result, calls = _run_stack(
         tmp_path,
         {
+            "LLS_DEPLOYMENT_MODE": "loopback",
             "LLS_PANEL_AUTH_MODE": "basic_dev",
             "LLS_PANEL_PASSWORD": "secret",
-            "PANEL_BIND_HOST": "127.0.0.1",
             "SCAFFOLD_POSTGRES_OWNER_PASSWORD": owner_password,
             "SCAFFOLD_POSTGRES_APP_PASSWORD": app_password,
             "LLS_TASK_SOURCE": "local",
@@ -121,7 +135,7 @@ def test_stack_validates_database_passwords_for_up_and_restart(
 
     assert result.returncode == 2
     assert message in result.stderr
-    assert calls == ["PANEL_BIND_HOST=;MLFLOW_TRACKING_URI=|compose version"]
+    assert calls == ["MLFLOW_TRACKING_URI=|compose version"]
 
 
 @pytest.mark.parametrize("command", ["up", "restart"])
@@ -129,6 +143,7 @@ def test_stack_validates_cloudflare_configuration_for_up_and_restart(tmp_path: P
     result, calls = _run_stack(
         tmp_path,
         {
+            "LLS_DEPLOYMENT_MODE": "tunnel",
             "LLS_PANEL_AUTH_MODE": "cloudflare_access",
             "LLS_CF_ACCESS_ISSUER": "https://team.cloudflareaccess.com",
             "LLS_TASK_SOURCE": "local",
@@ -138,7 +153,7 @@ def test_stack_validates_cloudflare_configuration_for_up_and_restart(tmp_path: P
 
     assert result.returncode == 2
     assert "必须设置 LLS_CF_ACCESS_ISSUER 和 LLS_CF_ACCESS_AUD" in result.stderr
-    assert calls == ["PANEL_BIND_HOST=;MLFLOW_TRACKING_URI=|compose version"]
+    assert calls == ["MLFLOW_TRACKING_URI=|compose version"]
 
 
 @pytest.mark.parametrize("command", ["up", "restart"])
@@ -146,9 +161,9 @@ def test_stack_validates_mcp_tokens_for_up_and_restart(tmp_path: Path, command: 
     result, calls = _run_stack(
         tmp_path,
         {
+            "LLS_DEPLOYMENT_MODE": "loopback",
             "LLS_PANEL_AUTH_MODE": "basic_dev",
             "LLS_PANEL_PASSWORD": "secret",
-            "PANEL_BIND_HOST": "127.0.0.1",
             "LLS_TASK_SOURCE": "local",
         },
         command,
@@ -157,17 +172,17 @@ def test_stack_validates_mcp_tokens_for_up_and_restart(tmp_path: Path, command: 
 
     assert result.returncode == 2
     assert "启用 MCP 前必须设置彼此不同" in result.stderr
-    assert calls == ["PANEL_BIND_HOST=;MLFLOW_TRACKING_URI=|compose version"]
+    assert calls == ["MLFLOW_TRACKING_URI=|compose version"]
 
 
 def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp_path: Path):
     result, calls = _run_stack(
         tmp_path,
         {
+            "LLS_DEPLOYMENT_MODE": "tunnel",
             "LLS_PANEL_AUTH_MODE": "cloudflare_access",
             "LLS_CF_ACCESS_ISSUER": "https://team.cloudflareaccess.com",
             "LLS_CF_ACCESS_AUD": "configured-audience",
-            "PANEL_BIND_HOST": "0.0.0.0",
             "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
             "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
             "LLS_TASK_SOURCE": "local",
@@ -178,10 +193,30 @@ def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp
 
     assert result.returncode == 0
     deploy_call = calls[-1]
-    assert deploy_call.startswith("PANEL_BIND_HOST=0.0.0.0;MLFLOW_TRACKING_URI=http://mlflow:5000|")
+    assert deploy_call.startswith("MLFLOW_TRACKING_URI=http://mlflow:5000|")
     assert "compose -f docker-compose.yml --profile mlflow up -d --force-recreate" in deploy_call
+    assert "docker-compose.loopback.yml" not in deploy_call
     assert deploy_call.endswith(
         "scaffold-postgres db-role-init migrate panel argilla argilla-worker "
         "argilla-postgres elasticsearch redis mlflow"
     )
     assert " restart " not in deploy_call
+
+
+def test_stack_cloudflare_loopback_mode_uses_fixed_override(tmp_path: Path):
+    result, calls = _run_stack(
+        tmp_path,
+        {
+            "LLS_DEPLOYMENT_MODE": "loopback",
+            "LLS_PANEL_AUTH_MODE": "cloudflare_access",
+            "LLS_CF_ACCESS_ISSUER": "https://team.cloudflareaccess.com",
+            "LLS_CF_ACCESS_AUD": "configured-audience",
+            "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
+            "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
+            "LLS_TASK_SOURCE": "local",
+        },
+        "restart",
+    )
+
+    assert result.returncode == 0
+    assert "compose -f docker-compose.yml -f docker-compose.loopback.yml" in calls[-1]

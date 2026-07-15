@@ -10,6 +10,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 ROLE_SCRIPT = ROOT / "docker" / "postgres" / "init-runtime-role.sh"
 ROLE_SQL = ROOT / "docker" / "postgres" / "init-runtime-role.sql"
+LOOPBACK_COMPOSE = ROOT / "docker-compose.loopback.yml"
 
 
 def _fake_psql(tmp_path: Path) -> tuple[Path, Path]:
@@ -54,15 +55,26 @@ def test_compose_role_initialization_paths_are_explicit():
     services = compose["services"]
 
     panel = services["panel"]
-    panel_environment = set(panel["environment"])
-    assert panel["ports"] == ["${PANEL_BIND_HOST:-127.0.0.1}:${PANEL_PORT:-8765}:8765"]
-    assert "LLS_PANEL_AUTH_MODE=${LLS_PANEL_AUTH_MODE:-cloudflare_access}" in panel_environment
-    assert "LLS_CF_ACCESS_ISSUER=${LLS_CF_ACCESS_ISSUER:-}" in panel_environment
-    assert "LLS_CF_ACCESS_AUD=${LLS_CF_ACCESS_AUD:-}" in panel_environment
-    assert "LLS_DATABASE_USER=${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}" in panel_environment
-    assert (
-        "LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}"
-        in panel_environment
+    panel_environment = panel["environment"]
+    assert "ports" not in panel
+    assert panel["expose"] == ["8765"]
+    assert panel["networks"] == ["lls"]
+    assert panel_environment["LLS_PANEL_DEPLOYMENT_MODE"] == "docker_tunnel"
+    assert panel_environment["LLS_PANEL_AUTH_MODE"] == "${LLS_PANEL_AUTH_MODE:-cloudflare_access}"
+    assert panel_environment["LLS_CF_ACCESS_ISSUER"] == "${LLS_CF_ACCESS_ISSUER:-}"
+    assert panel_environment["LLS_CF_ACCESS_AUD"] == "${LLS_CF_ACCESS_AUD:-}"
+    assert panel_environment["LLS_DATABASE_USER"] == "${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}"
+    assert panel_environment["LLS_DATABASE_PASSWORD"] == (
+        "${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}"
+    )
+
+    loopback_compose = yaml.safe_load(LOOPBACK_COMPOSE.read_text(encoding="utf-8"))
+    loopback_panel = loopback_compose["services"]["panel"]
+    assert loopback_panel["ports"] == ["127.0.0.1:${PANEL_PORT:-8765}:8765"]
+    assert loopback_panel["environment"]["LLS_PANEL_DEPLOYMENT_MODE"] == "docker_loopback"
+    assert "PANEL_BIND_HOST" not in LOOPBACK_COMPOSE.read_text(encoding="utf-8")
+    assert '"--host", "0.0.0.0"' in (ROOT / "docker" / "panel" / "Dockerfile").read_text(
+        encoding="utf-8"
     )
 
     migrate_environment = set(services["migrate"]["environment"])
