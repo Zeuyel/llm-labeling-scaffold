@@ -587,6 +587,18 @@ def test_overlap_rules_must_select_disjoint_records():
     assert [item.code for item in report.blocking_errors] == ["overlap_rule_conflict"]
 
 
+def test_noop_overlap_selector_still_enforces_cohort_width():
+    request = _request(
+        overlap_rules=(OverlapRule(count=0, required_submissions=4),),
+    )
+
+    report = validate_allocation_request(request)
+
+    assert [item.code for item in report.blocking_errors] == ["cohort_too_small"]
+    assert report.blocking_errors[0].field == "overlap_rules[0].required_submissions"
+    assert dict(report.blocking_errors[0].context) == {"cohort_size": "3", "required": "4"}
+
+
 @pytest.mark.parametrize(
     ("capacities", "expected_warning"),
     [

@@ -1565,7 +1565,7 @@ def _resolve_request(
             field=f"overlap_rules[{index}]",
         )
         issues.extend(overlap_issues)
-        if selected_ids and rule.required_submissions > len(normalized_annotators):
+        if rule.required_submissions > len(normalized_annotators):
             issues.append(
                 _issue(
                     "cohort_too_small",
