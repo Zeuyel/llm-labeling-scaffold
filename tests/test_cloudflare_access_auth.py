@@ -726,6 +726,14 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
     assert (health_status, health["ok"]) == (200, True)
     assert capabilities_status == 200
     assert capabilities["authorization"] == {"state": "ready"}
+    advertised = {(item["method"], item["path"]) for item in capabilities["endpoints"]}
+    assert ("POST", "/api/tasks/{task_id}/check") in advertised
+    assert ("GET", "/api/task/imports") in advertised
+    assert ("GET", "/api/import/detail") in advertised
+    assert ("GET", "/api/task/data_lake") in advertised
+    assert ("GET", "/api/jobs") in advertised
+    assert ("GET", "/api/task/annotation_jobs") not in advertised
+    assert ("POST", "/api/action") not in advertised
     assert settings_status == 200
     assert "settings" in settings_body
     assert (read_status, read_body["code"]) == (404, "resource_not_found")

@@ -1,20 +1,32 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from llm_labeling_scaffold import panel
-from llm_labeling_scaffold.auth import ActorContext, Identity, Principal as AuthPrincipal
+from llm_labeling_scaffold import data_lake, panel
+from llm_labeling_scaffold.auth import (
+    ActorContext,
+    CloudflareAccessVerifier,
+    Identity,
+    PanelAuthenticator,
+    Principal as AuthPrincipal,
+)
 from llm_labeling_scaffold.db import (
     AuthorizationUnavailable,
     DatabaseService,
@@ -27,6 +39,19 @@ from llm_labeling_scaffold.db.database import create_database_engine
 from llm_labeling_scaffold.db.enums import AuditChannel
 from llm_labeling_scaffold.db.migration import upgrade_database
 from llm_labeling_scaffold.db.models import AuditEvent, Principal, RoleBinding, Task, Workspace
+from llm_labeling_scaffold.mcp_server import (
+    McpAuthenticationMiddleware,
+    McpServerConfig,
+    PanelApiClient,
+    create_mcp_server,
+)
+
+
+ISSUER = "https://team.cloudflareaccess.com"
+PANEL_AUDIENCE = "panel-application-audience"
+MCP_AUDIENCE = "mcp-application-audience"
+SUBJECT = "mcp-user-7335d417"
+INTERNAL_TOKEN = "mcp-internal-0123456789-abcdef-012"
 
 
 class ContextAuthenticator:
@@ -73,6 +98,52 @@ def _mcp_principal() -> AuthPrincipal:
     )
 
 
+def _base64url_uint(value: int) -> str:
+    width = (value.bit_length() + 7) // 8
+    return jwt.utils.base64url_encode(value.to_bytes(width, "big")).decode("ascii")
+
+
+def _signing_key() -> tuple[rsa.RSAPrivateKey, dict[str, str]]:
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    numbers = private_key.public_key().public_numbers()
+    return private_key, {
+        "kid": "key-1",
+        "kty": "RSA",
+        "alg": "RS256",
+        "use": "sig",
+        "e": _base64url_uint(numbers.e),
+        "n": _base64url_uint(numbers.n),
+    }
+
+
+def _access_assertion(private_key: rsa.RSAPrivateKey, audience: str) -> str:
+    now = int(time.time())
+    return jwt.encode(
+        {
+            "aud": [audience],
+            "exp": now + 300,
+            "iat": now - 1,
+            "iss": ISSUER,
+            "nbf": now - 1,
+            "sub": SUBJECT,
+            "type": "app",
+            "email": "mcp-user@example.test",
+            "name": "MCP User",
+        },
+        private_key,
+        algorithm="RS256",
+        headers={"kid": "key-1", "typ": "JWT"},
+    )
+
+
+def _access_verifier(jwk: dict[str, str], audience: str) -> CloudflareAccessVerifier:
+    return CloudflareAccessVerifier(
+        ISSUER,
+        audience,
+        jwks_fetcher=lambda *_: {"keys": [jwk]},
+    )
+
+
 @pytest.fixture
 def control_database():
     engine = create_database_engine(
@@ -95,9 +166,14 @@ def control_database():
             subject="mcp",
             principal_type=PrincipalType.SERVICE,
         )
+        cloudflare_user = Principal(
+            issuer=ISSUER,
+            subject=SUBJECT,
+            principal_type=PrincipalType.USER,
+        )
         workspace_a = Workspace(slug="workspace-a", name="Workspace A")
         workspace_b = Workspace(slug="workspace-b", name="Workspace B")
-        session.add_all([*principals.values(), mcp, workspace_a, workspace_b])
+        session.add_all([*principals.values(), mcp, cloudflare_user, workspace_a, workspace_b])
         session.flush()
 
         task = Task(
@@ -138,6 +214,12 @@ def control_database():
                 RoleBinding(
                     workspace_id=workspace_a.id,
                     principal_id=principals["experimenter"].id,
+                    role=Role.EXPERIMENTER,
+                    created_by_principal_id=principals["admin"].id,
+                ),
+                RoleBinding(
+                    workspace_id=workspace_a.id,
+                    principal_id=cloudflare_user.id,
                     role=Role.EXPERIMENTER,
                     created_by_principal_id=principals["admin"].id,
                 ),
@@ -193,7 +275,8 @@ def _active_revision(*, task_config=None) -> panel.ActiveTaskRevision:
 def _panel_server(
     tmp_path: Path,
     *,
-    context: ActorContext,
+    context: ActorContext | None = None,
+    authenticator=None,
     service: DatabaseService | None,
     loader: panel.ActiveTaskLoader | None,
     ready: bool = True,
@@ -210,7 +293,11 @@ def _panel_server(
     panel._Handler.runs_root = tmp_path / "runs"
     panel._Handler.tasks_root = tmp_path / "tasks"
     panel._Handler.static_dir = None
-    panel._Handler.authenticator = ContextAuthenticator(context)
+    if authenticator is None:
+        if context is None:
+            raise ValueError("context or authenticator is required")
+        authenticator = ContextAuthenticator(context)
+    panel._Handler.authenticator = authenticator
     panel._Handler.authorization_service = service
     panel._Handler.authorization_ready = ready
     panel._Handler.active_task_loader = loader
@@ -262,6 +349,19 @@ def test_authorization_runtime_requires_current_schema(tmp_path: Path):
         assert service.get_session(ExternalIdentity("urn:test", "unknown")).workspaces == ()
     finally:
         service.close()
+
+
+def test_authorization_runtime_readiness_requires_control_mode_and_active_loader(monkeypatch):
+    service = object()
+    loader = FakeActiveTaskLoader()
+
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    assert panel._authorization_runtime_ready(service, loader) is True
+    assert panel._authorization_runtime_ready(None, loader) is False
+    assert panel._authorization_runtime_ready(service, None) is False
+
+    monkeypatch.setenv("LLS_TASK_SOURCE", "local")
+    assert panel._authorization_runtime_ready(service, loader) is False
 
 
 def test_session_and_workspace_selection_fail_closed(control_database, tmp_path: Path, monkeypatch):
@@ -437,7 +537,7 @@ def test_draft_etag_publish_errors_and_audit_context(control_database, tmp_path:
     assert update_status == 200
     assert updated["record"]["draft_version"] == 2
     assert current_etag != etag
-    assert (stale_status, stale["code"]) == (409, "task_draft_conflict")
+    assert (stale_status, stale["code"]) == (412, "task_draft_conflict")
     assert stale_headers["ETag"] == current_etag
     assert (no_reason_status, no_reason["code"]) == (422, "invalid_definition")
     assert (no_match_status, no_match["code"]) == (428, "task_precondition_required")
@@ -533,6 +633,112 @@ def test_mcp_delegation_records_actor_caller_and_server_channel(control_database
     assert event.channel == AuditChannel.MCP
 
 
+def test_mcp_asgi_tool_to_panel_http_preserves_delegated_actor_and_independent_audience(
+    control_database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    monkeypatch.setenv("LLS_MCP_ENABLE_WRITES", "1")
+    private_key, jwk = _signing_key()
+    panel_assertion = _access_assertion(private_key, PANEL_AUDIENCE)
+    mcp_assertion = _access_assertion(private_key, MCP_AUDIENCE)
+    panel_authenticator = PanelAuthenticator(
+        mode="cloudflare_access",
+        cloudflare_verifier=_access_verifier(jwk, PANEL_AUDIENCE),
+        mcp_cloudflare_verifier=_access_verifier(jwk, MCP_AUDIENCE),
+        internal_token=INTERNAL_TOKEN,
+    )
+
+    with _panel_server(
+        tmp_path,
+        authenticator=panel_authenticator,
+        service=control_database["service"],
+        loader=FakeActiveTaskLoader(),
+    ) as base_url:
+        config = McpServerConfig(
+            panel_url=base_url,
+            internal_token=INTERNAL_TOKEN,
+            auth_mode="cloudflare_access",
+            cloudflare_issuer=ISSUER,
+            cloudflare_audience=MCP_AUDIENCE,
+            panel_cloudflare_audience=PANEL_AUDIENCE,
+            enable_writes=True,
+        )
+        panel_client = PanelApiClient(config)
+        server = create_mcp_server(config, panel_client=panel_client)
+
+        async def downstream(scope, receive, send):
+            await server.call_tool(
+                "scaffold_task_draft_create",
+                {"spec": _draft_spec(), "workspace": "workspace-a"},
+            )
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        app = McpAuthenticationMiddleware(
+            downstream,
+            config,
+            cloudflare_verifier=_access_verifier(jwk, MCP_AUDIENCE),
+        )
+
+        async def run_asgi_requests():
+            transport = httpx.ASGITransport(app=app)
+            try:
+                async with httpx.AsyncClient(transport=transport, base_url="http://mcp") as client:
+                    valid = await client.post(
+                        "/mcp",
+                        headers={"Cf-Access-Jwt-Assertion": mcp_assertion},
+                    )
+                    wrong_audience = await client.post(
+                        "/mcp",
+                        headers={"Cf-Access-Jwt-Assertion": panel_assertion},
+                    )
+                return valid, wrong_audience
+            finally:
+                await panel_client.aclose()
+
+        valid, wrong_audience = asyncio.run(run_asgi_requests())
+        direct_mcp_status, direct_mcp, _ = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a",
+            headers={"Cf-Access-Jwt-Assertion": mcp_assertion},
+        )
+        bearer_only_status, bearer_only, _ = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a",
+            headers={"Authorization": f"Bearer {INTERNAL_TOKEN}"},
+        )
+        invalid_delegation_status, invalid_delegation, _ = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a",
+            headers={
+                "Authorization": f"Bearer {INTERNAL_TOKEN}",
+                "Cf-Access-Jwt-Assertion": panel_assertion,
+            },
+        )
+
+    assert valid.status_code == 204
+    assert (wrong_audience.status_code, wrong_audience.json()["code"]) == (
+        403,
+        "access_assertion_not_for_application",
+    )
+    assert (direct_mcp_status, direct_mcp["code"]) == (403, "access_assertion_not_for_application")
+    assert (bearer_only_status, bearer_only["code"]) == (403, "delegated_actor_required")
+    assert (invalid_delegation_status, invalid_delegation["code"]) == (
+        403,
+        "access_assertion_not_for_application",
+    )
+
+    with Session(control_database["engine"]) as session:
+        event = session.scalar(select(AuditEvent).where(AuditEvent.event_type == "task.draft_created"))
+        actor = session.get(Principal, event.actor_principal_id)
+        caller = session.get(Principal, event.caller_principal_id)
+    assert (actor.issuer, actor.subject) == (ISSUER, SUBJECT)
+    assert (caller.issuer, caller.subject) == ("urn:lls:mcp-service", "mcp")
+    assert event.channel == AuditChannel.MCP
+
+
 def test_data_lake_import_requires_acl_and_active_materialization(
     control_database,
     tmp_path: Path,
@@ -540,15 +746,25 @@ def test_data_lake_import_requires_acl_and_active_materialization(
 ):
     monkeypatch.setenv("LLS_TASK_SOURCE", "control")
     monkeypatch.setattr(panel, "_apply_runtime_settings", lambda *_args, **_kwargs: {})
+    runtime_roots: list[Path] = []
+
+    def dry_run(runs_root, *_args, **_kwargs):
+        runtime_roots.append(Path(runs_root))
+        return {"validation": {"ok": True}}
+
+    def submit(runs_root, *_args, **_kwargs):
+        runtime_roots.append(Path(runs_root))
+        return {"job_id": "job-1"}
+
     monkeypatch.setattr(
         panel.pipeline,
         "dry_run_data_lake_import",
-        lambda *_args, **_kwargs: {"validation": {"ok": True}},
+        dry_run,
     )
     monkeypatch.setattr(
         panel.pipeline,
         "start_data_lake_import",
-        lambda *_args, **_kwargs: {"job_id": "job-1"},
+        submit,
     )
     loader = FakeActiveTaskLoader(
         {("workspace-a", "panel-control-task"): _active_revision(task_config=object())},
@@ -564,7 +780,7 @@ def test_data_lake_import_requires_acl_and_active_materialization(
             base_url,
             "/api/import/data_lake",
             method="POST",
-            body={"task_id": "panel-control-task", "dry_run": True},
+            body={"task_id": "panel-control-task", "workspace": "workspace-a", "dry_run": True},
         )
         submit_status, submit, _ = _request(
             base_url,
@@ -572,6 +788,7 @@ def test_data_lake_import_requires_acl_and_active_materialization(
             method="POST",
             body={
                 "task_id": "panel-control-task",
+                "workspace": "workspace-a",
                 "confirm": True,
                 "idempotency_key": "import-001",
             },
@@ -581,6 +798,10 @@ def test_data_lake_import_requires_acl_and_active_materialization(
     assert dry["dry_run"] is True
     assert submit_status == 200
     assert submit["job"]["job_id"] == "job-1"
+    assert runtime_roots == [
+        tmp_path / "runs" / "workspace-a",
+        tmp_path / "runs" / "workspace-a",
+    ]
     with Session(control_database["engine"]) as session:
         event = session.scalar(select(AuditEvent).where(AuditEvent.event_type == "task.import_requested"))
     assert event.channel == AuditChannel.PANEL
@@ -595,6 +816,113 @@ def test_data_lake_import_requires_acl_and_active_materialization(
             base_url,
             "/api/import/data_lake",
             method="POST",
-            body={"task_id": "panel-control-task", "dry_run": True},
+            body={"task_id": "panel-control-task", "workspace": "workspace-a", "dry_run": True},
         )
     assert (denied_status, denied["code"]) == (403, "permission_denied")
+
+
+def test_control_runtime_reads_require_task_acl_and_isolate_workspace_paths(
+    control_database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    monkeypatch.setattr(panel, "_apply_runtime_settings", lambda *_args, **_kwargs: {})
+    observed: list[tuple[str, Path, str]] = []
+
+    def list_imports(runs_root, task_id, **_kwargs):
+        observed.append(("imports", Path(runs_root), task_id))
+        return [{"import_id": Path(runs_root).name}]
+
+    def import_detail(runs_root, task_id, import_id, **_kwargs):
+        observed.append(("import", Path(runs_root), task_id))
+        return {"import_id": import_id, "namespace": Path(runs_root).name}
+
+    def jobs_for_task(runs_root, task_id):
+        observed.append(("jobs", Path(runs_root), task_id))
+        return [{"job_id": Path(runs_root).name}]
+
+    monkeypatch.setattr(panel.pipeline, "list_imports", list_imports)
+    monkeypatch.setattr(panel.pipeline, "import_detail", import_detail)
+    monkeypatch.setattr(panel.pipeline, "jobs_for_task", jobs_for_task)
+    monkeypatch.setattr(data_lake, "preview_source", lambda task: {"source": task.data_lake["source_dataset_id"]})
+
+    def task_config(workspace: str):
+        return SimpleNamespace(
+            id_field="record_id",
+            path=tmp_path / workspace / "task.yaml",
+            profile="manual_labeling_cv_v1",
+            data_lake={"source_dataset_id": workspace},
+        )
+
+    loader = FakeActiveTaskLoader({
+        ("workspace-a", "panel-control-task"): _active_revision(task_config=task_config("workspace-a")),
+        ("workspace-b", "hidden-task"): _active_revision(task_config=task_config("workspace-b")),
+    })
+
+    handler = SimpleNamespace(runs_root=tmp_path / "runs")
+    same_key_a = panel._Handler._workspace_runs_root(handler, "workspace-a") / "same-task"
+    same_key_b = panel._Handler._workspace_runs_root(handler, "workspace-b") / "same-task"
+    assert same_key_a == tmp_path / "runs" / "workspace-a" / "same-task"
+    assert same_key_b == tmp_path / "runs" / "workspace-b" / "same-task"
+    assert same_key_a != same_key_b
+
+    with _panel_server(
+        tmp_path,
+        context=ActorContext.direct(_auth_principal("admin")),
+        service=control_database["service"],
+        loader=loader,
+    ) as base_url:
+        imports_a_status, imports_a, _ = _request(
+            base_url,
+            "/api/task/imports?task_id=panel-control-task&workspace=workspace-a",
+        )
+        imports_b_status, imports_b, _ = _request(
+            base_url,
+            "/api/task/imports?task_id=hidden-task&workspace=workspace-b",
+        )
+        detail_status, detail, _ = _request(
+            base_url,
+            "/api/import/detail?task_id=hidden-task&import_id=import-1&workspace=workspace-b",
+        )
+        jobs_status, jobs, _ = _request(
+            base_url,
+            "/api/jobs?task_id=panel-control-task&workspace=workspace-a",
+        )
+        preview_status, preview, _ = _request(
+            base_url,
+            "/api/task/data_lake?task_id=hidden-task&workspace=workspace-b",
+        )
+        check_status, check, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/check",
+            method="POST",
+            body={"workspace": "workspace-a"},
+        )
+
+    assert imports_a_status == imports_b_status == detail_status == jobs_status == preview_status == check_status == 200
+    assert imports_a["imports"][0]["import_id"] == "workspace-a"
+    assert imports_b["imports"][0]["import_id"] == "workspace-b"
+    assert detail["import"]["namespace"] == "workspace-b"
+    assert jobs["jobs"][0]["job_id"] == "workspace-a"
+    assert preview["preview"]["source"] == "workspace-b"
+    assert check["ok"] is True
+    assert observed == [
+        ("imports", tmp_path / "runs" / "workspace-a", "panel-control-task"),
+        ("imports", tmp_path / "runs" / "workspace-b", "hidden-task"),
+        ("import", tmp_path / "runs" / "workspace-b", "hidden-task"),
+        ("jobs", tmp_path / "runs" / "workspace-a", "panel-control-task"),
+    ]
+
+    with _panel_server(
+        tmp_path,
+        context=ActorContext.direct(_auth_principal("experimenter")),
+        service=control_database["service"],
+        loader=loader,
+    ) as base_url:
+        hidden_status, hidden, _ = _request(
+            base_url,
+            "/api/jobs?task_id=hidden-task&workspace=workspace-b",
+        )
+
+    assert (hidden_status, hidden["code"]) == (404, "resource_not_found")

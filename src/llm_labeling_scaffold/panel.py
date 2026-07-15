@@ -171,6 +171,13 @@ def _control_task_source_enabled() -> bool:
     return _task_source_mode() == "control"
 
 
+def _authorization_runtime_ready(
+    service: DatabaseService | None,
+    active_task_loader: ActiveTaskLoader | None,
+) -> bool:
+    return service is not None and _control_task_source_enabled() and active_task_loader is not None
+
+
 def _task_registry_sync_ttl_seconds() -> float:
     raw = os.environ.get("LLS_TASK_REGISTRY_SYNC_TTL_SECONDS")
     if raw is None:
@@ -233,7 +240,7 @@ def _contract_capabilities(
     auth_mode: str = "unconfigured",
     authorization_state: str = AUTHORIZATION_UNAVAILABLE,
 ) -> dict[str, Any]:
-    return {
+    payload = {
         "service": "llm-labeling-scaffold",
         "api_contract_version": API_CONTRACT_VERSION,
         "auth": {
@@ -325,7 +332,7 @@ def _contract_capabilities(
                 "action": "task_detail",
                 "side_effects": False,
                 "path_params": {"task_id": {"type": "string"}},
-                "query_params": {"workspace": {"type": "string", "required": False}},
+                "query_params": {"workspace": {"type": "string", "required": True}},
                 "response_schema": {
                     "type": "object",
                     "required": ["task"],
@@ -337,7 +344,7 @@ def _contract_capabilities(
                 "path": "/api/tasks",
                 "action": "tasks_list",
                 "side_effects": False,
-                "query_params": {"workspace": {"type": "string", "required": False}},
+                "query_params": {"workspace": {"type": "string", "required": True}},
                 "response_schema": {"type": "object", "required": ["tasks"]},
             },
             {
@@ -348,7 +355,7 @@ def _contract_capabilities(
                 "requires_task_source": "control",
                 "query_params": {
                     "task_id": {"type": "string", "required": True},
-                    "workspace": {"type": "string", "required": False},
+                    "workspace": {"type": "string", "required": True},
                 },
                 "response_schema": {"type": "object", "required": ["task"]},
             },
@@ -360,7 +367,7 @@ def _contract_capabilities(
                 "requires_task_source": "control",
                 "request_schema": {
                     "type": "object",
-                    "required": ["task_id", "text_fields", "primary_label_values"],
+                    "required": ["task_id", "text_fields", "primary_label_values", "workspace"],
                     "properties": {"workspace": {"type": "string"}},
                 },
                 "response_schema": {"type": "object", "required": ["ok", "task"]},
@@ -375,7 +382,7 @@ def _contract_capabilities(
                 "required_headers": {"If-Match": {"type": "string", "format": "strong-etag"}},
                 "request_schema": {
                     "type": "object",
-                    "required": ["task_id", "text_fields", "primary_label_values"],
+                    "required": ["task_id", "text_fields", "primary_label_values", "workspace"],
                     "properties": {"workspace": {"type": "string"}},
                 },
                 "response_schema": {"type": "object", "required": ["ok", "task"]},
@@ -389,7 +396,7 @@ def _contract_capabilities(
                 "path_params": {"task_id": {"type": "string"}},
                 "request_schema": {
                     "type": "object",
-                    "required": ["confirm", "idempotency_key", "reason"],
+                    "required": ["confirm", "idempotency_key", "reason", "workspace"],
                     "properties": {
                         "confirm": {"const": True},
                         "idempotency_key": {"type": "string"},
@@ -409,6 +416,7 @@ def _contract_capabilities(
                 "path_params": {"task_id": {"type": "string"}},
                 "request_schema": {
                     "type": "object",
+                    "required": ["workspace"],
                     "properties": {"workspace": {"type": "string"}},
                     "additionalProperties": False,
                 },
@@ -416,6 +424,58 @@ def _contract_capabilities(
                     "type": "object",
                     "required": ["ok", "task_id", "checks", "warnings", "errors"],
                 },
+            },
+            {
+                "method": "GET",
+                "path": "/api/task/imports",
+                "action": "task_imports_list",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["workspace", "imports"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/import/detail",
+                "action": "task_import_detail",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "import_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["workspace", "import"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/task/data_lake",
+                "action": "task_data_lake_preview",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": True},
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["workspace", "enabled", "data_lake", "preview"],
+                },
+            },
+            {
+                "method": "GET",
+                "path": "/api/jobs",
+                "action": "task_jobs_list",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["workspace", "jobs"]},
             },
             {
                 "method": "GET",
@@ -542,7 +602,7 @@ def _contract_capabilities(
                 "side_effects": False,
                 "request_schema": {
                     "type": "object",
-                    "required": ["task_id", "dry_run"],
+                    "required": ["task_id", "dry_run", "workspace"],
                     "properties": {
                         "task_id": {"type": "string"},
                         "import_id": {"type": "string"},
@@ -568,7 +628,7 @@ def _contract_capabilities(
                 "side_effects": True,
                 "request_schema": {
                     "type": "object",
-                    "required": ["task_id", "confirm", "idempotency_key"],
+                    "required": ["task_id", "confirm", "idempotency_key", "workspace"],
                     "properties": {
                         "task_id": {"type": "string"},
                         "import_id": {"type": "string"},
@@ -585,6 +645,20 @@ def _contract_capabilities(
             },
         ],
     }
+    if auth_mode == "cloudflare_access":
+        public_routes = {
+            ("GET", "/api/health"),
+            ("GET", "/api/version"),
+            ("GET", "/api/capabilities"),
+            ("GET", "/api/settings/public"),
+        }
+        payload["endpoints"] = [
+            endpoint
+            for endpoint in payload["endpoints"]
+            if (endpoint["method"], endpoint["path"]) in public_routes
+            or _database_authorized_route(endpoint["method"], endpoint["path"])
+        ]
+    return payload
 
 
 def _contract_task_path(path: str, *, suffix: str = "") -> str | None:
@@ -635,13 +709,21 @@ def _database_authorized_route(method: str, path: str) -> bool:
     if not _control_task_source_enabled():
         return False
     if method == "GET":
-        if path in {"/api/tasks", "/api/task/control"}:
+        if path in {
+            "/api/tasks",
+            "/api/task/control",
+            "/api/task/imports",
+            "/api/import/detail",
+            "/api/task/data_lake",
+            "/api/jobs",
+        }:
             return True
         return _contract_task_path(path) is not None
     if method == "POST":
         return (
             path in {"/api/tasks", "/api/import/data_lake"}
             or _contract_task_path(path, suffix="publish") is not None
+            or _contract_task_path(path, suffix="check") is not None
         )
     return method == "PUT" and _contract_task_path(path) is not None
 
@@ -1054,6 +1136,48 @@ class _Handler(BaseHTTPRequestHandler):
                 "active task loader 返回失败",
             ) from exc
 
+    def _workspace_runs_root(self, workspace_slug: str) -> Path:
+        if not _safe_segment(workspace_slug):
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_workspace",
+                "workspace 必须是单段安全标识符",
+            )
+        return self.runs_root / workspace_slug
+
+    def _authorized_active_task(
+        self,
+        task_id: str,
+        params,
+        *,
+        body: dict[str, Any] | None = None,
+        permission: Permission = Permission.TASK_READ,
+        require_materialized: bool = True,
+    ) -> tuple[str, ActiveTaskRevision, Path]:
+        if not _safe_segment(task_id):
+            raise ValueError("task_id 必须是单段安全标识符")
+        service, actor_identity, _, _ = self._authorization_context()
+        workspace_slug = self._resolve_workspace(
+            service,
+            actor_identity,
+            self._workspace_selector(params, body),
+        )
+        service.require_task(actor_identity, workspace_slug, task_id, permission)
+        active = self._load_active_revision(workspace_slug, task_id)
+        if active is None:
+            raise _PanelRouteError(
+                HTTPStatus.NOT_FOUND,
+                "resource_not_found",
+                "active published revision 不存在",
+            )
+        if require_materialized and active.task_config is None:
+            raise _PanelRouteError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "active_task_materialization_unavailable",
+                "active task 尚未完成物化",
+            )
+        return workspace_slug, active, self._workspace_runs_root(workspace_slug)
+
     def _route_error(self, exc: Exception) -> None:
         if isinstance(exc, _PanelRouteError):
             self._json(
@@ -1108,7 +1232,7 @@ class _Handler(BaseHTTPRequestHandler):
             headers = {"ETag": exc.current_etag} if exc.current_etag is not None else None
             self._json(
                 {"error": "任务草稿已变化，请重新读取", "code": exc.code},
-                status=HTTPStatus.CONFLICT,
+                status=HTTPStatus.PRECONDITION_FAILED,
                 headers=headers,
             )
             return
@@ -1487,9 +1611,10 @@ class _Handler(BaseHTTPRequestHandler):
 
             max_bytes = int(os.environ.get("LLS_MAX_IMPORT_BYTES", str(100 * 1024 * 1024)))
             _apply_runtime_settings(self.runs_root)
+            workspace_runs_root = self._workspace_runs_root(workspace_slug)
             if dry_run:
                 result = pipeline.dry_run_data_lake_import(
-                    self.runs_root,
+                    workspace_runs_root,
                     active.task_config,
                     import_id=import_id or None,
                     overrides=overrides,
@@ -1509,7 +1634,7 @@ class _Handler(BaseHTTPRequestHandler):
                 details={"import_id": import_id or None},
             )
             job = pipeline.start_data_lake_import(
-                self.runs_root,
+                workspace_runs_root,
                 active.task_config,
                 import_id=import_id or None,
                 overrides=overrides,
@@ -1517,6 +1642,73 @@ class _Handler(BaseHTTPRequestHandler):
                 idempotency_key=idempotency_key,
             )
             self._json({"ok": True, "job": job})
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_import_list(self, params) -> None:
+        try:
+            task_id = str(params.get("task_id", [""])[0] or "").strip()
+            workspace_slug, active, workspace_runs_root = self._authorized_active_task(task_id, params)
+            self._json({
+                "workspace": workspace_slug,
+                "imports": pipeline.list_imports(
+                    workspace_runs_root,
+                    task_id,
+                    id_field=active.task_config.id_field,
+                ),
+            })
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_import_detail(self, params) -> None:
+        try:
+            task_id = str(params.get("task_id", [""])[0] or "").strip()
+            import_id = str(params.get("import_id", [""])[0] or "").strip()
+            if not _safe_segment(import_id):
+                raise ValueError("import_id 必须是单段安全标识符")
+            workspace_slug, active, workspace_runs_root = self._authorized_active_task(task_id, params)
+            try:
+                item = pipeline.import_detail(
+                    workspace_runs_root,
+                    task_id,
+                    import_id,
+                    id_field=active.task_config.id_field,
+                )
+            except ValueError as exc:
+                raise _PanelRouteError(
+                    HTTPStatus.NOT_FOUND,
+                    "resource_not_found",
+                    "导入资产不存在",
+                ) from exc
+            self._json({"workspace": workspace_slug, "import": item})
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_jobs(self, params) -> None:
+        try:
+            task_id = str(params.get("task_id", [""])[0] or "").strip()
+            workspace_slug, _, workspace_runs_root = self._authorized_active_task(task_id, params)
+            self._json({
+                "workspace": workspace_slug,
+                "jobs": pipeline.jobs_for_task(workspace_runs_root, task_id),
+            })
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _control_data_lake_preview(self, params) -> None:
+        try:
+            from .data_lake import preview_source
+
+            task_id = str(params.get("task_id", [""])[0] or "").strip()
+            workspace_slug, active, _ = self._authorized_active_task(task_id, params)
+            _apply_runtime_settings(self.runs_root)
+            task_config = active.task_config
+            self._json({
+                "workspace": workspace_slug,
+                "enabled": bool(task_config.data_lake),
+                "data_lake": task_config.data_lake,
+                "preview": preview_source(task_config) if task_config.data_lake else None,
+            })
         except Exception as exc:
             self._route_error(exc)
 
@@ -1603,7 +1795,36 @@ class _Handler(BaseHTTPRequestHandler):
                 {"check": "task_id", "message": "bad task"}
             ]}, status=400)
             return
+        try:
+            task = self._load_task_by_id(task_id)
+        except Exception as exc:
+            self._json({
+                "ok": False,
+                "task_id": task_id,
+                "checks": [{
+                    "name": "task_load",
+                    "status": "error",
+                    "message": str(exc),
+                    "details": {"error_class": exc.__class__.__name__},
+                }],
+                "warnings": [],
+                "errors": [{
+                    "check": "task_load",
+                    "message": str(exc),
+                    "details": {"error_class": exc.__class__.__name__},
+                }],
+            }, status=404)
+            return
+        self._task_check_loaded(task_id, task)
 
+    def _control_task_check(self, task_id: str, params, body: dict[str, Any]) -> None:
+        try:
+            _, active, _ = self._authorized_active_task(task_id, params, body=body)
+            self._task_check_loaded(task_id, active.task_config)
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _task_check_loaded(self, task_id: str, task) -> None:
         checks: list[dict[str, Any]] = []
         warnings: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
@@ -1618,19 +1839,7 @@ class _Handler(BaseHTTPRequestHandler):
             elif status == "error":
                 errors.append({"check": name, "message": message, "details": details or {}})
 
-        try:
-            task = self._load_task_by_id(task_id)
-            add_check("task_load", "ok", "task loaded", {"path": str(task.path)})
-        except Exception as exc:
-            add_check("task_load", "error", str(exc), {"error_class": exc.__class__.__name__})
-            self._json({
-                "ok": False,
-                "task_id": task_id,
-                "checks": checks,
-                "warnings": warnings,
-                "errors": errors,
-            }, status=404)
-            return
+        add_check("task_load", "ok", "task loaded", {"path": str(task.path)})
 
         try:
             from .profiles import profile_definition
@@ -1838,6 +2047,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json({"samples": pipeline.list_samples(self.runs_root, task)})
         elif path == "/api/task/imports":
+            if _control_task_source_enabled():
+                self._control_import_list(params)
+                return
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
@@ -1848,6 +2060,9 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/import/detail":
+            if _control_task_source_enabled():
+                self._control_import_detail(params)
+                return
             task = params.get("task_id", [""])[0]
             import_id = params.get("import_id", [""])[0]
             try:
@@ -1941,6 +2156,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json({"decisions": pipeline.list_decisions(self.runs_root, task, run)})
         elif path == "/api/jobs":
+            if _control_task_source_enabled():
+                self._control_jobs(params)
+                return
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
@@ -1953,6 +2171,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json({"events": pipeline.list_audit_events(self.runs_root, task)})
         elif path == "/api/task/data_lake":
+            if _control_task_source_enabled():
+                self._control_data_lake_preview(params)
+                return
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
@@ -2014,7 +2235,10 @@ class _Handler(BaseHTTPRequestHandler):
         contract_check_task_id = _contract_task_path(path, suffix="check")
         publish_task_id = _contract_task_path(path, suffix="publish")
         if contract_check_task_id is not None:
-            self._task_check(contract_check_task_id)
+            if _control_task_source_enabled():
+                self._control_task_check(contract_check_task_id, params, self._read_body())
+            else:
+                self._task_check(contract_check_task_id)
         elif publish_task_id is not None:
             if not _control_task_source_enabled():
                 self._json({"error": "只有 scaffold 控制面任务来源模式支持发布任务 revision"}, status=400)
@@ -2418,7 +2642,7 @@ def serve_panel(
     except Exception:
         authorization_service = None
     _Handler.authorization_service = authorization_service
-    _Handler.authorization_ready = authorization_service is not None
+    _Handler.authorization_ready = _authorization_runtime_ready(authorization_service, active_task_loader)
     _Handler.active_task_loader = active_task_loader
     if static_dir is None:
         guess = Path("frontend/dist")
@@ -2430,8 +2654,8 @@ def serve_panel(
         print(f"[lls panel] serving frontend from {_Handler.static_dir}")
     else:
         print("[lls panel] no frontend build found; run 'npm run build' in frontend/ or use the Vite dev server")
-    if authorization_service is None:
-        print("[lls panel] database authorization unavailable; protected routes fail closed")
+    if not _Handler.authorization_ready:
+        print("[lls panel] authorization runtime unavailable; protected routes fail closed")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
