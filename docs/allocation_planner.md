@@ -16,7 +16,9 @@ Dispatch must submit the preview's `plan_fingerprint` and reject a mismatch. Rep
 task revision, manifest, cohort, capacity, seed, rule, or algorithm change produces a new
 fingerprint, preventing confirmation of a stale preview.
 
-The supported algorithm allowlist currently contains only `allocation-v1`.
+The supported algorithm allowlist currently contains only `allocation-v1`. The value is trimmed
+before selector ranking, assignment ranking, normalized request hashing, and preview generation,
+so surrounding whitespace cannot produce a different plan with the same input fingerprint.
 
 ## Overlap rules
 
@@ -57,6 +59,22 @@ different `required_submissions` values are placed in separate dataset groups wi
 Personal workspace keys depend only on the stable annotator ID, so one annotator reuses the same
 workspace across cohorts, tasks, seeds, and allocation plans. Shared workspace keys are scoped to
 the cohort. Calibration workspace keys are scoped to the plan input fingerprint.
+
+## Performance
+
+Validation uses degree-sequence prefix checks and does not generate an assignment witness.
+`plan_allocation()` and `preview_allocation()` each resolve once and generate assignments once.
+Balanced annotator quotas and record realization use heaps, with work proportional to generated
+assignment rows rather than repeated annotator-pair and record scans.
+
+Local benchmark with Python 3.14.6 after one warm-up, using 10 annotators, 2,000 records,
+heterogeneous capacities, 200 `k=2` records, and 200 `k=3` records (7 measured runs):
+
+- `plan_allocation`: median `0.119s`, maximum `0.121s`.
+- `preview_allocation`: median `0.119s`, maximum `0.120s`.
+
+The property test also caps seed-rank calls below 4,000 for this fixture and verifies reversed
+record/annotator input produces the same plan and fingerprint.
 
 ## Fingerprints and gates
 
