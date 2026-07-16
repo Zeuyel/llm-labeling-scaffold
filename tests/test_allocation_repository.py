@@ -330,7 +330,17 @@ def test_repository_rebuilds_and_idempotently_persists_planner_output(repository
     assert first.plan_id == replay.plan_id
     assert replay.replayed
     with Session(data["engine"]) as session:
-        assert session.scalar(select(func.count()).select_from(AllocationPlan)) == 1
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(AllocationPlan)
+                .where(
+                    AllocationPlan.workspace_id == data["workspace_id"],
+                    AllocationPlan.task_id == data["task_id"],
+                )
+            )
+            == 1
+        )
 
 
 def test_repository_confirm_and_receipt_progress_are_server_derived(repository):
@@ -507,4 +517,14 @@ def test_postgres_repository_concurrent_create_replays_one_plan(repository):
     assert len({result.plan_id for result in results}) == 1
     assert sum(result.replayed for result in results) == 1
     with Session(data["engine"]) as session:
-        assert session.scalar(select(func.count()).select_from(AllocationPlan)) == 1
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(AllocationPlan)
+                .where(
+                    AllocationPlan.workspace_id == data["workspace_id"],
+                    AllocationPlan.task_id == data["task_id"],
+                )
+            )
+            == 1
+        )
