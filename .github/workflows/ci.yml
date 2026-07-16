@@ -52,6 +52,23 @@ jobs:
           SCAFFOLD_POSTGRES_APP_PASSWORD: app_ci_password
         run: ./docker/postgres/init-runtime-role.sh
 
+      - name: Verify PostgreSQL runtime role after migration
+        env:
+          LLS_DATABASE_URL: postgresql+psycopg://scaffold_owner:owner_ci_password@127.0.0.1:5432/scaffold
+          PGHOST: 127.0.0.1
+          PGPASSWORD: owner_ci_password
+          POSTGRES_USER: scaffold_owner
+          POSTGRES_DB: scaffold
+          SCAFFOLD_POSTGRES_APP_USER: scaffold_app
+          SCAFFOLD_POSTGRES_APP_PASSWORD: app_ci_password
+          LLS_RUNTIME_ROLE_VERIFY_SQL_PATH: ./docker/postgres/verify-runtime-role.sql
+        run: |
+          alembic upgrade head
+          ./docker/postgres/init-runtime-role.sh
+          alembic downgrade base
+          alembic upgrade head
+          ./docker/postgres/init-runtime-role.sh
+
       - name: Run Python tests
         run: python -m pytest tests -q
 

@@ -60,10 +60,13 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      db-role-verify:
+        condition: service_completed_successfully
       argilla:
         condition: service_started
     networks:
       - lls
+      - scaffold-db
 
   migrate:
     image: ${PANEL_IMAGE:-llm-labeling-scaffold-panel:local}
@@ -80,7 +83,7 @@ services:
       db-role-init:
         condition: service_completed_successfully
     networks:
-      - lls
+      - scaffold-db
 
   materializer:
     image: ${PANEL_IMAGE:-llm-labeling-scaffold-panel:local}
@@ -129,7 +132,30 @@ services:
       scaffold-postgres:
         condition: service_healthy
     networks:
-      - lls
+      - scaffold-db
+
+  db-role-verify:
+    image: postgres:16
+    restart: "no"
+    environment:
+      PGHOST: scaffold-postgres
+      PGPASSWORD: ${SCAFFOLD_POSTGRES_OWNER_PASSWORD:?Set SCAFFOLD_POSTGRES_OWNER_PASSWORD}
+      POSTGRES_USER: ${SCAFFOLD_POSTGRES_OWNER_USER:-scaffold_owner}
+      POSTGRES_DB: ${SCAFFOLD_POSTGRES_DB:-scaffold}
+      SCAFFOLD_POSTGRES_APP_USER: ${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}
+      SCAFFOLD_POSTGRES_APP_PASSWORD: ${SCAFFOLD_POSTGRES_APP_PASSWORD:?Set SCAFFOLD_POSTGRES_APP_PASSWORD}
+      LLS_RUNTIME_ROLE_SQL_PATH: /usr/local/share/lls/init-runtime-role.sql
+      LLS_RUNTIME_ROLE_VERIFY_SQL_PATH: /usr/local/share/lls/verify-runtime-role.sql
+    command: ["/usr/local/bin/lls-init-runtime-role"]
+    volumes:
+      - ./docker/postgres/init-runtime-role.sh:/usr/local/bin/lls-init-runtime-role:ro
+      - ./docker/postgres/init-runtime-role.sql:/usr/local/share/lls/init-runtime-role.sql:ro
+      - ./docker/postgres/verify-runtime-role.sql:/usr/local/share/lls/verify-runtime-role.sql:ro
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - scaffold-db
 
   mcp:
     image: ${PANEL_IMAGE:-llm-labeling-scaffold-panel:local}
@@ -226,7 +252,7 @@ services:
       timeout: 5s
       retries: 20
     networks:
-      - lls
+      - scaffold-db
 
   argilla-postgres:
     image: postgres:14
@@ -314,6 +340,9 @@ services:
 networks:
   lls:
     driver: bridge
+  scaffold-db:
+    driver: bridge
+    internal: true
 
 volumes:
   scaffold-postgres-data:

@@ -119,16 +119,25 @@ sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${ap
 unset owner_password app_password
 ```
 
-生产环境应从 secret manager 分别注入 `SCAFFOLD_POSTGRES_OWNER_PASSWORD` 与 `SCAFFOLD_POSTGRES_APP_PASSWORD`。任一变量为空时 Compose 会 fail fast；账号或密码相同时，角色初始化也会拒绝执行。`migrate` 只使用 owner，Panel 只使用 app role，不会使用弱口令静默启动。
+生产环境应从 secret manager 分别注入 `SCAFFOLD_POSTGRES_OWNER_PASSWORD` 与 `SCAFFOLD_POSTGRES_APP_PASSWORD`。任一变量为空时 Compose 会 fail fast；账号或密码相同时，角色初始化也会拒绝执行。app 密码只通过环境传入，`psql` 在 SQL 内用 `\getenv` 读取，不会拼入进程 argv。数据库初始化容器、`migrate`、`db-role-init` 与 `db-role-verify` 可读取 owner secret；Panel 和 MCP 只读取 app secret。Scaffold PostgreSQL 位于独立的 internal `scaffold-db` 网络，只有 Panel 和一次性数据库作业加入；宿主机端口默认仅绑定 `127.0.0.1`，生产无需本机访问时应删除端口映射。
 
-首次初始化时，PostgreSQL entrypoint 会从脚本自身目录或 `LLS_RUNTIME_ROLE_SQL_PATH` 读取角色 SQL；已有数据卷则由一次性 `db-role-init` 服务重复执行同一份幂等脚本：
+首次初始化时，PostgreSQL entrypoint 会从脚本自身目录或 `LLS_RUNTIME_ROLE_SQL_PATH` 读取角色 SQL；已有数据卷则由一次性 `db-role-init` 服务重复执行同一份幂等脚本。迁移完成后，`db-role-verify` 会重新应用权限并执行 catalog 验证，任一权限或对象白名单偏离都会阻止 Panel 启动：
 
 ```bash
 docker compose run --rm db-role-init
 docker compose run --rm migrate
+docker compose run --rm db-role-verify
 ```
 
-app role 只获得当前和未来 `public` 表的 `SELECT/INSERT/UPDATE/DELETE`、sequence 使用权，不获得 schema/database DDL、临时表或 `TRUNCATE` 权限。已有数据库若由外部 PostgreSQL 托管，应由具备创建/修改 role 权限的 DBA 运行 `docker/postgres/init-runtime-role.sh`，并确保 `POSTGRES_USER` 是后续执行迁移、拥有 schema 对象的 owner。
+app role 只在目标数据库获得 `CONNECT`，没有任何数据库的 `CREATE`/`TEMP`、schema `CREATE`、role membership、sequence、函数或未来对象的默认权限。当前白名单仅允许读取 principal/workspace/task/role binding，创建和更新指定展示列的 principal，创建和更新指定完成列的 idempotency record，创建 workspace setting，以及读取和追加 audit event；migration 与 Alembic 表不可见。除 `pg_catalog`、`information_schema`、`pg_toast` 及 PostgreSQL 临时 schema 外，用户 schema 目录必须精确等于 `public`；新增用户 schema 即使没有授予任何权限也会 fail closed。初始化会先撤销 app/PUBLIC 在所有用户 schema 及其中 table/column/sequence/function 上的权限，verifier 再对用户 schema 目录、每列的有效 `SELECT`/`INSERT`/`UPDATE`/`REFERENCES`、runtime 相关 column ACL、relation ACL、空 sequence 集合，以及函数名、identity argument signature、类型、返回值和语言做等值校验。
+
+ownership 也属于启动前白名单：目标数据库和迁移产生的 public relation、审计 trigger function 必须由 `owner_user`（即预期迁移 owner）所有；PG16 默认的 `public` schema owner `pg_database_owner` 是唯一额外允许值。app 或未知角色成为这些对象的 owner 会使 verifier fail closed。初始化只执行权限和 role 收敛，并在已有对象上先做 ownership preflight，不会把漂移对象重新改回 owner；因此 ownership drift 仍会阻止启动。
+
+初始化会撤销 migration owner 的全局及 `public` schema 级 table/sequence/function 默认授权，特别是 PostgreSQL 默认授予 `PUBLIC` 的 function `EXECUTE`。verifier 同时检查 `pg_default_acl` 的全局规则与 schema 增量，任何非 owner 的未来对象授权都会阻止启动。
+
+跨数据库隔离依赖专用 PostgreSQL 集群。PostgreSQL 没有 ACL `DENY`，runtime role 会继承其他数据库默认授予 `PUBLIC` 的 `CONNECT`/`TEMP`；因此初始化必须以该专用集群的超级用户执行，并撤销当前集群所有数据库对 `PUBLIC` 和 app 的权限，再只向目标数据库授予 app `CONNECT`。非超级 owner、共享托管集群或不能修改所有数据库 ACL 的环境会直接初始化失败，不得把该脚本描述为已经提供集群级最小权限。此类环境必须由 DBA 提供独立集群或等价的 `pg_hba.conf` 与数据库 ACL 隔离后再接入。
+
+数据库 ACL 验证是当前 catalog 的时点保证。验证后新建数据库会重新获得 PostgreSQL 默认的 `PUBLIC CONNECT/TEMP`；专用集群应禁止发布流程外创建数据库，确需创建时必须在 app 再次启动前重跑 `db-role-init` 与 `db-role-verify`。
 
 ## 首位管理员
 
@@ -146,7 +155,13 @@ docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap
 
 ## 审计不可变性
 
-应用通过授权 façade 追加普通审计，bootstrap/system 审计只走内部路径。SQLAlchemy ORM 会拒绝更新或删除已存在事件；PostgreSQL migration 安装 `BEFORE UPDATE OR DELETE` 和 `BEFORE TRUNCATE` 触发器，SQLite migration 与 `Base.metadata.create_all` 测试路径也安装 UPDATE/DELETE 触发器，因此 bulk SQL 不能覆盖或删除审计历史。数据库 owner 仅用于迁移、备份和受控恢复，Panel 不得持有 owner 凭据。
+应用通过授权 façade 追加普通审计，bootstrap/system 审计只走内部路径。SQLAlchemy ORM 会拒绝更新或删除已存在事件；PostgreSQL migration 安装固定的 `BEFORE UPDATE OR DELETE ... FOR EACH ROW` 与 `BEFORE TRUNCATE ... FOR EACH STATEMENT` 触发器，且二者必须调用同一个 owner-owned `lls_reject_audit_event_mutation()`。verifier 会精确比较 trigger 名称、事件/timing/level、启用状态和函数 OID，并检查函数语言、返回类型、关键属性及规范化函数体；额外 trigger、错误事件或 timing、禁用 trigger、函数体替换都会 fail closed。SQLite migration 与 `Base.metadata.create_all` 测试路径也安装 UPDATE/DELETE 触发器，因此 bulk SQL 不能覆盖或删除审计历史。数据库 owner 仅用于迁移、备份和受控恢复，Panel 不得持有 owner 凭据。
+
+## 生产信任边界
+
+Scaffold RBAC 用于约束终端用户、跨 workspace 访问和普通应用路径；应用进程、runtime app credential、数据库 owner/运维入口、secret manager 与数据库网络边界都属于 trusted computing base。runtime credential 不是逐用户数据库身份，不能用它抵御 Panel 进程或该凭据完全失陷。
+
+凭据失陷者仍可读取和写入白名单允许的数据，包括伪造新的 audit event；既有 audit event 仍受触发器和权限保护。权限脚本、catalog 验证、internal 网络与 owner credential 隔离减少误配置和横向访问，但不证明应用二进制没有被攻破。需要抵御 runtime credential 完全失陷时，应把敏感授权或审计写入放到持有独立凭据的服务，或采用数据库可验证的逐请求身份。
 
 ## 凭据轮换
 
@@ -175,6 +190,7 @@ docker compose exec -T scaffold-postgres \
   sh -c 'pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists' < scaffold.dump
 docker compose run --rm db-role-init
 docker compose run --rm migrate
+docker compose run --rm db-role-verify
 ```
 
 恢复后必须重新执行 role 初始化，确保 runtime app 对恢复出的当前对象拥有 DML 且仍无 DDL/TRUNCATE 权限。备份文件包含身份和审计数据，应按敏感生产数据加密、限制访问并设置保留周期；定期在隔离数据库验证恢复与 Alembic revision，而不是只验证 `pg_dump` 返回码。

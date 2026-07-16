@@ -31,5 +31,19 @@ psql \
   --dbname "$POSTGRES_DB" \
   --set owner_user="$POSTGRES_USER" \
   --set app_user="$SCAFFOLD_POSTGRES_APP_USER" \
-  --set app_password="$SCAFFOLD_POSTGRES_APP_PASSWORD" \
   --file "$sql_path"
+
+verify_sql_path="${LLS_RUNTIME_ROLE_VERIFY_SQL_PATH:-}"
+if [ -n "$verify_sql_path" ]; then
+  if [ ! -r "$verify_sql_path" ]; then
+    echo "runtime role verification SQL is not readable: $verify_sql_path" >&2
+    exit 2
+  fi
+  psql \
+    --set ON_ERROR_STOP=1 \
+    --username "$POSTGRES_USER" \
+    --dbname "$POSTGRES_DB" \
+    --set owner_user="$POSTGRES_USER" \
+    --set app_user="$SCAFFOLD_POSTGRES_APP_USER" \
+    --file "$verify_sql_path"
+fi
