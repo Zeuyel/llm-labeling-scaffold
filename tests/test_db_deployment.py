@@ -27,6 +27,7 @@ class _RuntimeDatabase:
     app_url: URL
     app_user: str
     helper_role: str
+    non_app_user: str = ""
 
 
 def _render_url(url: URL) -> str:
@@ -142,6 +143,7 @@ def postgres_runtime_database() -> _RuntimeDatabase:
     database_name = f"lls73_{token}"
     app_user = f"lls73_app_{token}"
     helper_role = f"lls73_parent_{token}"
+    non_app_user = f"lls73_nonapp_{token}"
     source_owner_url = make_url(owner_url_value)
     source_app_url = make_url(app_url_value)
     owner_url = source_owner_url.set(database=database_name)
@@ -155,19 +157,30 @@ def postgres_runtime_database() -> _RuntimeDatabase:
         app_url=app_url,
         app_user=app_user,
         helper_role=helper_role,
+        non_app_user=non_app_user,
     )
     maintenance_url = source_owner_url.set(database="postgres")
 
     with psycopg.connect(_render_psycopg_url(maintenance_url), autocommit=True) as connection:
         connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
         connection.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(helper_role)))
+        connection.execute(
+            sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                sql.Identifier(non_app_user),
+                sql.Literal(source_app_url.password or "non-app-test-password"),
+            )
+        )
 
     try:
         _run_role_script(database)
         subprocess.run(
             [sys.executable, "-m", "alembic", "upgrade", "head"],
             cwd=ROOT,
-            env={**os.environ, "LLS_DATABASE_URL": _render_url(owner_url)},
+            env={
+                **os.environ,
+                "LLS_DATABASE_URL": _render_url(owner_url),
+                "SCAFFOLD_POSTGRES_APP_USER": app_user,
+            },
             text=True,
             capture_output=True,
             check=True,
@@ -183,6 +196,7 @@ def postgres_runtime_database() -> _RuntimeDatabase:
             connection.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(database_name)))
             connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(app_user)))
             connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(helper_role)))
+            connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(non_app_user)))
 
 
 def _fake_psql(tmp_path: Path) -> tuple[Path, Path]:
@@ -264,6 +278,7 @@ def test_compose_role_initialization_paths_are_explicit():
         "LLS_DATABASE_PASSWORD=${SCAFFOLD_POSTGRES_OWNER_PASSWORD:?Set SCAFFOLD_POSTGRES_OWNER_PASSWORD}"
         in migrate_environment
     )
+    assert "SCAFFOLD_POSTGRES_APP_USER=${SCAFFOLD_POSTGRES_APP_USER:-scaffold_app}" in migrate_environment
 
     materializer = services["materializer"]
     materializer_environment = set(materializer["environment"])
@@ -357,6 +372,7 @@ def test_runtime_role_sql_uses_explicit_fail_closed_privileges():
     assert "AND rolsuper AS cluster_admin_ok" in sql
     assert "FROM pg_database AS target_database" in sql
     assert "FOR ROLE %I REVOKE ALL ON FUNCTIONS FROM PUBLIC" in sql
+    assert "REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA %I FROM %I" in sql
     assert "namespace.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')" in sql
     assert "namespace.nspname !~ '^pg_(toast_)?temp_[0-9]+$'" in verifier_sql
     assert "AS user_schema_catalog_ok" in verifier_sql
@@ -376,6 +392,12 @@ def test_runtime_role_sql_uses_explicit_fail_closed_privileges():
     assert "--set app_password" not in ROLE_SCRIPT.read_text(encoding="utf-8")
     assert "'{}'::aclitem[]" not in verifier_sql
     assert "aclexplode(attribute.attacl)" in verifier_sql
+    function_acl_section = verifier_sql[
+        verifier_sql.index("), actual AS (\n    SELECT namespace.nspname,\n           procedure.proname")
+        : verifier_sql.index(") AS function_acl_catalog_ok")
+    ]
+    assert "privilege.grantee IN (0, app_role.oid)" not in function_acl_section
+    assert "privilege.grantee <> procedure.proowner" in function_acl_section
 
 
 def test_runtime_role_script_runs_optional_verification(tmp_path: Path):
@@ -497,6 +519,179 @@ def test_runtime_role_final_schema_acl_matches_service_dependencies(
               AND privilege.grantee = 0
             """
         ).fetchone()[0] == 0
+
+        non_app_completion_privileges = connection.execute(
+            """
+            SELECT has_table_privilege(%s, 'idempotency_records', 'INSERT'),
+                   has_function_privilege(
+                       %s,
+                       'lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text)',
+                       'EXECUTE'
+                   )
+            """,
+            (database.non_app_user, database.non_app_user),
+        ).fetchone()
+        assert non_app_completion_privileges == (False, False)
+
+
+def test_runtime_role_verifier_rejects_completion_execute_grant_to_insert_capable_non_app(
+    postgres_runtime_database: _RuntimeDatabase,
+):
+    database = postgres_runtime_database
+    non_app_identifier = _quoted_identifier(database.non_app_user)
+    completion_function = (
+        "public.lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, "
+        "text, uuid, text, integer, text, boolean, text)"
+    )
+    _run_sql(
+        database.owner_url,
+        f"GRANT INSERT ON TABLE public.idempotency_records TO {non_app_identifier}; "
+        f"GRANT EXECUTE ON FUNCTION {completion_function} TO {non_app_identifier}",
+    )
+    try:
+        with psycopg.connect(_render_psycopg_url(database.owner_url)) as connection:
+            assert connection.execute(
+                """
+                SELECT has_table_privilege(%s, 'idempotency_records', 'INSERT'),
+                       has_function_privilege(%s, %s, 'EXECUTE')
+                """,
+                (database.non_app_user, database.non_app_user, completion_function),
+            ).fetchone() == (True, True)
+
+        drift = _run_verifier(database, check=False)
+        assert drift.returncode == 3
+        assert "runtime function ACL catalog verification failed" in drift.stdout
+
+        _run_role_script(database, verify=True)
+        with psycopg.connect(_render_psycopg_url(database.owner_url)) as connection:
+            assert connection.execute(
+                """
+                SELECT has_table_privilege(%s, 'idempotency_records', 'INSERT'),
+                       has_function_privilege(%s, %s, 'EXECUTE'),
+                       has_function_privilege(%s, %s, 'EXECUTE')
+                """,
+                (
+                    database.non_app_user,
+                    database.non_app_user,
+                    completion_function,
+                    database.app_user,
+                    completion_function,
+                ),
+            ).fetchone() == (True, False, True)
+    finally:
+        _run_sql(
+            database.owner_url,
+            f"REVOKE INSERT ON TABLE public.idempotency_records FROM {non_app_identifier}; "
+            f"REVOKE EXECUTE ON FUNCTION {completion_function} FROM {non_app_identifier}",
+            check=False,
+        )
+
+    _run_verifier(database)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LLS_TEST_POSTGRES_URL") or not os.environ.get("LLS_TEST_POSTGRES_APP_URL"),
+    reason="PostgreSQL owner/app test URLs are not set",
+)
+def test_sensitive_json_migration_completion_execute_acl_uses_explicit_app_role():
+    source_owner_url = make_url(os.environ["LLS_TEST_POSTGRES_URL"])
+    source_app_url = make_url(os.environ["LLS_TEST_POSTGRES_APP_URL"])
+    token = uuid.uuid4().hex[:12]
+    database_name = f"lls75_acl_{token}"
+    app_user = f"lls75_app_{token}"
+    non_app_user = f"lls75_nonapp_{token}"
+    owner_url = source_owner_url.set(database=database_name)
+    app_url = source_owner_url.set(
+        username=app_user,
+        password=source_app_url.password,
+        database=database_name,
+    )
+    database = _RuntimeDatabase(
+        owner_url=owner_url,
+        app_url=app_url,
+        app_user=app_user,
+        helper_role="",
+        non_app_user=non_app_user,
+    )
+    maintenance_url = source_owner_url.set(database="postgres")
+    completion_function = (
+        "public.lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, "
+        "text, uuid, text, integer, text, boolean, text)"
+    )
+
+    with psycopg.connect(_render_psycopg_url(maintenance_url), autocommit=True) as connection:
+        connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
+        connection.execute(
+            sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
+                sql.Identifier(non_app_user),
+                sql.Literal(source_app_url.password or "non-app-test-password"),
+            )
+        )
+
+    alembic_env = {
+        **os.environ,
+        "LLS_DATABASE_URL": _render_url(owner_url),
+        "SCAFFOLD_POSTGRES_APP_USER": app_user,
+    }
+    try:
+        _run_role_script(database)
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "20260716_0004"],
+            cwd=ROOT,
+            env=alembic_env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        _run_sql(
+            owner_url,
+            f"GRANT INSERT ON TABLE public.idempotency_records TO {_quoted_identifier(non_app_user)}",
+        )
+        subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=ROOT,
+            env=alembic_env,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        with psycopg.connect(_render_psycopg_url(owner_url)) as connection:
+            assert connection.execute(
+                """
+                SELECT has_table_privilege(%s, 'idempotency_records', 'INSERT'),
+                       has_function_privilege(%s, %s, 'EXECUTE'),
+                       has_function_privilege(%s, %s, 'EXECUTE'),
+                       EXISTS (
+                           SELECT 1
+                           FROM pg_proc AS procedure
+                           JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+                           CROSS JOIN LATERAL aclexplode(
+                               coalesce(procedure.proacl, acldefault('f', procedure.proowner))
+                           ) AS privilege
+                           WHERE namespace.nspname = 'public'
+                             AND procedure.proname = 'lls_complete_idempotency'
+                             AND pg_get_function_identity_arguments(procedure.oid)
+                                 = 'p_record_id uuid, p_workspace_id uuid, p_actor_principal_id uuid, p_caller_principal_id uuid, p_operation text, p_idempotency_key_hash text, p_request_fingerprint text, p_required_permission text, p_resource_type text, p_resource_id uuid, p_channel text, p_response_status integer, p_response_body text, p_succeeded boolean, p_request_id text'
+                             AND privilege.grantee = 0
+                       )
+                """,
+                (
+                    non_app_user,
+                    non_app_user,
+                    completion_function,
+                    app_user,
+                    completion_function,
+                ),
+            ).fetchone() == (True, False, True, False)
+    finally:
+        with psycopg.connect(_render_psycopg_url(maintenance_url), autocommit=True) as connection:
+            connection.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (database_name,),
+            )
+            connection.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(database_name)))
+            connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(app_user)))
+            connection.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(non_app_user)))
 
 
 def test_runtime_role_verifier_accepts_absent_acl_catalog_entries(

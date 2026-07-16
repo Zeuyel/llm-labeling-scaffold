@@ -89,9 +89,20 @@ WITH expected_relations(relation_name, relation_kind) AS (
         WHERE namespace.nspname = 'public'
           AND pg_get_userbyid(namespace.nspowner)::text IN (:'owner_user', 'pg_database_owner')
     ) AS is_expected
+), sequence_owner AS (
+    SELECT NOT EXISTS (
+        SELECT 1
+        FROM pg_class AS sequence
+        JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+        WHERE namespace.nspname = 'public'
+          AND sequence.relname = 'lls_idempotency_completion_gate_seq'
+          AND sequence.relkind = 'S'
+          AND pg_get_userbyid(sequence.relowner)::text <> :'owner_user'
+    ) AS is_expected
 )
 SELECT database_owner.is_expected
    AND schema_owner.is_expected
+   AND sequence_owner.is_expected
    AND NOT EXISTS (
        SELECT 1
        FROM expected_relations
@@ -117,6 +128,7 @@ SELECT database_owner.is_expected
    ) AS ownership_preflight_ok
 FROM database_owner
 CROSS JOIN schema_owner
+CROSS JOIN sequence_owner
 \gset
 
 \if :ownership_preflight_ok
@@ -280,6 +292,18 @@ SELECT format(
 FROM pg_namespace AS namespace
 WHERE namespace.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
   AND namespace.nspname !~ '^pg_(toast_)?temp_[0-9]+$'
+\gexec
+SELECT format(
+    'REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA %I FROM %I',
+    namespace.nspname,
+    role.rolname
+)
+FROM pg_namespace AS namespace
+CROSS JOIN pg_roles AS role
+WHERE namespace.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND namespace.nspname !~ '^pg_(toast_)?temp_[0-9]+$'
+  AND role.rolname NOT IN (:'owner_user', :'app_user')
+  AND NOT role.rolsuper
 \gexec
 
 SELECT format(

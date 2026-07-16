@@ -8,6 +8,7 @@ Create Date: 2026-07-16
 from __future__ import annotations
 
 from collections.abc import Sequence
+import os
 
 import sqlalchemy as sa
 from alembic import op
@@ -46,6 +47,14 @@ _TASK_PERMISSIONS = (
     "annotation:review",
 )
 _WORKSPACE_PERMISSIONS = ("task:create", "audit:view", "workspace:manage")
+_RUNTIME_FUNCTION_SIGNATURES = (
+    "lls_canonical_sensitive_json_text(json)",
+    "lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text)",
+    "lls_sensitive_json_node_is_valid(json, integer)",
+    "lls_sensitive_json_object_is_valid(json)",
+    "lls_sensitive_json_string_is_safe(text)",
+    "lls_validate_allocation_plan_graph(uuid)",
+)
 
 
 def upgrade() -> None:
@@ -266,28 +275,75 @@ def _drop_postgres_runtime_objects() -> None:
 
 
 def _configure_postgres_runtime_roles() -> None:
+    app_role = os.environ.get("SCAFFOLD_POSTGRES_APP_USER", "").strip()
+    if not app_role:
+        raise RuntimeError("SCAFFOLD_POSTGRES_APP_USER is required for PostgreSQL migrations")
+
+    connection = op.get_bind()
+    if not connection.scalar(
+        sa.text(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_roles
+                WHERE rolname = :app_role
+                  AND rolname <> current_user
+                  AND rolcanlogin
+                  AND NOT rolsuper
+                  AND NOT rolcreatedb
+                  AND NOT rolcreaterole
+                  AND NOT rolinherit
+                  AND NOT rolreplication
+                  AND NOT rolbypassrls
+            )
+            """
+        ),
+        {"app_role": app_role},
+    ):
+        raise RuntimeError(f"invalid PostgreSQL runtime app role: {app_role}")
+
+    app_role_literal = "'" + app_role.replace("'", "''") + "'"
+    function_signatures = ", ".join(
+        "'" + signature.replace("'", "''") + "'"
+        for signature in _RUNTIME_FUNCTION_SIGNATURES
+    )
     op.execute(
-        """
+        f"""
         DO $$
         DECLARE
             role_name text;
+            function_signature text;
+            app_role_name text := {app_role_literal};
         BEGIN
-            FOR role_name IN
-                SELECT rolname
-                FROM pg_roles
-                WHERE rolname <> current_user
-                  AND NOT rolsuper
-                  AND has_table_privilege(rolname, 'public.idempotency_records', 'INSERT')
+            FOREACH function_signature IN ARRAY ARRAY[{function_signatures}]
             LOOP
                 EXECUTE format(
-                    'REVOKE UPDATE, DELETE ON TABLE public.idempotency_records FROM %I',
-                    role_name
+                    'REVOKE EXECUTE ON FUNCTION public.%s FROM PUBLIC',
+                    function_signature
                 );
+                FOR role_name IN
+                    SELECT rolname
+                    FROM pg_roles
+                    WHERE rolname <> current_user
+                      AND rolname <> app_role_name
+                      AND NOT rolsuper
+                LOOP
+                    EXECUTE format(
+                        'REVOKE EXECUTE ON FUNCTION public.%s FROM %I',
+                        function_signature,
+                        role_name
+                    );
+                END LOOP;
                 EXECUTE format(
-                    'GRANT EXECUTE ON FUNCTION public.lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text) TO %I',
-                    role_name
+                    'GRANT EXECUTE ON FUNCTION public.%s TO %I',
+                    function_signature,
+                    app_role_name
                 );
             END LOOP;
+            EXECUTE format(
+                'REVOKE UPDATE, DELETE ON TABLE public.idempotency_records FROM %I',
+                app_role_name
+            );
         END
         $$
         """

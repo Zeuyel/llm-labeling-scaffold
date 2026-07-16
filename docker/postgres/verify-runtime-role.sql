@@ -440,6 +440,17 @@ SELECT NOT EXISTS (
 ) AS sequence_catalog_ok
 \gset
 
+SELECT EXISTS (
+    SELECT 1
+    FROM pg_class AS sequence
+    JOIN pg_namespace AS namespace ON namespace.oid = sequence.relnamespace
+    WHERE namespace.nspname = 'public'
+      AND sequence.relname = 'lls_idempotency_completion_gate_seq'
+      AND sequence.relkind = 'S'
+      AND pg_get_userbyid(sequence.relowner)::text = :'owner_user'
+) AS sequence_owner_ok
+\gset
+
 WITH app_role AS (
     SELECT oid FROM pg_roles WHERE rolname = :'app_user'
 )
@@ -626,7 +637,7 @@ WITH app_role AS (
     ) AS privilege
     WHERE namespace.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
       AND namespace.nspname !~ '^pg_(toast_)?temp_[0-9]+$'
-      AND privilege.grantee IN (0, app_role.oid)
+      AND privilege.grantee <> procedure.proowner
 )
 SELECT NOT EXISTS (
     (SELECT * FROM expected EXCEPT SELECT * FROM actual)
@@ -873,6 +884,11 @@ SELECT NOT EXISTS (
 \if :sequence_catalog_ok
 \else
   \echo 'runtime sequence catalog verification failed'
+  SELECT 1 / 0;
+\endif
+\if :sequence_owner_ok
+\else
+  \echo 'runtime sequence ownership verification failed'
   SELECT 1 / 0;
 \endif
 \if :sequence_acl_catalog_ok
