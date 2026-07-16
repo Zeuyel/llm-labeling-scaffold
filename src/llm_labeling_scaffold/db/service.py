@@ -1018,6 +1018,7 @@ class DatabaseTransaction:
                 "reason": normalized_reason,
                 "channel": channel.value,
             },
+            channel=channel,
             task_key=task_key,
         )
         if claim.status == IdempotencyClaimStatus.REPLAY:
@@ -1101,6 +1102,8 @@ class DatabaseTransaction:
         response_body = _task_publish_response(revision, materialization)
         completed = self.complete_idempotency(
             claim,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
             response_status=202,
             response_body=response_body,
         )

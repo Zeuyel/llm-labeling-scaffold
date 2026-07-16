@@ -69,7 +69,7 @@ ALLOCATION_TABLES = {
     "allocation_collection_receipts",
 }
 
-EXPECTED_ALEMBIC_HEAD = "20260715_0003"
+EXPECTED_ALEMBIC_HEAD = "20260716_0005"
 
 EXPECTED_ALLOCATION_ENUMS = {
     "argilla_binding_state": ("active", "disabled"),
@@ -350,7 +350,7 @@ def test_sqlite_membership_revision_upgrades_existing_0001_database(tmp_path: Pa
 def test_sqlite_sensitive_json_revision_round_trips_existing_0002_database(tmp_path: Path):
     database_url = f"sqlite+pysqlite:///{tmp_path / 'sensitive-json-upgrade.db'}"
     config = build_alembic_config(database_url)
-    command.upgrade(config, "20260715_0002")
+    command.upgrade(config, "20260714_0002")
     engine = create_database_engine(database_url)
     try:
         previous_idempotency_columns = {
@@ -505,7 +505,7 @@ def test_sqlite_sensitive_json_revision_round_trips_existing_0002_database(tmp_p
     finally:
         engine.dispose()
 
-    command.downgrade(config, "20260715_0002")
+    command.downgrade(config, "20260714_0002")
     engine = create_database_engine(database_url)
     try:
         downgraded_idempotency_columns = {
@@ -722,9 +722,10 @@ def test_task_revision_schema_rejects_cross_task_pointer_and_parent_delete(tmp_p
                 operation="task.publish",
                 idempotency_key_hash="a" * 64,
                 request_fingerprint="b" * 64,
-                state=IdempotencyState.SUCCEEDED,
-                response_status=202,
-                response_body={},
+                required_permission="task:create",
+                resource_type="workspace",
+                resource_id=workspace.id,
+                channel=AuditChannel.API,
             )
             session.add(claim)
             session.flush()

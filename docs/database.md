@@ -18,7 +18,7 @@ Scaffold 使用独立 PostgreSQL 保存身份、工作空间、授权和审计�
 
 ### Allocation 持久化不变量
 
-revision `20260715_0003` 将 allocation planner 的确定性输出和 Argilla 远端绑定拆分保存：
+revision `20260716_0004` 将 allocation planner 的确定性输出和 Argilla 远端绑定拆分保存：
 
 - `argilla_connection_bindings`、`argilla_annotator_mappings` 保存工作空间内的 Argilla 连接、用户和个人工作空间 UUID；本地 identity/关联键插入后冻结，远端 UUID 只允许从 NULL 首次绑定，绑定后不得改写或删除替换。
 - `annotator_cohorts`、`annotator_cohort_revisions`、`annotator_cohort_members` 保存可复现的标注者集合。revision 封存时，实际成员数必须等于 `member_count`，所有成员必须属于同一 connection binding 且已有 Argilla user UUID；封存后的 revision 和成员不可更新或删除。
@@ -104,7 +104,7 @@ membership grant/change/revoke 在取得 workspace 锁后重新读取 actor 权�
 
 ## 迁移
 
-迁移链为 `20260713_0001` → `20260714_0002`（task revision 与 materialization）→ `20260715_0003`（membership lifecycle）。`20260714_0002` 保留为 task revision authority，membership lifecycle 只作为其后续迁移。
+迁移链为 `20260713_0001` → `20260714_0002`（task revision 与 materialization）→ `20260715_0003`（membership lifecycle）→ `20260716_0004`（allocation schema）→ `20260716_0005`（sensitive JSON/idempotency）。`20260714_0002` 保留为 task revision authority，membership lifecycle、allocation 和 sensitive JSON/idempotency 均作为其后续迁移。
 
 Docker Compose 会等待 `scaffold-postgres` 健康，再由一次性 `migrate` 服务执行：
 

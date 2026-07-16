@@ -34,7 +34,6 @@ from llm_labeling_scaffold.db.enums import (
     ArgillaBindingState,
     AuditChannel,
     CollectionDisposition,
-    IdempotencyState,
 )
 from llm_labeling_scaffold.db.migration import build_alembic_config
 from llm_labeling_scaffold.db.models import (
@@ -206,9 +205,10 @@ def _claim(session: Session, workspace_id: uuid.UUID, principal_id: uuid.UUID, o
         operation=operation,
         idempotency_key_hash=_hash(f"key:{operation}:{uuid.uuid4()}"),
         request_fingerprint=_hash(f"request:{operation}:{uuid.uuid4()}"),
-        state=IdempotencyState.SUCCEEDED,
-        response_status=200,
-        response_body={},
+        required_permission="task:create",
+        resource_type="workspace",
+        resource_id=workspace_id,
+        channel=AuditChannel.API,
     )
     session.add(record)
     session.flush()
@@ -1373,7 +1373,7 @@ def test_allocation_migration_upgrade_downgrade_round_trip(tmp_path: Path):
         assert ALLOCATION_TABLES <= set(inspect(engine).get_table_names())
         with Session(engine) as session:
             assert session.scalar(select(text("version_num")).select_from(text("alembic_version"))) == (
-                "20260715_0003"
+                "20260716_0005"
             )
     finally:
         engine.dispose()

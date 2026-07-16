@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -24,6 +25,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -51,6 +53,9 @@ from .enums import (
 )
 from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS
 from .sensitive_json import SENSITIVE_JSON_DOCUMENT, install_sensitive_json_schema_events
+
+
+JSON_DOCUMENT = JSON().with_variant(postgresql.JSONB(), "postgresql")
 
 
 def _enum_type(enum_class: type, name: str) -> SqlEnum:

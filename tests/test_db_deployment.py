@@ -237,7 +237,7 @@ def test_compose_role_initialization_paths_are_explicit():
     panel_environment = panel["environment"]
     assert "ports" not in panel
     assert panel["expose"] == ["8765"]
-    assert panel["networks"] == ["lls"]
+    assert panel["networks"] == ["lls", "scaffold-db"]
     assert panel_environment["LLS_PANEL_DEPLOYMENT_MODE"] == "docker_tunnel"
     assert panel_environment["LLS_PANEL_AUTH_MODE"] == "${LLS_PANEL_AUTH_MODE:-cloudflare_access}"
     assert panel_environment["LLS_CF_ACCESS_ISSUER"] == "${LLS_CF_ACCESS_ISSUER:-}"

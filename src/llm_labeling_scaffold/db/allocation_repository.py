@@ -310,6 +310,7 @@ class TrustedAllocationRepository:
                 idempotency_key=idempotency_key,
                 request_payload=_plan_request_payload(normalized, context),
                 task_key=task_key,
+                channel=channel,
             )
             if claim.status == IdempotencyClaimStatus.REPLAY:
                 return _plan_result_from_claim(claim, replayed=True)
@@ -342,6 +343,8 @@ class TrustedAllocationRepository:
             response_body = _plan_response(existing, state)
             completed = transaction.complete_idempotency(
                 claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
                 response_status=201,
                 response_body=response_body,
             )
@@ -390,6 +393,7 @@ class TrustedAllocationRepository:
                 idempotency_key=idempotency_key,
                 request_payload={"plan_id": str(plan_id), "plan_fingerprint": plan_fingerprint},
                 task_key=task.task_key,
+                channel=channel,
             )
             if claim.status == IdempotencyClaimStatus.REPLAY:
                 return _confirmation_result_from_claim(claim, replayed=True)
@@ -420,6 +424,8 @@ class TrustedAllocationRepository:
             response_body = _confirmation_response(state)
             completed = transaction.complete_idempotency(
                 claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
                 response_status=200,
                 response_body=response_body,
             )
@@ -481,6 +487,7 @@ class TrustedAllocationRepository:
                 idempotency_key=idempotency_key,
                 request_payload=_receipt_payload(request),
                 task_key=task.task_key,
+                channel=channel,
             )
             if claim.status == IdempotencyClaimStatus.REPLAY:
                 return _receipt_result_from_claim(claim, replayed=True)
@@ -515,6 +522,8 @@ class TrustedAllocationRepository:
             response_body = _receipt_response(existing, progress)
             completed = transaction.complete_idempotency(
                 claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
                 response_status=201,
                 response_body=response_body,
             )

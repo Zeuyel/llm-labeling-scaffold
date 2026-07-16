@@ -43,7 +43,6 @@ from llm_labeling_scaffold.db.enums import (
     AnnotatorMappingState,
     AnnotatorVerificationState,
     ArgillaBindingState,
-    IdempotencyState,
     PrincipalType,
 )
 from llm_labeling_scaffold.db.models import (
@@ -233,9 +232,10 @@ def _claim(session: Session, workspace_id: uuid.UUID, principal_id: uuid.UUID) -
         operation=f"fixture.{uuid.uuid4()}",
         idempotency_key_hash=_hash(str(uuid.uuid4())),
         request_fingerprint=_hash(str(uuid.uuid4())),
-        state=IdempotencyState.SUCCEEDED,
-        response_status=200,
-        response_body={},
+        required_permission="task:create",
+        resource_type="workspace",
+        resource_id=workspace_id,
+        channel=AuditChannel.API,
     )
     session.add(record)
     session.flush()

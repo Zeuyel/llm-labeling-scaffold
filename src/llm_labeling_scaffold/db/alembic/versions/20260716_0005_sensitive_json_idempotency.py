@@ -1,7 +1,7 @@
 """Enforce sensitive JSON and idempotency completion context.
 
-Revision ID: 20260716_0003
-Revises: 20260715_0002
+Revision ID: 20260716_0005
+Revises: 20260716_0004
 Create Date: 2026-07-16
 """
 
@@ -31,8 +31,8 @@ from llm_labeling_scaffold.db.sensitive_json import (
 )
 
 
-revision: str = "20260716_0003"
-down_revision: str | None = "20260715_0002"
+revision: str = "20260716_0005"
+down_revision: str | None = "20260716_0004"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
