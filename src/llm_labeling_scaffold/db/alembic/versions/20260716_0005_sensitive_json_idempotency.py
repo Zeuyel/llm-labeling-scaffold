@@ -47,6 +47,32 @@ _TASK_PERMISSIONS = (
     "annotation:review",
 )
 _WORKSPACE_PERMISSIONS = ("task:create", "audit:view", "workspace:manage")
+_RUNTIME_TABLE_PRIVILEGES = (
+    ("principals", "SELECT, INSERT"),
+    ("workspaces", "SELECT, INSERT, UPDATE"),
+    ("tasks", "SELECT, INSERT, UPDATE"),
+    ("role_bindings", "SELECT, INSERT, UPDATE, DELETE"),
+    ("idempotency_records", "SELECT, INSERT"),
+    ("workspace_settings", "SELECT, INSERT, UPDATE"),
+    ("task_drafts", "SELECT, INSERT, UPDATE"),
+    ("task_revisions", "SELECT, INSERT"),
+    ("task_revision_materializations", "SELECT, INSERT, UPDATE"),
+    ("argilla_connection_bindings", "SELECT, INSERT, UPDATE"),
+    ("argilla_annotator_mappings", "SELECT, INSERT, UPDATE"),
+    ("annotator_cohorts", "SELECT, INSERT, UPDATE"),
+    ("annotator_cohort_revisions", "SELECT, INSERT, UPDATE"),
+    ("annotator_cohort_members", "SELECT, INSERT, UPDATE, DELETE"),
+    ("allocation_plans", "SELECT, INSERT, UPDATE"),
+    ("allocation_plan_states", "SELECT, UPDATE"),
+    ("allocation_workspace_groups", "SELECT, INSERT, UPDATE"),
+    ("allocation_dataset_groups", "SELECT, INSERT, UPDATE"),
+    ("allocation_dataset_group_states", "SELECT, UPDATE"),
+    ("allocation_assignment_items", "SELECT, INSERT"),
+    ("allocation_record_bindings", "SELECT, UPDATE"),
+    ("allocation_assignments", "SELECT, INSERT, UPDATE"),
+    ("allocation_collection_receipts", "SELECT, INSERT"),
+    ("audit_events", "SELECT, INSERT"),
+)
 _RUNTIME_FUNCTION_SIGNATURES = (
     "lls_canonical_sensitive_json_text(json)",
     "lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text)",
@@ -307,14 +333,31 @@ def _configure_postgres_runtime_roles() -> None:
         "'" + signature.replace("'", "''") + "'"
         for signature in _RUNTIME_FUNCTION_SIGNATURES
     )
+    table_privileges = ", ".join(
+        "('" + table_name + "', '" + privileges + "')"
+        for table_name, privileges in _RUNTIME_TABLE_PRIVILEGES
+    )
     op.execute(
         f"""
         DO $$
         DECLARE
             role_name text;
             function_signature text;
+            table_name text;
+            privilege_list text;
             app_role_name text := {app_role_literal};
         BEGIN
+            FOR table_name, privilege_list IN
+                SELECT relation_name, privilege_list
+                FROM (VALUES {table_privileges}) AS runtime(relation_name, privilege_list)
+            LOOP
+                EXECUTE format(
+                    'GRANT %s ON TABLE public.%I TO %I',
+                    privilege_list,
+                    table_name,
+                    app_role_name
+                );
+            END LOOP;
             FOREACH function_signature IN ARRAY ARRAY[{function_signatures}]
             LOOP
                 EXECUTE format(

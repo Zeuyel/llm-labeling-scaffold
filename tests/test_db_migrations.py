@@ -834,6 +834,51 @@ def test_postgres_membership_revision_upgrades_existing_0001_database():
         command.upgrade(config, "head")
 
 
+@pytest.mark.skipif(
+    not os.environ.get("LLS_TEST_POSTGRES_URL") or not os.environ.get("LLS_TEST_POSTGRES_APP_URL"),
+    reason="PostgreSQL owner/app test URLs are not set",
+)
+def test_postgres_reupgrade_restores_noinherit_app_role_task_dml():
+    owner_url = os.environ["LLS_TEST_POSTGRES_URL"]
+    app_url = os.environ["LLS_TEST_POSTGRES_APP_URL"]
+    config = build_alembic_config(owner_url)
+    command.upgrade(config, "head")
+    command.downgrade(config, "20260713_0001")
+    try:
+        command.upgrade(config, "head")
+        app_engine = create_database_engine(app_url)
+        try:
+            with app_engine.connect() as connection:
+                assert connection.scalar(
+                    text(
+                        "SELECT NOT rolinherit FROM pg_roles "
+                        "WHERE rolname = current_user"
+                    )
+                ) is True
+                assert connection.scalar(
+                    text(
+                        "SELECT has_table_privilege(current_user, 'task_drafts', "
+                        "'SELECT, INSERT, UPDATE')"
+                    )
+                ) is True
+                assert connection.scalar(
+                    text("SELECT has_table_privilege(current_user, 'task_drafts', 'DELETE')")
+                ) is False
+                assert connection.scalar(
+                    text("SELECT has_table_privilege(current_user, 'task_drafts', 'TRUNCATE')")
+                ) is False
+                assert connection.scalar(
+                    text("SELECT has_table_privilege(current_user, 'task_drafts', 'REFERENCES')")
+                ) is False
+                assert connection.scalar(
+                    text("SELECT has_table_privilege(current_user, 'migration_runs', 'SELECT')")
+                ) is False
+        finally:
+            app_engine.dispose()
+    finally:
+        command.upgrade(config, "head")
+
+
 @pytest.mark.skipif(not os.environ.get("LLS_TEST_POSTGRES_URL"), reason="LLS_TEST_POSTGRES_URL is not set")
 def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
     database_url = os.environ["LLS_TEST_POSTGRES_URL"]
@@ -990,9 +1035,6 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
         assert allocation_trigger_names == EXPECTED_POSTGRES_ALLOCATION_TRIGGERS
         assert event_type == "workspace.admin_bootstrapped"
         assert {
-            ("idempotency_records", "response_body"),
-            ("workspace_settings", "setting_value"),
-            ("audit_events", "details"),
             ("task_drafts", "definition"),
             ("task_revisions", "definition"),
         } <= jsonb_columns
@@ -1001,6 +1043,11 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
             ("workspace_settings", "setting_value"),
             ("audit_events", "details"),
         } <= json_columns
+        assert {
+            ("idempotency_records", "response_body"),
+            ("workspace_settings", "setting_value"),
+            ("audit_events", "details"),
+        }.isdisjoint(jsonb_columns)
         assert "actor_email_snapshot" not in audit_columns
         assert {
             "lls_canonical_sensitive_json_text",
