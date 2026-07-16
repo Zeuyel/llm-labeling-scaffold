@@ -1,4 +1,21 @@
-from .enums import AuditChannel, PrincipalType, Role, TaskMaterializationState
+from .enums import (
+    AllocationAssignmentRole,
+    AllocationDatasetState,
+    AllocationManifestKind,
+    AllocationPhase,
+    AllocationPlanLifecycle,
+    AllocationStrategy,
+    AllocationWorkspaceMode,
+    AnnotatorCohortState,
+    AnnotatorMappingState,
+    AnnotatorVerificationState,
+    ArgillaBindingState,
+    AuditChannel,
+    CollectionDisposition,
+    PrincipalType,
+    Role,
+    TaskMaterializationState,
+)
 from .materialization import (
     ControlTaskSnapshotLoader,
     LoadedTaskRevision,
@@ -47,6 +64,17 @@ from .service import (
 )
 
 __all__ = [
+    "AllocationAssignmentRole",
+    "AllocationDatasetState",
+    "AllocationManifestKind",
+    "AllocationPhase",
+    "AllocationPlanLifecycle",
+    "AllocationStrategy",
+    "AllocationWorkspaceMode",
+    "AnnotatorCohortState",
+    "AnnotatorMappingState",
+    "AnnotatorVerificationState",
+    "ArgillaBindingState",
     "AuditChannel",
     "AuditEventRef",
     "AuthorizationDecision",
@@ -56,6 +84,7 @@ __all__ = [
     "AuthorizationUnavailable",
     "ControlTaskSnapshotLoader",
     "LoadedTaskRevision",
+    "CollectionDisposition",
     "DatabaseService",
     "ExternalIdentity",
     "IdempotencyClaim",

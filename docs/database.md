@@ -16,6 +16,19 @@ Scaffold 使用独立 PostgreSQL 保存身份、工作空间、授权和审计�
 
 `idempotency_records.response_body`、`workspace_settings.setting_value` 和 `audit_events.details` 在 PostgreSQL 使用 `JSONB`，SQLite 测试环境保持通用 `JSON`。
 
+### Allocation 持久化不变量
+
+revision `20260715_0003` 将 allocation planner 的确定性输出和 Argilla 远端绑定拆分保存：
+
+- `argilla_connection_bindings`、`argilla_annotator_mappings` 保存工作空间内的 Argilla 连接、用户和个人工作空间 UUID；本地 identity/关联键插入后冻结，远端 UUID 只允许从 NULL 首次绑定，绑定后不得改写或删除替换。
+- `annotator_cohorts`、`annotator_cohort_revisions`、`annotator_cohort_members` 保存可复现的标注者集合。revision 封存时，实际成员数必须等于 `member_count`，所有成员必须属于同一 connection binding 且已有 Argilla user UUID；封存后的 revision 和成员不可更新或删除。
+- `allocation_plans` 保存 task revision、manifest、算法版本、seed、输入 fingerprint、容量和质检快照。plan 必须引用同一 workspace 中的 task revision 和已封存 cohort，`task_revision_hash` 必须等于被引用 revision 的内容哈希，cohort 与 plan 必须使用同一 connection binding。
+- `allocation_workspace_groups`、`allocation_dataset_groups`、`allocation_assignment_items`、`allocation_assignments` 保存 planner 输出。planner-derived 行可在 draft 事务中逐行插入，插入后结构与 target 不可更新，子节点不可直接删除；未确认 plan 只允许从 plan 根删除并级联清理。复合外键固定 workspace、plan、group 和 item 归属；phase、workspace mode、直接 assignee、共享 pool、提交数和 cohort 容量之间的约束由数据库校验。
+- 每个 plan、dataset group 和 assignment item 分别自动创建 `allocation_plan_states`、`allocation_dataset_group_states` 和 `allocation_record_bindings`。这些自动子记录不可直接删除重建，但随 draft plan 根删除级联清理。plan state 只能从 `draft` 一次性转为带完整确认主体与幂等记录的 `confirmed`；确认转换在锁定 plan state 后重新校验完整 planner graph 与远端 binding。远端 dataset/record UUID 必须成对绑定，首次绑定后不可替换，`ready` dataset 必须已有远端绑定。
+- `allocation_collection_receipts` 只接受已确认 plan 上、与 record binding 一致的远端响应。`accepted` receipt 必须匹配直接 assignee 或 cohort pool 中的 respondent，同一 assignment/respondent 只能接受一次；`quarantined` receipt 必须记录原因。receipt 是 append-only。
+
+PostgreSQL 使用原生 enum、`JSONB`、行级触发器和 `BEFORE TRUNCATE` 触发器执行这些约束；SQLite migration 与 `Base.metadata.create_all` 测试路径使用等价的 enum check 和行级触发器。downgrade 到 `20260714_0002` 会删除全部 allocation 表、触发器、函数和原生 enum，因此执行前必须先保留需要的 allocation 数据。
+
 不会创建密码、session、OAuth client、authorization code、access token 或 refresh token 表。
 
 ## 角色矩阵

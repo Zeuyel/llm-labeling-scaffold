@@ -28,6 +28,73 @@ class TaskMaterializationState(str, Enum):
     FAILED = "failed"
 
 
+class ArgillaBindingState(str, Enum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
+class AnnotatorMappingState(str, Enum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+
+
+class AnnotatorVerificationState(str, Enum):
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+
+
+class AnnotatorCohortState(str, Enum):
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class AllocationStrategy(str, Enum):
+    SHARED_QUEUE = "shared_queue"
+    FIXED_PARTITION = "fixed_partition"
+    CALIBRATION_THEN_PARTITION = "calibration_then_partition"
+
+
+class AllocationManifestKind(str, Enum):
+    SAMPLE = "sample"
+    BATCH = "batch"
+
+
+class AllocationPhase(str, Enum):
+    CALIBRATION = "calibration"
+    PRODUCTION = "production"
+
+
+class AllocationWorkspaceMode(str, Enum):
+    CALIBRATION = "calibration"
+    PERSONAL = "personal"
+    SHARED = "shared"
+
+
+class AllocationAssignmentRole(str, Enum):
+    CALIBRATION = "calibration"
+    PRIMARY = "primary"
+    OVERLAP = "overlap"
+    SHARED = "shared"
+
+
+class AllocationPlanLifecycle(str, Enum):
+    DRAFT = "draft"
+    CONFIRMED = "confirmed"
+
+
+class AllocationDatasetState(str, Enum):
+    PENDING = "pending"
+    MATERIALIZING = "materializing"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class CollectionDisposition(str, Enum):
+    ACCEPTED = "accepted"
+    QUARANTINED = "quarantined"
+
+
 class AuditActorType(str, Enum):
     PRINCIPAL = "principal"
     SYSTEM = "system"

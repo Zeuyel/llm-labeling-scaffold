@@ -46,6 +46,134 @@ from llm_labeling_scaffold.db.models import (
 )
 
 
+ALLOCATION_TABLES = {
+    "argilla_connection_bindings",
+    "argilla_annotator_mappings",
+    "annotator_cohorts",
+    "annotator_cohort_revisions",
+    "annotator_cohort_members",
+    "allocation_plans",
+    "allocation_plan_states",
+    "allocation_workspace_groups",
+    "allocation_dataset_groups",
+    "allocation_dataset_group_states",
+    "allocation_assignment_items",
+    "allocation_record_bindings",
+    "allocation_assignments",
+    "allocation_collection_receipts",
+}
+
+EXPECTED_ALEMBIC_HEAD = "20260715_0003"
+
+EXPECTED_ALLOCATION_ENUMS = {
+    "argilla_binding_state": ("active", "disabled"),
+    "annotator_mapping_state": ("active", "disabled"),
+    "annotator_verification_state": ("unverified", "verified", "rejected"),
+    "annotator_cohort_state": ("active", "archived"),
+    "allocation_strategy": ("shared_queue", "fixed_partition", "calibration_then_partition"),
+    "allocation_manifest_kind": ("sample", "batch"),
+    "allocation_phase": ("calibration", "production"),
+    "allocation_workspace_mode": ("calibration", "personal", "shared"),
+    "allocation_assignment_role": ("calibration", "primary", "overlap", "shared"),
+    "allocation_plan_lifecycle": ("draft", "confirmed"),
+    "allocation_dataset_state": ("pending", "materializing", "ready", "failed"),
+    "collection_disposition": ("accepted", "quarantined"),
+}
+
+EXPECTED_SQLITE_ALLOCATION_ENUMS = {
+    ("argilla_connection_bindings", "argilla_binding_state"),
+    ("argilla_annotator_mappings", "annotator_mapping_state"),
+    ("argilla_annotator_mappings", "annotator_verification_state"),
+    ("annotator_cohorts", "annotator_cohort_state"),
+    ("allocation_plans", "allocation_strategy"),
+    ("allocation_plans", "allocation_manifest_kind"),
+    ("allocation_plan_states", "allocation_plan_lifecycle"),
+    ("allocation_workspace_groups", "allocation_phase"),
+    ("allocation_workspace_groups", "allocation_workspace_mode"),
+    ("allocation_dataset_groups", "allocation_phase"),
+    ("allocation_dataset_group_states", "allocation_dataset_state"),
+    ("allocation_assignments", "allocation_phase"),
+    ("allocation_assignments", "allocation_assignment_role"),
+    ("allocation_collection_receipts", "collection_disposition"),
+}
+
+EXPECTED_SQLITE_ALLOCATION_TRIGGERS = {
+    "trg_argilla_connection_bindings_remote_freeze",
+    "trg_argilla_connection_bindings_bound_delete",
+    "trg_argilla_annotator_mappings_remote_freeze",
+    "trg_argilla_annotator_mappings_bound_delete",
+    "trg_annotator_cohort_members_guard_insert",
+    "trg_annotator_cohort_members_guard_update",
+    "trg_annotator_cohort_members_guard_delete",
+    "trg_annotator_cohort_revisions_unsealed_insert",
+    "trg_annotator_cohort_revisions_seal_update",
+    "trg_annotator_cohort_revisions_sealed_delete",
+    "trg_allocation_plans_contract_insert",
+    "trg_allocation_plans_contract_update",
+    "trg_allocation_plans_create_state",
+    "trg_allocation_plan_states_draft_insert",
+    "trg_allocation_plan_states_validate_confirm",
+    "trg_allocation_plan_states_confirm_once",
+    "trg_allocation_plan_states_no_delete",
+    "trg_allocation_plans_confirmed_update",
+    "trg_allocation_plans_confirmed_delete",
+    "trg_allocation_workspace_groups_contract_insert",
+    "trg_allocation_workspace_groups_contract_update",
+    "trg_allocation_dataset_groups_contract_insert",
+    "trg_allocation_dataset_groups_contract_update",
+    "trg_allocation_dataset_groups_create_state",
+    "trg_allocation_dataset_group_states_contract_insert",
+    "trg_allocation_dataset_group_states_contract_update",
+    "trg_allocation_dataset_group_states_remote_freeze",
+    "trg_allocation_dataset_group_states_bound_delete",
+    "trg_allocation_assignment_items_create_binding",
+    "trg_allocation_record_bindings_insert",
+    "trg_allocation_record_bindings_contract",
+    "trg_allocation_record_bindings_bound_delete",
+    "trg_allocation_assignments_contract_insert",
+    "trg_allocation_assignments_contract_update",
+    "trg_allocation_collection_receipts_contract",
+    "trg_allocation_collection_receipts_append_only_update",
+    "trg_allocation_collection_receipts_append_only_delete",
+} | {
+    f"trg_{table_name}_confirmed_{operation}"
+    for table_name in (
+        "allocation_workspace_groups",
+        "allocation_dataset_groups",
+        "allocation_assignment_items",
+        "allocation_assignments",
+    )
+    for operation in ("insert", "update", "delete")
+}
+
+EXPECTED_POSTGRES_ALLOCATION_TRIGGERS = {
+    "trg_argilla_connection_bindings_remote_freeze",
+    "trg_argilla_annotator_mappings_remote_freeze",
+    "trg_annotator_cohort_members_guard",
+    "trg_annotator_cohort_revisions_guard",
+    "trg_10_allocation_plans_contract",
+    "trg_allocation_plans_create_state",
+    "trg_allocation_plan_states_guard",
+    "trg_00_allocation_plans_confirmed_guard",
+    "trg_10_allocation_workspace_groups_contract",
+    "trg_10_allocation_dataset_groups_contract",
+    "trg_allocation_dataset_groups_create_state",
+    "trg_allocation_dataset_group_states_guard",
+    "trg_allocation_assignment_items_create_binding",
+    "trg_allocation_record_bindings_guard",
+    "trg_10_allocation_assignments_contract",
+    "trg_allocation_collection_receipts_contract",
+    "trg_allocation_collection_receipts_append_only",
+} | {
+    f"trg_00_{table_name}_confirmed_guard"
+    for table_name in (
+        "allocation_workspace_groups",
+        "allocation_dataset_groups",
+        "allocation_assignment_items",
+        "allocation_assignments",
+    )
+} | {f"trg_{table_name}_no_truncate" for table_name in ALLOCATION_TABLES}
+
 EXPECTED_TABLES = {
     "alembic_version",
     "principals",
@@ -59,7 +187,7 @@ EXPECTED_TABLES = {
     "task_drafts",
     "task_revisions",
     "task_revision_materializations",
-}
+} | ALLOCATION_TABLES
 
 FORBIDDEN_TABLES = {
     "sessions",
@@ -224,6 +352,24 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
         table_names = set(inspect(engine).get_table_names())
         assert EXPECTED_TABLES <= table_names
         assert FORBIDDEN_TABLES.isdisjoint(table_names)
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == EXPECTED_ALEMBIC_HEAD
+            allocation_trigger_names = {
+                trigger_name
+                for table_name, trigger_name in connection.execute(
+                    text("SELECT tbl_name, name FROM sqlite_master WHERE type = 'trigger'")
+                ).tuples()
+                if table_name in ALLOCATION_TABLES
+            }
+        assert allocation_trigger_names == EXPECTED_SQLITE_ALLOCATION_TRIGGERS
+        inspector = inspect(engine)
+        for table_name, enum_name in EXPECTED_SQLITE_ALLOCATION_ENUMS:
+            constraints = {
+                constraint["name"]: constraint["sqltext"]
+                for constraint in inspector.get_check_constraints(table_name)
+            }
+            constraint_sql = constraints[f"ck_{table_name}_{enum_name}"]
+            assert all(f"'{value}'" in constraint_sql for value in EXPECTED_ALLOCATION_ENUMS[enum_name])
         task_unique_constraints = inspect(engine).get_unique_constraints("tasks")
         assert any(constraint["column_names"] == ["task_key"] for constraint in task_unique_constraints)
         task_foreign_keys = inspect(engine).get_foreign_keys("tasks")
@@ -255,8 +401,8 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
             "workspace_id",
             "task_id",
         ]
-        assert first.applied_revision == "20260715_0003"
-        assert second.applied_revision == "20260715_0003"
+        assert first.applied_revision == EXPECTED_ALEMBIC_HEAD
+        assert second.applied_revision == EXPECTED_ALEMBIC_HEAD
         with Session(engine) as session:
             assert len(session.scalars(select(MigrationRun)).all()) == 2
         with Session(engine) as session:
@@ -528,6 +674,41 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
                     )
                 ).tuples()
             )
+            enum_rows = connection.execute(
+                text(
+                    """
+                    SELECT pg_type.typname, pg_enum.enumlabel
+                    FROM pg_enum
+                    JOIN pg_type ON pg_type.oid = pg_enum.enumtypid
+                    JOIN pg_namespace ON pg_namespace.oid = pg_type.typnamespace
+                    WHERE pg_namespace.nspname = current_schema()
+                    ORDER BY pg_type.typname, pg_enum.enumsortorder
+                    """
+                )
+            ).tuples()
+            trigger_rows = connection.execute(
+                text(
+                    """
+                    SELECT pg_class.relname, pg_trigger.tgname
+                    FROM pg_trigger
+                    JOIN pg_class ON pg_class.oid = pg_trigger.tgrelid
+                    JOIN pg_namespace ON pg_namespace.oid = pg_class.relnamespace
+                    WHERE pg_namespace.nspname = current_schema()
+                      AND NOT pg_trigger.tgisinternal
+                    """
+                )
+            ).tuples()
+            revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
+        actual_enums: dict[str, list[str]] = {}
+        for enum_name, enum_value in enum_rows:
+            if enum_name in EXPECTED_ALLOCATION_ENUMS:
+                actual_enums.setdefault(enum_name, []).append(enum_value)
+        allocation_trigger_names = {
+            trigger_name for table_name, trigger_name in trigger_rows if table_name in ALLOCATION_TABLES
+        }
+        assert revision == EXPECTED_ALEMBIC_HEAD
+        assert {name: tuple(values) for name, values in actual_enums.items()} == EXPECTED_ALLOCATION_ENUMS
+        assert allocation_trigger_names == EXPECTED_POSTGRES_ALLOCATION_TRIGGERS
         assert event_type == "workspace.admin_bootstrapped"
         assert {
             ("idempotency_records", "response_body"),
