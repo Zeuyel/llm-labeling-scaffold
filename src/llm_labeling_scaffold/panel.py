@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
+import socket
 import threading
 import time
 from dataclasses import dataclass
@@ -15,7 +17,13 @@ import yaml
 from sqlalchemy import text
 
 from . import __version__
-from .auth import ActorContext, PanelAuthenticationError, PanelAuthenticator, build_panel_authenticator
+from .auth import (
+    ActorContext,
+    PanelAuthenticationError,
+    PanelAuthenticator,
+    build_panel_authenticator,
+    resolve_panel_auth_mode,
+)
 from .config import load_task
 from .db import (
     AuditChannel,
@@ -51,6 +59,95 @@ POOL_FILES = {
 _TASK_REGISTRY_SYNC_CACHE: dict[tuple[str, str, str, str], tuple[float, object]] = {}
 _TASK_REGISTRY_SYNC_CACHE_LOCK = threading.Lock()
 _DEFAULT_TASK_REGISTRY_SYNC_TTL_SECONDS = 5.0
+_PANEL_DEPLOYMENT_MODES = {"host", "docker_loopback", "docker_tunnel"}
+
+
+class _IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+def _resolve_panel_deployment_mode(explicit: str | None = None) -> str:
+    mode = str(explicit or os.environ.get("LLS_PANEL_DEPLOYMENT_MODE") or "host").strip().lower()
+    if mode not in _PANEL_DEPLOYMENT_MODES:
+        raise ValueError(
+            "LLS_PANEL_DEPLOYMENT_MODE 只能是 host、docker_loopback 或 docker_tunnel"
+        )
+    return mode
+
+
+def _ip_address(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(str(host or "").strip())
+    except ValueError:
+        return None
+
+
+def _normalize_bind_host(host: str) -> str:
+    value = str(host or "").strip()
+    if value.lower().rstrip(".") == "localhost":
+        return "127.0.0.1"
+    return value
+
+
+def _is_loopback_bind_host(host: str) -> bool:
+    value = _normalize_bind_host(host)
+    address = _ip_address(value)
+    if address is None:
+        return False
+    if address.is_loopback:
+        return True
+    mapped = getattr(address, "ipv4_mapped", None)
+    return bool(mapped and mapped.is_loopback)
+
+
+def _is_unspecified_bind_host(host: str) -> bool:
+    address = _ip_address(host)
+    return bool(address and address.is_unspecified)
+
+
+def _container_runtime_detected() -> bool:
+    return Path("/.dockerenv").exists() or Path("/run/.containerenv").exists()
+
+
+def _validate_panel_startup(
+    *,
+    host: str,
+    auth_mode: str,
+    deployment_mode: str,
+    containerized: bool | None = None,
+) -> None:
+    host = _normalize_bind_host(host)
+    if deployment_mode == "host":
+        if not _is_loopback_bind_host(host):
+            raise ValueError(
+                f"{auth_mode} 主机模式只允许绑定 IPv4/IPv6 loopback 地址"
+            )
+        return
+
+    if deployment_mode == "docker_tunnel" and auth_mode != "cloudflare_access":
+        raise ValueError("docker_tunnel 部署模式只允许 cloudflare_access 认证")
+    if containerized is None:
+        containerized = _container_runtime_detected()
+    if not containerized:
+        raise ValueError(f"{deployment_mode} 部署模式只能在容器内使用")
+    if not _is_unspecified_bind_host(host):
+        raise ValueError(
+            f"{deployment_mode} 部署模式要求容器进程绑定 0.0.0.0 或 ::"
+        )
+
+
+def _panel_server_type(host: str) -> type[ThreadingHTTPServer]:
+    address = _ip_address(host)
+    if isinstance(address, ipaddress.IPv6Address):
+        return _IPv6ThreadingHTTPServer
+    return ThreadingHTTPServer
+
+
+def _display_bind_host(host: str) -> str:
+    address = _ip_address(host)
+    if isinstance(address, ipaddress.IPv6Address):
+        return f"[{host}]"
+    return host
 
 
 def _safe_segment(value: str) -> bool:
@@ -2635,9 +2732,18 @@ def serve_panel(
     tasks_root: str | Path = "tasks",
     auth_mode: str | None = None,
     active_task_loader: ActiveTaskLoader | None = None,
+    deployment_mode: str | None = None,
 ) -> None:
+    host = _normalize_bind_host(host)
+    resolved_auth_mode = resolve_panel_auth_mode(auth_mode)
+    resolved_deployment_mode = _resolve_panel_deployment_mode(deployment_mode)
+    _validate_panel_startup(
+        host=host,
+        auth_mode=resolved_auth_mode,
+        deployment_mode=resolved_deployment_mode,
+    )
     authenticator = build_panel_authenticator(
-        mode=auth_mode,
+        mode=resolved_auth_mode,
         basic_user=user,
         basic_password=password,
     )
@@ -2655,8 +2761,12 @@ def serve_panel(
         guess = Path("frontend/dist")
         static_dir = guess if guess.is_dir() else None
     _Handler.static_dir = Path(static_dir) if static_dir else None
-    httpd = ThreadingHTTPServer((host, port), _Handler)
-    print(f"[lls panel] serving on http://{host}:{port} (auth mode='{authenticator.mode}')")
+    httpd = _panel_server_type(host)((host, port), _Handler)
+    display_host = _display_bind_host(host)
+    print(
+        f"[lls panel] serving on http://{display_host}:{port} "
+        f"(auth mode='{authenticator.mode}', deployment mode='{resolved_deployment_mode}')"
+    )
     if _Handler.static_dir:
         print(f"[lls panel] serving frontend from {_Handler.static_dir}")
     else:

@@ -34,11 +34,30 @@ LLS_PANEL_AUTH_MODE=basic_dev
 LLS_PANEL_PASSWORD=<local-only-password>
 ```
 
-`scripts/stack up` 和 `scripts/stack restart` 会拒绝将 `basic_dev` 绑定到 `127.0.0.1`、`localhost`、`::1` 之外的地址。restart 使用强制重建容器，以应用认证和 MCP 环境变量变更。生产模式不会在 Access 配置缺失或验证失败时回退到 Basic Auth。
+直接运行 `lls panel` 时使用 `host` 部署模式。`basic_dev` 和 `cloudflare_access` 都只能绑定 IPv4/IPv6 loopback 地址；`127.0.0.0/8`、`localhost` 和 `::1` 可用，`0.0.0.0`、`::`、私网地址和普通主机名会在创建监听 socket 前被拒绝。IPv6 literal 会使用 IPv6 HTTP server。
+
+容器部署显式区分两种边界：
+
+- `LLS_DEPLOYMENT_MODE=loopback`：`scripts/stack` 叠加 `docker-compose.loopback.yml`。Panel 进程在容器内绑定 `0.0.0.0:8765`，Docker 只把它固定发布到宿主机 `127.0.0.1:${PANEL_PORT}`。该 override 不接受可改成 `0.0.0.0` 的 bind-host 变量。
+- `LLS_DEPLOYMENT_MODE=tunnel`：只使用 base Compose。Panel 进程仍绑定容器内 `0.0.0.0:8765`，但没有 `ports` 发布；同一 `lls` Docker network 中的 `cloudflared` sidecar 可访问 `http://panel:8765`。该模式只允许 `cloudflare_access`，`basic_dev` 会在服务启动时失败。
+
+本地直接 Compose 启动必须显式叠加 loopback override：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.loopback.yml up -d
+```
+
+Tunnel sidecar 部署使用 base Compose，不叠加 loopback override。把 `cloudflared` 加入 `lls` network，并将 Tunnel service URL 配置为 `http://panel:8765`。如果 `cloudflared` 运行在宿主机而不是 Compose network 中，则使用 loopback 模式，将 service URL 指向 `http://127.0.0.1:${PANEL_PORT}`。
+
+`scripts/stack up` 和 `scripts/stack restart` 要求显式设置 `LLS_DEPLOYMENT_MODE`，并校验部署模式、认证配置、开发密码和数据库凭据组合。restart 使用强制重建容器，以应用认证和 MCP 环境变量变更。生产模式不会在 Access 配置缺失或验证失败时回退到 Basic Auth。
 
 ## Tunnel-only 源站
 
-生产源站必须只能通过 Cloudflare Tunnel 到达，不能把 Panel 端口暴露到公网后仅依赖请求头。Compose 默认把 Panel 绑定到 `127.0.0.1`；部署时应保持回环绑定，或让 `cloudflared` 与 Panel 位于同一私有容器网络并移除宿主机端口发布。
+生产源站必须只能通过 Cloudflare Tunnel 到达，不能把 Panel 端口暴露到公网后仅依赖请求头。Base Compose 不发布 Panel 端口；loopback override 只发布到 `127.0.0.1`。自定义 Compose override 不得为 Panel 增加 `0.0.0.0`、`::`、私网或公网宿主接口的 `ports` 映射。
+
+`Cf-Access-Jwt-Assertion` 是 bearer assertion。签名验证证明 token 由配置的 Access issuer 签发且 claims 适用于当前 application，但不证明当前 HTTP 请求实际经过 Cloudflare Tunnel。若源站可被客户端直接访问，合法或被窃取的 assertion 可以绕过 Tunnel 路径直接重放到源站，Cloudflare 对该请求的边缘路径控制也不再成立。因此 Scaffold 只在受控 Tunnel-only 源站边界内把已验证 assertion 作为用户身份依据；仅有正确 JWT 验证不能替代网络隔离。
+
+Panel 启动校验能约束直接主机启动和官方容器模式，但容器内进程无法自行验证 Docker 在宿主机创建的 NAT/port publish。官方 base 与 loopback override 是部署安全策略的一部分；拥有 Compose 文件或 Docker daemon 修改权限的操作者仍可用自定义 `ports` 绕过该策略，必须通过代码审阅、主机防火墙和部署检查共同控制。
 
 MCP 使用独立的 Access application 和 `LLS_MCP_CF_ACCESS_AUD`，不能复用 Panel 的 `LLS_CF_ACCESS_AUD`。Managed OAuth 的 opaque `Authorization` token 只由 Cloudflare Edge 消费；MCP 源站验证 Edge 注入的 `Cf-Access-Jwt-Assertion`，随后在进入 FastMCP 前从 ASGI headers 删除外部 `Authorization` 和 assertion。验证后的 assertion 只保存在 request-scoped context，并与 `LLS_MCP_INTERNAL_TOKEN` 一起发送到 Panel。Panel 用独立 MCP verifier 再次验证 assertion 以确定 actor，内部 Bearer 只确定 caller；任一凭据缺失或无效都不会降级为用户身份。完整配置见 [MCP 接入说明](mcp_integration.md)。
 

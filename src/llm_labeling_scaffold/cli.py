@@ -326,16 +326,19 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "panel":
         from .panel import serve_panel
 
-        serve_panel(
-            runs_root=args.runs_root,
-            host=args.host,
-            port=args.port,
-            user=args.user,
-            password=args.password,
-            static_dir=args.static_dir,
-            tasks_root=args.tasks_root,
-            auth_mode=args.auth_mode,
-        )
+        try:
+            serve_panel(
+                runs_root=args.runs_root,
+                host=args.host,
+                port=args.port,
+                user=args.user,
+                password=args.password,
+                static_dir=args.static_dir,
+                tasks_root=args.tasks_root,
+                auth_mode=args.auth_mode,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     elif args.cmd == "mcp":
         from .mcp_server import McpServerConfig, serve_mcp
 
