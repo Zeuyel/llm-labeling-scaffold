@@ -4,7 +4,8 @@ import hashlib
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine, delete, event, func, select, update
+import llm_labeling_scaffold.db.service as service_module
+from sqlalchemy import create_engine, delete, event, func, inspect, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, IntegrityError, StatementError
 from sqlalchemy.orm import Session, sessionmaker
@@ -20,6 +21,10 @@ from llm_labeling_scaffold.db import (
     IdempotencyClaimStatus,
     IdempotencyConflict,
     IdentityTypeConflict,
+    LastWorkspaceAdmin,
+    MembershipConflict,
+    MembershipMutationAction,
+    MembershipNotFound,
     Permission,
     PrincipalType,
     Role,
@@ -265,6 +270,24 @@ def test_nonmember_cannot_enumerate_workspace_or_task_existence(seeded_service):
     assert {decision.reason for decision in decisions} == {AuthorizationReason.RESOURCE_NOT_VISIBLE}
     assert all(decision.workspace is None for decision in decisions)
     assert all(decision.task is None for decision in decisions)
+
+
+def test_membership_mutation_preserves_resource_not_visible_precheck(seeded_service):
+    service = seeded_service["service"]
+    unknown_target = ExternalIdentity("https://access.example.test", "unknown-membership-target")
+
+    for workspace_slug in ("workspace-a", "missing-workspace"):
+        with pytest.raises(AuthorizationDenied) as denied:
+            service.grant_workspace_membership(
+                workspace_slug=workspace_slug,
+                target_identity=unknown_target,
+                role=Role.VIEWER,
+                actor_identity=seeded_service["mcp"],
+                caller_identity=seeded_service["mcp"],
+                channel=AuditChannel.API,
+            )
+        assert denied.value.decision.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+        assert denied.value.decision.workspace is None
 
 
 def test_role_matrix_task_acl_and_workspace_isolation(seeded_service):
@@ -817,6 +840,374 @@ def test_idempotency_claim_conflicts_and_successful_replay(seeded_service):
             request_payload={"count": 2, "label": "é"},
         )
     assert user_caller.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
+
+
+def test_workspace_membership_lifecycle_is_atomic_idempotent_and_audited(seeded_service, engine):
+    service = seeded_service["service"]
+    target = ExternalIdentity(
+        "https://access.example.test",
+        "new-member",
+        email_snapshot="new-member@example.test",
+    )
+    target_ref = service.resolve_or_provision(target)
+
+    granted = service.grant_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        role=Role.VIEWER,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        channel=AuditChannel.MCP,
+        request_id="membership-grant",
+    )
+    grant_unchanged = service.grant_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        role=Role.VIEWER,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+    with pytest.raises(MembershipConflict):
+        service.grant_workspace_membership(
+            workspace_slug="workspace-a",
+            target_identity=target,
+            role=Role.ANNOTATOR,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.API,
+        )
+
+    changed = service.change_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        role=Role.EXPERIMENTER,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+        request_id="membership-change",
+    )
+    change_unchanged = service.change_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        role=Role.EXPERIMENTER,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+    assert service.authorize_workspace(target, "workspace-a", Permission.AUDIT_VIEW).allowed is True
+
+    with Session(engine) as session, session.begin():
+        principal = session.get(Principal, target_ref.id)
+        principal.is_active = False
+
+    with pytest.raises(MembershipNotFound):
+        service.change_workspace_membership(
+            workspace_slug="workspace-a",
+            target_identity=target,
+            role=Role.VIEWER,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.API,
+        )
+    revoked = service.revoke_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+        request_id="membership-revoke",
+    )
+    revoke_unchanged = service.revoke_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+
+    assert granted.action == MembershipMutationAction.GRANTED
+    assert grant_unchanged.action == MembershipMutationAction.UNCHANGED
+    assert changed.action == MembershipMutationAction.CHANGED
+    assert change_unchanged.action == MembershipMutationAction.UNCHANGED
+    assert revoked.action == MembershipMutationAction.REVOKED
+    assert revoked.principal.is_active is False
+    assert revoke_unchanged.action == MembershipMutationAction.UNCHANGED
+    assert grant_unchanged.audit_event_id is None
+    assert change_unchanged.audit_event_id is None
+    assert revoke_unchanged.audit_event_id is None
+
+    with Session(engine) as session:
+        events = session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.event_type.like("workspace.membership_%"))
+            .order_by(AuditEvent.event_type)
+        ).all()
+        assert {event.event_type for event in events} == {
+            "workspace.membership_granted",
+            "workspace.membership_changed",
+            "workspace.membership_revoked",
+        }
+        assert len(events) == 3
+        assert all(event.details["target_principal_id"] == str(target_ref.id) for event in events)
+        assert all("email" not in event.details for event in events)
+        assert session.scalar(
+            select(func.count()).select_from(RoleBinding).where(
+                RoleBinding.principal_id == target_ref.id,
+                RoleBinding.task_id.is_(None),
+            )
+        ) == 0
+
+
+def test_sqlite_membership_grant_rereads_a_stale_missing_binding(
+    seeded_service,
+    engine,
+    monkeypatch,
+):
+    service = seeded_service["service"]
+    target = ExternalIdentity("https://access.example.test", "stale-grant-target")
+    target_ref = service.resolve_or_provision(target)
+    granted = service.grant_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        role=Role.VIEWER,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+    original = service_module.DatabaseTransaction._workspace_binding
+    lock_modes = []
+
+    def stale_first_lookup(transaction, workspace_id, principal_id, *, for_update=True):
+        if principal_id == target_ref.id:
+            lock_modes.append(for_update)
+            if len(lock_modes) == 1:
+                return None
+        return original(
+            transaction,
+            workspace_id,
+            principal_id,
+            for_update=for_update,
+        )
+
+    monkeypatch.setattr(
+        service_module.DatabaseTransaction,
+        "_workspace_binding",
+        stale_first_lookup,
+    )
+
+    unchanged = service.grant_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        role=Role.VIEWER,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+
+    assert unchanged.action == MembershipMutationAction.UNCHANGED
+    assert unchanged.binding_id == granted.binding_id
+    assert lock_modes == [True, False]
+    with Session(engine) as session:
+        assert session.scalar(
+            select(func.count()).select_from(RoleBinding).where(
+                RoleBinding.principal_id == target_ref.id,
+                RoleBinding.task_id.is_(None),
+            )
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.event_type == "workspace.membership_granted",
+                AuditEvent.details["target_principal_id"].as_string() == str(target_ref.id),
+            )
+        ) == 1
+
+
+def test_principal_with_membership_requires_revoke_before_delete(engine):
+    issuer = "https://principal-lifecycle.example.test"
+    last_admin_identity = ExternalIdentity(issuer, "last-admin")
+    actor_identity = ExternalIdentity(issuer, "actor-admin")
+    removable_identity = ExternalIdentity(issuer, "removable-admin")
+    with Session(engine) as session, session.begin():
+        last_admin = Principal(
+            issuer=issuer,
+            subject=last_admin_identity.subject,
+            principal_type=PrincipalType.USER,
+        )
+        actor = Principal(
+            issuer=issuer,
+            subject=actor_identity.subject,
+            principal_type=PrincipalType.USER,
+        )
+        removable = Principal(
+            issuer=issuer,
+            subject=removable_identity.subject,
+            principal_type=PrincipalType.USER,
+        )
+        last_workspace = Workspace(slug="principal-last-admin", name="Principal Last Admin")
+        shared_workspace = Workspace(slug="principal-shared-admin", name="Principal Shared Admin")
+        session.add_all([last_admin, actor, removable, last_workspace, shared_workspace])
+        session.flush()
+        session.add_all(
+            [
+                RoleBinding(
+                    workspace_id=last_workspace.id,
+                    principal_id=last_admin.id,
+                    role=Role.ADMIN,
+                ),
+                RoleBinding(
+                    workspace_id=shared_workspace.id,
+                    principal_id=actor.id,
+                    role=Role.ADMIN,
+                ),
+                RoleBinding(
+                    workspace_id=shared_workspace.id,
+                    principal_id=removable.id,
+                    role=Role.ADMIN,
+                ),
+            ]
+        )
+        last_admin_id = last_admin.id
+        removable_id = removable.id
+
+    principal_fk = next(iter(RoleBinding.__table__.c.principal_id.foreign_keys))
+    database_fk = next(
+        foreign_key
+        for foreign_key in inspect(engine).get_foreign_keys("role_bindings")
+        if foreign_key["constrained_columns"] == ["principal_id"]
+    )
+    assert principal_fk.ondelete == "RESTRICT"
+    assert database_fk["options"]["ondelete"] == "RESTRICT"
+
+    for principal_id in (last_admin_id, removable_id):
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(delete(Principal).where(Principal.id == principal_id))
+        with Session(engine) as session:
+            assert session.get(Principal, principal_id) is not None
+            assert session.scalar(
+                select(func.count()).select_from(RoleBinding).where(
+                    RoleBinding.principal_id == principal_id,
+                )
+            ) == 1
+
+    service = DatabaseService(sessionmaker(bind=engine, class_=Session, expire_on_commit=False))
+    revoked = service.revoke_workspace_membership(
+        workspace_slug="principal-shared-admin",
+        target_identity=removable_identity,
+        actor_identity=actor_identity,
+        caller_identity=actor_identity,
+        channel=AuditChannel.API,
+    )
+    assert revoked.action == MembershipMutationAction.REVOKED
+
+    with engine.begin() as connection:
+        assert connection.execute(delete(Principal).where(Principal.id == removable_id)).rowcount == 1
+    with Session(engine) as session:
+        assert session.get(Principal, removable_id) is None
+        assert session.scalar(
+            select(func.count()).select_from(RoleBinding).where(
+                RoleBinding.principal_id == removable_id,
+            )
+        ) == 0
+
+
+def test_membership_audit_failure_rolls_back_mutation(seeded_service, engine, monkeypatch):
+    service = seeded_service["service"]
+    target = ExternalIdentity("https://access.example.test", "audit-failure-target")
+    target_ref = service.resolve_or_provision(target)
+
+    def fail_audit(*args, **kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(service_module, "append_audit_event", fail_audit)
+    with pytest.raises(RuntimeError, match="audit unavailable"):
+        service.grant_workspace_membership(
+            workspace_slug="workspace-a",
+            target_identity=target,
+            role=Role.VIEWER,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.API,
+        )
+
+    with Session(engine) as session:
+        assert session.scalar(
+            select(func.count()).select_from(RoleBinding).where(
+                RoleBinding.principal_id == target_ref.id,
+                RoleBinding.task_id.is_(None),
+            )
+        ) == 0
+        assert session.scalar(
+            select(func.count()).select_from(AuditEvent).where(
+                AuditEvent.event_type.like("workspace.membership_%"),
+            )
+        ) == 0
+
+
+def test_last_workspace_admin_cannot_be_downgraded_or_deleted(seeded_service, engine):
+    service = seeded_service["service"]
+    admin = seeded_service["admin"]
+    admin_id = service.resolve_identity(admin).id
+    inactive_admin = ExternalIdentity("https://access.example.test", "inactive-admin")
+    inactive_admin_ref = service.resolve_or_provision(inactive_admin)
+    service.grant_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=inactive_admin,
+        role=Role.ADMIN,
+        actor_identity=admin,
+        caller_identity=admin,
+        channel=AuditChannel.API,
+    )
+    with Session(engine) as session, session.begin():
+        principal = session.get(Principal, inactive_admin_ref.id)
+        principal.is_active = False
+
+    with pytest.raises(LastWorkspaceAdmin):
+        service.change_workspace_membership(
+            workspace_slug="workspace-a",
+            target_identity=admin,
+            role=Role.VIEWER,
+            actor_identity=admin,
+            caller_identity=admin,
+            channel=AuditChannel.API,
+        )
+    with pytest.raises(LastWorkspaceAdmin):
+        service.revoke_workspace_membership(
+            workspace_slug="workspace-a",
+            target_identity=admin,
+            actor_identity=admin,
+            caller_identity=admin,
+            channel=AuditChannel.API,
+        )
+
+    with pytest.raises(DBAPIError):
+        with Session(engine) as session, session.begin():
+            session.execute(
+                update(RoleBinding)
+                .where(RoleBinding.principal_id == admin_id, RoleBinding.task_id.is_(None))
+                .values(role=Role.VIEWER)
+            )
+    with pytest.raises(DBAPIError):
+        with Session(engine) as session, session.begin():
+            session.execute(
+                delete(RoleBinding).where(
+                    RoleBinding.principal_id == admin_id,
+                    RoleBinding.task_id.is_(None),
+                )
+            )
+
+    revoked = service.revoke_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=inactive_admin,
+        actor_identity=admin,
+        caller_identity=admin,
+        channel=AuditChannel.API,
+    )
+
+    assert revoked.action == MembershipMutationAction.REVOKED
+    assert revoked.principal.is_active is False
+    assert service.authorize_workspace(admin, "workspace-a", Permission.WORKSPACE_MANAGE).allowed is True
 
 
 def test_bootstrap_is_idempotent_and_audit_actor_is_structured(engine):

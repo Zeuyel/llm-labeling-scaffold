@@ -207,6 +207,24 @@ class TaskPublishResult:
     replayed: bool
 
 
+class MembershipMutationAction(str, Enum):
+    GRANTED = "granted"
+    CHANGED = "changed"
+    REVOKED = "revoked"
+    UNCHANGED = "unchanged"
+
+
+@dataclass(frozen=True)
+class MembershipMutationResult:
+    action: MembershipMutationAction
+    workspace: WorkspaceRef
+    principal: PrincipalRef
+    binding_id: uuid.UUID | None
+    previous_role: Role | None
+    role: Role | None
+    audit_event_id: uuid.UUID | None
+
+
 class AuthorizationUnavailable(RuntimeError):
     pass
 
@@ -255,6 +273,18 @@ class TaskPublishInProgress(RuntimeError):
 
     def __init__(self):
         super().__init__(self.code)
+
+
+class MembershipConflict(RuntimeError):
+    pass
+
+
+class MembershipNotFound(RuntimeError):
+    pass
+
+
+class LastWorkspaceAdmin(RuntimeError):
+    pass
 
 
 class DatabaseService:
@@ -396,6 +426,70 @@ class DatabaseService:
                 response_status=response_status,
                 response_body=response_body,
                 succeeded=succeeded,
+            )
+
+    def grant_workspace_membership(
+        self,
+        *,
+        workspace_slug: str,
+        target_identity: ExternalIdentity,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> MembershipMutationResult:
+        with self.transaction() as transaction:
+            return transaction.grant_workspace_membership(
+                workspace_slug=workspace_slug,
+                target_identity=target_identity,
+                role=role,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                channel=channel,
+                request_id=request_id,
+            )
+
+    def change_workspace_membership(
+        self,
+        *,
+        workspace_slug: str,
+        target_identity: ExternalIdentity,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> MembershipMutationResult:
+        with self.transaction() as transaction:
+            return transaction.change_workspace_membership(
+                workspace_slug=workspace_slug,
+                target_identity=target_identity,
+                role=role,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                channel=channel,
+                request_id=request_id,
+            )
+
+    def revoke_workspace_membership(
+        self,
+        *,
+        workspace_slug: str,
+        target_identity: ExternalIdentity,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> MembershipMutationResult:
+        with self.transaction() as transaction:
+            return transaction.revoke_workspace_membership(
+                workspace_slug=workspace_slug,
+                target_identity=target_identity,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                channel=channel,
+                request_id=request_id,
             )
 
     def append_audit(
@@ -1095,6 +1189,181 @@ class DatabaseTransaction:
             raise IdempotencyConflict()
         return _idempotency_claim(record, IdempotencyClaimStatus.REPLAY)
 
+    def grant_workspace_membership(
+        self,
+        *,
+        workspace_slug: str,
+        target_identity: ExternalIdentity,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> MembershipMutationResult:
+        actor, caller, workspace, target, binding = self._membership_context(
+            workspace_slug=workspace_slug,
+            target_identity=target_identity,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            channel=channel,
+            require_active_target=True,
+        )
+        if binding is not None:
+            if binding.role != role:
+                raise MembershipConflict("workspace membership already exists with another role")
+            return _membership_result(
+                MembershipMutationAction.UNCHANGED,
+                workspace,
+                target,
+                binding=binding,
+                previous_role=role,
+                role=role,
+            )
+
+        binding = RoleBinding(
+            workspace_id=workspace.id,
+            principal_id=target.id,
+            role=role,
+            created_by_principal_id=actor.id,
+        )
+        self._session.add(binding)
+        self._session.flush()
+        audit_event = self._append_membership_audit(
+            workspace=workspace,
+            actor=actor,
+            caller=caller,
+            target=target,
+            binding=binding,
+            event_type="workspace.membership_granted",
+            channel=channel,
+            request_id=request_id,
+            previous_role=None,
+            role=role,
+        )
+        return _membership_result(
+            MembershipMutationAction.GRANTED,
+            workspace,
+            target,
+            binding=binding,
+            previous_role=None,
+            role=role,
+            audit_event=audit_event,
+        )
+
+    def change_workspace_membership(
+        self,
+        *,
+        workspace_slug: str,
+        target_identity: ExternalIdentity,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> MembershipMutationResult:
+        actor, caller, workspace, target, binding = self._membership_context(
+            workspace_slug=workspace_slug,
+            target_identity=target_identity,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            channel=channel,
+            require_active_target=True,
+        )
+        if binding is None:
+            raise MembershipNotFound("workspace membership does not exist")
+        previous_role = binding.role
+        if previous_role == role:
+            return _membership_result(
+                MembershipMutationAction.UNCHANGED,
+                workspace,
+                target,
+                binding=binding,
+                previous_role=previous_role,
+                role=role,
+            )
+        if previous_role == Role.ADMIN and role != Role.ADMIN:
+            self._require_another_workspace_admin(workspace.id, binding.id)
+
+        binding.role = role
+        self._session.flush()
+        audit_event = self._append_membership_audit(
+            workspace=workspace,
+            actor=actor,
+            caller=caller,
+            target=target,
+            binding=binding,
+            event_type="workspace.membership_changed",
+            channel=channel,
+            request_id=request_id,
+            previous_role=previous_role,
+            role=role,
+        )
+        return _membership_result(
+            MembershipMutationAction.CHANGED,
+            workspace,
+            target,
+            binding=binding,
+            previous_role=previous_role,
+            role=role,
+            audit_event=audit_event,
+        )
+
+    def revoke_workspace_membership(
+        self,
+        *,
+        workspace_slug: str,
+        target_identity: ExternalIdentity,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> MembershipMutationResult:
+        actor, caller, workspace, target, binding = self._membership_context(
+            workspace_slug=workspace_slug,
+            target_identity=target_identity,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            channel=channel,
+            require_active_target=False,
+        )
+        if binding is None:
+            return _membership_result(
+                MembershipMutationAction.UNCHANGED,
+                workspace,
+                target,
+                binding=None,
+                previous_role=None,
+                role=None,
+            )
+        previous_role = binding.role
+        if previous_role == Role.ADMIN and target.is_active:
+            self._require_another_workspace_admin(workspace.id, binding.id)
+
+        binding_id = binding.id
+        audit_event = self._append_membership_audit(
+            workspace=workspace,
+            actor=actor,
+            caller=caller,
+            target=target,
+            binding=binding,
+            event_type="workspace.membership_revoked",
+            channel=channel,
+            request_id=request_id,
+            previous_role=previous_role,
+            role=None,
+        )
+        self._session.delete(binding)
+        self._session.flush()
+        return MembershipMutationResult(
+            action=MembershipMutationAction.REVOKED,
+            workspace=_workspace_ref(workspace),
+            principal=_principal_ref(target),
+            binding_id=binding_id,
+            previous_role=previous_role,
+            role=None,
+            audit_event_id=audit_event.id,
+        )
+
     def append_audit(
         self,
         *,
@@ -1142,15 +1411,178 @@ class DatabaseTransaction:
         self._session.flush()
         return _audit_event_ref(event)
 
-    def _find_principal(self, identity: ExternalIdentity | None) -> Principal | None:
-        if identity is None:
-            return None
-        return self._session.scalar(
-            select(Principal).where(
-                Principal.issuer == identity.issuer,
-                Principal.subject == identity.subject,
+    def _membership_context(
+        self,
+        *,
+        workspace_slug: str,
+        target_identity: ExternalIdentity,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        require_active_target: bool,
+    ) -> tuple[Principal, Principal, Workspace, Principal, RoleBinding | None]:
+        if channel == AuditChannel.SYSTEM:
+            raise AuthorizationDenied(
+                _decision(Permission.WORKSPACE_MANAGE, AuthorizationReason.INVALID_AUDIT_CONTEXT),
+            )
+
+        initial_decision = self.authorize_workspace(
+            actor_identity,
+            workspace_slug,
+            Permission.WORKSPACE_MANAGE,
+        )
+        self.require(initial_decision)
+        target = self._find_principal(target_identity, populate_existing=True)
+        if target is None:
+            raise MembershipNotFound("target principal does not exist")
+        binding = self._workspace_binding(initial_decision.workspace.id, target.id)
+        workspace = self._session.scalar(
+            select(Workspace)
+            .where(Workspace.id == initial_decision.workspace.id)
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        if binding is None and workspace is not None:
+            binding = self._workspace_binding(
+                workspace.id,
+                target.id,
+                for_update=False,
+            )
+        actor = self._find_principal(actor_identity, populate_existing=True)
+        if actor is None:
+            raise AuthorizationDenied(
+                _decision(Permission.WORKSPACE_MANAGE, AuthorizationReason.UNKNOWN_PRINCIPAL),
+            )
+        actor_ref = _principal_ref(actor)
+        if not actor.is_active:
+            raise AuthorizationDenied(
+                _decision(
+                    Permission.WORKSPACE_MANAGE,
+                    AuthorizationReason.INACTIVE_PRINCIPAL,
+                    principal=actor_ref,
+                ),
+            )
+        if workspace is None:
+            raise AuthorizationDenied(
+                _decision(
+                    Permission.WORKSPACE_MANAGE,
+                    AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                    principal=actor_ref,
+                ),
+            )
+
+        roles = self._roles(actor.id, workspace.id)
+        workspace_ref = _workspace_ref(workspace)
+        if not workspace.is_active:
+            raise AuthorizationDenied(
+                _decision(
+                    Permission.WORKSPACE_MANAGE,
+                    AuthorizationReason.INACTIVE_WORKSPACE,
+                    principal=actor_ref,
+                    workspace=workspace_ref,
+                    roles=roles,
+                ),
+            )
+        self.require(
+            _role_decision(
+                Permission.WORKSPACE_MANAGE,
+                actor_ref,
+                workspace_ref,
+                None,
+                roles,
+            )
+        )
+        caller = self._require_caller(caller_identity, actor.id, Permission.WORKSPACE_MANAGE)
+        target = self._find_principal(target_identity, populate_existing=True)
+        if target is None or (require_active_target and not target.is_active):
+            status = "active " if require_active_target else ""
+            raise MembershipNotFound(f"{status}target principal does not exist")
+        return actor, caller, workspace, target, binding
+
+    def _workspace_binding(
+        self,
+        workspace_id: uuid.UUID,
+        principal_id: uuid.UUID,
+        *,
+        for_update: bool = True,
+    ) -> RoleBinding | None:
+        statement = select(RoleBinding).where(
+            RoleBinding.workspace_id == workspace_id,
+            RoleBinding.principal_id == principal_id,
+            RoleBinding.task_id.is_(None),
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return self._session.scalar(statement.execution_options(populate_existing=True))
+
+    def _require_another_workspace_admin(
+        self,
+        workspace_id: uuid.UUID,
+        excluded_binding_id: uuid.UUID,
+    ) -> None:
+        count = self._session.scalar(
+            select(func.count())
+            .select_from(RoleBinding)
+            .join(Principal, Principal.id == RoleBinding.principal_id)
+            .where(
+                RoleBinding.workspace_id == workspace_id,
+                RoleBinding.task_id.is_(None),
+                RoleBinding.role == Role.ADMIN,
+                RoleBinding.id != excluded_binding_id,
+                Principal.is_active.is_(True),
             ),
         )
+        if not count:
+            raise LastWorkspaceAdmin("the last workspace admin cannot be revoked or downgraded")
+
+    def _append_membership_audit(
+        self,
+        *,
+        workspace: Workspace,
+        actor: Principal,
+        caller: Principal,
+        target: Principal,
+        binding: RoleBinding,
+        event_type: str,
+        channel: AuditChannel,
+        request_id: str | None,
+        previous_role: Role | None,
+        role: Role | None,
+    ) -> AuditEvent:
+        event = append_audit_event(
+            self._session,
+            workspace_id=workspace.id,
+            event_type=event_type,
+            actor=actor,
+            caller=caller,
+            channel=channel,
+            resource_type="workspace_membership",
+            resource_id=binding.id,
+            request_id=request_id,
+            details={
+                "target_principal_id": str(target.id),
+                "previous_role": previous_role.value if previous_role is not None else None,
+                "role": role.value if role is not None else None,
+            },
+        )
+        self._session.flush()
+        return event
+
+    def _find_principal(
+        self,
+        identity: ExternalIdentity | None,
+        *,
+        populate_existing: bool = False,
+    ) -> Principal | None:
+        if identity is None:
+            return None
+        statement = select(Principal).where(
+            Principal.issuer == identity.issuer,
+            Principal.subject == identity.subject,
+        )
+        if populate_existing:
+            statement = statement.execution_options(populate_existing=True)
+        return self._session.scalar(statement)
 
     def _lock_task(self, task_id: uuid.UUID) -> Task:
         task = self._session.scalar(
@@ -1176,7 +1608,7 @@ class DatabaseTransaction:
         actor_principal_id: uuid.UUID,
         permission: Permission,
     ) -> Principal:
-        caller = self._find_principal(identity)
+        caller = self._find_principal(identity, populate_existing=True)
         if caller is None or not caller.is_active or (
             caller.id != actor_principal_id and caller.principal_type != PrincipalType.SERVICE
         ):
@@ -1436,6 +1868,27 @@ def _task_publish_result_from_claim(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AuthorizationUnavailable("task publish idempotency response is invalid") from exc
+
+
+def _membership_result(
+    action: MembershipMutationAction,
+    workspace: Workspace,
+    principal: Principal,
+    *,
+    binding: RoleBinding | None,
+    previous_role: Role | None,
+    role: Role | None,
+    audit_event: AuditEvent | None = None,
+) -> MembershipMutationResult:
+    return MembershipMutationResult(
+        action=action,
+        workspace=_workspace_ref(workspace),
+        principal=_principal_ref(principal),
+        binding_id=binding.id if binding is not None else None,
+        previous_role=previous_role,
+        role=role,
+        audit_event_id=audit_event.id if audit_event is not None else None,
+    )
 
 
 def canonical_request_fingerprint(request_payload: Any) -> str:

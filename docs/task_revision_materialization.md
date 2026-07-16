@@ -4,7 +4,7 @@
 
 ## Schema 决策
 
-沿用 `20260714_0002`，不修改该迁移，也不新增 `0003`。现有 `task_revision_materializations` 已提供状态、可领取时间、lease、worker、attempt 和错误字段；snapshot 路径可由 revision UUID 与 `content_hash` 确定性推导，不需要持久化路径列。
+沿用 `20260714_0002`，不修改该 task revision 迁移。membership lifecycle 使用独立的后续 `20260715_0003`，不改变 task revision authority。现有 `task_revision_materializations` 已提供状态、可领取时间、lease、worker、attempt 和错误字段；snapshot 路径可由 revision UUID 与 `content_hash` 确定性推导，不需要持久化路径列。
 
 ## 数据库状态机
 
