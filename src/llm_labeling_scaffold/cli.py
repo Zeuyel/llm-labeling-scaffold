@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from .annotation import annotate
 from .audit import audit_run
 from .batching import batch_records
-from .config import load_task
+from .config import load_task, with_runs_root
 from .gold import build_gold
 from .merge import merge_run
 from .sampling import sample_records
@@ -31,7 +32,34 @@ def _print_json(value: object) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def _load_task_reference(task_path: str | None, task_id: str | None, tasks_root: str):
+def _control_task_source_enabled() -> bool:
+    return str(os.environ.get("LLS_TASK_SOURCE", "local")).strip().lower() in {
+        "control",
+        "scaffold",
+        "panel",
+    }
+
+
+def _load_task_reference(
+    task_path: str | None,
+    task_id: str | None,
+    tasks_root: str,
+    runs_root: str = "runs",
+    workspace: str | None = None,
+):
+    if _control_task_source_enabled():
+        if task_path:
+            raise SystemExit("control 模式不能读取 --task 文件；请改用 --workspace 和 --task-id")
+        if not task_id or not workspace:
+            raise SystemExit("control 模式必须同时提供 --workspace 和 --task-id")
+        from .db import ControlTaskSnapshotLoader
+
+        loader = ControlTaskSnapshotLoader.from_url(None, runs_root, tasks_root)
+        try:
+            task = loader.load(workspace, task_id)
+        finally:
+            loader.close()
+        return with_runs_root(task, Path(runs_root) / workspace)
     if task_path:
         return load_task(task_path)
     if task_id:
@@ -41,6 +69,32 @@ def _load_task_reference(task_path: str | None, task_id: str | None, tasks_root:
     raise SystemExit("requires --task or --task-id")
 
 
+def _add_task_selector(parser: argparse.ArgumentParser) -> None:
+    selector = parser.add_mutually_exclusive_group(required=True)
+    selector.add_argument("--task")
+    selector.add_argument("--task-id")
+    parser.add_argument("--workspace")
+    parser.add_argument("--tasks-root", default="tasks")
+    parser.add_argument("--runs-root", default="runs")
+
+
+def _task_from_args(args):
+    return _load_task_reference(
+        args.task,
+        args.task_id,
+        args.tasks_root,
+        args.runs_root,
+        args.workspace,
+    )
+
+
+def _task_runs_root(args) -> Path:
+    root = Path(args.runs_root)
+    if _control_task_source_enabled():
+        return root / str(args.workspace)
+    return root
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="lls")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -48,11 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     schema = sub.add_parser("schema")
     schema_sub = schema.add_subparsers(dest="schema_cmd", required=True)
     schema_build = schema_sub.add_parser("build")
-    schema_build.add_argument("--task", required=True)
+    _add_task_selector(schema_build)
     schema_build.add_argument("--output")
 
     sample = sub.add_parser("sample")
-    sample.add_argument("--task", required=True)
+    _add_task_selector(sample)
     sample.add_argument("--rows", type=int, required=True)
     sample.add_argument("--sample-id", required=True)
     sample.add_argument("--strategy", default="random", choices=["random", "head"])
@@ -60,13 +114,13 @@ def build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--source")
 
     batch = sub.add_parser("batch")
-    batch.add_argument("--task", required=True)
+    _add_task_selector(batch)
     batch.add_argument("--sample", required=True)
     batch.add_argument("--batch-size", type=int, required=True)
     batch.add_argument("--output-dir")
 
     ann = sub.add_parser("annotate")
-    ann.add_argument("--task", required=True)
+    _add_task_selector(ann)
     ann.add_argument("--provider", default="local_stub")
     ann.add_argument("--run-id", required=True)
     ann.add_argument("--sample", required=True)
@@ -74,31 +128,31 @@ def build_parser() -> argparse.ArgumentParser:
     ann.add_argument("--skip-existing", action="store_true")
 
     audit = sub.add_parser("audit")
-    audit.add_argument("--task", required=True)
+    _add_task_selector(audit)
     audit.add_argument("--run", required=True)
 
     merge = sub.add_parser("merge")
-    merge.add_argument("--task", required=True)
+    _add_task_selector(merge)
     merge.add_argument("--run", required=True)
 
     gold = sub.add_parser("gold")
     gold_sub = gold.add_subparsers(dest="gold_cmd", required=True)
     gold_build = gold_sub.add_parser("build")
-    gold_build.add_argument("--task", required=True)
+    _add_task_selector(gold_build)
     gold_build.add_argument("--run")
     gold_build.add_argument("--version", required=True)
     gold_build.add_argument("--decisions")
     gold_build.add_argument("--sample")
 
     train = sub.add_parser("train")
-    train.add_argument("--task", required=True)
+    _add_task_selector(train)
     train.add_argument("--gold", required=True)
     train.add_argument("--model-id", required=True)
     train.add_argument("--trainer", default="tfidf_sgd")
     train.add_argument("--param", action="append", default=[])
 
     infer = sub.add_parser("infer")
-    infer.add_argument("--task", required=True)
+    _add_task_selector(infer)
     infer.add_argument("--model", required=True)
     infer.add_argument("--corpus", required=True)
     infer.add_argument("--output", required=True)
@@ -106,28 +160,25 @@ def build_parser() -> argparse.ArgumentParser:
     lake = sub.add_parser("data-lake")
     lake_sub = lake.add_subparsers(dest="lake_cmd", required=True)
     lake_check = lake_sub.add_parser("check")
-    lake_check.add_argument("--task", required=True)
+    _add_task_selector(lake_check)
     lake_import = lake_sub.add_parser("import")
-    lake_import.add_argument("--task", required=True)
-    lake_import.add_argument("--runs-root", default="runs")
+    _add_task_selector(lake_import)
     lake_import.add_argument("--import-id")
     lake_import.add_argument("--source-object-path")
     lake_import.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024)
     lake_export = lake_sub.add_parser("export")
-    lake_export.add_argument("--task", required=True)
+    _add_task_selector(lake_export)
     lake_export.add_argument("--local", required=True)
     lake_export.add_argument("--target-uri")
     lake_export.add_argument("--target-path")
     lake_publish = lake_sub.add_parser("publish")
     lake_publish_sub = lake_publish.add_subparsers(dest="publish_cmd", required=True)
     lake_publish_plan = lake_publish_sub.add_parser("plan")
-    lake_publish_plan.add_argument("--task", required=True)
-    lake_publish_plan.add_argument("--runs-root", default="runs")
+    _add_task_selector(lake_publish_plan)
     lake_publish_plan.add_argument("--kind", required=True, choices=["decisions", "gold", "predictions", "model_metadata"])
     lake_publish_plan.add_argument("--artifact-id", required=True)
     lake_publish_submit = lake_publish_sub.add_parser("submit")
-    lake_publish_submit.add_argument("--task", required=True)
-    lake_publish_submit.add_argument("--runs-root", default="runs")
+    _add_task_selector(lake_publish_submit)
     lake_publish_submit.add_argument("--kind", required=True, choices=["decisions", "gold", "predictions", "model_metadata"])
     lake_publish_submit.add_argument("--artifact-id", required=True)
     lake_publish_submit.add_argument("--confirm", action="store_true")
@@ -138,23 +189,14 @@ def build_parser() -> argparse.ArgumentParser:
     task_list = task_sub.add_parser("list")
     task_list.add_argument("--tasks-root", default="tasks")
     task_status = task_sub.add_parser("status")
-    task_status.add_argument("--task")
-    task_status.add_argument("--task-id")
-    task_status.add_argument("--tasks-root", default="tasks")
-    task_status.add_argument("--runs-root", default="runs")
+    _add_task_selector(task_status)
 
     imports = sub.add_parser("import")
     import_sub = imports.add_subparsers(dest="import_cmd", required=True)
     import_list = import_sub.add_parser("list")
-    import_list.add_argument("--task")
-    import_list.add_argument("--task-id")
-    import_list.add_argument("--tasks-root", default="tasks")
-    import_list.add_argument("--runs-root", default="runs")
+    _add_task_selector(import_list)
     import_detail = import_sub.add_parser("detail")
-    import_detail.add_argument("--task")
-    import_detail.add_argument("--task-id")
-    import_detail.add_argument("--tasks-root", default="tasks")
-    import_detail.add_argument("--runs-root", default="runs")
+    _add_task_selector(import_detail)
     import_detail.add_argument("--import-id", required=True)
 
     smoke = sub.add_parser("smoke")
@@ -203,27 +245,27 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     if args.cmd == "schema":
-        task = load_task(args.task)
+        task = _task_from_args(args)
         print(write_output_schema(task, args.output))
     elif args.cmd == "sample":
-        task = load_task(args.task)
+        task = _task_from_args(args)
         print(sample_records(task, args.rows, args.sample_id, args.strategy, args.seed, args.source))
     elif args.cmd == "batch":
-        task = load_task(args.task)
+        task = _task_from_args(args)
         sample_id = Path(args.sample).parent.name
         out = Path(args.output_dir) if args.output_dir else task.runs_dir / "samples" / sample_id / "batches" / f"size_{args.batch_size}"
         print("\n".join(str(p) for p in batch_records(args.sample, out, args.batch_size)))
     elif args.cmd == "annotate":
-        task = load_task(args.task)
+        task = _task_from_args(args)
         print(annotate(task, args.sample, args.run_id, args.provider, args.batch_size, args.skip_existing))
     elif args.cmd == "audit":
-        task = load_task(args.task)
+        task = _task_from_args(args)
         print(audit_run(task, args.run))
     elif args.cmd == "merge":
-        task = load_task(args.task)
+        task = _task_from_args(args)
         print(merge_run(task, args.run))
     elif args.cmd == "gold":
-        task = load_task(args.task)
+        task = _task_from_args(args)
         if args.sample and args.decisions:
             from .gold import build_gold_from_decisions
 
@@ -235,15 +277,16 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "train":
         from .train import train_model
 
-        task = load_task(args.task)
+        task = _task_from_args(args)
         print(train_model(task, args.gold, args.model_id, args.trainer, _parse_params(args.param)))
     elif args.cmd == "infer":
         from .infer import infer_jsonl
 
-        task = load_task(args.task)
+        task = _task_from_args(args)
         print(infer_jsonl(task, args.model, args.corpus, args.output))
     elif args.cmd == "data-lake":
-        task = load_task(args.task)
+        task = _task_from_args(args)
+        task_runs_root = _task_runs_root(args)
         if args.lake_cmd == "check":
             from .data_lake import preview_source
 
@@ -255,7 +298,7 @@ def main(argv: list[str] | None = None) -> None:
                 "source_object_path": args.source_object_path,
             }
             _print_json(
-                import_from_data_lake(args.runs_root, task, import_id=args.import_id, overrides=overrides, max_bytes=args.max_bytes),
+                import_from_data_lake(task_runs_root, task, import_id=args.import_id, overrides=overrides, max_bytes=args.max_bytes),
             )
         elif args.lake_cmd == "export":
             from .data_lake import export_artifact
@@ -268,7 +311,7 @@ def main(argv: list[str] | None = None) -> None:
                 from .data_lake import plan_artifact_publish
 
                 _print_json(
-                    plan_artifact_publish(task, args.runs_root, args.kind, args.artifact_id),
+                    plan_artifact_publish(task, task_runs_root, args.kind, args.artifact_id),
                 )
             elif args.publish_cmd == "submit":
                 from .data_lake import submit_artifact_publish
@@ -276,7 +319,7 @@ def main(argv: list[str] | None = None) -> None:
                 _print_json(
                     submit_artifact_publish(
                         task,
-                        args.runs_root,
+                        task_runs_root,
                         args.kind,
                         args.artifact_id,
                         confirm=args.confirm,
@@ -286,23 +329,25 @@ def main(argv: list[str] | None = None) -> None:
 
     elif args.cmd == "task":
         if args.task_cmd == "list":
+            if _control_task_source_enabled():
+                raise SystemExit("control 模式不能读取本地任务目录；请使用 Panel 或 MCP 任务列表")
             from .pipeline import list_tasks
 
             _print_json({"tasks": list_tasks(args.tasks_root)})
         elif args.task_cmd == "status":
             from .pipeline import task_profile_status
 
-            task = _load_task_reference(args.task, args.task_id, args.tasks_root)
-            _print_json(task_profile_status(args.runs_root, task))
+            task = _task_from_args(args)
+            _print_json(task_profile_status(_task_runs_root(args), task))
 
     elif args.cmd == "import":
         from .pipeline import import_detail, list_imports
 
-        task = _load_task_reference(args.task, args.task_id, args.tasks_root)
+        task = _task_from_args(args)
         if args.import_cmd == "list":
-            _print_json({"imports": list_imports(args.runs_root, task.task_id, id_field=task.id_field)})
+            _print_json({"imports": list_imports(_task_runs_root(args), task.task_id, id_field=task.id_field)})
         elif args.import_cmd == "detail":
-            _print_json({"import": import_detail(args.runs_root, task.task_id, args.import_id, id_field=task.id_field)})
+            _print_json({"import": import_detail(_task_runs_root(args), task.task_id, args.import_id, id_field=task.id_field)})
 
     elif args.cmd == "smoke":
         from .smoke import config_from_env, render_summary, run_smoke

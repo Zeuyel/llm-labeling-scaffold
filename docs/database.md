@@ -197,4 +197,4 @@ docker compose run --rm db-role-verify
 
 ## 兼容边界
 
-本数据层尚未迁移 `runs/_system/task_control/` 或 `tasks/` 中的现有任务，也不修改 Panel、MCP、Argilla 或文件流水线的业务行为。Task revision、draft/version/reason、可见状态和编辑状态全部由 #46 定义；后续接入必须显式把已有资源映射到 workspace，并为迁移 actor 写入审计事件。只有当 `runs/` 与 `tasks/` 的物理路径完成 workspace 分区、迁移和碰撞验证后，才能把 `task_key` 从全局唯一放宽为 workspace 内唯一。
+control 模式的运行时只读取数据库 current revision 对应的 immutable snapshot；`runs/_system/task_control/registry.json`、live `tasks/<task_key>/task.yaml` 和 `load_task_by_id()` 多 root 搜索不再是运行时回退路径。旧文件式任务如需保留，必须由管理员显式运行 `python -m llm_labeling_scaffold.cli db import-legacy-tasks --registry <旧 registry.json> --workspace <workspace> --actor-issuer <issuer> --actor-subject <subject> --confirm`。该命令只导入 draft，记录 `task.legacy_imported` CLI 审计事件；冲突会整批拒绝，导入后仍需通过正常发布流程生成 current revision。

@@ -82,6 +82,15 @@ class RevisionSnapshot:
 
 
 @dataclass(frozen=True)
+class LoadedTaskRevision:
+    revision_id: uuid.UUID
+    revision_number: int
+    definition: dict[str, Any]
+    rendered_task: str
+    task_config: TaskConfig
+
+
+@dataclass(frozen=True)
 class MaterializationClaim:
     materialization_id: uuid.UUID
     worker_id: str
@@ -888,6 +897,13 @@ class ControlTaskSnapshotLoader:
             self._engine.dispose()
 
     def load(self, workspace_slug: str, task_key: str) -> TaskConfig:
+        loaded = self.load_active_revision(workspace_slug, task_key)
+        if loaded is None:
+            raise SnapshotValidationError(f"task has no ready current revision: {workspace_slug}/{task_key}")
+        return loaded.task_config
+
+    def load_active_revision(self, workspace_slug: str, task_key: str) -> LoadedTaskRevision | None:
+        _require_safe_segment(workspace_slug)
         _require_safe_segment(task_key)
         with self._session_factory() as session:
             row = session.execute(
@@ -905,12 +921,19 @@ class ControlTaskSnapshotLoader:
                 ),
             ).one_or_none()
         if row is None:
-            raise SnapshotValidationError(f"task has no ready current revision: {workspace_slug}/{task_key}")
+            return None
         task, revision, _materialization = row
-        snapshot_task = self._snapshot_store.load(_revision_snapshot(task, revision))
-        return TaskConfig(
-            path=self._logical_root / task_key / "task.yaml",
-            raw=snapshot_task.raw,
+        descriptor = _revision_snapshot(task, revision)
+        snapshot_task = self._snapshot_store.load(descriptor)
+        return LoadedTaskRevision(
+            revision_id=revision.id,
+            revision_number=revision.revision_number,
+            definition=dict(revision.definition),
+            rendered_task=revision.rendered_task,
+            task_config=TaskConfig(
+                path=self._logical_root / task_key / "task.yaml",
+                raw=snapshot_task.raw,
+            ),
         )
 
 

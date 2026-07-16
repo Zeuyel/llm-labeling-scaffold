@@ -119,23 +119,23 @@ MCP endpoint 为 `http://localhost:8766/mcp`，生产只通过 Cloudflare Tunnel
 1. **`r2`**：R2 registry 管理任务列表和远端 `task.yaml`。`task_registry_uri` 指向数据湖治理登记表，通常是 `governance/data_lake/v1/current/data_lake.yaml`；登记表中的 `tasks.<task_id>.task_uri` 才指向具体 `task.yaml`。
 2. **`control`**：scaffold 控制面管理任务单、草稿和发布 revision。R2 不再作为任务单来源，只提供任务配置中声明的数据湖输入和产物读写。
 3. **`local`**：直接读取本地 `tasks/`，仅适合开发或测试。
-4. **panel settings 和本地执行目录**：`task_registry_uri` 与 `data_lake_r2_prefix` 配置 R2 数据湖连接和允许前缀；`runs/` 保存运行产物，`tasks/` 保存 `r2` 模式的同步缓存或 `control` 模式当前已发布的可执行任务配置。
+4. **panel settings 和本地执行目录**：`task_registry_uri` 与 `data_lake_r2_prefix` 配置 R2 数据湖连接和允许前缀；`runs/` 保存运行产物，`tasks/` 只保存 R2 同步缓存或 control 模式的可恢复兼容缓存，不是任务权威。
 
 `r2` 模式首次部署后，应在“系统设置”填写 `task_registry_uri` 和 `data_lake_r2_prefix`，再同步任务配置。`control` 模式不从 R2 同步任务；其中的 R2 配置只在任务访问数据湖时使用。不要把示例 bucket 当成生产配置；同一套镜像应能连接任意符合约定的 R2 数据湖。
 
 ## 控制面任务生命周期
 
-`LLS_TASK_SOURCE=control` 下，任务单先以 draft 保存。创建 draft 时 revision 为 `0`，草稿的最新内容保存在 `runs/_system/task_control/registry.json`，此时不会生成可执行的 `task.yaml`。修改已发布任务会保留当前已发布 revision，并把状态改为 `published_with_draft`。
+`LLS_TASK_SOURCE=control` 下，任务单、draft、revision 和 current revision 全部保存在 scaffold PostgreSQL。创建 draft 时 revision 为 `0`，此时不会生成可执行快照。修改已发布任务会保留当前已发布 revision，并把状态改为 `published_with_draft`。
 
-发布会校验 draft，生成递增的 revision，并把当前可执行配置写到 `tasks/<task_id>/task.yaml`；如果配置包含 prompt，同时写入同目录的 `prompt.revision_<六位编号>.md`。每次发布还会保留不可覆盖快照：
+发布会校验 draft，生成递增的 revision，并由 materializer 写入不可变快照；如果配置包含 prompt，也会写入快照目录：
 
 ```text
-runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/task.yaml
-runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/prompt.md
-runs/_system/task_control/task_snapshots/<task_id>/revision_<六位编号>/draft_spec.json
+runs/_system/task_control/task_snapshots/<revision_uuid>/<content_sha256>/task.yaml
+runs/_system/task_control/task_snapshots/<revision_uuid>/<content_sha256>/definition.json
+runs/_system/task_control/task_snapshots/<revision_uuid>/<content_sha256>/manifest.json
 ```
 
-`registry.json` 保留 draft、当前发布信息和 revision 历史；流水线只使用当前已发布的 `tasks/<task_id>/task.yaml`。因此 draft 不会直接改变正在执行的已发布任务。
+运行时按数据库 `current_revision_id` 读取并校验 immutable snapshot，不读取 `registry.json`、live `task.yaml` 或多 root 搜索结果。旧文件式任务如需保留，必须由管理员显式运行一次 `db import-legacy-tasks` 导入为待发布 draft；导入不会自动激活旧 revision。
 
 ## 认证边界
 
@@ -328,7 +328,7 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - `./tasks:/app/tasks`：`r2` 模式的任务配置缓存，或 `control` 模式当前已发布的可执行任务配置
 - `./configs:/app/configs:ro`：配置示例
 
-生产面板默认使用 `LLS_TASK_SOURCE=control`。任务单由控制面创建、编辑和发布，当前已发布 revision 写入 `tasks/<任务编号>/task.yaml` 供流水线执行；`runs/` 保留草稿和 revision 快照。启动兜底值可由 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 提供，它们只配置 R2 数据湖。需要兼容既有上游任务登记表时，可显式设置 `LLS_TASK_SOURCE=r2`；该模式从登记表读取 `tasks.<任务编号>.task_uri` 并缓存远端 `task.yaml`。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
+生产面板默认使用 `LLS_TASK_SOURCE=control`。任务单由控制面创建、编辑和发布，运行时读取数据库 current revision 对应的 immutable snapshot；`tasks/<任务编号>/task.yaml` 仅是可恢复兼容缓存，`runs/` 保存物化和业务产物。启动兜底值可由 `LLS_TASK_REGISTRY_URI` 和 `LLS_DATA_LAKE_R2_PREFIX` 提供，它们只配置 R2 数据湖。需要兼容既有上游任务登记表时，可显式设置 `LLS_TASK_SOURCE=r2`；该模式从登记表读取 `tasks.<任务编号>.task_uri` 并缓存远端 `task.yaml`。`examples/` 只保留给本地开发和测试命令使用，不会在正式面板中默认显示。任务可以在 `task.yaml` 中写 `profile: {preset: manual_labeling_cv_v1}`，让面板按预设模板预填阶段参数并执行质量门槛，而不是把流程写成说明文字。
 
 无论任务来源，只要任务配置了 `data_lake`，R2 数据湖就是任务输入的权威来源；面板只把登记表和 manifest 指定的任务级 JSONL materialize 到本地 `runs/<task_id>/imports/`。手动上传文件和粘贴导入默认关闭，只能在本地开发或测试模式下开启。导入数据按不可覆盖资产管理：同一导入编号和同一内容会幂等复用，同一编号但内容不同会拒绝写入。面板支持导入详情、字段清单、ID 唯一性检查、分页查看、搜索、下载和归档；归档不会物理删除原始文件，且已被样本使用的导入数据不能归档。样本同样按不可覆盖资产管理，已被本地标注、Argilla 分发、标注结果或训练集使用时不能归档。数据操作规范见 [数据操作规范](docs/data_governance.md)。
 

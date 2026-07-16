@@ -30,6 +30,7 @@ from .db import (
     AuthorizationDenied,
     AuthorizationReason,
     AuthorizationUnavailable,
+    ControlTaskSnapshotLoader,
     DatabaseService,
     ExternalIdentity,
     IdempotencyConflict,
@@ -914,6 +915,7 @@ def _active_task_summary(workspace_slug: str, access, active: ActiveTaskRevision
             "status": "published",
             "revision": active.revision_number,
             "revision_id": active.revision_id,
+            "path": str(active.task_config.path) if active.task_config is not None else None,
             "profile": raw["profile"],
             "id_field": raw["id_field"],
         },
@@ -932,6 +934,7 @@ def _active_task_detail(workspace_slug: str, task_key: str, active: ActiveTaskRe
             "workspace": workspace_slug,
             "revision": active.revision_number,
             "revision_id": active.revision_id,
+            "path": str(active.task_config.path) if active.task_config is not None else None,
             "profile": raw["profile"],
             "id_field": raw["id_field"],
             "text_fields": raw.get("input", {}).get("text_fields", []),
@@ -1227,7 +1230,16 @@ class _Handler(BaseHTTPRequestHandler):
                 "active task loader 尚未就绪",
             )
         try:
-            return loader.load_active_revision(workspace_slug, task_key)
+            loaded = loader.load_active_revision(workspace_slug, task_key)
+            if loaded is None or isinstance(loaded, ActiveTaskRevision):
+                return loaded
+            return ActiveTaskRevision(
+                revision_id=str(loaded.revision_id),
+                revision_number=int(loaded.revision_number),
+                definition=dict(loaded.definition),
+                rendered_task=str(loaded.rendered_task),
+                task_config=loaded.task_config,
+            )
         except ActiveTaskLoaderUnavailable as exc:
             raise _PanelRouteError(
                 HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1257,6 +1269,7 @@ class _Handler(BaseHTTPRequestHandler):
         *,
         body: dict[str, Any] | None = None,
         permission: Permission = Permission.TASK_READ,
+        require_task_config: bool = False,
         require_materialized: bool = True,
     ) -> tuple[str, ActiveTaskRevision, Path]:
         if not _safe_segment(task_id):
@@ -1282,6 +1295,27 @@ class _Handler(BaseHTTPRequestHandler):
                 "active task 尚未完成物化",
             )
         return workspace_slug, active, self._workspace_runs_root(workspace_slug)
+
+    def _task_context(
+        self,
+        task_id: str,
+        params,
+        *,
+        body: dict[str, Any] | None = None,
+        permission: Permission = Permission.TASK_READ,
+        require_task_config: bool = False,
+    ) -> tuple[Any, Path, str | None]:
+        if _control_task_source_enabled():
+            workspace_slug, active, workspace_runs_root = self._authorized_active_task(
+                task_id,
+                params,
+                body=body,
+                permission=permission,
+            )
+            return active.task_config, workspace_runs_root, workspace_slug
+        if require_task_config:
+            return self._load_task_by_id(task_id), self.runs_root, None
+        return None, self.runs_root, None
 
     def _route_error(self, exc: Exception) -> None:
         if isinstance(exc, _PanelRouteError):
@@ -1385,11 +1419,18 @@ class _Handler(BaseHTTPRequestHandler):
             return {}
 
     def _resolve_run(self, params) -> Path | None:
-        task = params.get("task", [""])[0]
+        task = params.get("task", params.get("task_id", [""]))[0]
         run = params.get("run", [""])[0]
         if not _safe_segment(task) or not _safe_segment(run):
             return None
-        run_dir = self.runs_root / task / run
+        if _control_task_source_enabled():
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+            except Exception:
+                return None
+        else:
+            task_runs_root = self.runs_root
+        run_dir = task_runs_root / task / run
         return run_dir if run_dir.is_dir() else None
 
     def _sync_tasks_if_needed(self, *, force: bool = False):
@@ -1819,9 +1860,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _list_tasks(self) -> list[dict]:
         if _control_task_source_enabled():
-            from .task_control import list_control_tasks
-
-            return list_control_tasks(self.runs_root)
+            raise RuntimeError("control 模式任务列表必须通过数据库授权 resolver")
         tasks = pipeline.list_tasks(self.tasks_root)
         if not _r2_task_source_enabled():
             return tasks
@@ -1838,19 +1877,38 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _load_task_by_id(self, task_id: str):
         if _control_task_source_enabled():
-            from .task_control import get_task_record
-
-            record = get_task_record(self.runs_root, task_id)
-            if not record.get("published"):
-                raise ValueError(f"任务尚未发布，不能执行: {task_id}")
+            service, actor_identity, _, _ = self._authorization_context()
+            workspace_slug = self._resolve_workspace(service, actor_identity, None)
+            active = self._load_active_revision(workspace_slug, task_id)
+            if active is None:
+                raise ValueError(f"任务尚未发布或不存在: {task_id}")
+            if active.task_config is None:
+                raise ActiveTaskLoaderUnavailable(f"任务尚未完成物化: {task_id}")
+            return active.task_config
         return pipeline.load_task_by_id(self.tasks_root, task_id)
 
-    def _resolve_action_task_path(self, task_path: str) -> str:
+    def _resolve_action_task_path(
+        self,
+        task_path: str,
+        body: dict[str, Any] | None = None,
+    ) -> tuple[Any, Path]:
         if _control_task_source_enabled():
-            task = load_task(task_path)
-            return str(self._load_task_by_id(task.task_id).path)
+            reference = str(task_path or "").strip()
+            reference_path = Path(reference)
+            if reference_path.name == "task.yaml":
+                task_id = reference_path.parent.name
+            else:
+                task_id = reference
+            if not _safe_segment(task_id):
+                raise ValueError("control 模式 action 必须提交 task_id 或 task.yaml 逻辑路径")
+            _, active, workspace_runs_root = self._authorized_active_task(
+                task_id,
+                {},
+                body=body,
+            )
+            return active.task_config, workspace_runs_root
         if not _r2_task_source_enabled():
-            return task_path
+            return task_path, self.runs_root
         try:
             submitted = Path(task_path).expanduser().resolve()
         except Exception as exc:
@@ -1864,7 +1922,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception:
                 continue
             if submitted == resolved:
-                return str(resolved)
+                return str(resolved), self.runs_root
         raise ValueError("生产模式只能执行已同步到本地缓存的 R2 任务配置；请先同步任务配置")
 
     def _sync_tasks_from_registry(self) -> None:
@@ -2050,6 +2108,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/tasks/"):
             self._json({"error": "not found"}, status=404)
         elif path == "/api/runs":
+            if _control_task_source_enabled():
+                self._json({"error": "control 模式必须使用带 task_id 的任务范围接口"}, status=400)
+                return
             self._json({"runs": discover_runs(self.runs_root)})
         elif path == "/api/run":
             run_dir = self._resolve_run(params)
@@ -2069,7 +2130,11 @@ class _Handler(BaseHTTPRequestHandler):
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"gold": list_gold(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"gold": list_gold(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/tasks":
             if _control_task_source_enabled():
                 self._control_task_list(params)
@@ -2090,10 +2155,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                task_cfg = self._load_task_by_id(task)
-                self._json(pipeline.task_profile_status(self.runs_root, task_cfg, profile_id=preset))
+                task_cfg, task_runs_root, _ = self._task_context(
+                    task,
+                    params,
+                    require_task_config=True,
+                )
+                self._json(pipeline.task_profile_status(task_runs_root, task_cfg, profile_id=preset))
             except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+                self._route_error(exc)
         elif path == "/api/task/graph":
             task = params.get("task_id", [""])[0]
             preset = params.get("preset", [""])[0].strip() or None
@@ -2101,25 +2170,34 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                task_cfg = self._load_task_by_id(task)
-                self._json(pipeline.task_asset_graph(self.runs_root, task_cfg, profile_id=preset))
+                task_cfg, task_runs_root, _ = self._task_context(
+                    task,
+                    params,
+                    require_task_config=True,
+                )
+                self._json(pipeline.task_asset_graph(task_runs_root, task_cfg, profile_id=preset))
             except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+                self._route_error(exc)
         elif path == "/api/task/archive_plan":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                task_cfg = self._load_task_by_id(task)
+                task_cfg, task_runs_root, _ = self._task_context(
+                    task,
+                    params,
+                    require_task_config=True,
+                )
                 self._json(pipeline.task_archive_plan(
                     self.tasks_root,
-                    self.runs_root,
+                    task_runs_root,
                     task_cfg,
                     r2_task_source=_r2_task_source_enabled(),
+                    control_task_source=_control_task_source_enabled(),
                 ))
             except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+                self._route_error(exc)
         elif path == "/api/profile/presets":
             try:
                 from .profiles import DEFAULT_PROFILE, list_profile_presets
@@ -2144,13 +2222,21 @@ class _Handler(BaseHTTPRequestHandler):
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"runs": pipeline.list_runs(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"runs": pipeline.list_runs(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/samples":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"samples": pipeline.list_samples(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"samples": pipeline.list_samples(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/imports":
             if _control_task_source_enabled():
                 self._control_import_list(params)
@@ -2160,10 +2246,14 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                task_cfg = self._load_task_by_id(task)
-                self._json({"imports": pipeline.list_imports(self.runs_root, task, id_field=task_cfg.id_field)})
+                task_cfg, task_runs_root, _ = self._task_context(
+                    task,
+                    params,
+                    require_task_config=True,
+                )
+                self._json({"imports": pipeline.list_imports(task_runs_root, task, id_field=task_cfg.id_field)})
             except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+                self._route_error(exc)
         elif path == "/api/import/detail":
             if _control_task_source_enabled():
                 self._control_import_detail(params)
@@ -2171,16 +2261,21 @@ class _Handler(BaseHTTPRequestHandler):
             task = params.get("task_id", [""])[0]
             import_id = params.get("import_id", [""])[0]
             try:
-                task_cfg = self._load_task_by_id(task)
-                self._json({"import": pipeline.import_detail(self.runs_root, task, import_id, id_field=task_cfg.id_field)})
+                task_cfg, task_runs_root, _ = self._task_context(
+                    task,
+                    params,
+                    require_task_config=True,
+                )
+                self._json({"import": pipeline.import_detail(task_runs_root, task, import_id, id_field=task_cfg.id_field)})
             except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+                self._route_error(exc)
         elif path == "/api/import/rows":
             task = params.get("task_id", [""])[0]
             import_id = params.get("import_id", [""])[0]
             try:
+                _, task_runs_root, _ = self._task_context(task, params)
                 self._json(pipeline.import_rows(
-                    self.runs_root,
+                    task_runs_root,
                     task,
                     import_id,
                     offset=int(params.get("offset", ["0"])[0] or 0),
@@ -2198,7 +2293,11 @@ class _Handler(BaseHTTPRequestHandler):
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"annotation_jobs": pipeline.list_annotation_jobs(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"annotation_jobs": pipeline.list_annotation_jobs(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/annotation_job/detail":
             task = params.get("task_id", [""])[0]
             annotation_id = params.get("annotation_id", [""])[0]
@@ -2206,27 +2305,42 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task/annotation_id"}, status=400)
                 return
             try:
-                self._json({"annotation_job": pipeline.annotation_job_detail(self.runs_root, task, annotation_id)})
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"annotation_job": pipeline.annotation_job_detail(task_runs_root, task, annotation_id)})
             except ValueError as exc:
                 self._json({"error": str(exc), "found": False}, status=404)
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/agreement_audits":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"agreement_audits": pipeline.list_agreement_audits(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"agreement_audits": pipeline.list_agreement_audits(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/models":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"models": pipeline.list_models(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"models": pipeline.list_models(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/gold_versions":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"gold_versions": pipeline.list_gold_versions(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"gold_versions": pipeline.list_gold_versions(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/gold_version/detail":
             task = params.get("task_id", [""])[0]
             version = params.get("version", [""])[0]
@@ -2234,15 +2348,22 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task/version"}, status=400)
                 return
             try:
-                self._json({"gold_version": pipeline.gold_version_detail(self.runs_root, task, version)})
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"gold_version": pipeline.gold_version_detail(task_runs_root, task, version)})
             except ValueError as exc:
                 self._json({"error": str(exc), "found": False}, status=404)
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/decision_artifacts":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"decision_artifacts": pipeline.list_decision_artifacts(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"decision_artifacts": pipeline.list_decision_artifacts(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/decision_artifact/detail":
             task = params.get("task_id", [""])[0]
             decision_id = params.get("decision_id", [""])[0]
@@ -2250,16 +2371,23 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task/decision_id"}, status=400)
                 return
             try:
-                self._json({"decision_artifact": pipeline.decision_artifact_detail(self.runs_root, task, decision_id)})
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"decision_artifact": pipeline.decision_artifact_detail(task_runs_root, task, decision_id)})
             except ValueError as exc:
                 self._json({"error": str(exc), "found": False}, status=404)
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/decisions":
             task = params.get("task_id", [""])[0]
             run = params.get("run", [""])[0]
             if not _safe_segment(task) or not _safe_segment(run):
                 self._json({"error": "bad task/run"}, status=400)
                 return
-            self._json({"decisions": pipeline.list_decisions(self.runs_root, task, run)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"decisions": pipeline.list_decisions(task_runs_root, task, run)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/jobs":
             if _control_task_source_enabled():
                 self._control_jobs(params)
@@ -2268,13 +2396,21 @@ class _Handler(BaseHTTPRequestHandler):
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"jobs": pipeline.jobs_for_task(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"jobs": pipeline.jobs_for_task(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/audit":
             task = params.get("task_id", [""])[0]
             if not _safe_segment(task):
                 self._json({"error": "bad task"}, status=400)
                 return
-            self._json({"events": pipeline.list_audit_events(self.runs_root, task)})
+            try:
+                _, task_runs_root, _ = self._task_context(task, params)
+                self._json({"events": pipeline.list_audit_events(task_runs_root, task)})
+            except Exception as exc:
+                self._route_error(exc)
         elif path == "/api/task/data_lake":
             if _control_task_source_enabled():
                 self._control_data_lake_preview(params)
@@ -2287,7 +2423,11 @@ class _Handler(BaseHTTPRequestHandler):
                 from .data_lake import preview_source
 
                 _apply_runtime_settings(self.runs_root)
-                task_cfg = self._load_task_by_id(task)
+                task_cfg, _, _ = self._task_context(
+                    task,
+                    params,
+                    require_task_config=True,
+                )
                 self._json({
                     "enabled": bool(task_cfg.data_lake),
                     "data_lake": task_cfg.data_lake,
@@ -2379,7 +2519,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "task and action required"}, status=400)
                 return
             try:
-                job = pipeline.start_action(self.runs_root, self._resolve_action_task_path(task_path), action, body.get("params", {}))
+                resolved_task, resolved_runs_root = self._resolve_action_task_path(task_path, body)
+                job = pipeline.start_action(
+                    resolved_runs_root,
+                    resolved_task,
+                    action,
+                    body.get("params", {}),
+                )
                 self._json({"ok": True, "job": job})
             except Exception as exc:
                 self._json({"error": redact_text(exc)}, status=400)
@@ -2410,6 +2556,9 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._import_data_lake(params)
         elif path == "/api/task/archive":
+            if _control_task_source_enabled():
+                self._json({"error": "control 模式不能通过文件归档任务；请在控制面停用或归档任务"}, status=400)
+                return
             body = self._read_body()
             task_id = str(body.get("task_id") or params.get("task_id", [""])[0])
             reason = str(body.get("reason") or "")
@@ -2429,6 +2578,9 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/task/cache_cleanup":
+            if _control_task_source_enabled():
+                self._json({"error": "control 模式不能清理任务配置缓存"}, status=400)
+                return
             body = self._read_body()
             task_id = str(body.get("task_id") or params.get("task_id", [""])[0])
             if not _safe_segment(task_id):
@@ -2509,6 +2661,9 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/import":
+            if _control_task_source_enabled():
+                self._json({"error": "control 模式暂不提供文件资产归档入口"}, status=400)
+                return
             task_id = params.get("task_id", [""])[0]
             import_id = params.get("import_id", [""])[0]
             reason = params.get("reason", [""])[0]
@@ -2520,6 +2675,9 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/sample":
+            if _control_task_source_enabled():
+                self._json({"error": "control 模式暂不提供文件资产归档入口"}, status=400)
+                return
             task_id = params.get("task_id", [""])[0]
             sample_id = params.get("sample_id", [""])[0]
             reason = params.get("reason", [""])[0]
@@ -2531,6 +2689,9 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif path == "/api/annotation_job":
+            if _control_task_source_enabled():
+                self._json({"error": "control 模式暂不提供文件资产归档入口"}, status=400)
+                return
             task_id = params.get("task_id", [""])[0]
             annotation_id = params.get("annotation_id", [""])[0]
             reason = params.get("reason", [""])[0]
@@ -2568,11 +2729,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": str(exc)}, status=400)
             return
         try:
-            task_cfg = self._load_task_by_id(task)
-            result = pipeline.save_import(self.runs_root, task_cfg, name, rows, source="upload")
+            task_cfg, task_runs_root, _ = self._task_context(
+                task,
+                params,
+                require_task_config=True,
+            )
+            result = pipeline.save_import(task_runs_root, task_cfg, name, rows, source="upload")
             self._json({"ok": True, "import": result})
         except Exception as exc:
-            self._json({"error": str(exc)}, status=400)
+            self._route_error(exc)
 
     def _import_data_lake(self, params) -> None:
         body = self._read_body()
@@ -2660,9 +2825,13 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             from .suggestions import import_external_suggestions
 
-            task_cfg = self._load_task_by_id(task_id)
+            task_cfg, task_runs_root, _ = self._task_context(
+                task_id,
+                params,
+                require_task_config=True,
+            )
             result = import_external_suggestions(
-                self.runs_root,
+                task_runs_root,
                 task_cfg,
                 annotation_id,
                 suggestion_id,
@@ -2681,7 +2850,12 @@ class _Handler(BaseHTTPRequestHandler):
         if not _safe_segment(task) or not _safe_segment(import_id):
             self._json({"error": "bad task/import"}, status=400)
             return
-        path = self.runs_root / task / "imports" / import_id / "raw.jsonl"
+        try:
+            _, task_runs_root, _ = self._task_context(task, params)
+        except Exception as exc:
+            self._route_error(exc)
+            return
+        path = task_runs_root / task / "imports" / import_id / "raw.jsonl"
         if not path.exists():
             self._json({"error": "no data"}, status=404)
             return
@@ -2710,7 +2884,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "unknown suggestions download kind"}, status=400)
             return
         filename, content_type = files[kind]
-        path = self.runs_root / task / "suggestions" / annotation_id / suggestion_id / filename
+        try:
+            _, task_runs_root, _ = self._task_context(task, params)
+        except Exception as exc:
+            self._route_error(exc)
+            return
+        path = task_runs_root / task / "suggestions" / annotation_id / suggestion_id / filename
         if not path.is_file():
             self._json({"error": "no data"}, status=404)
             return
@@ -2751,6 +2930,17 @@ def serve_panel(
     _Handler.runs_root = Path(runs_root)
     _Handler.tasks_root = Path(tasks_root)
     _Handler.authenticator = authenticator
+    owned_active_task_loader = False
+    if _control_task_source_enabled() and active_task_loader is None:
+        try:
+            active_task_loader = ControlTaskSnapshotLoader.from_url(
+                None,
+                runs_root,
+                tasks_root,
+            )
+            owned_active_task_loader = True
+        except Exception:
+            active_task_loader = None
     try:
         authorization_service = _build_authorization_service()
     except Exception:
@@ -2782,3 +2972,5 @@ def serve_panel(
         httpd.server_close()
         if authorization_service is not None:
             authorization_service.close()
+        if owned_active_task_loader and active_task_loader is not None:
+            active_task_loader.close()

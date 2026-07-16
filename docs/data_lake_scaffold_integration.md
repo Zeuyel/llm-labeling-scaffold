@@ -6,7 +6,7 @@
 
 1. **任务单权威层**：`r2` 模式中，任务列表和远端 `task.yaml` 以 R2 registry 中登记的 URI 为准；`control` 模式中，任务单及其 revision 由 scaffold 控制面本地持久化。
 2. **panel settings 是运行配置层**：每个部署在“系统设置”中保存当前要使用的 `task_registry_uri` 和 `data_lake_r2_prefix`。同一套镜像可以连接不同团队、不同环境或不同 bucket。
-3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 保存 `r2` 模式的任务配置缓存，或 `control` 模式当前已发布的任务配置；`runs/` 保存控制面元数据、导入、样本、标注结果、训练集、模型、推理结果和审计日志。
+3. **本地 `tasks/` / `runs/` 是执行层**：`tasks/` 保存 `r2` 模式的任务配置缓存，或 control 模式由 materializer 维护的兼容缓存；control 运行时以 PostgreSQL current revision 对应的 immutable snapshot 为唯一任务配置来源。`runs/` 保存导入、样本、标注结果、训练集、模型、推理结果和审计日志。
 
 不要把某个单一项目、业务域或固定 R2 bucket 写死到部署说明中。生产环境必须按自己的 R2 registry 填写配置。
 

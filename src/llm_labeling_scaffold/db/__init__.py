@@ -1,6 +1,7 @@
 from .enums import AuditChannel, PrincipalType, Role, TaskMaterializationState
 from .materialization import (
     ControlTaskSnapshotLoader,
+    LoadedTaskRevision,
     MaterializationCrash,
     MaterializationError,
     SnapshotConflictError,
@@ -54,6 +55,7 @@ __all__ = [
     "AuthorizationSession",
     "AuthorizationUnavailable",
     "ControlTaskSnapshotLoader",
+    "LoadedTaskRevision",
     "DatabaseService",
     "ExternalIdentity",
     "IdempotencyClaim",

@@ -13,7 +13,7 @@ import uuid
 
 import yaml
 
-from .config import load_task, resolve_profile_id, with_runs_root
+from .config import TaskConfig, load_task, resolve_profile_id, with_runs_root
 from .io import append_jsonl, iter_jsonl, read_json, write_json, write_jsonl, write_text_atomic
 from .jobs import Job, create_job, get_job, run_job
 from .profiles import DEFAULT_PROFILE, list_profile_presets, profile_definition, status_label
@@ -1238,6 +1238,7 @@ def task_archive_plan(
     task,
     *,
     r2_task_source: bool = False,
+    control_task_source: bool = False,
 ) -> dict[str, Any]:
     task_id = str(getattr(task, "task_id", task)).strip()
     if not _safe_segment(task_id):
@@ -1246,16 +1247,31 @@ def task_archive_plan(
     warnings: list[dict[str, Any]] = []
     blocked: list[dict[str, Any]] = []
     task_config: dict[str, Any] | None = None
-    try:
-        task_config = _task_config_archive_info(tasks_root, task_id)
-        if not task_config.get("deletable"):
-            blocked.append({
-                "code": "task_config_readonly",
-                "message": "任务配置来自只读目录，不能由面板归档 task.yaml。",
-                "path": task_config.get("path"),
-            })
-    except Exception as exc:
-        blocked.append({"code": "task_config_missing", "message": str(exc)})
+    if control_task_source:
+        task_path = Path(getattr(task, "path", ""))
+        task_config = {
+            "task_id": task_id,
+            "path": str(task_path),
+            "task_dir": str(task_path.parent),
+            "root": str(task_path.parent.parent),
+            "deletable": False,
+        }
+        blocked.append({
+            "code": "control_task_authority",
+            "message": "control 模式任务配置由数据库 revision 权威管理，不能归档本地 task.yaml。",
+            "path": str(task_path),
+        })
+    else:
+        try:
+            task_config = _task_config_archive_info(tasks_root, task_id)
+            if not task_config.get("deletable"):
+                blocked.append({
+                    "code": "task_config_readonly",
+                    "message": "任务配置来自只读目录，不能由面板归档 task.yaml。",
+                    "path": task_config.get("path"),
+                })
+        except Exception as exc:
+            blocked.append({"code": "task_config_missing", "message": str(exc)})
     if r2_task_source:
         blocked.append({
             "code": "r2_registry_authority",
@@ -1271,7 +1287,7 @@ def task_archive_plan(
         })
     return {
         "task_id": task_id,
-        "mode": "r2" if r2_task_source else "local",
+        "mode": "control" if control_task_source else "r2" if r2_task_source else "local",
         "can_archive": not blocked,
         "blocked": blocked,
         "warnings": warnings,
@@ -2047,11 +2063,16 @@ def _reject_argilla_sensitive_params(action: str, params: dict[str, Any]) -> Non
         )
 
 
-def start_action(runs_root: Path, task_path: str, action: str, params: dict) -> dict:
+def start_action(runs_root: Path, task_path: str | Path | TaskConfig, action: str, params: dict) -> dict:
     _reject_argilla_sensitive_params(action, params)
-    task = with_runs_root(load_task(task_path), runs_root)
+    if isinstance(task_path, TaskConfig):
+        task = with_runs_root(task_path, runs_root)
+        task_reference = str(task_path.path)
+    else:
+        task = with_runs_root(load_task(task_path), runs_root)
+        task_reference = str(task_path)
     jobs_dir = _jobs_dir(runs_root, task.task_id)
-    job = create_job(action, dict(params, task=task_path), jobs_dir)
+    job = create_job(action, dict(params, task=task_reference), jobs_dir)
 
     def target(j: Job) -> dict:
         j.log(f"action={action} task={task.task_id}")

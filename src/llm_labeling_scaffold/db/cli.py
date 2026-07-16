@@ -44,6 +44,16 @@ def add_db_parser(subparsers) -> None:
     materialize.add_argument("--drain-seconds", type=float)
     materialize.add_argument("--once", action="store_true")
 
+    legacy_import = db_sub.add_parser("import-legacy-tasks")
+    legacy_import.add_argument("--database-url")
+    legacy_import.add_argument("--registry", required=True)
+    legacy_import.add_argument("--workspace", required=True)
+    legacy_import.add_argument("--actor-issuer", required=True)
+    legacy_import.add_argument("--actor-subject", required=True)
+    legacy_import.add_argument("--caller-issuer")
+    legacy_import.add_argument("--caller-subject")
+    legacy_import.add_argument("--confirm", action="store_true")
+
     status = db_sub.add_parser("materialization-status")
     status.add_argument("materialization_id", type=uuid.UUID)
     status.add_argument("--database-url")
@@ -67,6 +77,28 @@ def handle_db_command(args: argparse.Namespace) -> None:
             _print_json(worker.status(args.materialization_id).to_dict())
         finally:
             worker.close()
+        return
+
+    if args.db_cmd == "import-legacy-tasks":
+        from .legacy_import import import_legacy_registry
+        from .service import ExternalIdentity
+
+        caller_issuer = args.caller_issuer or args.actor_issuer
+        caller_subject = args.caller_subject or args.actor_subject
+        engine = create_database_engine(args.database_url)
+        try:
+            with Session(engine) as session, session.begin():
+                result = import_legacy_registry(
+                    session,
+                    registry_path=args.registry,
+                    workspace_slug=args.workspace,
+                    actor_identity=ExternalIdentity(args.actor_issuer, args.actor_subject),
+                    caller_identity=ExternalIdentity(caller_issuer, caller_subject),
+                    confirm=args.confirm,
+                )
+        finally:
+            engine.dispose()
+        _print_json(result)
         return
 
     if args.db_cmd == "materialize":
