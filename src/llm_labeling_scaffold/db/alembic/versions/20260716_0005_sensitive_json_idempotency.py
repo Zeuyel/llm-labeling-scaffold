@@ -348,8 +348,8 @@ def _configure_postgres_runtime_roles() -> None:
             app_role_name text := {app_role_literal};
         BEGIN
             FOR table_name, privilege_list IN
-                SELECT relation_name, privilege_list
-                FROM (VALUES {table_privileges}) AS runtime(relation_name, privilege_list)
+                SELECT relation_name, runtime_privileges
+                FROM (VALUES {table_privileges}) AS runtime(relation_name, runtime_privileges)
             LOOP
                 EXECUTE format(
                     'GRANT %s ON TABLE public.%I TO %I',
