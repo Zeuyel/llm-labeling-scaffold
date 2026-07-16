@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import uuid
 
 from sqlalchemy.orm import Session
 
@@ -30,11 +31,79 @@ def add_db_parser(subparsers) -> None:
     bootstrap.add_argument("--workspace-slug")
     bootstrap.add_argument("--workspace-name")
 
+    materialize = db_sub.add_parser("materialize")
+    materialize.add_argument("--database-url")
+    materialize.add_argument("--runs-root", default="runs")
+    materialize.add_argument("--tasks-root", default="tasks")
+    materialize.add_argument("--worker-id")
+    materialize.add_argument("--lease-seconds", type=float, default=30.0)
+    materialize.add_argument("--retry-delay-seconds", type=float, default=1.0)
+    materialize.add_argument("--max-attempts", type=int, default=5)
+    materialize.add_argument("--poll-seconds", type=float, default=1.0)
+    materialize.add_argument("--materialization-id", type=uuid.UUID)
+    materialize.add_argument("--drain-seconds", type=float)
+    materialize.add_argument("--once", action="store_true")
+
+    status = db_sub.add_parser("materialization-status")
+    status.add_argument("materialization_id", type=uuid.UUID)
+    status.add_argument("--database-url")
+    status.add_argument("--runs-root", default="runs")
+
 
 def handle_db_command(args: argparse.Namespace) -> None:
     if args.db_cmd == "upgrade":
         result = upgrade_database(args.database_url, args.revision)
         _print_json(result.to_dict())
+        return
+
+    if args.db_cmd == "materialization-status":
+        from .materialization import TaskMaterializationWorker
+
+        worker = TaskMaterializationWorker.from_url(
+            args.database_url,
+            runs_root=args.runs_root,
+        )
+        try:
+            _print_json(worker.status(args.materialization_id).to_dict())
+        finally:
+            worker.close()
+        return
+
+    if args.db_cmd == "materialize":
+        from .materialization import TaskMaterializationWorker
+
+        if args.drain_seconds is not None and args.materialization_id is None:
+            raise SystemExit("--drain-seconds requires --materialization-id")
+        if args.materialization_id is not None and not args.once and args.drain_seconds is None:
+            raise SystemExit("--materialization-id requires --once or --drain-seconds")
+        worker = TaskMaterializationWorker.from_url(
+            args.database_url,
+            runs_root=args.runs_root,
+            tasks_root=args.tasks_root,
+            worker_id=args.worker_id,
+            lease_seconds=args.lease_seconds,
+            retry_delay_seconds=args.retry_delay_seconds,
+            max_attempts=args.max_attempts,
+            poll_seconds=args.poll_seconds,
+        )
+        try:
+            if args.drain_seconds is not None:
+                _print_json(
+                    worker.drain(
+                        args.materialization_id,
+                        timeout_seconds=args.drain_seconds,
+                    ).to_dict(),
+                )
+            elif args.once:
+                result = worker.run_once(args.materialization_id)
+                payload = result.to_dict()
+                if args.materialization_id is not None:
+                    payload["status"] = worker.status(args.materialization_id).to_dict()
+                _print_json(payload)
+            else:
+                worker.run_forever()
+        finally:
+            worker.close()
         return
 
     database_url = resolve_database_url(args.database_url)
