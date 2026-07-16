@@ -998,3 +998,26 @@ def test_panel_api_errors_redact_configured_tokens():
     assert MCP_TOKEN not in str(exc_info.value)
     assert assertion not in str(exc_info.value)
     assert str(exc_info.value).count("[REDACTED]") == 3
+
+
+def test_panel_api_errors_redact_short_configured_tokens():
+    short_token = "todo"
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": f"echo {short_token}"})
+
+    async def run():
+        client = PanelApiClient(
+            _config(bearer_token=short_token),
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            await client.get("/api/tasks")
+        finally:
+            await client.aclose()
+
+    with pytest.raises(PanelApiError) as exc_info:
+        asyncio.run(run())
+
+    assert short_token not in str(exc_info.value)
+    assert "[REDACTED]" in str(exc_info.value)
