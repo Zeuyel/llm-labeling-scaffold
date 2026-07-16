@@ -10,11 +10,11 @@ Scaffold 使用独立 PostgreSQL 保存身份、工作空间、授权和审计�
 - `workspaces`：租户和资源隔离边界。
 - `role_bindings`：工作空间级或任务级角色绑定；任务绑定使用复合外键保证任务属于同一工作空间。
 - `tasks`：只提供 workspace-scoped `TaskRef` 与 task ACL 所需基础，不定义 draft、revision 或可见状态。由于现有 `runs/<task_id>`、`tasks/<task_id>` 文件路径尚未按 workspace 分区，初始 schema 暂时强制 `task_key` 全局唯一；授权查询仍必须同时携带 workspace。
-- `idempotency_records`、`workspace_settings`：工作空间级幂等记录和设置；数据库只保存 idempotency key 的 SHA-256，不保存或回显原 key，并同时绑定 actor、caller 和规范化 request fingerprint，重复键不能由其他主体重放。
-- `audit_events`：带 actor 身份快照的追加式审计事件。
+- `idempotency_records`、`workspace_settings`：工作空间级幂等记录和设置；数据库只保存 idempotency key 的 SHA-256，不保存或回显原 key，并同时绑定 actor、caller 和规范化 request fingerprint，重复键不能由其他主体重放。0003 对旧记录的新增授权上下文列保持 nullable，无法推断的旧 claim 保留原状态和响应但不能被 completion 重新授权。
+- `audit_events`：带 actor 身份快照的追加式审计事件；不保存 email snapshot。
 - `migration_runs`：`lls db upgrade` 的执行记录；Alembic revision 仍由 `alembic_version` 管理。
 
-`idempotency_records.response_body`、`workspace_settings.setting_value` 和 `audit_events.details` 在 PostgreSQL 使用 `JSONB`，SQLite 测试环境保持通用 `JSON`。
+`idempotency_records.response_body`、`workspace_settings.setting_value` 和 `audit_events.details` 在 PostgreSQL 使用保留原始文本的 `json`，SQLite 使用通用 `JSON` 文本。两端的数据库入口都会在敏感检查前拒绝重复 object key；Python、SQLite、PostgreSQL 共同执行 64 KiB canonical UTF-8、8 层容器、ASCII identifier key、Unicode NFC 和敏感 key/value 契约。
 
 ### Allocation 持久化不变量
 
@@ -51,8 +51,8 @@ Panel、MCP 和后续认证层不直接接收 SQLAlchemy ORM 或 `Session`。公
 - `get_session`、`list_authorized_workspaces`：只返回不可变的 principal、workspace 级角色、`workspace_capabilities`，以及该 workspace role 可继承到任务的 `task_capabilities`；不枚举任务，也不创建数据库 session/token 表。
 - `list_authorized_tasks`：按 workspace 和 task ACL 延迟加载任务，必须显式传入 `limit`，单页上限 100，并使用 `after_task_key` cursor 翻页。
 - `authorize_workspace`、`authorize_task`：每次从数据库读取角色，不缓存放行结果。
-- `claim_idempotency`、`complete_idempotency`：原子 claim/pending/replay，唯一范围固定为 workspace + operation + key hash；actor、caller 或 request fingerprint 任一不一致即返回稳定 conflict，绝不返回其他主体的 response。
-- `grant_workspace_membership`、`change_workspace_membership`、`revoke_workspace_membership`：先通过标准 workspace 授权入口保持 `resource_not_visible` 语义，再按 role binding → workspace 顺序加锁并重新校验 `WORKSPACE_MANAGE`；原子修改 binding 并追加审计，重复操作返回稳定的 unchanged 结果。
+- `claim_idempotency`、`complete_idempotency`：原子 claim/pending/replay，唯一范围固定为 workspace + operation + key hash；actor、caller 或 request fingerprint 任一不一致即返回稳定 conflict，绝不返回其他主体的 response。PostgreSQL app role 没有 `idempotency_records` 的 UPDATE/DELETE 权限，completion 只能调用 owner-side security-definer gate；SQLite Core SQL 由同等连接 gate trigger 保护。gate 会重新锁定并读取 workspace、principal、role binding、task/resource 的 active、permission 和 visibility，再写 terminal response 与一条 completion audit。
+- `grant_workspace_membership`、`change_workspace_membership`、`revoke_workspace_membership`：先通过标准 workspace 授权入口保持 `resource_not_visible` 语义，再按 workspace → principal → role binding → task/resource 锁序重新校验 `WORKSPACE_MANAGE`；原子修改 binding 并追加审计，重复操作返回稳定的 unchanged 结果。
 - `transaction`、`append_audit`：在 façade 事务内组合授权和追加审计，不向调用方暴露 ORM session。
 
 `TASK_CREATE` 是 workspace-scoped 权限，只授予 `experimenter` 和 `admin`。其他 task 权限只能传给 task 授权入口；`AUDIT_VIEW`、`WORKSPACE_MANAGE` 和 `TASK_CREATE` 不能通过 task role 获得。actor 与 caller 不同时，caller 必须是 active service principal；普通用户不能伪装成另一用户的调用方。
@@ -119,7 +119,7 @@ export LLS_DATABASE_URL='postgresql+psycopg://scaffold_owner:<url-encoded-owner-
 alembic upgrade head
 ```
 
-`LLS_DATABASE_URL` 必须指向 Scaffold 数据库，不能指向 Argilla 的 `argilla` 数据库。迁移前应先备份生产数据库；不要在多个发布任务中同时执行 downgrade。
+`LLS_DATABASE_URL` 必须指向 Scaffold 数据库，不能指向 Argilla 的 `argilla` 数据库。迁移前应先备份生产数据库；不要在多个发布任务中同时执行 downgrade。0003 是无损前向迁移：不删除 `idempotency_records`，旧记录的状态、key hash、actor/caller context 和 response 原样保留；无法回填的新授权列为空并使旧 claim fail closed。downgrade 会移除新 gate/校验触发器并恢复 email 列，但保留新增幂等列和原始 JSON 类型，避免静默丢失新上下文或重复 key 原文。
 
 Compose 不提供数据库密码默认值。开发环境可生成 URL 安全的十六进制随机密码并写入本地 `.env`：
 
@@ -143,6 +143,7 @@ docker compose run --rm db-role-verify
 ```
 
 app role 只在目标数据库获得 `CONNECT`，没有任何数据库的 `CREATE`/`TEMP`、schema `CREATE`、role membership、sequence、函数或未来对象的默认权限。当前白名单仅允许读取 principal/workspace/task/role binding，创建和更新指定展示列的 principal，创建和更新指定完成列的 idempotency record，创建 workspace setting，以及读取和追加 audit event；migration 与 Alembic 表不可见。除 `pg_catalog`、`information_schema`、`pg_toast` 及 PostgreSQL 临时 schema 外，用户 schema 目录必须精确等于 `public`；新增用户 schema 即使没有授予任何权限也会 fail closed。初始化会先撤销 app/PUBLIC 在所有用户 schema 及其中 table/column/sequence/function 上的权限，verifier 再对用户 schema 目录、每列的有效 `SELECT`/`INSERT`/`UPDATE`/`REFERENCES`、runtime 相关 column ACL、relation ACL、空 sequence 集合，以及函数名、identity argument signature、类型、返回值和语言做等值校验。
+app role 只在目标数据库获得 `CONNECT`，没有任何数据库的 `CREATE`/`TEMP`、schema `CREATE`、role membership、sequence、函数或未来对象的默认权限。当前白名单仅允许读取 principal/workspace/task/role binding，创建和更新指定展示列的 principal，创建和更新指定完成列的 idempotency record，创建 workspace setting，以及读取和追加 audit event；migration 与 Alembic 表不可见。除 `pg_catalog`、`information_schema`、`pg_toast` 及 PostgreSQL 临时 schema 外，用户 schema 目录必须精确等于 `public`；新增用户 schema 即使没有授予任何权限也会 fail closed。初始化会先撤销 app/PUBLIC 在所有用户 schema 及其中 table/column/sequence/function 上的权限，verifier 再对用户 schema 目录、每列的有效 `SELECT`/`INSERT`/`UPDATE`/`REFERENCES`、runtime 相关 column ACL、relation ACL、空 sequence 集合，以及函数名、identity argument signature、类型、返回值和语言做等值校验。
 
 ownership 也属于启动前白名单：目标数据库和迁移产生的 public relation、审计 trigger function 必须由 `owner_user`（即预期迁移 owner）所有；PG16 默认的 `public` schema owner `pg_database_owner` 是唯一额外允许值。app 或未知角色成为这些对象的 owner 会使 verifier fail closed。初始化只执行权限和 role 收敛，并在已有对象上先做 ownership preflight，不会把漂移对象重新改回 owner；因此 ownership drift 仍会阻止启动。
 
@@ -150,7 +151,7 @@ ownership 也属于启动前白名单：目标数据库和迁移产生的 public
 
 跨数据库隔离依赖专用 PostgreSQL 集群。PostgreSQL 没有 ACL `DENY`，runtime role 会继承其他数据库默认授予 `PUBLIC` 的 `CONNECT`/`TEMP`；因此初始化必须以该专用集群的超级用户执行，并撤销当前集群所有数据库对 `PUBLIC` 和 app 的权限，再只向目标数据库授予 app `CONNECT`。非超级 owner、共享托管集群或不能修改所有数据库 ACL 的环境会直接初始化失败，不得把该脚本描述为已经提供集群级最小权限。此类环境必须由 DBA 提供独立集群或等价的 `pg_hba.conf` 与数据库 ACL 隔离后再接入。
 
-数据库 ACL 验证是当前 catalog 的时点保证。验证后新建数据库会重新获得 PostgreSQL 默认的 `PUBLIC CONNECT/TEMP`；专用集群应禁止发布流程外创建数据库，确需创建时必须在 app 再次启动前重跑 `db-role-init` 与 `db-role-verify`。
+数据库 ACL 验证是当前 catalog 的时点保证。验证后新建数据库会重新获得 PostgreSQL 默认的 `PUBLIC CONNECT/TEMP`；专用集群应禁止发布流程外创建数据库，确需创建时必须在 app 再次启动前重跑 `db-role-init` 与 `db-role-verify`。已有数据库若由外部 PostgreSQL 托管，应由具备创建/修改 role 权限的 DBA 运行 `docker/postgres/init-runtime-role.sh`，并确保 `POSTGRES_USER` 是后续执行迁移、拥有 schema 对象的 owner。app role 对 `idempotency_records` 和 `audit_events` 不获得 UPDATE/DELETE，只能通过受控 completion function 完成幂等终结写入。
 
 ## 首位管理员
 

@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from .enums import AuditActorType, AuditChannel
 from .models import AuditEvent, Principal
+from .sensitive_json import normalize_sensitive_json_object
 
 
 SYSTEM_ISSUER = "llm-labeling-scaffold"
@@ -32,14 +33,14 @@ def append_audit_event(
         actor_issuer = SYSTEM_ISSUER
         actor_subject = SYSTEM_SUBJECT
         actor_display_name = None
-        actor_email_snapshot = None
     else:
         actor_type = AuditActorType.PRINCIPAL
         actor_principal_id = actor.id
         actor_issuer = actor.issuer
         actor_subject = actor.subject
         actor_display_name = actor.display_name
-        actor_email_snapshot = actor.email_snapshot
+
+    normalized_details = {} if details is None else normalize_sensitive_json_object(details)
 
     event = AuditEvent(
         workspace_id=workspace_id,
@@ -50,12 +51,11 @@ def append_audit_event(
         actor_issuer=actor_issuer,
         actor_subject=actor_subject,
         actor_display_name=actor_display_name,
-        actor_email_snapshot=actor_email_snapshot,
         event_type=event_type,
         resource_type=resource_type,
         resource_id=str(resource_id) if resource_id is not None else None,
         request_id=request_id,
-        details=details or {},
+        details=normalized_details,
     )
     session.add(event)
     return event

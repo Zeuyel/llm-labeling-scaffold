@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -43,6 +45,10 @@ from llm_labeling_scaffold.db.models import (
     TaskRevisionMaterialization,
     Workspace,
     WorkspaceSetting,
+)
+from llm_labeling_scaffold.db.sensitive_json import (
+    MAX_CANONICAL_JSON_BYTES,
+    canonical_sensitive_json_bytes,
 )
 
 
@@ -341,6 +347,204 @@ def test_sqlite_membership_revision_upgrades_existing_0001_database(tmp_path: Pa
         engine.dispose()
 
 
+def test_sqlite_sensitive_json_revision_round_trips_existing_0002_database(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'sensitive-json-upgrade.db'}"
+    config = build_alembic_config(database_url)
+    command.upgrade(config, "20260715_0002")
+    engine = create_database_engine(database_url)
+    try:
+        previous_idempotency_columns = {
+            column["name"] for column in inspect(engine).get_columns("idempotency_records")
+        }
+        previous_audit_columns = {
+            column["name"] for column in inspect(engine).get_columns("audit_events")
+        }
+        assert "required_permission" not in previous_idempotency_columns
+        assert "actor_email_snapshot" in previous_audit_columns
+        with Session(engine) as session:
+            result = bootstrap_admin(
+                session,
+                issuer="https://sqlite-0002.example",
+                subject="admin",
+                workspace_slug="sqlite-0002",
+                workspace_name="SQLite 0002",
+            )
+        pending_id = uuid.uuid4()
+        terminal_id = uuid.uuid4()
+        pending_key_hash = hashlib.sha256(b"legacy-pending-key").hexdigest()
+        terminal_key_hash = hashlib.sha256(b"legacy-terminal-key").hexdigest()
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                INSERT INTO idempotency_records (
+                    id, workspace_id, actor_principal_id, caller_principal_id,
+                    operation, idempotency_key_hash, request_fingerprint,
+                    state, response_status, response_body
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    pending_id.hex,
+                    result.workspace_id.hex,
+                    result.principal_id.hex,
+                    result.principal_id.hex,
+                    "task.publish",
+                    pending_key_hash,
+                    hashlib.sha256(b"legacy-request").hexdigest(),
+                    "pending",
+                    None,
+                    None,
+                ),
+            )
+            connection.exec_driver_sql(
+                """
+                INSERT INTO idempotency_records (
+                    id, workspace_id, actor_principal_id, caller_principal_id,
+                    operation, idempotency_key_hash, request_fingerprint,
+                    state, response_status, response_body
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    terminal_id.hex,
+                    result.workspace_id.hex,
+                    result.principal_id.hex,
+                    result.principal_id.hex,
+                    "task.publish",
+                    terminal_key_hash,
+                    hashlib.sha256(b"legacy-terminal-request").hexdigest(),
+                    "succeeded",
+                    200,
+                    '{"published":true,"label":"é"}',
+                ),
+            )
+    finally:
+        engine.dispose()
+
+    command.upgrade(config, "head")
+    engine = create_database_engine(database_url)
+    try:
+        head_idempotency_columns = {
+            column["name"] for column in inspect(engine).get_columns("idempotency_records")
+        }
+        head_audit_columns = {
+            column["name"] for column in inspect(engine).get_columns("audit_events")
+        }
+        assert {
+            "required_permission",
+            "resource_type",
+            "resource_id",
+            "channel",
+        } <= head_idempotency_columns
+        assert "actor_email_snapshot" not in head_audit_columns
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM idempotency_records")) == 2
+            rows = connection.execute(
+                text(
+                    "SELECT id, idempotency_key_hash, state, response_status, response_body, "
+                    "required_permission, resource_type, resource_id, channel "
+                    "FROM idempotency_records ORDER BY id"
+                )
+            ).mappings().all()
+            triggers = set(
+                connection.scalars(
+                    text("SELECT name FROM sqlite_master WHERE type = 'trigger'"),
+                )
+            )
+        pending_row = next(row for row in rows if str(row["id"]).replace("-", "") == pending_id.hex)
+        terminal_row = next(row for row in rows if str(row["id"]).replace("-", "") == terminal_id.hex)
+        assert pending_row["idempotency_key_hash"] == pending_key_hash
+        assert pending_row["state"] == "pending"
+        assert pending_row["response_status"] is None
+        assert pending_row["response_body"] is None
+        assert terminal_row["idempotency_key_hash"] == terminal_key_hash
+        assert terminal_row["state"] == "succeeded"
+        assert terminal_row["response_status"] == 200
+        assert terminal_row["response_body"] == '{"published":true,"label":"é"}'
+        assert all(row["required_permission"] is None for row in rows)
+        assert all(row["resource_type"] is None for row in rows)
+        assert all(row["resource_id"] is None for row in rows)
+        assert all(row["channel"] is None for row in rows)
+        assert {
+            "trg_idempotency_records_sensitive_json_insert",
+            "trg_workspace_settings_sensitive_json_insert",
+            "trg_audit_events_sensitive_json_insert",
+            "trg_idempotency_records_controlled_insert",
+            "trg_idempotency_records_controlled_update",
+            "trg_idempotency_records_controlled_delete",
+        } <= triggers
+        with engine.begin() as connection:
+            connection.exec_driver_sql(
+                """
+                INSERT INTO workspace_settings (
+                    id, workspace_id, setting_key, setting_value, updated_by_principal_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    result.workspace_id.hex,
+                    "email_templates",
+                    '{"email_templates":{"enabled":true}}',
+                    result.principal_id.hex,
+                ),
+            )
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    """
+                    INSERT INTO workspace_settings (
+                        id, workspace_id, setting_key, setting_value, updated_by_principal_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        uuid.uuid4().hex,
+                        result.workspace_id.hex,
+                        "raw_invalid",
+                        '{"message":"contact admin@example.test"}',
+                        result.principal_id.hex,
+                    ),
+                )
+    finally:
+        engine.dispose()
+
+    command.downgrade(config, "20260715_0002")
+    engine = create_database_engine(database_url)
+    try:
+        downgraded_idempotency_columns = {
+            column["name"] for column in inspect(engine).get_columns("idempotency_records")
+        }
+        downgraded_audit_columns = {
+            column["name"] for column in inspect(engine).get_columns("audit_events")
+        }
+        assert {
+            "required_permission",
+            "resource_type",
+            "resource_id",
+            "channel",
+        } <= downgraded_idempotency_columns
+        assert "actor_email_snapshot" in downgraded_audit_columns
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM idempotency_records")) == 2
+            assert connection.scalar(
+                text(
+                    "SELECT response_body FROM idempotency_records "
+                    "WHERE id = :id"
+                ),
+                {"id": terminal_id.hex},
+            ) == '{"published":true,"label":"é"}'
+            triggers = set(
+                connection.scalars(
+                    text("SELECT name FROM sqlite_master WHERE type = 'trigger'"),
+                )
+            )
+        assert {
+            "trg_audit_events_append_only_update",
+            "trg_audit_events_append_only_delete",
+        } <= triggers
+        assert not any("sensitive_json" in trigger for trigger in triggers)
+        assert not any("idempotency_records_controlled" in trigger for trigger in triggers)
+    finally:
+        engine.dispose()
+
+
 def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: Path):
     database_url = f"sqlite+pysqlite:///{tmp_path / 'migration.db'}"
     command.upgrade(build_alembic_config(database_url), "head")
@@ -387,7 +591,13 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
             for foreign_key in revision_foreign_keys
         )
         idempotency_columns = {column["name"] for column in inspect(engine).get_columns("idempotency_records")}
-        assert "idempotency_key_hash" in idempotency_columns
+        assert {
+            "idempotency_key_hash",
+            "required_permission",
+            "resource_type",
+            "resource_id",
+            "channel",
+        } <= idempotency_columns
         assert "idempotency_key" not in idempotency_columns
         assert "current_revision_id" in {column["name"] for column in inspect(engine).get_columns("tasks")}
         assert "lease_expires_at" in {
@@ -401,6 +611,27 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
             "workspace_id",
             "task_id",
         ]
+        assert first.applied_revision == EXPECTED_ALEMBIC_HEAD
+        assert second.applied_revision == EXPECTED_ALEMBIC_HEAD
+        audit_columns = {column["name"] for column in inspect(engine).get_columns("audit_events")}
+        assert "actor_email_snapshot" not in audit_columns
+        with engine.connect() as connection:
+            triggers = set(
+                connection.scalars(
+                    text("SELECT name FROM sqlite_master WHERE type = 'trigger'"),
+                )
+            )
+        assert {
+            "trg_idempotency_records_sensitive_json_insert",
+            "trg_idempotency_records_sensitive_json_update",
+            "trg_workspace_settings_sensitive_json_insert",
+            "trg_workspace_settings_sensitive_json_update",
+            "trg_audit_events_sensitive_json_insert",
+            "trg_audit_events_sensitive_json_update",
+            "trg_idempotency_records_controlled_insert",
+            "trg_idempotency_records_controlled_update",
+            "trg_idempotency_records_controlled_delete",
+        } <= triggers
         assert first.applied_revision == EXPECTED_ALEMBIC_HEAD
         assert second.applied_revision == EXPECTED_ALEMBIC_HEAD
         with Session(engine) as session:
@@ -663,6 +894,17 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
                 text("SELECT event_type FROM audit_events WHERE workspace_id = :workspace_id"),
                 {"workspace_id": result.workspace_id},
             )
+            json_columns = set(
+                connection.execute(
+                    text(
+                        """
+                        SELECT table_name, column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema() AND data_type = 'json'
+                        """
+                    )
+                ).tuples()
+            )
             jsonb_columns = set(
                 connection.execute(
                     text(
@@ -698,6 +940,42 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
                     """
                 )
             ).tuples()
+            sensitive_functions = set(
+                connection.scalars(
+                    text(
+                        """
+                        SELECT proname
+                        FROM pg_proc
+                        WHERE proname LIKE 'lls_%sensitive_json%'
+                        """
+                    )
+                )
+            )
+            sensitive_triggers = set(
+                connection.scalars(
+                    text(
+                        """
+                        SELECT tgname
+                        FROM pg_trigger
+                        WHERE tgname LIKE 'trg_%sensitive_json%'
+                          AND NOT tgisinternal
+                        """
+                    )
+                )
+            )
+            audit_columns = {
+                row[0]
+                for row in connection.execute(
+                    text(
+                        """
+                        SELECT column_name
+                        FROM information_schema.columns
+                        WHERE table_schema = current_schema()
+                          AND table_name = 'audit_events'
+                        """
+                    )
+                )
+            }
             revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
         actual_enums: dict[str, list[str]] = {}
         for enum_name, enum_value in enum_rows:
@@ -717,6 +995,85 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
             ("task_drafts", "definition"),
             ("task_revisions", "definition"),
         } <= jsonb_columns
+        assert {
+            ("idempotency_records", "response_body"),
+            ("workspace_settings", "setting_value"),
+            ("audit_events", "details"),
+        } <= json_columns
+        assert "actor_email_snapshot" not in audit_columns
+        assert {
+            "lls_canonical_sensitive_json_text",
+            "lls_sensitive_json_string_is_safe",
+            "lls_sensitive_json_node_is_valid",
+            "lls_sensitive_json_object_is_valid",
+        } <= sensitive_functions
+        assert {
+            "trg_idempotency_records_sensitive_json",
+            "trg_workspace_settings_sensitive_json",
+            "trg_audit_events_sensitive_json",
+        } <= sensitive_triggers
+
+        empty_size = len(canonical_sensitive_json_bytes({"payload": ""}))
+        exact_document = canonical_sensitive_json_bytes(
+            {"payload": "a" * (MAX_CANONICAL_JSON_BYTES - empty_size)}
+        ).decode()
+        depth_eight: dict[str, object] = {}
+        for _ in range(7):
+            depth_eight = {"level": depth_eight}
+        with engine.begin() as connection:
+            for setting_key, document in (
+                (f"pg-exact-{suffix}", exact_document),
+                (f"pg-depth-{suffix}", json.dumps(depth_eight, separators=(",", ":"))),
+                (f"pg-template-{suffix}", '{"email_templates":{"enabled":true}}'),
+            ):
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO workspace_settings (
+                            id, workspace_id, setting_key, setting_value, updated_by_principal_id
+                        ) VALUES (
+                            :id, :workspace_id, :setting_key, CAST(:setting_value AS json), :principal_id
+                        )
+                        """
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "workspace_id": result.workspace_id,
+                        "setting_key": setting_key,
+                        "setting_value": document,
+                        "principal_id": result.principal_id,
+                    },
+                )
+
+        invalid_documents = (
+            '{"safe":1,"safe":2}',
+            json.dumps({"tоken": "value"}, ensure_ascii=False),
+            json.dumps({"message": "contact admin@example.test"}),
+            json.dumps({"payload": "a" * (MAX_CANONICAL_JSON_BYTES - empty_size + 1)}),
+            json.dumps({"level": depth_eight}, separators=(",", ":")),
+        )
+        for index, document in enumerate(invalid_documents):
+            with pytest.raises(DBAPIError):
+                with engine.begin() as connection:
+                    connection.execute(
+                        text(
+                            """
+                            INSERT INTO workspace_settings (
+                                id, workspace_id, setting_key, setting_value, updated_by_principal_id
+                            ) VALUES (
+                                :id, :workspace_id, :setting_key,
+                                CAST(:setting_value AS json), :principal_id
+                            )
+                            """
+                        ),
+                        {
+                            "id": uuid.uuid4(),
+                            "workspace_id": result.workspace_id,
+                            "setting_key": f"pg-invalid-{suffix}-{index}",
+                            "setting_value": document,
+                            "principal_id": result.principal_id,
+                        },
+                    )
     finally:
         engine.dispose()
 
@@ -797,6 +1154,261 @@ def test_postgres_runtime_role_has_dml_without_ddl_or_truncate():
     not os.environ.get("LLS_TEST_POSTGRES_URL") or not os.environ.get("LLS_TEST_POSTGRES_APP_URL"),
     reason="PostgreSQL owner/app test URLs are not set",
 )
+def test_postgres_app_role_cannot_directly_complete_or_forge_idempotency():
+    owner_url = os.environ["LLS_TEST_POSTGRES_URL"]
+    app_url = os.environ["LLS_TEST_POSTGRES_APP_URL"]
+    command.upgrade(build_alembic_config(owner_url), "head")
+    suffix = uuid.uuid4().hex[:12]
+    actor_identity = ExternalIdentity("https://app-boundary.example", f"admin-{suffix}")
+    caller_identity = ExternalIdentity("llm-labeling-scaffold", f"service-{suffix}")
+    workspace_slug = f"app-boundary-{suffix}"
+    owner_engine = create_database_engine(owner_url)
+    app_engine = create_database_engine(app_url)
+    try:
+        with Session(owner_engine) as session:
+            result = bootstrap_admin(
+                session,
+                issuer=actor_identity.issuer,
+                subject=actor_identity.subject,
+                workspace_slug=workspace_slug,
+                workspace_name="App Boundary",
+            )
+        owner_service = DatabaseService.from_url(owner_url)
+        try:
+            owner_service.resolve_or_provision(caller_identity, PrincipalType.SERVICE)
+        finally:
+            owner_service.close()
+        with Session(owner_engine) as session, session.begin():
+            task = Task(
+                workspace_id=result.workspace_id,
+                task_key=f"task-{suffix}",
+                name="Task",
+                created_by_principal_id=result.principal_id,
+            )
+            session.add(task)
+            session.flush()
+            task_key = task.task_key
+            session.add(
+                RoleBinding(
+                    workspace_id=result.workspace_id,
+                    principal_id=result.principal_id,
+                    task_id=task.id,
+                    role=Role.ADMIN,
+                )
+            )
+
+        service = DatabaseService.from_url(app_url)
+        try:
+            claim = service.claim_idempotency(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+                required_permission=Permission.TASK_PUBLISH,
+                operation="task.publish",
+                idempotency_key=f"key-{suffix}",
+                request_payload={"revision": 1},
+                channel=AuditChannel.MCP,
+            )
+            with Session(app_engine) as session:
+                assert session.scalar(
+                    text(
+                        "SELECT has_table_privilege(current_user, "
+                        "'idempotency_records', 'UPDATE')"
+                    )
+                ) is False
+            with pytest.raises(DBAPIError):
+                with app_engine.begin() as connection:
+                    connection.execute(
+                        update(IdempotencyRecord)
+                        .where(IdempotencyRecord.id == claim.record_id)
+                        .values(
+                            state=IdempotencyState.SUCCEEDED,
+                            response_status=200,
+                            response_body={"published": True},
+                            actor_principal_id=uuid.uuid4(),
+                            resource_id=uuid.uuid4(),
+                        )
+                    )
+            completed = service.complete_idempotency(
+                claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                response_status=200,
+                response_body={"published": True},
+            )
+            assert completed.state == IdempotencyState.SUCCEEDED
+        finally:
+            service.close()
+
+        with Session(owner_engine) as session:
+            assert session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.event_type == "idempotency.completed",
+                    AuditEvent.resource_id == str(claim.resource_id),
+                    AuditEvent.details["idempotency_record_id"].as_string() == str(claim.record_id),
+                )
+            ) == 1
+    finally:
+        app_engine.dispose()
+        owner_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LLS_TEST_POSTGRES_URL") or not os.environ.get("LLS_TEST_POSTGRES_APP_URL"),
+    reason="PostgreSQL owner/app test URLs are not set",
+)
+def test_postgres_concurrent_revoke_and_complete_linearize_old_claim():
+    owner_url = os.environ["LLS_TEST_POSTGRES_URL"]
+    app_url = os.environ["LLS_TEST_POSTGRES_APP_URL"]
+    command.upgrade(build_alembic_config(owner_url), "head")
+    suffix = uuid.uuid4().hex[:12]
+    admin_identity = ExternalIdentity("https://revoke-race.example", f"admin-{suffix}")
+    actor_identity = ExternalIdentity("https://revoke-race.example", f"actor-{suffix}")
+    caller_identity = ExternalIdentity("llm-labeling-scaffold", f"service-{suffix}")
+    workspace_slug = f"revoke-race-{suffix}"
+    owner_engine = create_database_engine(owner_url)
+    try:
+        with Session(owner_engine) as session:
+            result = bootstrap_admin(
+                session,
+                issuer=admin_identity.issuer,
+                subject=admin_identity.subject,
+                workspace_slug=workspace_slug,
+                workspace_name="Revoke Race",
+            )
+        owner_service = DatabaseService.from_url(owner_url)
+        try:
+            owner_service.resolve_or_provision(actor_identity, PrincipalType.USER)
+            owner_service.resolve_or_provision(caller_identity, PrincipalType.SERVICE)
+            owner_service.grant_workspace_membership(
+                workspace_slug=workspace_slug,
+                target_identity=actor_identity,
+                role=Role.EXPERIMENTER,
+                actor_identity=admin_identity,
+                caller_identity=caller_identity,
+                channel=AuditChannel.MCP,
+            )
+        finally:
+            owner_service.close()
+        with Session(owner_engine) as session, session.begin():
+            actor_id = session.scalar(
+                select(Principal.id).where(
+                    Principal.issuer == actor_identity.issuer,
+                    Principal.subject == actor_identity.subject,
+                )
+            )
+            task = Task(
+                workspace_id=result.workspace_id,
+                task_key=f"task-{suffix}",
+                name="Task",
+                created_by_principal_id=result.principal_id,
+            )
+            session.add(task)
+            session.flush()
+            task_key = task.task_key
+
+        service = DatabaseService.from_url(app_url)
+        try:
+            claim = service.claim_idempotency(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+                required_permission=Permission.TASK_PUBLISH,
+                operation="task.publish",
+                idempotency_key=f"key-{suffix}",
+                request_payload={"revision": 1},
+                channel=AuditChannel.MCP,
+            )
+        finally:
+            service.close()
+
+        barrier = Barrier(2)
+
+        def complete():
+            worker = DatabaseService.from_url(app_url)
+            try:
+                barrier.wait()
+                try:
+                    result = worker.complete_idempotency(
+                        claim,
+                        actor_identity=actor_identity,
+                        caller_identity=caller_identity,
+                        response_status=200,
+                        response_body={"published": True},
+                    )
+                    return "completed", result
+                except AuthorizationDenied as exc:
+                    return "denied", exc
+            finally:
+                worker.close()
+
+        def revoke():
+            worker = DatabaseService.from_url(app_url)
+            try:
+                barrier.wait()
+                return "revoked", worker.revoke_workspace_membership(
+                    workspace_slug=workspace_slug,
+                    target_identity=actor_identity,
+                    actor_identity=admin_identity,
+                    caller_identity=caller_identity,
+                    channel=AuditChannel.MCP,
+                )
+            finally:
+                worker.close()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            complete_result, revoke_result = executor.map(lambda function: function(), (complete, revoke))
+        assert revoke_result[0] == "revoked"
+
+        with Session(owner_engine) as session:
+            record = session.get(IdempotencyRecord, claim.record_id)
+            completion_count = session.scalar(
+                select(func.count())
+                .select_from(AuditEvent)
+                .where(
+                    AuditEvent.event_type == "idempotency.completed",
+                    AuditEvent.details["idempotency_record_id"].as_string() == str(claim.record_id),
+                )
+            )
+            binding_count = session.scalar(
+                select(func.count()).select_from(RoleBinding).where(
+                    RoleBinding.workspace_id == result.workspace_id,
+                    RoleBinding.principal_id == actor_id,
+                    RoleBinding.task_id.is_(None),
+                )
+            )
+        assert binding_count == 0
+        if complete_result[0] == "completed":
+            assert record.state == IdempotencyState.SUCCEEDED
+            assert completion_count == 1
+        else:
+            assert complete_result[0] == "denied"
+            assert record.state == IdempotencyState.PENDING
+            assert completion_count == 0
+            stale_service = DatabaseService.from_url(app_url)
+            try:
+                with pytest.raises(AuthorizationDenied):
+                    stale_service.complete_idempotency(
+                        claim,
+                        actor_identity=actor_identity,
+                        caller_identity=caller_identity,
+                        response_status=200,
+                        response_body={"published": True},
+                    )
+            finally:
+                stale_service.close()
+    finally:
+        owner_engine.dispose()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("LLS_TEST_POSTGRES_URL") or not os.environ.get("LLS_TEST_POSTGRES_APP_URL"),
+    reason="PostgreSQL owner/app test URLs are not set",
+)
 def test_postgres_concurrent_idempotency_claim_is_atomic():
     owner_url = os.environ["LLS_TEST_POSTGRES_URL"]
     app_url = os.environ["LLS_TEST_POSTGRES_APP_URL"]
@@ -847,6 +1459,7 @@ def test_postgres_concurrent_idempotency_claim_is_atomic():
                 operation="task.publish",
                 idempotency_key=f"key-{suffix}",
                 request_payload={"task": "task", "revision": 1},
+                channel=AuditChannel.MCP,
             )
         finally:
             service.close()
@@ -1089,6 +1702,95 @@ def test_postgres_task_draft_publish_concurrency_permissions_and_triggers():
         owner_engine.dispose()
 
 
+@pytest.mark.skipif(
+    not os.environ.get("LLS_TEST_POSTGRES_URL") or not os.environ.get("LLS_TEST_POSTGRES_APP_URL"),
+    reason="PostgreSQL owner/app test URLs are not set",
+)
+def test_postgres_concurrent_idempotency_complete_is_atomic_and_audited_once():
+    owner_url = os.environ["LLS_TEST_POSTGRES_URL"]
+    app_url = os.environ["LLS_TEST_POSTGRES_APP_URL"]
+    command.upgrade(build_alembic_config(owner_url), "head")
+    suffix = uuid.uuid4().hex[:12]
+    actor_identity = ExternalIdentity("https://complete-concurrency.example", f"admin-{suffix}")
+    caller_identity = ExternalIdentity("llm-labeling-scaffold", f"service-{suffix}")
+
+    owner_engine = create_database_engine(owner_url)
+    try:
+        with Session(owner_engine) as session:
+            result = bootstrap_admin(
+                session,
+                issuer=actor_identity.issuer,
+                subject=actor_identity.subject,
+                workspace_slug=f"complete-{suffix}",
+                workspace_name="Complete Concurrency",
+            )
+        owner_service = DatabaseService.from_url(owner_url)
+        try:
+            owner_service.resolve_or_provision(caller_identity, PrincipalType.SERVICE)
+        finally:
+            owner_service.close()
+        with Session(owner_engine) as session, session.begin():
+            session.add(
+                Task(
+                    workspace_id=result.workspace_id,
+                    task_key=f"complete-task-{suffix}",
+                    name="Complete Task",
+                    created_by_principal_id=result.principal_id,
+                )
+            )
+    finally:
+        owner_engine.dispose()
+
+    service = DatabaseService.from_url(app_url)
+    try:
+        claim = service.claim_idempotency(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=f"complete-{suffix}",
+            task_key=f"complete-task-{suffix}",
+            required_permission=Permission.TASK_PUBLISH,
+            operation="task.publish",
+            idempotency_key=f"complete-key-{suffix}",
+            request_payload={"revision": 1},
+            channel=AuditChannel.MCP,
+        )
+    finally:
+        service.close()
+
+    barrier = Barrier(2)
+
+    def complete():
+        worker_service = DatabaseService.from_url(app_url)
+        try:
+            barrier.wait()
+            return worker_service.complete_idempotency(
+                claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                response_status=200,
+                response_body={"published": True},
+            )
+        finally:
+            worker_service.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        completions = list(executor.map(lambda _: complete(), range(2)))
+
+    assert all(completion.state.value == "succeeded" for completion in completions)
+    assert all(completion.response_body == {"published": True} for completion in completions)
+    owner_engine = create_database_engine(owner_url)
+    try:
+        with Session(owner_engine) as session:
+            completion_events = [
+                event
+                for event in session.scalars(
+                    select(AuditEvent).where(AuditEvent.event_type == "idempotency.completed")
+                )
+                if event.details.get("idempotency_record_id") == str(claim.record_id)
+            ]
+        assert len(completion_events) == 1
+    finally:
+        owner_engine.dispose()
 @pytest.mark.skipif(not os.environ.get("LLS_TEST_POSTGRES_URL"), reason="LLS_TEST_POSTGRES_URL is not set")
 def test_postgres_concurrent_resolve_or_provision_is_idempotent():
     database_url = os.environ["LLS_TEST_POSTGRES_URL"]
@@ -1443,19 +2145,22 @@ def test_postgres_service_and_direct_sql_membership_updates_share_lock_order():
         lookup_engine.dispose()
 
     row_locked = Event()
-    service_binding_query_started = Event()
 
     def direct_change():
         direct_engine = create_database_engine(database_url)
         try:
             with direct_engine.begin() as connection:
                 connection.execute(
+                    select(Workspace.id)
+                    .where(Workspace.slug == workspace_slug)
+                    .with_for_update()
+                )
+                connection.execute(
                     select(RoleBinding.id)
                     .where(RoleBinding.id == target_binding_id)
                     .with_for_update()
                 )
                 row_locked.set()
-                assert service_binding_query_started.wait(timeout=10)
                 connection.execute(
                     update(RoleBinding)
                     .where(RoleBinding.id == target_binding_id)
@@ -1470,13 +2175,6 @@ def test_postgres_service_and_direct_sql_membership_updates_share_lock_order():
         service_engine = create_database_engine(database_url)
         factory = sessionmaker(bind=service_engine, class_=Session, expire_on_commit=False)
         service = DatabaseService(factory, service_engine)
-
-        def capture_binding_lock(connection, cursor, statement, parameters, context, executemany):
-            normalized = " ".join(statement.lower().split())
-            if "from role_bindings" in normalized and "for update" in normalized:
-                service_binding_query_started.set()
-
-        event.listen(service_engine, "before_cursor_execute", capture_binding_lock)
         try:
             return service.change_workspace_membership(
                 workspace_slug=workspace_slug,
@@ -1487,7 +2185,6 @@ def test_postgres_service_and_direct_sql_membership_updates_share_lock_order():
                 channel=AuditChannel.API,
             )
         finally:
-            event.remove(service_engine, "before_cursor_execute", capture_binding_lock)
             service.close()
 
     with ThreadPoolExecutor(max_workers=2) as executor:

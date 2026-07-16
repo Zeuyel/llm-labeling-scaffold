@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -729,6 +730,7 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
         workspace_id = session.scalar(select(Workspace.id).where(Workspace.slug == "workspace-a"))
         actor_id = session.scalar(select(Principal.id).where(Principal.subject == "admin-1"))
         caller_id = session.scalar(select(Principal.id).where(Principal.subject == "mcp-service"))
+        task_id = session.scalar(select(Task.id).where(Task.task_key == "shared-key"))
         session.add(
             IdempotencyRecord(
                 workspace_id=workspace_id,
@@ -737,6 +739,10 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
                 operation="task.publish",
                 idempotency_key_hash=hashlib.sha256(b"request-1").hexdigest(),
                 request_fingerprint="fingerprint-a",
+                required_permission=Permission.TASK_PUBLISH.value,
+                resource_type="task",
+                resource_id=task_id,
+                channel=AuditChannel.MCP,
                 state=IdempotencyState.PENDING,
             )
         )
@@ -746,6 +752,7 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
             workspace_id = session.scalar(select(Workspace.id).where(Workspace.slug == "workspace-a"))
             different_actor_id = session.scalar(select(Principal.id).where(Principal.subject == "viewer-1"))
             different_caller_id = session.scalar(select(Principal.id).where(Principal.subject == "admin-1"))
+            task_id = session.scalar(select(Task.id).where(Task.task_key == "shared-key"))
             session.add(
                 IdempotencyRecord(
                     workspace_id=workspace_id,
@@ -754,6 +761,10 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
                     operation="task.publish",
                     idempotency_key_hash=hashlib.sha256(b"request-1").hexdigest(),
                     request_fingerprint="fingerprint-b",
+                    required_permission=Permission.TASK_PUBLISH.value,
+                    resource_type="task",
+                    resource_id=task_id,
+                    channel=AuditChannel.MCP,
                     state=IdempotencyState.PENDING,
                 )
             )
@@ -766,7 +777,7 @@ def test_idempotency_key_is_bound_to_actor_caller_and_fingerprint(seeded_service
         assert "idempotency_key" not in IdempotencyRecord.__table__.columns
 
 
-def test_idempotency_claim_conflicts_and_successful_replay(seeded_service):
+def test_idempotency_claim_conflicts_and_successful_replay(seeded_service, engine):
     service = seeded_service["service"]
     claim_args = {
         "actor_identity": seeded_service["admin"],
@@ -776,6 +787,7 @@ def test_idempotency_claim_conflicts_and_successful_replay(seeded_service):
         "required_permission": Permission.TASK_PUBLISH,
         "operation": "task.publish",
         "idempotency_key": "claim-1",
+        "channel": AuditChannel.MCP,
     }
 
     first = service.claim_idempotency(
@@ -793,10 +805,15 @@ def test_idempotency_claim_conflicts_and_successful_replay(seeded_service):
     assert first.request_fingerprint == pending.request_fingerprint
     assert first.idempotency_key_hash == hashlib.sha256(b"claim-1").hexdigest()
     assert not hasattr(first, "idempotency_key")
+    assert first.required_permission == Permission.TASK_PUBLISH
+    assert first.resource_type == "task"
+    assert first.channel == AuditChannel.MCP
     assert pending.response_body is None
 
     completed = service.complete_idempotency(
         first,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
         response_status=202,
         response_body={"published": True},
     )
@@ -809,6 +826,47 @@ def test_idempotency_claim_conflicts_and_successful_replay(seeded_service):
     assert replay.status == IdempotencyClaimStatus.REPLAY
     assert replay.response_status == 202
     assert replay.response_body == {"published": True}
+
+    same_completion = service.complete_idempotency(
+        first,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        response_status=202,
+        response_body={"published": True},
+    )
+    assert same_completion.response_body == {"published": True}
+
+    for response_status, response_body, succeeded in (
+        (409, {"published": True}, True),
+        (202, {"published": 1}, True),
+        (202, {"published": 1.0}, True),
+        (202, {"published": True}, False),
+    ):
+        with pytest.raises(IdempotencyConflict):
+            service.complete_idempotency(
+                first,
+                actor_identity=seeded_service["admin"],
+                caller_identity=seeded_service["mcp"],
+                response_status=response_status,
+                response_body=response_body,
+                succeeded=succeeded,
+            )
+
+    with Session(engine) as session:
+        events = session.scalars(
+            select(AuditEvent).where(AuditEvent.event_type == "idempotency.completed")
+        ).all()
+        assert len(events) == 1
+        assert events[0].resource_type == "task"
+        assert events[0].resource_id == str(first.resource_id)
+        assert events[0].details == {
+            "idempotency_record_id": str(first.record_id),
+            "operation": "task.publish",
+            "response_status": 202,
+            "state": "succeeded",
+        }
+        assert "response_body" not in events[0].details
+        assert "idempotency_key_hash" not in events[0].details
 
     with pytest.raises(IdempotencyConflict) as actor_conflict:
         service.claim_idempotency(
@@ -840,6 +898,256 @@ def test_idempotency_claim_conflicts_and_successful_replay(seeded_service):
             request_payload={"count": 2, "label": "é"},
         )
     assert user_caller.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
+
+
+def test_idempotency_completion_rejects_revoked_membership(seeded_service, engine):
+    service = seeded_service["service"]
+    claim = service.claim_idempotency(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        required_permission=Permission.TASK_PUBLISH,
+        operation="task.publish",
+        idempotency_key="revoked-membership",
+        request_payload={"revision": 1},
+        channel=AuditChannel.MCP,
+    )
+
+    service.revoke_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=seeded_service["experimenter"],
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        channel=AuditChannel.MCP,
+    )
+
+    with pytest.raises(AuthorizationDenied) as denied:
+        service.complete_idempotency(
+            claim,
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["mcp"],
+            response_status=200,
+            response_body={"published": True},
+        )
+    assert denied.value.decision.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+    with Session(engine) as session:
+        record = session.get(IdempotencyRecord, claim.record_id)
+        assert record.state == IdempotencyState.PENDING
+
+
+@pytest.mark.parametrize(
+    ("inactive_target", "expected_reason"),
+    [
+        ("actor", AuthorizationReason.INACTIVE_PRINCIPAL),
+        ("caller", AuthorizationReason.INVALID_AUDIT_CONTEXT),
+        ("workspace", AuthorizationReason.INACTIVE_WORKSPACE),
+    ],
+)
+def test_idempotency_completion_rejects_inactive_context(
+    seeded_service,
+    engine,
+    inactive_target,
+    expected_reason,
+):
+    service = seeded_service["service"]
+    claim = service.claim_idempotency(
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        required_permission=Permission.TASK_PUBLISH,
+        operation="task.publish",
+        idempotency_key=f"inactive-{inactive_target}",
+        request_payload={"revision": 1},
+        channel=AuditChannel.MCP,
+    )
+
+    with Session(engine) as session, session.begin():
+        if inactive_target == "actor":
+            principal = session.scalar(select(Principal).where(Principal.subject == "admin-1"))
+            principal.is_active = False
+        elif inactive_target == "caller":
+            principal = session.scalar(select(Principal).where(Principal.subject == "mcp-service"))
+            principal.is_active = False
+        else:
+            workspace = session.scalar(select(Workspace).where(Workspace.slug == "workspace-a"))
+            workspace.is_active = False
+
+    with pytest.raises(AuthorizationDenied) as denied:
+        service.complete_idempotency(
+            claim,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["mcp"],
+            response_status=200,
+            response_body={"published": True},
+        )
+    assert denied.value.decision.reason == expected_reason
+    with Session(engine) as session:
+        assert session.get(IdempotencyRecord, claim.record_id).state == IdempotencyState.PENDING
+
+
+def test_idempotency_completion_rejects_forged_claim_without_enumerating_context(
+    seeded_service,
+    engine,
+):
+    service = seeded_service["service"]
+    claim = service.claim_idempotency(
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        required_permission=Permission.TASK_PUBLISH,
+        operation="task.publish",
+        idempotency_key="forged-claim",
+        request_payload={"revision": 1},
+        channel=AuditChannel.MCP,
+    )
+    with Session(engine) as session:
+        other_workspace_id = session.scalar(
+            select(Workspace.id).where(Workspace.slug == "workspace-b")
+        )
+        other_task_id = session.scalar(select(Task.id).where(Task.task_key == "workspace-b-key"))
+        viewer_id = session.scalar(select(Principal.id).where(Principal.subject == "viewer-1"))
+
+    forged_claims = (
+        replace(claim, workspace_id=other_workspace_id),
+        replace(claim, actor_principal_id=viewer_id),
+        replace(claim, resource_id=other_task_id),
+        replace(claim, required_permission=Permission.TASK_READ),
+        replace(claim, channel=AuditChannel.API),
+    )
+    for forged in forged_claims:
+        with pytest.raises(IdempotencyConflict) as conflict:
+            service.complete_idempotency(
+                forged,
+                actor_identity=seeded_service["admin"],
+                caller_identity=seeded_service["mcp"],
+                response_status=200,
+                response_body={"published": True},
+            )
+        assert conflict.value.code == "idempotency_conflict"
+
+    for actor_identity, caller_identity in (
+        (seeded_service["viewer"], seeded_service["mcp"]),
+        (seeded_service["admin"], seeded_service["worker"]),
+    ):
+        with pytest.raises(IdempotencyConflict):
+            service.complete_idempotency(
+                claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                response_status=200,
+                response_body={"published": True},
+            )
+
+
+def test_idempotency_replay_uses_canonical_body_and_exact_json_types(seeded_service):
+    service = seeded_service["service"]
+    claim = service.claim_idempotency(
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        required_permission=Permission.TASK_PUBLISH,
+        operation="task.publish",
+        idempotency_key="canonical-response",
+        request_payload={"revision": 1},
+        channel=AuditChannel.MCP,
+    )
+    service.complete_idempotency(
+        claim,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        response_status=200,
+        response_body={"result": {"label": "e\u0301", "count": 1}},
+    )
+
+    replay = service.complete_idempotency(
+        claim,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["mcp"],
+        response_status=200,
+        response_body={"result": {"count": 1, "label": "é"}},
+    )
+    assert replay.response_body == {"result": {"count": 1, "label": "é"}}
+
+    for response_body in (
+        {"result": {"count": True, "label": "é"}},
+        {"result": {"count": 1.0, "label": "é"}},
+    ):
+        with pytest.raises(IdempotencyConflict):
+            service.complete_idempotency(
+                claim,
+                actor_identity=seeded_service["admin"],
+                caller_identity=seeded_service["mcp"],
+                response_status=200,
+                response_body=response_body,
+            )
+    with pytest.raises(ValueError, match="response_status"):
+        service.complete_idempotency(
+            claim,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["mcp"],
+            response_status=True,
+            response_body={"result": {"count": 1, "label": "é"}},
+        )
+    with pytest.raises(ValueError, match="succeeded"):
+        service.complete_idempotency(
+            claim,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["mcp"],
+            response_status=200,
+            response_body={"result": {"count": 1, "label": "é"}},
+            succeeded=1,
+        )
+
+
+def test_idempotency_rejects_sensitive_request_and_response_json(seeded_service, engine):
+    service = seeded_service["service"]
+    claim_args = {
+        "actor_identity": seeded_service["admin"],
+        "caller_identity": seeded_service["mcp"],
+        "workspace_slug": "workspace-a",
+        "task_key": "shared-key",
+        "required_permission": Permission.TASK_PUBLISH,
+        "operation": "task.publish",
+        "channel": AuditChannel.MCP,
+    }
+    sensitive_requests = (
+        {"message": "contact admin@example.test"},
+        {"assertion": "redacted"},
+        {"access_token": "redacted"},
+        {"refresh_token": "redacted"},
+    )
+    for index, request_payload in enumerate(sensitive_requests):
+        with pytest.raises(ValueError):
+            service.claim_idempotency(
+                **claim_args,
+                idempotency_key=f"sensitive-request-{index}",
+                request_payload=request_payload,
+            )
+
+    claim = service.claim_idempotency(
+        **claim_args,
+        idempotency_key="sensitive-response",
+        request_payload={"revision": 1},
+    )
+    with pytest.raises(ValueError):
+        service.complete_idempotency(
+            claim,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["mcp"],
+            response_status=200,
+            response_body={"message": "Bearer secret-token"},
+        )
+    with Session(engine) as session:
+        assert session.get(IdempotencyRecord, claim.record_id).state == IdempotencyState.PENDING
+        assert session.scalar(
+            select(func.count())
+            .select_from(AuditEvent)
+            .where(AuditEvent.event_type == "idempotency.completed")
+        ) == 0
 
 
 def test_workspace_membership_lifecycle_is_atomic_idempotent_and_audited(seeded_service, engine):
@@ -1007,7 +1315,7 @@ def test_sqlite_membership_grant_rereads_a_stale_missing_binding(
 
     assert unchanged.action == MembershipMutationAction.UNCHANGED
     assert unchanged.binding_id == granted.binding_id
-    assert lock_modes == [True, False]
+    assert lock_modes == [False, True]
     with Session(engine) as session:
         assert session.scalar(
             select(func.count()).select_from(RoleBinding).where(
@@ -1246,7 +1554,7 @@ def test_bootstrap_is_idempotent_and_audit_actor_is_structured(engine):
         assert event.actor_principal_id is None
         assert event.caller_principal_id is None
         assert event.channel == AuditChannel.CLI
-        assert event.actor_email_snapshot is None
+        assert "actor_email_snapshot" not in AuditEvent.__table__.columns
         assert event.details["granted_principal_id"] == str(first.principal_id)
         assert event.details["workspace_id"] == str(first.workspace_id)
         assert event.details["granted_role"] == Role.ADMIN.value
@@ -1278,6 +1586,33 @@ def test_facade_appends_audit_without_exposing_orm(seeded_service, engine):
     with Session(engine) as session:
         event = session.get(AuditEvent, event_ref.id)
         assert event.resource_id == str(decision.task.id)
+
+
+def test_audit_details_defaults_only_none_and_rejects_falsy_non_objects(seeded_service, engine):
+    service = seeded_service["service"]
+    event_ref = service.append_audit(
+        workspace_slug="workspace-a",
+        event_type="workspace.viewed",
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+        required_permission=Permission.AUDIT_VIEW,
+        details=None,
+    )
+    with Session(engine) as session:
+        assert session.get(AuditEvent, event_ref.id).details == {}
+
+    for details in (False, 0, "", []):
+        with pytest.raises(ValueError):
+            service.append_audit(
+                workspace_slug="workspace-a",
+                event_type="workspace.viewed",
+                actor_identity=seeded_service["admin"],
+                caller_identity=seeded_service["admin"],
+                channel=AuditChannel.API,
+                required_permission=Permission.AUDIT_VIEW,
+                details=details,
+            )
 
 
 def test_audit_facade_allows_actor_as_caller_and_rejects_inactive_service_caller(seeded_service, engine):

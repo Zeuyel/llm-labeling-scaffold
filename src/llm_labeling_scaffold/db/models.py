@@ -6,7 +6,6 @@ from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import (
-    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -25,10 +24,10 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects import postgresql
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
+from .idempotency_boundary import install_idempotency_boundary_events
 from .enums import (
     AllocationAssignmentRole,
     AllocationDatasetState,
@@ -50,9 +49,8 @@ from .enums import (
     Role,
     TaskMaterializationState,
 )
-
-
-JSON_DOCUMENT = JSON().with_variant(postgresql.JSONB(), "postgresql")
+from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS
+from .sensitive_json import SENSITIVE_JSON_DOCUMENT, install_sensitive_json_schema_events
 
 
 def _enum_type(enum_class: type, name: str) -> SqlEnum:
@@ -63,6 +61,13 @@ def _enum_type(enum_class: type, name: str) -> SqlEnum:
         validate_strings=True,
         create_constraint=True,
     )
+
+
+AUDIT_CHANNEL_ENUM = _enum_type(AuditChannel, "audit_channel")
+_TASK_PERMISSION_VALUES = ", ".join(f"'{value.value}'" for value in sorted(TASK_PERMISSIONS, key=str))
+_WORKSPACE_PERMISSION_VALUES = ", ".join(
+    f"'{value.value}'" for value in sorted(WORKSPACE_PERMISSIONS, key=str)
+)
 
 
 class Principal(Base):
@@ -229,6 +234,28 @@ class IdempotencyRecord(Base):
         ),
         CheckConstraint("length(trim(operation)) > 0", name="operation_not_blank"),
         CheckConstraint("length(idempotency_key_hash) = 64", name="key_hash_sha256"),
+        CheckConstraint(
+            "(required_permission IS NULL AND resource_type IS NULL "
+            "AND resource_id IS NULL AND channel IS NULL) "
+            "OR ((resource_type = 'workspace' "
+            "AND resource_id = workspace_id "
+            f"AND required_permission IN ({_WORKSPACE_PERMISSION_VALUES})) "
+            "OR (resource_type = 'task' "
+            f"AND required_permission IN ({_TASK_PERMISSION_VALUES})))",
+            name="authorization_context",
+        ),
+        CheckConstraint(
+            "channel IS NULL OR channel IN ('panel', 'mcp', 'api', 'cli', 'worker', 'system')",
+            name="channel_valid",
+        ),
+        CheckConstraint("channel IS NULL OR channel <> 'system'", name="channel_not_system"),
+        CheckConstraint(
+            "(required_permission IS NULL AND resource_type IS NULL "
+            "AND resource_id IS NULL AND channel IS NULL) "
+            "OR ((state = 'pending' AND response_status IS NULL AND response_body IS NULL) "
+            "OR (state IN ('succeeded', 'failed') AND response_status IS NOT NULL))",
+            name="response_state",
+        ),
         Index("ix_idempotency_records_workspace_state", "workspace_id", "state"),
         Index(
             "ix_idempotency_records_actor_caller",
@@ -258,6 +285,10 @@ class IdempotencyRecord(Base):
     operation: Mapped[str] = mapped_column(String(255), nullable=False)
     idempotency_key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     request_fingerprint: Mapped[str] = mapped_column(String(128), nullable=False)
+    required_permission: Mapped[str | None] = mapped_column(String(64))
+    resource_type: Mapped[str | None] = mapped_column(String(16))
+    resource_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    channel: Mapped[AuditChannel | None] = mapped_column(AUDIT_CHANNEL_ENUM)
     state: Mapped[IdempotencyState] = mapped_column(
         _enum_type(IdempotencyState, "idempotency_state"),
         nullable=False,
@@ -265,7 +296,7 @@ class IdempotencyRecord(Base):
         server_default=IdempotencyState.PENDING.value,
     )
     response_status: Mapped[int | None] = mapped_column(Integer)
-    response_body: Mapped[dict[str, Any] | None] = mapped_column(JSON_DOCUMENT)
+    response_body: Mapped[dict[str, Any] | None] = mapped_column(SENSITIVE_JSON_DOCUMENT)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -294,7 +325,7 @@ class WorkspaceSetting(Base):
         nullable=False,
     )
     setting_key: Mapped[str] = mapped_column(String(255), nullable=False)
-    setting_value: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False)
+    setting_value: Mapped[dict[str, Any]] = mapped_column(SENSITIVE_JSON_DOCUMENT, nullable=False)
     updated_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("principals.id", ondelete="RESTRICT"),
@@ -1278,18 +1309,21 @@ class AuditEvent(Base):
         ForeignKey("principals.id", ondelete="RESTRICT"),
     )
     channel: Mapped[AuditChannel] = mapped_column(
-        _enum_type(AuditChannel, "audit_channel"),
+        AUDIT_CHANNEL_ENUM,
         nullable=False,
     )
     actor_issuer: Mapped[str] = mapped_column(String(255), nullable=False)
     actor_subject: Mapped[str] = mapped_column(String(512), nullable=False)
     actor_display_name: Mapped[str | None] = mapped_column(String(255))
-    actor_email_snapshot: Mapped[str | None] = mapped_column(String(320))
     event_type: Mapped[str] = mapped_column(String(255), nullable=False)
     resource_type: Mapped[str | None] = mapped_column(String(255))
     resource_id: Mapped[str | None] = mapped_column(String(255))
     request_id: Mapped[str | None] = mapped_column(String(255))
-    details: Mapped[dict[str, Any]] = mapped_column(JSON_DOCUMENT, nullable=False, default=dict)
+    details: Mapped[dict[str, Any]] = mapped_column(
+        SENSITIVE_JSON_DOCUMENT,
+        nullable=False,
+        default=dict,
+    )
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -2334,6 +2368,16 @@ event.listen(
         """
     ).execute_if(dialect="sqlite"),
 )
+
+install_sensitive_json_schema_events(
+    Base.metadata,
+    (
+        IdempotencyRecord.__table__,
+        WorkspaceSetting.__table__,
+        AuditEvent.__table__,
+    ),
+)
+install_idempotency_boundary_events(Base.metadata, IdempotencyRecord.__table__)
 
 
 event.listen(

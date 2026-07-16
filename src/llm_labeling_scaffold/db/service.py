@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import unicodedata
+import re
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import Engine, and_, func, or_, select
+from sqlalchemy import Engine, and_, func, or_, select, text
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -30,10 +30,13 @@ from .models import (
     TaskRevisionMaterialization,
     Workspace,
 )
+from .idempotency_boundary import sqlite_idempotency_completion_gate
 from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS, Permission, role_allows
+from .sensitive_json import canonical_sensitive_json_bytes, normalize_sensitive_json_object
 
 
 MAX_AUTHORIZED_TASKS_PAGE_SIZE = 100
+_IDEMPOTENCY_OPERATION = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,254}\Z", re.ASCII)
 
 
 class AuthorizationReason(str, Enum):
@@ -148,6 +151,10 @@ class IdempotencyClaim:
     operation: str
     idempotency_key_hash: str
     request_fingerprint: str
+    required_permission: Permission
+    resource_type: str
+    resource_id: uuid.UUID
+    channel: AuditChannel
     status: IdempotencyClaimStatus
     state: IdempotencyState
     response_status: int | None
@@ -398,6 +405,7 @@ class DatabaseService:
         operation: str,
         idempotency_key: str,
         request_payload: Any,
+        channel: AuditChannel,
         task_key: str | None = None,
     ) -> IdempotencyClaim:
         with self.transaction() as transaction:
@@ -409,6 +417,7 @@ class DatabaseService:
                 operation=operation,
                 idempotency_key=idempotency_key,
                 request_payload=request_payload,
+                channel=channel,
                 task_key=task_key,
             )
 
@@ -416,16 +425,22 @@ class DatabaseService:
         self,
         claim: IdempotencyClaim,
         *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
         response_status: int,
         response_body: dict[str, Any] | None,
         succeeded: bool = True,
+        request_id: str | None = None,
     ) -> IdempotencyClaim:
         with self.transaction() as transaction:
             return transaction.complete_idempotency(
                 claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
                 response_status=response_status,
                 response_body=response_body,
                 succeeded=succeeded,
+                request_id=request_id,
             )
 
     def grant_workspace_membership(
@@ -762,7 +777,8 @@ class DatabaseTransaction:
                     RoleBinding.task_id.is_(None),
                 ),
             )
-            .where(Workspace.slug == workspace_slug),
+            .where(Workspace.slug == workspace_slug)
+            .execution_options(populate_existing=True),
         )
         if workspace is None:
             return _decision(
@@ -815,6 +831,7 @@ class DatabaseTransaction:
                 ),
             )
             .where(Workspace.slug == workspace_slug, Task.task_key == task_key)
+            .execution_options(populate_existing=True)
             .limit(1),
         ).first()
         if row is None:
@@ -1099,10 +1116,15 @@ class DatabaseTransaction:
         operation: str,
         idempotency_key: str,
         request_payload: Any,
+        channel: AuditChannel,
         task_key: str | None = None,
     ) -> IdempotencyClaim:
-        if not operation.strip() or not idempotency_key.strip():
-            raise ValueError("operation and idempotency_key must not be blank")
+        if _IDEMPOTENCY_OPERATION.fullmatch(operation) is None or not idempotency_key.strip():
+            raise ValueError("operation must be a safe identifier and idempotency_key must not be blank")
+        if channel == AuditChannel.SYSTEM:
+            raise AuthorizationDenied(
+                _decision(required_permission, AuthorizationReason.INVALID_AUDIT_CONTEXT),
+            )
         if task_key is None:
             decision = self.authorize_workspace(actor_identity, workspace_slug, required_permission)
         else:
@@ -1112,6 +1134,8 @@ class DatabaseTransaction:
 
         request_fingerprint = canonical_request_fingerprint(request_payload)
         key_hash = idempotency_key_hash(idempotency_key)
+        resource_type = "task" if decision.task is not None else "workspace"
+        resource_id = decision.task.id if decision.task is not None else decision.workspace.id
         candidate_id = uuid.uuid4()
         values = {
             "id": candidate_id,
@@ -1121,6 +1145,10 @@ class DatabaseTransaction:
             "operation": operation,
             "idempotency_key_hash": key_hash,
             "request_fingerprint": request_fingerprint,
+            "required_permission": required_permission.value,
+            "resource_type": resource_type,
+            "resource_id": resource_id,
+            "channel": channel,
             "state": IdempotencyState.PENDING,
         }
         dialect_name = self._session.get_bind().dialect.name
@@ -1135,21 +1163,24 @@ class DatabaseTransaction:
         else:
             raise AuthorizationUnavailable(f"unsupported idempotency dialect: {dialect_name}")
         inserted = self._session.scalar(statement) == candidate_id
-        record = self._session.scalar(
-            select(IdempotencyRecord)
-            .where(
-                IdempotencyRecord.workspace_id == decision.workspace.id,
-                IdempotencyRecord.operation == operation,
-                IdempotencyRecord.idempotency_key_hash == key_hash,
-            )
-            .with_for_update(),
+        record_statement = select(IdempotencyRecord).where(
+            IdempotencyRecord.workspace_id == decision.workspace.id,
+            IdempotencyRecord.operation == operation,
+            IdempotencyRecord.idempotency_key_hash == key_hash,
         )
+        if dialect_name != "postgresql":
+            record_statement = record_statement.with_for_update()
+        record = self._session.scalar(record_statement)
         if record is None:
             raise AuthorizationUnavailable("idempotency claim was not readable after insert")
         if (
             record.actor_principal_id != decision.principal.id
             or record.caller_principal_id != caller.id
             or record.request_fingerprint != request_fingerprint
+            or record.required_permission != required_permission.value
+            or record.resource_type != resource_type
+            or record.resource_id != resource_id
+            or record.channel != channel
         ):
             raise IdempotencyConflict()
         if inserted:
@@ -1164,30 +1195,302 @@ class DatabaseTransaction:
         self,
         claim: IdempotencyClaim,
         *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
         response_status: int,
         response_body: dict[str, Any] | None,
         succeeded: bool = True,
+        request_id: str | None = None,
     ) -> IdempotencyClaim:
-        record = self._session.scalar(
-            select(IdempotencyRecord).where(IdempotencyRecord.id == claim.record_id).with_for_update(),
+        if type(response_status) is not int:
+            raise ValueError("response_status must be an integer")
+        if type(succeeded) is not bool:
+            raise ValueError("succeeded must be a boolean")
+        normalized_body = (
+            None if response_body is None else normalize_sensitive_json_object(response_body)
         )
-        if record is None or (
-            record.workspace_id != claim.workspace_id
-            or record.actor_principal_id != claim.actor_principal_id
-            or record.caller_principal_id != claim.caller_principal_id
-            or record.operation != claim.operation
-            or record.idempotency_key_hash != claim.idempotency_key_hash
-            or record.request_fingerprint != claim.request_fingerprint
+        canonical_body = (
+            None if normalized_body is None else canonical_sensitive_json_bytes(normalized_body)
+        )
+        if self._session.get_bind().dialect.name == "postgresql":
+            return self._complete_idempotency_postgresql(
+                claim,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                response_status=response_status,
+                canonical_body=canonical_body,
+                succeeded=succeeded,
+                request_id=request_id,
+            )
+
+        record = self._session.scalar(
+            select(IdempotencyRecord)
+            .where(IdempotencyRecord.id == claim.record_id)
+            .execution_options(populate_existing=True),
+        )
+        if record is None or not _idempotency_claim_matches_record(claim, record):
+            raise IdempotencyConflict()
+        self._lock_idempotency_context(record)
+        record = self._session.scalar(
+            select(IdempotencyRecord)
+            .where(IdempotencyRecord.id == claim.record_id)
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        if record is None or not _idempotency_claim_matches_record(claim, record):
+            raise IdempotencyConflict()
+        actor, caller, _, channel = self._reauthorize_idempotency_completion(
+            record,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+        )
+        target_state = IdempotencyState.SUCCEEDED if succeeded else IdempotencyState.FAILED
+        if record.state == IdempotencyState.PENDING:
+            with sqlite_idempotency_completion_gate(self._session):
+                record.state = target_state
+                record.response_status = response_status
+                record.response_body = normalized_body
+                append_audit_event(
+                    self._session,
+                    workspace_id=record.workspace_id,
+                    event_type="idempotency.completed",
+                    actor=actor,
+                    caller=caller,
+                    channel=channel,
+                    resource_type=record.resource_type,
+                    resource_id=record.resource_id,
+                    request_id=request_id,
+                    details={
+                        "idempotency_record_id": str(record.id),
+                        "operation": record.operation,
+                        "response_status": response_status,
+                        "state": target_state.value,
+                    },
+                )
+                self._session.flush()
+        else:
+            stored_body = (
+                None
+                if record.response_body is None
+                else canonical_sensitive_json_bytes(record.response_body)
+            )
+            if (
+                record.state != target_state
+                or record.response_status != response_status
+                or stored_body != canonical_body
+            ):
+                raise IdempotencyConflict()
+        return _idempotency_claim(record, IdempotencyClaimStatus.REPLAY)
+
+    def _complete_idempotency_postgresql(
+        self,
+        claim: IdempotencyClaim,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        response_status: int,
+        canonical_body: bytes | None,
+        succeeded: bool,
+        request_id: str | None,
+    ) -> IdempotencyClaim:
+        actor = self._find_principal(actor_identity, populate_existing=True)
+        caller = self._find_principal(caller_identity, populate_existing=True)
+        if (
+            actor is None
+            or caller is None
+            or actor.id != claim.actor_principal_id
+            or caller.id != claim.caller_principal_id
         ):
             raise IdempotencyConflict()
-        if record.state == IdempotencyState.PENDING:
-            record.state = IdempotencyState.SUCCEEDED if succeeded else IdempotencyState.FAILED
-            record.response_status = response_status
-            record.response_body = response_body
-            self._session.flush()
-        elif record.response_status != response_status or record.response_body != response_body:
+        result = self._session.execute(
+            text(
+                """
+                SELECT outcome, state, response_status, response_body, reason
+                FROM public.lls_complete_idempotency(
+                    :record_id,
+                    :workspace_id,
+                    :actor_principal_id,
+                    :caller_principal_id,
+                    :operation,
+                    :idempotency_key_hash,
+                    :request_fingerprint,
+                    :required_permission,
+                    :resource_type,
+                    :resource_id,
+                    :channel,
+                    :response_status,
+                    :response_body,
+                    :succeeded,
+                    :request_id
+                )
+                """
+            ),
+            {
+                "record_id": claim.record_id,
+                "workspace_id": claim.workspace_id,
+                "actor_principal_id": claim.actor_principal_id,
+                "caller_principal_id": claim.caller_principal_id,
+                "operation": claim.operation,
+                "idempotency_key_hash": claim.idempotency_key_hash,
+                "request_fingerprint": claim.request_fingerprint,
+                "required_permission": claim.required_permission.value,
+                "resource_type": claim.resource_type,
+                "resource_id": claim.resource_id,
+                "channel": claim.channel.value,
+                "response_status": response_status,
+                "response_body": None if canonical_body is None else canonical_body.decode("utf-8"),
+                "succeeded": succeeded,
+                "request_id": request_id,
+            },
+        ).mappings().one()
+        outcome = result["outcome"]
+        if outcome == "conflict":
             raise IdempotencyConflict()
-        return _idempotency_claim(record, IdempotencyClaimStatus.REPLAY)
+        if outcome == "denied":
+            try:
+                reason = AuthorizationReason(result["reason"])
+            except ValueError as exc:
+                raise AuthorizationUnavailable("database authorization state is unavailable") from exc
+            raise AuthorizationDenied(_decision(claim.required_permission, reason))
+        if outcome not in {"completed", "replay"}:
+            raise AuthorizationUnavailable("database authorization state is unavailable")
+        response_value = result["response_body"]
+        if isinstance(response_value, str):
+            response_value = json.loads(response_value)
+        return IdempotencyClaim(
+            record_id=claim.record_id,
+            workspace_id=claim.workspace_id,
+            actor_principal_id=claim.actor_principal_id,
+            caller_principal_id=claim.caller_principal_id,
+            operation=claim.operation,
+            idempotency_key_hash=claim.idempotency_key_hash,
+            request_fingerprint=claim.request_fingerprint,
+            required_permission=claim.required_permission,
+            resource_type=claim.resource_type,
+            resource_id=claim.resource_id,
+            channel=claim.channel,
+            status=IdempotencyClaimStatus.REPLAY,
+            state=IdempotencyState(result["state"]),
+            response_status=result["response_status"],
+            response_body=response_value,
+        )
+
+    def _lock_idempotency_context(self, record: IdempotencyRecord) -> None:
+        self._session.scalar(
+            select(Workspace)
+            .where(Workspace.id == record.workspace_id)
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        principal_ids = sorted(
+            {record.actor_principal_id, record.caller_principal_id},
+            key=str,
+        )
+        if principal_ids:
+            self._session.scalars(
+                select(Principal)
+                .where(Principal.id.in_(principal_ids))
+                .order_by(Principal.id)
+                .with_for_update()
+                .execution_options(populate_existing=True),
+            ).all()
+        binding_query = (
+            select(RoleBinding)
+            .where(
+                RoleBinding.workspace_id == record.workspace_id,
+                RoleBinding.principal_id.in_(principal_ids),
+                or_(
+                    RoleBinding.task_id.is_(None),
+                    and_(
+                        record.resource_type == "task",
+                        RoleBinding.task_id == record.resource_id,
+                    ),
+                ),
+            )
+            .order_by(RoleBinding.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        self._session.scalars(binding_query).all()
+        if record.resource_type == "task":
+            self._session.scalar(
+                select(Task)
+                .where(Task.id == record.resource_id, Task.workspace_id == record.workspace_id)
+                .with_for_update()
+                .execution_options(populate_existing=True),
+            )
+
+    def _reauthorize_idempotency_completion(
+        self,
+        record: IdempotencyRecord,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+    ) -> tuple[Principal, Principal, Permission, AuditChannel]:
+        try:
+            permission = Permission(record.required_permission)
+            channel = AuditChannel(record.channel)
+        except ValueError as exc:
+            raise IdempotencyConflict() from exc
+        actor = self._find_principal(actor_identity, populate_existing=True)
+        caller = self._find_principal(caller_identity, populate_existing=True)
+        if (
+            actor is None
+            or caller is None
+            or actor.id != record.actor_principal_id
+            or caller.id != record.caller_principal_id
+        ):
+            raise IdempotencyConflict()
+
+        if record.resource_type == "workspace":
+            if record.resource_id != record.workspace_id:
+                raise IdempotencyConflict()
+            workspace = self._session.get(
+                Workspace,
+                record.workspace_id,
+                populate_existing=True,
+            )
+            if workspace is None:
+                raise AuthorizationDenied(
+                    _decision(
+                        permission,
+                        AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                        principal=_principal_ref(actor),
+                    )
+                )
+            decision = self.authorize_workspace(actor_identity, workspace.slug, permission)
+        elif record.resource_type == "task":
+            row = self._session.execute(
+                select(Workspace, Task)
+                .join(Task, Task.workspace_id == Workspace.id)
+                .where(
+                    Workspace.id == record.workspace_id,
+                    Task.id == record.resource_id,
+                )
+                .execution_options(populate_existing=True),
+            ).first()
+            if row is None:
+                raise AuthorizationDenied(
+                    _decision(
+                        permission,
+                        AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                        principal=_principal_ref(actor),
+                    )
+                )
+            workspace, task = row
+            decision = self.authorize_task(
+                actor_identity,
+                workspace.slug,
+                task.task_key,
+                permission,
+            )
+        else:
+            raise IdempotencyConflict()
+        self.require(decision)
+        authorized_caller = self._require_caller(caller_identity, actor.id, permission)
+        if authorized_caller.id != record.caller_principal_id:
+            raise IdempotencyConflict()
+        return actor, authorized_caller, permission, channel
 
     def grant_workspace_membership(
         self,
@@ -1432,23 +1735,76 @@ class DatabaseTransaction:
             Permission.WORKSPACE_MANAGE,
         )
         self.require(initial_decision)
+        actor = self._find_principal(actor_identity, populate_existing=True)
+        if actor is None:
+            raise AuthorizationDenied(
+                _decision(Permission.WORKSPACE_MANAGE, AuthorizationReason.UNKNOWN_PRINCIPAL),
+            )
+        caller = self._find_principal(caller_identity, populate_existing=True)
         target = self._find_principal(target_identity, populate_existing=True)
         if target is None:
             raise MembershipNotFound("target principal does not exist")
-        binding = self._workspace_binding(initial_decision.workspace.id, target.id)
+        self._workspace_binding(
+            initial_decision.workspace.id,
+            target.id,
+            for_update=False,
+        )
         workspace = self._session.scalar(
             select(Workspace)
-            .where(Workspace.id == initial_decision.workspace.id)
+            .where(Workspace.slug == workspace_slug)
+            .execution_options(populate_existing=True),
+        )
+        actor_ref = _principal_ref(actor)
+        if workspace is None:
+            raise AuthorizationDenied(
+                _decision(
+                    Permission.WORKSPACE_MANAGE,
+                    AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                    principal=actor_ref,
+                ),
+            )
+
+        workspace = self._session.scalar(
+            select(Workspace)
+            .where(Workspace.id == workspace.id)
             .with_for_update()
             .execution_options(populate_existing=True),
         )
-        if binding is None and workspace is not None:
-            binding = self._workspace_binding(
-                workspace.id,
-                target.id,
-                for_update=False,
-            )
+        principal_ids = sorted(
+            {
+                principal.id
+                for principal in (actor, caller, target)
+                if principal is not None
+            },
+            key=str,
+        )
+        if principal_ids:
+            self._session.scalars(
+                select(Principal)
+                .where(Principal.id.in_(principal_ids))
+                .order_by(Principal.id)
+                .with_for_update()
+                .execution_options(populate_existing=True),
+            ).all()
+            self._session.scalars(
+                select(RoleBinding)
+                .where(
+                    RoleBinding.workspace_id == workspace.id,
+                    RoleBinding.principal_id.in_(principal_ids),
+                )
+                .order_by(RoleBinding.id)
+                .with_for_update()
+                .execution_options(populate_existing=True),
+            ).all()
+
         actor = self._find_principal(actor_identity, populate_existing=True)
+        caller = self._find_principal(caller_identity, populate_existing=True)
+        target = self._find_principal(target_identity, populate_existing=True)
+        workspace = self._session.scalar(
+            select(Workspace)
+            .where(Workspace.id == workspace.id)
+            .execution_options(populate_existing=True),
+        )
         if actor is None:
             raise AuthorizationDenied(
                 _decision(Permission.WORKSPACE_MANAGE, AuthorizationReason.UNKNOWN_PRINCIPAL),
@@ -1493,10 +1849,10 @@ class DatabaseTransaction:
             )
         )
         caller = self._require_caller(caller_identity, actor.id, Permission.WORKSPACE_MANAGE)
-        target = self._find_principal(target_identity, populate_existing=True)
         if target is None or (require_active_target and not target.is_active):
             status = "active " if require_active_target else ""
             raise MembershipNotFound(f"{status}target principal does not exist")
+        binding = self._workspace_binding(workspace.id, target.id)
         return actor, caller, workspace, target, binding
 
     def _workspace_binding(
@@ -1631,7 +1987,7 @@ class DatabaseTransaction:
                 RoleBinding.principal_id == principal_id,
                 RoleBinding.workspace_id == workspace_id,
                 scope,
-            ),
+            ).execution_options(populate_existing=True),
         )
         return _sorted_roles(values)
 
@@ -1892,18 +2248,7 @@ def _membership_result(
 
 
 def canonical_request_fingerprint(request_payload: Any) -> str:
-    try:
-        canonical_json = json.dumps(
-            request_payload,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError("request_payload must be canonical JSON data") from exc
-    normalized = unicodedata.normalize("NFC", canonical_json)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return hashlib.sha256(canonical_sensitive_json_bytes(request_payload)).hexdigest()
 
 
 def idempotency_key_hash(idempotency_key: str) -> str:
@@ -1922,8 +2267,35 @@ def _idempotency_claim(
         operation=record.operation,
         idempotency_key_hash=record.idempotency_key_hash,
         request_fingerprint=record.request_fingerprint,
+        required_permission=Permission(record.required_permission),
+        resource_type=record.resource_type,
+        resource_id=record.resource_id,
+        channel=AuditChannel(record.channel),
         status=status,
         state=record.state,
         response_status=record.response_status if status == IdempotencyClaimStatus.REPLAY else None,
         response_body=record.response_body if status == IdempotencyClaimStatus.REPLAY else None,
+    )
+
+
+def _idempotency_claim_matches_record(
+    claim: IdempotencyClaim,
+    record: IdempotencyRecord,
+) -> bool:
+    try:
+        record_permission = Permission(record.required_permission)
+        record_channel = AuditChannel(record.channel)
+    except ValueError:
+        return False
+    return (
+        record.workspace_id == claim.workspace_id
+        and record.actor_principal_id == claim.actor_principal_id
+        and record.caller_principal_id == claim.caller_principal_id
+        and record.operation == claim.operation
+        and record.idempotency_key_hash == claim.idempotency_key_hash
+        and record.request_fingerprint == claim.request_fingerprint
+        and record_permission == claim.required_permission
+        and record.resource_type == claim.resource_type
+        and record.resource_id == claim.resource_id
+        and record_channel == claim.channel
     )

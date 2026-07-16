@@ -133,7 +133,6 @@ FROM pg_namespace AS namespace
 WHERE namespace.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
   AND namespace.nspname !~ '^pg_(toast_)?temp_[0-9]+$'
 \gexec
-
 WITH relation_columns AS (
     SELECT namespace.nspname,
            relation.relname,
@@ -189,6 +188,15 @@ FROM relation_columns
 CROSS JOIN (
     VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('REFERENCES')
 ) AS privilege(privilege_type)
+\gexec
+
+SELECT format('REVOKE UPDATE, DELETE ON TABLE public.idempotency_records FROM %I', :'app_user')
+WHERE to_regclass('public.idempotency_records') IS NOT NULL
+\gexec
+SELECT format('REVOKE UPDATE, DELETE ON TABLE public.audit_events FROM %I', :'app_user')
+WHERE to_regclass('public.audit_events') IS NOT NULL
+\gexec
+SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %I', :'app_user')
 \gexec
 
 SELECT format(
@@ -255,6 +263,12 @@ SELECT format(
 \gexec
 SELECT format(
     'ALTER DEFAULT PRIVILEGES FOR ROLE %I REVOKE ALL ON FUNCTIONS FROM %I',
+    :'owner_user',
+    :'app_user'
+)
+\gexec
+SELECT format(
+    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO %I',
     :'owner_user',
     :'app_user'
 )
@@ -330,4 +344,13 @@ WHERE to_regclass('public.workspace_settings') IS NOT NULL
 \gexec
 SELECT format('GRANT SELECT, INSERT ON TABLE public.audit_events TO %I', :'app_user')
 WHERE to_regclass('public.audit_events') IS NOT NULL
+\gexec
+
+SELECT format(
+    'GRANT EXECUTE ON FUNCTION public.lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text) TO %I',
+    :'app_user'
+)
+WHERE to_regprocedure(
+    'public.lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text)'
+) IS NOT NULL
 \gexec
