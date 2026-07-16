@@ -14,6 +14,7 @@ from typing import Any, Protocol
 from urllib.parse import parse_qs, unquote, urlparse
 
 import yaml
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 
 from . import __version__
@@ -41,6 +42,7 @@ from .db import (
     TaskPublishInProgress,
 )
 from .db.database import create_database_engine, create_session_factory
+from .db.migration import build_alembic_config
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
@@ -49,7 +51,6 @@ from .redaction import redact_text
 API_CONTRACT_VERSION = "2026-07-14"
 AUTHORIZATION_READY = "ready"
 AUTHORIZATION_UNAVAILABLE = "unavailable"
-REQUIRED_DATABASE_REVISION = "20260714_0002"
 
 POOL_FILES = {
     "merged": ("merged", "merged_clean.jsonl"),
@@ -240,12 +241,20 @@ def _workspace_access_payload(access) -> dict[str, Any]:
     }
 
 
+def _database_migration_head() -> str:
+    config = build_alembic_config("sqlite+pysqlite:///:memory:")
+    heads = tuple(ScriptDirectory.from_config(config).get_heads())
+    if len(heads) != 1:
+        raise AuthorizationUnavailable("database migration graph is not at a single head")
+    return heads[0]
+
+
 def _build_authorization_service(database_url: str | None = None) -> DatabaseService:
     engine = create_database_engine(database_url)
     try:
         with engine.connect() as connection:
             revision = connection.scalar(text("SELECT version_num FROM alembic_version"))
-        if revision != REQUIRED_DATABASE_REVISION:
+        if revision != _database_migration_head():
             raise AuthorizationUnavailable("database schema revision is not ready")
         return DatabaseService(create_session_factory(engine), engine)
     except Exception:
@@ -1595,7 +1604,7 @@ class _Handler(BaseHTTPRequestHandler):
         params,
         body: dict[str, Any],
         *,
-        if_match: str,
+        if_match: str | None,
         create: bool,
     ) -> None:
         try:
@@ -1615,8 +1624,9 @@ class _Handler(BaseHTTPRequestHandler):
                 task_key=task_id,
                 definition=definition,
                 rendered_task=rendered_task,
-                if_match=if_match,
+                if_match=None if create else if_match,
                 channel=channel,
+                if_none_match="*" if create else None,
             )
             action = "created" if create else ("updated" if result.changed else "unchanged")
             self._json(
@@ -2535,7 +2545,7 @@ class _Handler(BaseHTTPRequestHandler):
             body = self._read_body()
             if _control_task_source_enabled():
                 task_id = str(body.get("task_id") or "").strip() if isinstance(body, dict) else ""
-                self._control_draft_save(task_id, params, body, if_match="*", create=True)
+                self._control_draft_save(task_id, params, body, if_match=None, create=True)
                 return
             try:
                 if _r2_task_source_enabled():
