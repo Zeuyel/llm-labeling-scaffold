@@ -149,15 +149,15 @@ Scaffold 已有独立的用户、工作空间、任务 ACL 和 RBAC 持久化层
 
 ### 方式一：从 GitHub Container Registry 拉取控制台镜像
 
-GitHub Actions 会在 push 到 `main` 或 tag 时构建控制台镜像并推送到：
+GitHub Actions 会在 push 到 `main`、`integration/multiuser-control-plane` 或 tag 时构建控制台镜像并推送到：
 
 ```text
 ghcr.io/zeuyel/llm-labeling-scaffold/panel
 ```
 
-`main` 分支会推送 `main` 和 `latest` 标签；tag push 会推送对应 tag。
+`main` 分支会推送 `main` 和 `latest` 标签；`integration/multiuser-control-plane` 分支会推送 `integration` 和 `sha-<短 SHA>` 标签；tag push 会推送对应 tag。
 
-在服务器上可以这样测试：
+在服务器上测试 `main` 镜像可以这样执行：
 
 ```bash
 git clone <repo-url>
@@ -173,6 +173,22 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull p
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
 ```
 
+验收当前多用户控制面时，在已完成上述 `.env` 初始化的服务器目录中使用集成分支镜像：
+
+```bash
+export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:integration
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull panel
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
+```
+
+需要固定到某次 `integration/multiuser-control-plane` 提交时，将镜像改为对应的不可变 SHA 标签：
+
+```bash
+export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:sha-<短 SHA>
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml pull panel
+docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d --no-build
+```
+
 上述 base Compose 故意不发布 Panel 宿主端口，适合让同一 `lls` network 中的 `cloudflared` sidecar 访问 `http://panel:8765`。若 Tunnel 运行在宿主机，命令中再叠加 `-f docker-compose.loopback.yml`，只向 `127.0.0.1` 发布 Panel；不得用自定义 override 发布到非 loopback 接口。
 
 `r2` 模式启动后，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。只要任务需要 R2 数据湖，compose 启动都必须包含 rclone override 或等价 secret 挂载。
@@ -180,7 +196,6 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d 
 如果要同时测试可选模型记录服务：
 
 ```bash
-export PANEL_IMAGE=ghcr.io/zeuyel/llm-labeling-scaffold/panel:main
 export MLFLOW_TRACKING_URI=http://mlflow:5000
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow pull panel
 docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow build mlflow

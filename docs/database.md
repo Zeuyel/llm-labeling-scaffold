@@ -112,9 +112,12 @@ Docker Compose 会等待 `scaffold-postgres` 健康，再由一次性 `migrate` 
 python -m llm_labeling_scaffold.cli db upgrade
 ```
 
-本机安装项目后也可以直接运行 Alembic：
+本机安装项目后也可以直接运行 Alembic。`20260716_0005` 在 PostgreSQL 中会读取 `SCAFFOLD_POSTGRES_APP_USER` 配置 runtime app role，因此迁移时要显式提供与 Compose 一致的 owner、app role 和数据库变量：
 
 ```bash
+export SCAFFOLD_POSTGRES_OWNER_USER=scaffold_owner
+export SCAFFOLD_POSTGRES_APP_USER=scaffold_app
+export SCAFFOLD_POSTGRES_DB=scaffold
 export LLS_DATABASE_URL='postgresql+psycopg://scaffold_owner:<url-encoded-owner-password>@127.0.0.1:5433/scaffold'
 alembic upgrade head
 ```
