@@ -43,6 +43,7 @@ from .db.database import create_database_engine, create_session_factory
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
+from .redaction import redact_text
 
 API_CONTRACT_VERSION = "2026-07-14"
 AUTHORIZATION_READY = "ready"
@@ -2381,7 +2382,7 @@ class _Handler(BaseHTTPRequestHandler):
                 job = pipeline.start_action(self.runs_root, self._resolve_action_task_path(task_path), action, body.get("params", {}))
                 self._json({"ok": True, "job": job})
             except Exception as exc:
-                self._json({"error": str(exc)}, status=400)
+                self._json({"error": redact_text(exc)}, status=400)
         elif path == "/api/suggestions/import":
             self._import_suggestions(params)
         elif path == "/api/tasks":

@@ -163,7 +163,7 @@ services:
       - lls
 
   argilla:
-    image: argilla/argilla-server:latest
+    image: argilla/argilla-server:v2.8.0
     restart: unless-stopped
     ports:
       - "${ARGILLA_PORT:-6900}:6900"
@@ -187,7 +187,7 @@ services:
       - lls
 
   argilla-worker:
-    image: argilla/argilla-server:latest
+    image: argilla/argilla-server:v2.8.0
     restart: unless-stopped
     environment:
       <<: *argilla-env

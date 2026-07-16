@@ -334,7 +334,9 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 
 配置了 `data_lake` 的任务可以从 R2 数据湖 manifest 生成本地导入。R2 导入是下载、校验和原子提交过程，应作为异步 job 执行；页面通过 job 状态反馈排队、运行、成功或失败。导入成功后，profile 的下一步是从该导入中抽取样本。scaffold 只缓存任务级输入和标注产物，不维护上游大数据的第二份路径体系。生产面板默认不能覆盖数据湖来源，只按 `task.yaml` 中的治理登记表配置导入；`LLS_ALLOW_DATA_LAKE_OVERRIDES=1` 只用于开发排查。Docker 部署时需要叠加 `docker-compose.rclone.example.yml`，把 rclone 配置以只读方式映射到面板容器。接入规则见 [数据湖接入说明](docs/data_lake_scaffold_integration.md)。
 
-推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题。拉回标注结果时，这些字段会完整写入 `human_label`，再进入训练集版本构建。
+推送到 Argilla 时，平台会把任务配置中的 `labels.primary` 和 `labels.auxiliary` 都同步为标注问题，并在 annotation manifest 中记录 server/SDK 版本、workspace/dataset UUID、settings schema 与 task/sample/batch/plan fingerprint。拉回时通过 Argilla 2.8 的分页 iterator 单遍扫描，只接受问题完整、用户属于目标 workspace、role 精确为 `annotator` 的 `submitted` response，并保留回答者 UUID、用户名、角色和 workspace UUID。draft/discarded 只计为 skipped；mixed/unknown status、重复问题、缺少 required 问题、无效或未知用户以及 owner/admin/未知 role 会写入 quarantine。accepted 与 quarantine 先写入同一不可变 generation，稳定路径只是兼容快照；原子 commit marker 是唯一发布点，内部 loader 会校验两份 generation 文件及哈希后读取，失败更新继续使用上一 committed generation。
+
+相同 contract 的恢复只补写远端缺失的 record ID，不重传已经存在的记录。完整重复重试不会产生 record 写请求。创建 dataset 时会在 live settings 中写入对 annotator 不可见的 intent fingerprint；如果进程在 `dataset.create()` 后、首批 record 写入前中断，下一次请求只有在 workspace/name、settings、`min_submitted` 和 intent 全部精确匹配时才自动续传。任一项不匹配都会拒绝按同名 dataset 恢复。`if_exists=replace` 不会删除任何既有 dataset：资源不存在时可创建，相同 contract 时按 resume 处理，其他情况必须使用新 dataset name。Argilla `api_url` 不允许 URL userinfo 或敏感 query/fragment，运行凭据只能通过环境变量或 secret 注入。
 
 ## 本地命令开发
 
