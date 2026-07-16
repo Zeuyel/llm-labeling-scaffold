@@ -346,8 +346,13 @@ def test_runtime_role_sql_uses_explicit_fail_closed_privileges():
     assert "relkind IN ('r', 'p', 'v', 'm', 'f')" in sql
     assert "REVOKE EXECUTE ON ALL FUNCTIONS" in sql
     assert "GRANT UPDATE (role)" not in sql
-    assert "GRANT SELECT, INSERT ON TABLE public.audit_events" in sql
-    assert "GRANT SELECT, INSERT ON TABLE public.workspace_settings" in sql
+    assert "('audit_events', true, true, false, false)" in sql
+    assert "('workspace_settings', true, true, true, false)" in sql
+    assert "('allocation_collection_receipts', true, true, false, false)" in sql
+    assert "GRANT %s ON TABLE public.%I TO %I" in sql
+    assert "IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO" not in sql
+    assert "lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text)" in sql
+    assert "lls_sensitive_json_object_is_valid" in sql
     assert "\\getenv app_password SCAFFOLD_POSTGRES_APP_PASSWORD" in sql
     assert "AND rolsuper AS cluster_admin_ok" in sql
     assert "FROM pg_database AS target_database" in sql
@@ -361,8 +366,9 @@ def test_runtime_role_sql_uses_explicit_fail_closed_privileges():
     assert "pg_get_userbyid(procedure.proowner)" in verifier_sql
     assert "ownership_preflight_ok" in ROLE_SQL.read_text(encoding="utf-8")
     assert "proiswindow" not in verifier_sql
-    assert "procedure.prokind::text" in verifier_sql
-    assert "'f',\n        'trigger'" in verifier_sql
+    assert "procedure.prokind = 'f'" in verifier_sql
+    assert "'lls_complete_idempotency'" in verifier_sql
+    assert "'lls_workspace_group_contract'" in verifier_sql
     assert "trigger.tgtype" in verifier_sql
     assert "trigger.tgenabled" in verifier_sql
     assert "trigger.tgfoid" in verifier_sql
@@ -396,6 +402,101 @@ def test_runtime_role_cannot_create_schema(postgres_runtime_database: _RuntimeDa
 
     assert result.returncode != 0
     assert "permission denied" in result.stderr
+
+
+def test_runtime_role_final_schema_acl_matches_service_dependencies(
+    postgres_runtime_database: _RuntimeDatabase,
+):
+    database = postgres_runtime_database
+    expected_relations = {
+        "principals": (True, True, False, False),
+        "workspaces": (True, True, True, False),
+        "tasks": (True, True, True, False),
+        "role_bindings": (True, True, True, True),
+        "idempotency_records": (True, True, False, False),
+        "workspace_settings": (True, True, True, False),
+        "task_drafts": (True, True, True, False),
+        "task_revisions": (True, True, False, False),
+        "task_revision_materializations": (True, True, True, False),
+        "argilla_connection_bindings": (True, True, True, False),
+        "argilla_annotator_mappings": (True, True, True, False),
+        "annotator_cohorts": (True, True, True, False),
+        "annotator_cohort_revisions": (True, True, True, False),
+        "annotator_cohort_members": (True, True, True, True),
+        "allocation_plans": (True, True, True, False),
+        "allocation_plan_states": (True, False, True, False),
+        "allocation_workspace_groups": (True, True, True, False),
+        "allocation_dataset_groups": (True, True, True, False),
+        "allocation_dataset_group_states": (True, False, True, False),
+        "allocation_assignment_items": (True, True, False, False),
+        "allocation_record_bindings": (True, False, True, False),
+        "allocation_assignments": (True, True, True, False),
+        "allocation_collection_receipts": (True, True, False, False),
+        "audit_events": (True, True, False, False),
+        "migration_runs": (False, False, False, False),
+        "alembic_version": (False, False, False, False),
+    }
+    allowed_functions = {
+        "lls_canonical_sensitive_json_text(document json)",
+        "lls_complete_idempotency(p_record_id uuid, p_workspace_id uuid, p_actor_principal_id uuid, p_caller_principal_id uuid, p_operation text, p_idempotency_key_hash text, p_request_fingerprint text, p_required_permission text, p_resource_type text, p_resource_id uuid, p_channel text, p_response_status integer, p_response_body text, p_succeeded boolean, p_request_id text)",
+        "lls_sensitive_json_node_is_valid(document json, current_depth integer)",
+        "lls_sensitive_json_object_is_valid(document json)",
+        "lls_sensitive_json_string_is_safe(value text)",
+        "lls_validate_allocation_plan_graph(target_plan_id uuid)",
+    }
+
+    with psycopg.connect(_render_psycopg_url(database.owner_url)) as connection:
+        for relation_name, expected_privileges in expected_relations.items():
+            actual_privileges = connection.execute(
+                """
+                SELECT has_table_privilege(%s, %s, 'SELECT'),
+                       has_table_privilege(%s, %s, 'INSERT'),
+                       has_table_privilege(%s, %s, 'UPDATE'),
+                       has_table_privilege(%s, %s, 'DELETE')
+                """,
+                (database.app_user, relation_name) * 4,
+            ).fetchone()
+            assert actual_privileges == expected_privileges
+
+        sequence_privileges = connection.execute(
+            """
+            SELECT has_sequence_privilege(%s, 'lls_idempotency_completion_gate_seq', 'USAGE'),
+                   has_sequence_privilege(%s, 'lls_idempotency_completion_gate_seq', 'SELECT')
+            """,
+            (database.app_user, database.app_user),
+        ).fetchone()
+        assert sequence_privileges == (False, False)
+
+        function_rows = connection.execute(
+            """
+            SELECT pg_get_function_identity_arguments(procedure.oid),
+                   procedure.proname,
+                   has_function_privilege(%s, procedure.oid, 'EXECUTE')
+            FROM pg_proc AS procedure
+            JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+            WHERE namespace.nspname = 'public'
+            ORDER BY procedure.proname, pg_get_function_identity_arguments(procedure.oid)
+            """,
+            (database.app_user,),
+        ).fetchall()
+        executable_functions = {
+            f"{function_name}({identity_arguments})"
+            for identity_arguments, function_name, can_execute in function_rows
+            if can_execute
+        }
+        assert executable_functions == allowed_functions
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM pg_proc AS procedure
+            JOIN pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
+            CROSS JOIN LATERAL aclexplode(
+                coalesce(procedure.proacl, acldefault('f', procedure.proowner))
+            ) AS privilege
+            WHERE namespace.nspname = 'public'
+              AND privilege.grantee = 0
+            """
+        ).fetchone()[0] == 0
 
 
 def test_runtime_role_verifier_accepts_absent_acl_catalog_entries(
@@ -802,7 +903,7 @@ def test_runtime_role_verifier_rejects_audit_function_body_drift_without_repair(
     try:
         verifier = _run_verifier(database, check=False)
         assert verifier.returncode == 3
-        assert "runtime function catalog verification failed" in verifier.stdout
+        assert "runtime audit function guard verification failed" in verifier.stdout
 
         initialization = _run_role_script(database, verify=True, check=False)
         assert initialization.returncode == 3
@@ -837,7 +938,7 @@ def test_runtime_role_verifier_rejects_audit_function_security_drift(
     try:
         drift = _run_verifier(database, check=False)
         assert drift.returncode == 3
-        assert "runtime function catalog verification failed" in drift.stdout
+        assert "runtime audit function guard verification failed" in drift.stdout
     finally:
         _run_sql(
             database.owner_url,

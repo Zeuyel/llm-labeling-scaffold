@@ -19,11 +19,62 @@ WITH expected_relations(relation_name, relation_kind) AS (
         ('role_bindings', 'r'),
         ('idempotency_records', 'r'),
         ('workspace_settings', 'r'),
+        ('task_drafts', 'r'),
+        ('task_revisions', 'r'),
+        ('task_revision_materializations', 'r'),
+        ('argilla_connection_bindings', 'r'),
+        ('argilla_annotator_mappings', 'r'),
+        ('annotator_cohorts', 'r'),
+        ('annotator_cohort_revisions', 'r'),
+        ('annotator_cohort_members', 'r'),
+        ('allocation_plans', 'r'),
+        ('allocation_plan_states', 'r'),
+        ('allocation_workspace_groups', 'r'),
+        ('allocation_dataset_groups', 'r'),
+        ('allocation_dataset_group_states', 'r'),
+        ('allocation_assignment_items', 'r'),
+        ('allocation_record_bindings', 'r'),
+        ('allocation_assignments', 'r'),
+        ('allocation_collection_receipts', 'r'),
         ('audit_events', 'r'),
         ('migration_runs', 'r'),
         ('alembic_version', 'r')
 ), expected_function(function_name, identity_arguments) AS (
-    VALUES ('lls_reject_audit_event_mutation', '')
+    VALUES
+        ('lls_allocation_plan_contract', ''),
+        ('lls_allocation_plan_create_state', ''),
+        ('lls_allocation_plan_state_guard', ''),
+        ('lls_argilla_annotator_mapping_freeze', ''),
+        ('lls_argilla_connection_binding_freeze', ''),
+        ('lls_assignment_contract', ''),
+        ('lls_assignment_item_create_binding', ''),
+        ('lls_canonical_sensitive_json_text', 'document json'),
+        ('lls_cohort_member_guard', ''),
+        ('lls_cohort_revision_guard', ''),
+        ('lls_collection_receipt_guard', ''),
+        ('lls_complete_idempotency', 'p_record_id uuid, p_workspace_id uuid, p_actor_principal_id uuid, p_caller_principal_id uuid, p_operation text, p_idempotency_key_hash text, p_request_fingerprint text, p_required_permission text, p_resource_type text, p_resource_id uuid, p_channel text, p_response_status integer, p_response_body text, p_succeeded boolean, p_request_id text'),
+        ('lls_confirmed_plan_child_guard', ''),
+        ('lls_dataset_group_contract', ''),
+        ('lls_dataset_group_create_state', ''),
+        ('lls_dataset_group_state_guard', ''),
+        ('lls_enforce_last_workspace_admin', ''),
+        ('lls_idempotency_completion_gate_is_open', ''),
+        ('lls_protect_idempotency_record_delete', ''),
+        ('lls_protect_idempotency_record_update', ''),
+        ('lls_record_binding_guard', ''),
+        ('lls_reject_allocation_receipt_mutation', ''),
+        ('lls_reject_allocation_truncate', ''),
+        ('lls_reject_audit_event_mutation', ''),
+        ('lls_reject_task_revision_mutation', ''),
+        ('lls_sensitive_json_node_is_valid', 'document json, current_depth integer'),
+        ('lls_sensitive_json_object_is_valid', 'document json'),
+        ('lls_sensitive_json_string_is_safe', 'value text'),
+        ('lls_validate_allocation_plan_graph', 'target_plan_id uuid'),
+        ('lls_validate_audit_event_details', ''),
+        ('lls_validate_idempotency_record_insert', ''),
+        ('lls_validate_idempotency_response_body', ''),
+        ('lls_validate_workspace_setting_value', ''),
+        ('lls_workspace_group_contract', '')
 ), database_owner AS (
     SELECT EXISTS (
         SELECT 1
@@ -196,9 +247,6 @@ WHERE to_regclass('public.idempotency_records') IS NOT NULL
 SELECT format('REVOKE UPDATE, DELETE ON TABLE public.audit_events FROM %I', :'app_user')
 WHERE to_regclass('public.audit_events') IS NOT NULL
 \gexec
-SELECT format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO %I', :'app_user')
-\gexec
-
 SELECT format(
     'REVOKE ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA %I FROM PUBLIC',
     namespace.nspname
@@ -268,13 +316,6 @@ SELECT format(
 )
 \gexec
 SELECT format(
-    'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO %I',
-    :'owner_user',
-    :'app_user'
-)
-\gexec
-
-SELECT format(
     'ALTER DEFAULT PRIVILEGES FOR ROLE %I IN SCHEMA public REVOKE ALL ON TABLES FROM PUBLIC',
     :'owner_user'
 )
@@ -308,9 +349,49 @@ SELECT format(
 )
 \gexec
 
-SELECT format('GRANT SELECT, INSERT ON TABLE public.principals TO %I', :'app_user')
-WHERE to_regclass('public.principals') IS NOT NULL
+WITH expected_relations(relation_name, can_select, can_insert, can_update, can_delete) AS (
+    VALUES
+        ('principals', true, true, false, false),
+        ('workspaces', true, true, true, false),
+        ('tasks', true, true, true, false),
+        ('role_bindings', true, true, true, true),
+        ('idempotency_records', true, true, false, false),
+        ('workspace_settings', true, true, true, false),
+        ('task_drafts', true, true, true, false),
+        ('task_revisions', true, true, false, false),
+        ('task_revision_materializations', true, true, true, false),
+        ('argilla_connection_bindings', true, true, true, false),
+        ('argilla_annotator_mappings', true, true, true, false),
+        ('annotator_cohorts', true, true, true, false),
+        ('annotator_cohort_revisions', true, true, true, false),
+        ('annotator_cohort_members', true, true, true, true),
+        ('allocation_plans', true, true, true, false),
+        ('allocation_plan_states', true, false, true, false),
+        ('allocation_workspace_groups', true, true, true, false),
+        ('allocation_dataset_groups', true, true, true, false),
+        ('allocation_dataset_group_states', true, false, true, false),
+        ('allocation_assignment_items', true, true, false, false),
+        ('allocation_record_bindings', true, false, true, false),
+        ('allocation_assignments', true, true, true, false),
+        ('allocation_collection_receipts', true, true, false, false),
+        ('audit_events', true, true, false, false),
+        ('migration_runs', false, false, false, false),
+        ('alembic_version', false, false, false, false)
+), privileges(privilege_type) AS (
+    VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')
+)
+SELECT format('GRANT %s ON TABLE public.%I TO %I', privileges.privilege_type, expected_relations.relation_name, :'app_user')
+FROM expected_relations
+CROSS JOIN privileges
+WHERE CASE privileges.privilege_type
+    WHEN 'SELECT' THEN expected_relations.can_select
+    WHEN 'INSERT' THEN expected_relations.can_insert
+    WHEN 'UPDATE' THEN expected_relations.can_update
+    WHEN 'DELETE' THEN expected_relations.can_delete
+END
+  AND to_regclass(format('public.%I', expected_relations.relation_name)) IS NOT NULL
 \gexec
+
 SELECT format(
     'GRANT UPDATE (display_name, email_snapshot, updated_at) ON TABLE public.principals TO %I',
     :'app_user'
@@ -318,32 +399,22 @@ SELECT format(
 WHERE to_regclass('public.principals') IS NOT NULL
 \gexec
 
-SELECT format('GRANT SELECT ON TABLE public.workspaces TO %I', :'app_user')
-WHERE to_regclass('public.workspaces') IS NOT NULL
-\gexec
-SELECT format('GRANT SELECT ON TABLE public.tasks TO %I', :'app_user')
-WHERE to_regclass('public.tasks') IS NOT NULL
-\gexec
-SELECT format('GRANT SELECT ON TABLE public.role_bindings TO %I', :'app_user')
-WHERE to_regclass('public.role_bindings') IS NOT NULL
-\gexec
-
-SELECT format('GRANT SELECT, INSERT ON TABLE public.idempotency_records TO %I', :'app_user')
-WHERE to_regclass('public.idempotency_records') IS NOT NULL
-\gexec
+WITH expected_functions(function_name, argument_types) AS (
+    VALUES
+        ('lls_canonical_sensitive_json_text', 'json'),
+        ('lls_sensitive_json_node_is_valid', 'json, integer'),
+        ('lls_sensitive_json_object_is_valid', 'json'),
+        ('lls_sensitive_json_string_is_safe', 'text'),
+        ('lls_validate_allocation_plan_graph', 'uuid')
+)
 SELECT format(
-    'GRANT UPDATE (state, response_status, response_body, updated_at) '
-    'ON TABLE public.idempotency_records TO %I',
+    'GRANT EXECUTE ON FUNCTION public.%I(%s) TO %I',
+    expected_functions.function_name,
+    expected_functions.argument_types,
     :'app_user'
 )
-WHERE to_regclass('public.idempotency_records') IS NOT NULL
-\gexec
-
-SELECT format('GRANT SELECT, INSERT ON TABLE public.workspace_settings TO %I', :'app_user')
-WHERE to_regclass('public.workspace_settings') IS NOT NULL
-\gexec
-SELECT format('GRANT SELECT, INSERT ON TABLE public.audit_events TO %I', :'app_user')
-WHERE to_regclass('public.audit_events') IS NOT NULL
+FROM expected_functions
+WHERE to_regprocedure(format('public.%I(%s)', expected_functions.function_name, expected_functions.argument_types)) IS NOT NULL
 \gexec
 
 SELECT format(

@@ -1658,7 +1658,7 @@ def test_postgres_task_draft_publish_concurrency_permissions_and_triggers():
             ) is True
             assert session.scalar(
                 text("SELECT has_table_privilege(current_user, 'task_revisions', 'UPDATE, DELETE')"),
-            ) is True
+            ) is False
             assert session.scalar(
                 text("SELECT has_table_privilege(current_user, 'task_revisions', 'TRUNCATE')"),
             ) is False
