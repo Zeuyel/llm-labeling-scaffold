@@ -989,18 +989,19 @@ def test_postgres_upgrade_and_audit_trigger_rejects_mutation():
         assert {name: tuple(values) for name, values in actual_enums.items()} == EXPECTED_ALLOCATION_ENUMS
         assert allocation_trigger_names == EXPECTED_POSTGRES_ALLOCATION_TRIGGERS
         assert event_type == "workspace.admin_bootstrapped"
-        assert {
+        expected_json_columns = {
             ("idempotency_records", "response_body"),
             ("workspace_settings", "setting_value"),
             ("audit_events", "details"),
+        }
+        expected_jsonb_columns = {
             ("task_drafts", "definition"),
             ("task_revisions", "definition"),
-        } <= jsonb_columns
-        assert {
-            ("idempotency_records", "response_body"),
-            ("workspace_settings", "setting_value"),
-            ("audit_events", "details"),
-        } <= json_columns
+        }
+        assert expected_json_columns <= json_columns
+        assert expected_jsonb_columns <= jsonb_columns
+        assert expected_json_columns.isdisjoint(jsonb_columns)
+        assert expected_jsonb_columns.isdisjoint(json_columns)
         assert "actor_email_snapshot" not in audit_columns
         assert {
             "lls_canonical_sensitive_json_text",
