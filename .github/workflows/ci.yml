@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+      - integration
+      - integration/multiuser-control-plane
   pull_request:
   workflow_dispatch:
 
@@ -86,3 +88,19 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: npm run build
+
+  compose:
+    runs-on: ubuntu-latest
+    env:
+      SCAFFOLD_POSTGRES_OWNER_PASSWORD: owner_ci_password
+      SCAFFOLD_POSTGRES_APP_PASSWORD: app_ci_password
+      RCLONE_CONFIG_HOST: /tmp/rclone.conf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate Compose configuration
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.loopback.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml config --quiet
