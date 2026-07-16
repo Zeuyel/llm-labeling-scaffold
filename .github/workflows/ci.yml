@@ -30,11 +30,19 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     env:
+      SCAFFOLD_POSTGRES_APP_USER: scaffold_app
       LLS_TEST_POSTGRES_URL: postgresql+psycopg://scaffold_owner:owner_ci_password@127.0.0.1:5432/scaffold
       LLS_TEST_POSTGRES_APP_URL: postgresql+psycopg://scaffold_app:app_ci_password@127.0.0.1:5432/scaffold
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate PostgreSQL test configuration
+        run: |
+          test -n "${SCAFFOLD_POSTGRES_APP_USER:-}"
+          test "${SCAFFOLD_POSTGRES_APP_USER}" = "scaffold_app"
+          test "${LLS_TEST_POSTGRES_URL}" = "postgresql+psycopg://scaffold_owner:owner_ci_password@127.0.0.1:5432/scaffold"
+          test "${LLS_TEST_POSTGRES_APP_URL}" = "postgresql+psycopg://${SCAFFOLD_POSTGRES_APP_USER}:app_ci_password@127.0.0.1:5432/scaffold"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -50,7 +58,6 @@ jobs:
           PGPASSWORD: owner_ci_password
           POSTGRES_USER: scaffold_owner
           POSTGRES_DB: scaffold
-          SCAFFOLD_POSTGRES_APP_USER: scaffold_app
           SCAFFOLD_POSTGRES_APP_PASSWORD: app_ci_password
         run: ./docker/postgres/init-runtime-role.sh
 
@@ -61,7 +68,6 @@ jobs:
           PGPASSWORD: owner_ci_password
           POSTGRES_USER: scaffold_owner
           POSTGRES_DB: scaffold
-          SCAFFOLD_POSTGRES_APP_USER: scaffold_app
           SCAFFOLD_POSTGRES_APP_PASSWORD: app_ci_password
           LLS_RUNTIME_ROLE_VERIFY_SQL_PATH: ./docker/postgres/verify-runtime-role.sql
         run: |
