@@ -302,6 +302,7 @@ def test_compose_role_initialization_paths_are_explicit():
     assert materializer["depends_on"]["migrate"]["condition"] == "service_completed_successfully"
     assert "./runs:/app/runs" in materializer["volumes"]
     assert "./tasks:/app/tasks" in materializer["volumes"]
+    assert materializer["networks"] == ["lls", "scaffold-db"]
 
     first_init = services["scaffold-postgres"]
     assert first_init["environment"]["LLS_RUNTIME_ROLE_SQL_PATH"] == (
@@ -347,6 +348,7 @@ def test_compose_database_network_is_internal_and_owner_secret_is_not_in_panel()
     assert compose["networks"]["scaffold-db"]["internal"] is True
     assert services["scaffold-postgres"]["networks"] == ["scaffold-db"]
     assert set(services["panel"]["networks"]) == {"lls", "scaffold-db"}
+    assert set(services["materializer"]["networks"]) == {"lls", "scaffold-db"}
     assert "scaffold-db" not in services["mcp"]["networks"]
     assert all("OWNER_PASSWORD" not in value for value in services["panel"]["environment"])
 
