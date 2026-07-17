@@ -36,10 +36,14 @@ from .db import (
     ExternalIdentity,
     IdempotencyConflict,
     Permission,
+    TaskCreateConflict,
+    TaskCreateInProgress,
     TaskDraftConflict,
     TaskDraftNotFound,
     TaskPreconditionRequired,
+    TaskPublishReasonRequired,
     TaskPublishInProgress,
+    task_definition_fingerprint,
 )
 from .db.database import create_database_engine, create_session_factory
 from .db.migration import build_alembic_config
@@ -48,7 +52,7 @@ from . import pipeline
 from . import panel_settings
 from .redaction import redact_text
 
-API_CONTRACT_VERSION = "2026-07-14"
+API_CONTRACT_VERSION = "2026-07-17"
 AUTHORIZATION_READY = "ready"
 AUTHORIZATION_UNAVAILABLE = "unavailable"
 
@@ -477,15 +481,21 @@ def _contract_capabilities(
             {
                 "method": "POST",
                 "path": "/api/tasks",
-                "action": "task_control_create_draft",
+                "action": "task_control_create",
                 "side_effects": True,
                 "requires_task_source": "control",
                 "request_schema": {
                     "type": "object",
                     "required": ["task_id", "text_fields", "primary_label_values", "workspace"],
-                    "properties": {"workspace": {"type": "string"}},
+                    "properties": {
+                        "workspace": {"type": "string"},
+                        "idempotency_key": {
+                            "type": "string",
+                            "description": "可选；省略时由任务定义生成稳定幂等键",
+                        },
+                    },
                 },
-                "response_schema": {"type": "object", "required": ["ok", "task"]},
+                "response_schema": {"type": "object", "required": ["ok", "task", "record", "action"]},
             },
             {
                 "method": "PUT",
@@ -915,13 +925,19 @@ def _active_task_summary(workspace_slug: str, access, active: ActiveTaskRevision
         "capabilities": [permission.value for permission in access.capabilities],
         "roles": [role.value for role in access.roles],
     }
+    draft_fingerprint = getattr(access.task, "draft_fingerprint", None)
+    draft_version = getattr(access.task, "draft_version", None)
     if active is None:
-        summary.update({"status": "unpublished", "revision": 0})
+        summary.update({"status": "draft" if draft_fingerprint else "unpublished", "revision": 0})
+        if draft_fingerprint:
+            summary.update({"draft_version": draft_version, "draft_fingerprint": draft_fingerprint})
         return summary
     raw = _active_task_raw(active)
+    active_fingerprint = task_definition_fingerprint(active.definition, active.rendered_task)
+    status = "published_with_draft" if draft_fingerprint and draft_fingerprint != active_fingerprint else "published"
     summary.update(
         {
-            "status": "published",
+            "status": status,
             "revision": active.revision_number,
             "revision_id": active.revision_id,
             "path": str(active.task_config.path) if active.task_config is not None else None,
@@ -929,6 +945,8 @@ def _active_task_summary(workspace_slug: str, access, active: ActiveTaskRevision
             "id_field": raw["id_field"],
         },
     )
+    if status == "published_with_draft":
+        summary.update({"draft_version": draft_version, "draft_fingerprint": draft_fingerprint})
     primary = raw.get("labels", {}).get("primary")
     if isinstance(primary, dict):
         summary["primary_label"] = primary
@@ -1376,6 +1394,12 @@ class _Handler(BaseHTTPRequestHandler):
                 status=HTTPStatus.PRECONDITION_REQUIRED,
             )
             return
+        if isinstance(exc, TaskPublishReasonRequired):
+            self._json(
+                {"error": "任务发布必须提供 reason", "code": exc.code},
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+            return
         if isinstance(exc, TaskDraftConflict):
             headers = {"ETag": exc.current_etag} if exc.current_etag is not None else None
             self._json(
@@ -1390,9 +1414,21 @@ class _Handler(BaseHTTPRequestHandler):
                 status=HTTPStatus.NOT_FOUND,
             )
             return
+        if isinstance(exc, TaskCreateConflict):
+            self._json(
+                {"error": "任务编号已存在，不能重复创建", "code": exc.code},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, TaskCreateInProgress):
+            self._json(
+                {"error": "任务创建正在处理中，请稍后重试", "code": exc.code},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
         if isinstance(exc, (IdempotencyConflict, TaskPublishInProgress)):
             self._json(
-                {"error": "请求与现有发布操作冲突", "code": exc.code},
+                {"error": "请求与现有幂等操作冲突", "code": exc.code},
                 status=HTTPStatus.CONFLICT,
             )
             return
@@ -1591,6 +1627,7 @@ class _Handler(BaseHTTPRequestHandler):
         definition = dict(body)
         definition.pop("workspace", None)
         definition.pop("workspace_slug", None)
+        definition.pop("idempotency_key", None)
         submitted_task_id = str(definition.get("task_id") or "").strip()
         if submitted_task_id != task_id:
             raise ValueError("body.task_id 必须与路由 task_id 一致")
@@ -1617,21 +1654,46 @@ class _Handler(BaseHTTPRequestHandler):
                 self._workspace_selector(params, body),
             )
             definition, rendered_task = self._validated_draft_definition(body, task_id=task_id)
-            result = service.save_task_draft(
-                actor_identity=actor_identity,
-                caller_identity=caller_identity,
-                workspace_slug=workspace_slug,
-                task_key=task_id,
-                definition=definition,
-                rendered_task=rendered_task,
-                if_match=None if create else if_match,
-                channel=channel,
-                if_none_match="*" if create else None,
-            )
-            action = "created" if create else ("updated" if result.changed else "unchanged")
+            if create:
+                idempotency_key = str(
+                    body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "",
+                ).strip()
+                if not idempotency_key:
+                    idempotency_key = (
+                        f"task-create:{workspace_slug}:{task_id}:"
+                        f"{task_definition_fingerprint(definition, rendered_task)}"
+                    )
+                if not _valid_idempotency_key(idempotency_key):
+                    raise ValueError("任务创建必须提供有效的 idempotency_key 或 Idempotency-Key header")
+                result = service.create_task(
+                    actor_identity=actor_identity,
+                    caller_identity=caller_identity,
+                    workspace_slug=workspace_slug,
+                    task_key=task_id,
+                    definition=definition,
+                    rendered_task=rendered_task,
+                    idempotency_key=idempotency_key,
+                    channel=channel,
+                )
+                action = "replayed" if result.replayed else "created"
+                status = result.response_status
+            else:
+                result = service.save_task_draft(
+                    actor_identity=actor_identity,
+                    caller_identity=caller_identity,
+                    workspace_slug=workspace_slug,
+                    task_key=task_id,
+                    definition=definition,
+                    rendered_task=rendered_task,
+                    if_match=if_match,
+                    channel=channel,
+                )
+                action = "updated" if result.changed else "unchanged"
+                status = 200
             self._json(
                 _draft_response(task_id, result.draft, action=action),
                 headers={"ETag": result.draft.etag, "Cache-Control": "no-store, private"},
+                status=status,
             )
         except Exception as exc:
             self._route_error(exc)
@@ -1650,7 +1712,7 @@ class _Handler(BaseHTTPRequestHandler):
                 raise ValueError("任务发布必须显式设置 confirm=true")
             reason = str(body.get("reason") or "").strip()
             if not reason:
-                raise ValueError("任务发布必须提供 reason")
+                raise TaskPublishReasonRequired()
             idempotency_key = str(
                 body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "",
             ).strip()
