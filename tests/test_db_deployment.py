@@ -366,6 +366,8 @@ def test_runtime_role_sql_uses_explicit_fail_closed_privileges():
     assert "('audit_events', true, true, false, false)" in sql
     assert "('workspace_settings', true, true, true, false)" in sql
     assert "('allocation_collection_receipts', true, true, false, false)" in sql
+    assert "('annotation_jobs', true, true, true, false)" in sql
+    assert "lls_annotation_job_guard" in sql
     assert "GRANT %s ON TABLE public.%I TO %I" in sql
     assert "IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO" not in sql
     assert "lls_complete_idempotency(uuid, uuid, uuid, uuid, text, text, text, text, text, uuid, text, integer, text, boolean, text)" in sql
@@ -456,6 +458,7 @@ def test_runtime_role_final_schema_acl_matches_service_dependencies(
         "allocation_record_bindings": (True, False, True, False),
         "allocation_assignments": (True, True, True, False),
         "allocation_collection_receipts": (True, True, False, False),
+        "annotation_jobs": (True, True, True, False),
         "audit_events": (True, True, False, False),
         "migration_runs": (False, False, False, False),
         "alembic_version": (False, False, False, False),

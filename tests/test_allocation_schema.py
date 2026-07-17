@@ -46,6 +46,7 @@ from llm_labeling_scaffold.db.models import (
     AllocationPlanState,
     AllocationRecordBinding,
     AllocationWorkspaceGroup,
+    AnnotationJob,
     AnnotatorCohort,
     AnnotatorCohortMember,
     AnnotatorCohortRevision,
@@ -72,6 +73,7 @@ ALLOCATION_TABLES = {
     "allocation_record_bindings",
     "allocation_assignments",
     "allocation_collection_receipts",
+    "annotation_jobs",
 }
 
 
@@ -183,6 +185,14 @@ def test_metadata_schema_names_excludes_only_enum_checks_for_postgres():
         assert sqlite_names["check"] - postgres_names["check"] == enum_checks
 
 
+def test_annotation_job_schema_names_match_metadata_and_migration(allocation_engine):
+    inspector = inspect(allocation_engine)
+    assert _database_schema_names(inspector, "annotation_jobs") == _metadata_schema_names(
+        "annotation_jobs",
+        allocation_engine.dialect.name,
+    )
+
+
 @pytest.fixture(params=("metadata", "migration"))
 def allocation_engine(request, tmp_path: Path):
     database_url = f"sqlite+pysqlite:///{tmp_path / f'allocation-{request.param}.db'}"
@@ -208,6 +218,29 @@ def _claim(session: Session, workspace_id: uuid.UUID, principal_id: uuid.UUID, o
         required_permission="task:create",
         resource_type="workspace",
         resource_id=workspace_id,
+        channel=AuditChannel.API,
+    )
+    session.add(record)
+    session.flush()
+    return record.id
+
+
+def _annotation_claim(
+    session: Session,
+    workspace_id: uuid.UUID,
+    task_id: uuid.UUID,
+    principal_id: uuid.UUID,
+) -> uuid.UUID:
+    record = IdempotencyRecord(
+        workspace_id=workspace_id,
+        actor_principal_id=principal_id,
+        caller_principal_id=principal_id,
+        operation=f"annotation.job.{uuid.uuid4()}",
+        idempotency_key_hash=_hash(f"annotation-key:{uuid.uuid4()}"),
+        request_fingerprint=_hash(f"annotation-request:{uuid.uuid4()}"),
+        required_permission="annotation:review",
+        resource_type="task",
+        resource_id=task_id,
         channel=AuditChannel.API,
     )
     session.add(record)
@@ -1364,6 +1397,124 @@ def test_receipts_bind_remote_identity_validate_respondents_and_are_append_only(
             session.flush()
 
 
+def test_annotation_job_is_scoped_immutable_and_stateful(allocation_engine):
+    ids = _build_graph(allocation_engine)
+    _confirm_plan(allocation_engine, ids)
+    with Session(allocation_engine) as session, session.begin():
+        plan = session.get(AllocationPlan, ids["plan"])
+        claim_id = _annotation_claim(
+            session,
+            ids["workspace"],
+            ids["task"],
+            ids["principal"],
+        )
+        job = AnnotationJob(
+            workspace_id=ids["workspace"],
+            task_id=ids["task"],
+            task_revision_id=ids["task_revision"],
+            source_manifest_id=plan.source_manifest_id,
+            source_manifest_hash=plan.source_manifest_hash,
+            connection_binding_id=ids["binding"],
+            cohort_revision_id=ids["cohort_revision"],
+            allocation_plan_id=ids["plan"],
+            logical_job_id=f"annotation-job-{uuid.uuid4().hex[:10]}",
+            dataset_name=f"annotation-dataset-{uuid.uuid4().hex[:10]}",
+            created_by_principal_id=ids["principal"],
+            idempotency_record_id=claim_id,
+        )
+        session.add(job)
+        session.flush()
+        job_id = job.id
+        assert job.lifecycle_state.value == "draft"
+        assert job.dispatch_state.value == "pending"
+        assert job.collection_state.value == "pending"
+
+        job.lifecycle_state = "ready"
+        session.flush()
+        job.lifecycle_state = "dispatching"
+        job.dispatch_state = "running"
+        session.flush()
+        job.lifecycle_state = "dispatched"
+        job.dispatch_state = "succeeded"
+        job.remote_dataset_id = uuid.uuid4()
+        session.flush()
+        job.lifecycle_state = "collecting"
+        job.collection_state = "running"
+        session.flush()
+        job.lifecycle_state = "completed"
+        job.collection_state = "succeeded"
+        session.flush()
+
+    with pytest.raises(DBAPIError):
+        with allocation_engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE annotation_jobs SET source_manifest_hash = :value WHERE id = :job_id"
+                ),
+                {"value": _hash("replacement"), "job_id": _db_uuid(job_id)},
+            )
+
+        with pytest.raises(DBAPIError):
+            with allocation_engine.begin() as connection:
+                connection.execute(
+                    text("DELETE FROM annotation_jobs WHERE id = :job_id"),
+                    {"job_id": _db_uuid(job_id)},
+                )
+
+
+def test_annotation_job_requires_confirmed_allocation_plan(allocation_engine):
+    ids = _build_graph(allocation_engine)
+    with Session(allocation_engine) as session, session.begin():
+        plan = session.get(AllocationPlan, ids["plan"])
+        job = AnnotationJob(
+            workspace_id=ids["workspace"],
+            task_id=ids["task"],
+            task_revision_id=ids["task_revision"],
+            source_manifest_id=plan.source_manifest_id,
+            source_manifest_hash=plan.source_manifest_hash,
+            connection_binding_id=ids["binding"],
+            cohort_revision_id=ids["cohort_revision"],
+            allocation_plan_id=ids["plan"],
+            logical_job_id=f"unconfirmed-annotation-job-{uuid.uuid4().hex[:10]}",
+            dataset_name=f"unconfirmed-annotation-dataset-{uuid.uuid4().hex[:10]}",
+            created_by_principal_id=ids["principal"],
+            idempotency_record_id=_annotation_claim(
+                session,
+                ids["workspace"],
+                ids["task"],
+                ids["principal"],
+            ),
+        )
+        session.add(job)
+        with pytest.raises(DBAPIError):
+            session.flush()
+
+    _confirm_plan(allocation_engine, ids)
+    with Session(allocation_engine) as session, session.begin():
+        plan = session.get(AllocationPlan, ids["plan"])
+        job = AnnotationJob(
+            workspace_id=ids["workspace"],
+            task_id=ids["task"],
+            task_revision_id=ids["task_revision"],
+            source_manifest_id=plan.source_manifest_id,
+            source_manifest_hash=plan.source_manifest_hash,
+            connection_binding_id=ids["binding"],
+            cohort_revision_id=ids["cohort_revision"],
+            allocation_plan_id=ids["plan"],
+            logical_job_id=f"confirmed-annotation-job-{uuid.uuid4().hex[:10]}",
+            dataset_name=f"confirmed-annotation-dataset-{uuid.uuid4().hex[:10]}",
+            created_by_principal_id=ids["principal"],
+            idempotency_record_id=_annotation_claim(
+                session,
+                ids["workspace"],
+                ids["task"],
+                ids["principal"],
+            ),
+        )
+        session.add(job)
+        session.flush()
+
+
 def test_allocation_migration_upgrade_downgrade_round_trip(tmp_path: Path):
     database_url = f"sqlite+pysqlite:///{tmp_path / 'allocation-round-trip.db'}"
     config = build_alembic_config(database_url)
@@ -1373,7 +1524,7 @@ def test_allocation_migration_upgrade_downgrade_round_trip(tmp_path: Path):
         assert ALLOCATION_TABLES <= set(inspect(engine).get_table_names())
         with Session(engine) as session:
             assert session.scalar(select(text("version_num")).select_from(text("alembic_version"))) == (
-                "20260716_0005"
+                "20260717_0006"
             )
     finally:
         engine.dispose()

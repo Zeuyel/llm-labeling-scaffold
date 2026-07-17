@@ -36,6 +36,7 @@ WITH expected_relations(relation_name, relation_kind) AS (
         ('allocation_record_bindings', 'r'),
         ('allocation_assignments', 'r'),
         ('allocation_collection_receipts', 'r'),
+        ('annotation_jobs', 'r'),
         ('audit_events', 'r'),
         ('migration_runs', 'r'),
         ('alembic_version', 'r')
@@ -48,6 +49,7 @@ WITH expected_relations(relation_name, relation_kind) AS (
         ('lls_argilla_connection_binding_freeze', ''),
         ('lls_assignment_contract', ''),
         ('lls_assignment_item_create_binding', ''),
+        ('lls_annotation_job_guard', ''),
         ('lls_canonical_sensitive_json_text', 'document json'),
         ('lls_cohort_member_guard', ''),
         ('lls_cohort_revision_guard', ''),
@@ -398,6 +400,7 @@ WITH expected_relations(relation_name, can_select, can_insert, can_update, can_d
         ('allocation_record_bindings', true, false, true, false),
         ('allocation_assignments', true, true, true, false),
         ('allocation_collection_receipts', true, true, false, false),
+        ('annotation_jobs', true, true, true, false),
         ('audit_events', true, true, false, false),
         ('migration_runs', false, false, false, false),
         ('alembic_version', false, false, false, false)

@@ -18,6 +18,8 @@ from llm_labeling_scaffold.db.enums import AuditChannel
 from llm_labeling_scaffold.db.migration import build_alembic_config
 from llm_labeling_scaffold.db.models import (
     AllocationAssignmentItem,
+    AllocationPlan,
+    AnnotationJob,
     AnnotatorCohortMember,
     AnnotatorCohortRevision,
 )
@@ -26,6 +28,7 @@ from tests.test_allocation_schema import (
     _build_graph,
     _build_peer_draft_plan,
     _build_unsealed_cohort_revision,
+    _annotation_claim,
     _claim,
     _confirm_plan,
     _database_schema_names,
@@ -793,6 +796,128 @@ def test_postgres_cohort_seal_locks_revision_before_member_insert():
         assert row.sealed_at is not None
         assert row.connection_binding_id == ids["binding"]
         assert row[2] == 1
+    finally:
+        engine.dispose()
+
+
+def test_postgres_annotation_job_migration_contract():
+    engine = _upgrade_engine()
+    try:
+        ids = _build_graph(engine)
+        _confirm_plan(engine, ids)
+        with Session(engine) as session, session.begin():
+            plan = session.get(AllocationPlan, ids["plan"])
+            job = AnnotationJob(
+                workspace_id=ids["workspace"],
+                task_id=ids["task"],
+                task_revision_id=ids["task_revision"],
+                source_manifest_id=plan.source_manifest_id,
+                source_manifest_hash=plan.source_manifest_hash,
+                connection_binding_id=ids["binding"],
+                cohort_revision_id=ids["cohort_revision"],
+                allocation_plan_id=ids["plan"],
+                logical_job_id=f"postgres-job-{uuid.uuid4().hex[:10]}",
+                dataset_name=f"postgres-dataset-{uuid.uuid4().hex[:10]}",
+                created_by_principal_id=ids["principal"],
+                idempotency_record_id=_annotation_claim(
+                    session,
+                    ids["workspace"],
+                    ids["task"],
+                    ids["principal"],
+                ),
+            )
+            session.add(job)
+            session.flush()
+            job_id = job.id
+
+        with engine.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT enumlabel FROM pg_enum "
+                    "JOIN pg_type ON pg_type.oid = pg_enum.enumtypid "
+                    "WHERE pg_type.typname = 'annotation_job_lifecycle' "
+                    "ORDER BY enumsortorder"
+                )
+            ).scalars().all() == [
+                "draft",
+                "ready",
+                "dispatching",
+                "dispatched",
+                "collecting",
+                "completed",
+                "failed",
+                "archived",
+            ]
+
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text("UPDATE annotation_jobs SET dataset_name = :name WHERE id = :job_id"),
+                    {"name": "replacement", "job_id": job_id},
+                )
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text("DELETE FROM annotation_jobs WHERE id = :job_id"),
+                    {"job_id": job_id},
+                )
+    finally:
+        engine.dispose()
+
+
+def test_postgres_annotation_job_requires_confirmed_allocation_plan():
+    engine = _upgrade_engine()
+    try:
+        ids = _build_graph(engine)
+        with Session(engine) as session, session.begin():
+            plan = session.get(AllocationPlan, ids["plan"])
+            job = AnnotationJob(
+                workspace_id=ids["workspace"],
+                task_id=ids["task"],
+                task_revision_id=ids["task_revision"],
+                source_manifest_id=plan.source_manifest_id,
+                source_manifest_hash=plan.source_manifest_hash,
+                connection_binding_id=ids["binding"],
+                cohort_revision_id=ids["cohort_revision"],
+                allocation_plan_id=ids["plan"],
+                logical_job_id=f"postgres-unconfirmed-job-{uuid.uuid4().hex[:10]}",
+                dataset_name=f"postgres-unconfirmed-dataset-{uuid.uuid4().hex[:10]}",
+                created_by_principal_id=ids["principal"],
+                idempotency_record_id=_annotation_claim(
+                    session,
+                    ids["workspace"],
+                    ids["task"],
+                    ids["principal"],
+                ),
+            )
+            session.add(job)
+            with pytest.raises(DBAPIError):
+                session.flush()
+
+        _confirm_plan(engine, ids)
+        with Session(engine) as session, session.begin():
+            plan = session.get(AllocationPlan, ids["plan"])
+            job = AnnotationJob(
+                workspace_id=ids["workspace"],
+                task_id=ids["task"],
+                task_revision_id=ids["task_revision"],
+                source_manifest_id=plan.source_manifest_id,
+                source_manifest_hash=plan.source_manifest_hash,
+                connection_binding_id=ids["binding"],
+                cohort_revision_id=ids["cohort_revision"],
+                allocation_plan_id=ids["plan"],
+                logical_job_id=f"postgres-confirmed-job-{uuid.uuid4().hex[:10]}",
+                dataset_name=f"postgres-confirmed-dataset-{uuid.uuid4().hex[:10]}",
+                created_by_principal_id=ids["principal"],
+                idempotency_record_id=_annotation_claim(
+                    session,
+                    ids["workspace"],
+                    ids["task"],
+                    ids["principal"],
+                ),
+            )
+            session.add(job)
+            session.flush()
     finally:
         engine.dispose()
 
