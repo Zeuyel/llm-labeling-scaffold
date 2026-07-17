@@ -27,19 +27,31 @@ function parseList(value) {
     .filter(Boolean);
 }
 
+async function readDataLakeCatalog(datasetId = "") {
+  const query = datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : "";
+  const response = await fetch(`/api/data_lake/catalog${query}`);
+  if (!response.ok) throw new Error(`读取数据湖资产目录失败：${response.status}`);
+  return response.json();
+}
+
+function generatedImportId(taskId, datasetId, objectPath) {
+  const suffix = String(objectPath || "v001").split("/").filter(Boolean).pop() || "v001";
+  return `${taskId || "task"}_${datasetId || "dataset"}_${suffix.replace(/\.[^.]+$/, "")}`
+    .replace(/[^A-Za-z0-9_.-]+/g, "_");
+}
+
 export default function TasksPage({
   tasks,
   onReload,
   onError,
-  allowDataLakeOverrides = false,
-  taskSource = "local",
-  taskRegistryUri = "",
 }) {
   const { navigate } = useRouter();
-  const r2TaskSource = taskSource === "r2";
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [syncing, setSyncing] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const [catalog, setCatalog] = useState(null);
+  const [catalogBusy, setCatalogBusy] = useState(false);
+  const [selectedAsset, setSelectedAsset] = useState(null);
   const [form, setForm] = useState({
     task_id: "",
     id_field: "record_id",
@@ -86,6 +98,7 @@ export default function TasksPage({
       output_base_uri: "",
     });
     setAuxiliary([]);
+    setSelectedAsset(null);
   }
 
   async function submit() {
@@ -116,16 +129,14 @@ export default function TasksPage({
             required: item.required,
           })),
       };
-      if (allowDataLakeOverrides) {
-        payload.data_lake = {
-          lake_registry_uri: form.lake_registry_uri.trim(),
-          source_dataset_id: form.source_dataset_id.trim(),
-          source_manifest_uri: form.source_manifest_uri.trim(),
-          source_object_path: form.source_object_path.trim(),
-          default_import_id: form.default_import_id.trim(),
-          output_base_uri: form.output_base_uri.trim(),
-        };
-      }
+      payload.data_lake = {
+        lake_registry_uri: form.lake_registry_uri.trim(),
+        source_dataset_id: form.source_dataset_id.trim(),
+        source_manifest_uri: form.source_manifest_uri.trim(),
+        source_object_path: form.source_object_path.trim(),
+        default_import_id: form.default_import_id.trim(),
+        output_base_uri: form.output_base_uri.trim(),
+      };
       await api.createTask(payload);
       resetForm();
       setOpen(false);
@@ -137,12 +148,60 @@ export default function TasksPage({
     }
   }
 
+  async function loadCatalog() {
+    setCatalogBusy(true);
+    try {
+      const next = await readDataLakeCatalog();
+      setCatalog(next);
+      setForm((current) => ({
+        ...current,
+        lake_registry_uri: current.lake_registry_uri || next.registry_uri || "",
+      }));
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setCatalogBusy(false);
+    }
+  }
+
+  async function chooseDataset(datasetId) {
+    const item = (catalog?.datasets || []).find((dataset) => dataset.dataset_id === datasetId);
+    if (!item) {
+      setSelectedAsset(null);
+      setForm((current) => ({
+        ...current,
+        source_dataset_id: "",
+        source_manifest_uri: "",
+        source_object_path: "",
+      }));
+      return;
+    }
+
+    setSelectedAsset(item);
+    try {
+      const response = await readDataLakeCatalog(item.dataset_id);
+      const detail = (response.datasets || []).find((dataset) => dataset.dataset_id === item.dataset_id) || item;
+      const objects = detail.manifest?.objects || [];
+      setSelectedAsset(detail);
+      setForm((current) => ({
+        ...current,
+        lake_registry_uri: current.lake_registry_uri || catalog.registry_uri || "",
+        source_dataset_id: detail.dataset_id,
+        source_manifest_uri: detail.manifest_uri || "",
+        source_object_path: objects.length === 1 ? objects[0].path || "" : current.source_object_path,
+        default_import_id: current.default_import_id || generatedImportId(current.task_id, detail.dataset_id, objects[0]?.path),
+      }));
+    } catch (error) {
+      onError(String(error));
+    }
+  }
+
   async function reloadTasks() {
-    setSyncing(true);
+    setRefreshing(true);
     try {
       await onReload();
     } finally {
-      setSyncing(false);
+      setRefreshing(false);
     }
   }
 
@@ -155,25 +214,20 @@ export default function TasksPage({
     <div>
       <div className="page-header">
         <h2>全部任务</h2>
-        <p>{r2TaskSource ? "任务配置来自系统设置中的 R2 登记表，本地只缓存执行配置" : "选择一个标注任务进入其数据流水线"}</p>
+        <p>任务单由 Scaffold 控制面管理；R2 仅提供数据湖资产与任务产物。</p>
       </div>
       <div className="toolbar">
         <div className="toolbar-stack">
-          <span className="muted">{tasks.length} 个任务{r2TaskSource && taskRegistryUri ? ` · ${taskRegistryUri}` : ""}</span>
-          {r2TaskSource && <span className="status-line">从 registry/data_lake.yaml 同步 task_id 到 task_uri，再读取任务配置。</span>}
+          <span className="muted">{tasks.length} 个任务 · 控制面</span>
         </div>
         <div className="action-row">
-          {!r2TaskSource && (
-            <button className="btn btn-sm" onClick={() => setOpen((value) => !value)}>{open ? "收起" : "新建任务"}</button>
-          )}
-          <button className={r2TaskSource ? "btn btn-sm btn-primary" : "btn btn-sm"} disabled={syncing} onClick={reloadTasks}>
-            {r2TaskSource ? (syncing ? "同步中..." : "同步任务配置") : "刷新"}
-          </button>
+          <button className="btn btn-sm" disabled={busy} onClick={() => setOpen((value) => !value)}>{open ? "收起" : "新建任务单"}</button>
+          <button className="btn btn-sm" disabled={refreshing} onClick={reloadTasks}>{refreshing ? "刷新中..." : "刷新任务"}</button>
         </div>
       </div>
-      {open && !r2TaskSource && (
+      {open && (
         <div className="card section-card">
-          <h3>新建任务</h3>
+          <h3>新建任务单</h3>
           <div className="form-grid">
             <div className="field">
               <label>任务编号</label>
@@ -211,34 +265,42 @@ export default function TasksPage({
               <label>提示词</label>
               <textarea rows={5} value={form.prompt} onChange={(event) => update("prompt", event.target.value)} placeholder="可留空，后续再补充" />
             </div>
-            {allowDataLakeOverrides && (
-              <>
-                <div className="field field-wide">
-                  <label>数据湖登记表地址</label>
-                  <input value={form.lake_registry_uri} onChange={(event) => update("lake_registry_uri", event.target.value)} placeholder="可留空，默认读取 R2 当前数据湖登记表" />
-                </div>
-                <div className="field">
-                  <label>源数据集编号</label>
-                  <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 raw_feedback_records" />
-                </div>
-                <div className="field">
-                  <label>默认导入编号</label>
-                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="例如 manual_seed_20260627" />
-                </div>
-                <div className="field field-wide">
-                  <label>源清单文件地址</label>
-                  <input value={form.source_manifest_uri} onChange={(event) => update("source_manifest_uri", event.target.value)} placeholder="可留空，系统按源数据集编号从登记表解析" />
-                </div>
-                <div className="field field-wide">
-                  <label>源对象路径</label>
-                  <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="清单对象中的路径，用于唯一选中数据文件" />
-                </div>
-                <div className="field field-wide">
-                  <label>标签回写根地址</label>
-                  <input value={form.output_base_uri} onChange={(event) => update("output_base_uri", event.target.value)} placeholder="例如 r2:bucket/prefix/labels/<task_id>/" />
-                </div>
-              </>
-            )}
+            <div className="field field-wide">
+              <label>数据湖资产目录</label>
+              <div className="action-row">
+                <select value={form.source_dataset_id} disabled={!catalog} onChange={(event) => chooseDataset(event.target.value)}>
+                  <option value="">{catalog ? "请选择已登记数据集" : "请先读取数据湖资产目录"}</option>
+                  {(catalog?.datasets || []).map((item) => <option key={item.dataset_id} value={item.dataset_id}>{item.name || item.dataset_id} · {item.dataset_id}</option>)}
+                </select>
+                <button className="btn btn-sm" type="button" disabled={catalogBusy} onClick={loadCatalog}>{catalogBusy ? "读取中..." : "读取资产目录"}</button>
+              </div>
+              <span className="hint">从已登记的数据湖资产选择任务输入来源；任务单保存数据集和对象引用，不保存原始数据。</span>
+              {selectedAsset && <span className="hint">已选择：{selectedAsset.name || selectedAsset.dataset_id} · {selectedAsset.layer || "未标注层级"} · {selectedAsset.domain || "未标注领域"}</span>}
+            </div>
+            <div className="field">
+              <label>源数据集编号</label>
+              <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 raw_feedback_records" />
+            </div>
+            <div className="field">
+              <label>默认输入编号</label>
+              <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="选择资产后自动生成，可调整" />
+            </div>
+            <div className="field field-wide">
+              <label>资产清单地址</label>
+              <input value={form.source_manifest_uri} onChange={(event) => update("source_manifest_uri", event.target.value)} placeholder="选择资产后由数据湖目录填充" />
+            </div>
+            <div className="field field-wide">
+              <label>源对象路径</label>
+              <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="清单对象中的路径，用于唯一选中数据文件" />
+            </div>
+            <div className="field field-wide">
+              <label>产物写回根地址</label>
+              <input value={form.output_base_uri} onChange={(event) => update("output_base_uri", event.target.value)} placeholder="例如 r2:bucket/path/labels/<task_id>/" />
+            </div>
+            <div className="field field-wide">
+              <label>资产目录来源</label>
+              <input value={form.lake_registry_uri || "由数据湖资产目录提供"} readOnly />
+            </div>
           </div>
 
           <div className="toolbar">
@@ -287,10 +349,10 @@ export default function TasksPage({
           </div>
         </div>
       )}
-      {!tasks.length && <div className="empty">{r2TaskSource ? "R2 登记表暂无启用任务" : "未发现任务，可新建任务或检查任务目录"}</div>}
+      {!tasks.length && <div className="empty">尚未创建任务单，可新建任务单或检查控制面连接。</div>}
       <div className="grid grid-cards">
         {tasks.map((t) => (
-          <div key={t.path} className="card task-card">
+          <div key={t.task_id || t.path} className="card task-card">
             <div className="task-card-head">
               <Link to={`/task/${encodeURIComponent(t.task_id)}`} className="task-title-link">
                 <h3>{t.task_id || "(无效)"}</h3>
@@ -308,7 +370,7 @@ export default function TasksPage({
             )}
             <div className="action-row task-card-actions">
               <button className="btn btn-sm" onClick={() => navigate(`/task/${encodeURIComponent(t.task_id)}`)}>进入</button>
-              {!t.deletable && <span className="badge badge-gray">{r2TaskSource ? "数据湖" : "只读"}</span>}
+              {!t.deletable && <span className="badge badge-gray">只读</span>}
             </div>
           </div>
         ))}
