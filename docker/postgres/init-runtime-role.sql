@@ -60,6 +60,7 @@ WITH expected_relations(relation_name, relation_kind) AS (
         ('lls_dataset_group_create_state', ''),
         ('lls_dataset_group_state_guard', ''),
         ('lls_enforce_last_workspace_admin', ''),
+        ('lls_enforce_task_lifecycle_transition', ''),
         ('lls_idempotency_completion_gate_is_open', ''),
         ('lls_protect_idempotency_record_delete', ''),
         ('lls_protect_idempotency_record_update', ''),
