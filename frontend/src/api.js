@@ -140,13 +140,14 @@ export const updateTask = (taskId, payload, draftFingerprint) =>
     body: JSON.stringify(payload),
   });
 
-export const publishTask = (taskId, draftFingerprint) =>
+export const publishTask = (taskId, draftFingerprint, reason = "面板发布任务") =>
   req(`/api/tasks/${encodeURIComponent(taskId)}/publish`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "If-Match": draftFingerprint },
     body: JSON.stringify({
       confirm: true,
       idempotency_key: taskPublishIdempotencyKey(taskId, draftFingerprint),
+      reason,
     }),
   });
 

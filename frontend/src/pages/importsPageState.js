@@ -126,7 +126,7 @@ export function createImportActions({ hasDataLakeConfig = false, showManualImpor
   return [
     {
       key: "data_lake",
-      label: "从数据湖导入",
+      label: "生成任务输入",
       visible: hasDataLakeConfig,
       primary: hasDataLakeConfig,
     },

@@ -409,8 +409,8 @@ export default function ImportsPage({
       </div>
       <div className="page-header imports-page-header">
         <div>
-          <h2>数据导入</h2>
-          <p>生产路径优先从 R2 数据湖读取；导入数据按不可覆盖资产管理，同名同内容幂等复用。</p>
+          <h2>任务输入</h2>
+          <p>从已登记的数据资产生成任务级输入缓存；原始数据和清单仍由数据湖保存。</p>
         </div>
         <div className="action-row">
           {createActions.length > 0 ? (
@@ -449,11 +449,11 @@ export default function ImportsPage({
       <div className="card section-card">
         <div className="toolbar">
           <div>
-            <h3>导入资产（{items.length}）</h3>
+            <h3>任务输入资产（{items.length}）</h3>
             <div className="status-line">
               {hasDataLakeConfig
-                ? "当前任务已配置数据湖来源；新增导入会按 task.yaml 中的数据湖配置执行。"
-                : "当前任务未配置 data_lake 来源；生产环境不会展示手动覆盖 R2 来源的主动作。"}
+                ? "当前任务已绑定数据资产；生成输入时会按清单校验对象、哈希和行数。"
+                : "当前任务尚未绑定数据资产，请先在任务单中选择登记的数据集和对象。"}
             </div>
           </div>
           <button className="btn btn-sm" disabled={assetsLoading} onClick={reload}>
@@ -463,9 +463,9 @@ export default function ImportsPage({
         {assetsLoading && !items.length && <div className="empty">正在读取导入资产...</div>}
         {!assetsLoading && !items.length && (
           <div className="empty action-empty">
-            <span>暂无导入数据</span>
+            <span>暂无任务输入</span>
             {createActions.length > 0 ? (
-              <button className="btn btn-primary" onClick={openDefaultCreatePanel}>新增导入</button>
+              <button className="btn btn-primary" onClick={openDefaultCreatePanel}>生成任务输入</button>
             ) : (
               <Link className="btn" to="/">去任务列表同步</Link>
             )}
@@ -531,8 +531,8 @@ export default function ImportsPage({
           <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
             <div className="drawer-head">
               <div>
-                <h3>新增导入</h3>
-                <p>新增和执行动作在这里完成，完成后回到导入资产列表。</p>
+                <h3>生成任务输入</h3>
+                <p>从任务绑定的数据资产生成不可覆盖的任务级输入缓存。</p>
               </div>
               <button className="btn btn-sm" type="button" onClick={() => setCreatePanel("")}>关闭</button>
             </div>
@@ -554,8 +554,8 @@ export default function ImportsPage({
             {createPanel === "data_lake" && (
               <div>
                 <div className="info-callout import-drawer-callout">
-                  <strong>从数据湖导入</strong>
-                  <p>按任务配置读取 R2 数据湖清单文件，并生成当前任务的本地导入缓存。</p>
+                  <strong>生成任务输入</strong>
+                  <p>后台读取登记清单并校验对象后生成本地任务缓存。</p>
                 </div>
                 <div className="form-grid drawer-form-grid">
                   <div className="field field-half">
@@ -601,7 +601,7 @@ export default function ImportsPage({
                 )}
                 <div className="drawer-actions">
                   <button className="btn btn-primary" disabled={lakeWorking} onClick={importLake}>
-                    {lakeWorking ? "导入任务执行中..." : "从数据湖导入"}
+                    {lakeWorking ? "生成任务输入中..." : "生成任务输入"}
                   </button>
                   <button className="btn" disabled={lakeWorking} onClick={checkDataLake}>检查配置</button>
                 </div>
