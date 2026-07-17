@@ -12,7 +12,7 @@ const TASK_PAGES = [
   { key: "models", label: "模型管理", short: "模", suffix: "/models" },
 ];
 
-export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, onToggle }) {
+export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, onToggle, user, onLogout }) {
   return (
     <aside className={collapsed ? "sidebar is-collapsed" : "sidebar"}>
       <div className="sidebar-head">
@@ -60,6 +60,14 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
           ))}
         </>
       )}
+      <div className="sidebar-account">
+        <div className="sidebar-account-name" title={user?.display_name || user?.email || "当前用户"}>
+          {user?.display_name || user?.email || "当前用户"}
+        </div>
+        <button className="sidebar-logout" type="button" onClick={onLogout} title="退出登录">
+          退出登录
+        </button>
+      </div>
     </aside>
   );
 }

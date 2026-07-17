@@ -1143,7 +1143,12 @@ class _Handler(BaseHTTPRequestHandler):
             context = self._authenticate()
         except PanelAuthenticationError as exc:
             headers = {}
-            if self.authenticator is not None and self.authenticator.challenge:
+            request_path = urlparse(self.path).path
+            if (
+                self.authenticator is not None
+                and self.authenticator.challenge
+                and not request_path.startswith("/api/")
+            ):
                 headers["WWW-Authenticate"] = self.authenticator.challenge
             self._json({"error": exc.message, "code": exc.code}, status=exc.status, headers=headers)
             return False
@@ -2142,10 +2147,12 @@ class _Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self) -> None:
-        if not self._require_auth():
-            return
         parsed = urlparse(self.path)
         path = parsed.path
+        if not path.startswith("/api/") and self._serve_static(path):
+            return
+        if not self._require_auth():
+            return
         params = parse_qs(parsed.query)
         contract_task_id = _contract_task_path(path)
         if path == "/api/health":
