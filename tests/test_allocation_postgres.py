@@ -626,7 +626,6 @@ def test_postgres_confirmation_serializes_parent_update():
     engine = _upgrade_engine()
     try:
         ids = _build_graph(engine)
-        _confirm_plan(engine, ids)
         with Session(engine) as session, session.begin():
             confirmation_id = _claim(
                 session,
@@ -696,7 +695,6 @@ def test_postgres_cohort_seal_locks_revision_before_member_insert():
     engine = _upgrade_engine()
     try:
         ids = _build_graph(engine)
-        _confirm_plan(engine, ids)
         with Session(engine) as session, session.begin():
             revision = AnnotatorCohortRevision(
                 workspace_id=ids["workspace"],
