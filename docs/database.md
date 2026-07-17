@@ -9,7 +9,7 @@ Scaffold 使用独立 PostgreSQL 保存身份、工作空间、授权和审计�
 - `principals`：用户和服务身份，唯一键固定为 `(issuer, subject)`；邮箱仅是可选展示属性。
 - `workspaces`：租户和资源隔离边界。
 - `role_bindings`：工作空间级或任务级角色绑定；任务绑定使用复合外键保证任务属于同一工作空间。
-- `tasks`：只提供 workspace-scoped `TaskRef` 与 task ACL 所需基础，不定义 draft、revision 或可见状态。由于现有 `runs/<task_id>`、`tasks/<task_id>` 文件路径尚未按 workspace 分区，初始 schema 暂时强制 `task_key` 全局唯一；授权查询仍必须同时携带 workspace。
+- `tasks`：保存 workspace-scoped `TaskRef`、task ACL 和 `lifecycle_state`。draft、revision 与 materialization 仍由独立表保存。由于现有 `runs/<task_id>`、`tasks/<task_id>` 文件路径尚未按 workspace 分区，初始 schema 暂时强制 `task_key` 全局唯一；授权查询仍必须同时携带 workspace。
 - `idempotency_records`、`workspace_settings`：工作空间级幂等记录和设置；数据库只保存 idempotency key 的 SHA-256，不保存或回显原 key，并同时绑定 actor、caller 和规范化 request fingerprint，重复键不能由其他主体重放。0003 对旧记录的新增授权上下文列保持 nullable，无法推断的旧 claim 保留原状态和响应但不能被 completion 重新授权。
 - `audit_events`：带 actor 身份快照的追加式审计事件；不保存 email snapshot。
 - `migration_runs`：`lls db upgrade` 的执行记录；Alembic revision 仍由 `alembic_version` 管理。
@@ -49,7 +49,7 @@ Panel、MCP 和后续认证层不直接接收 SQLAlchemy ORM 或 `Session`。公
 - `resolve_identity`：只按 `(issuer, subject)` 查找 principal。
 - `resolve_or_provision`：未知身份只创建零权限 principal；相同邮箱不会合并身份或授予 membership。
 - `get_session`、`list_authorized_workspaces`：只返回不可变的 principal、workspace 级角色、`workspace_capabilities`，以及该 workspace role 可继承到任务的 `task_capabilities`；不枚举任务，也不创建数据库 session/token 表。
-- `list_authorized_tasks`：按 workspace 和 task ACL 延迟加载任务，必须显式传入 `limit`，单页上限 100，并使用 `after_task_key` cursor 翻页。
+- `list_authorized_tasks`：按 workspace 和 task ACL 延迟加载任务，必须显式传入 `limit`，单页上限 100，并使用 `after_task_key` cursor 翻页；默认排除 archived，恢复/审计场景可显式请求 `include_archived`。
 - `authorize_workspace`、`authorize_task`：每次从数据库读取角色，不缓存放行结果。
 - `claim_idempotency`、`complete_idempotency`：原子 claim/pending/replay，唯一范围固定为 workspace + operation + key hash；actor、caller 或 request fingerprint 任一不一致即返回稳定 conflict，绝不返回其他主体的 response。PostgreSQL app role 没有 `idempotency_records` 的 UPDATE/DELETE 权限，completion 只能调用 owner-side security-definer gate；SQLite Core SQL 由同等连接 gate trigger 保护。gate 会重新锁定并读取 workspace、principal、role binding、task/resource 的 active、permission 和 visibility，再写 terminal response 与一条 completion audit。
 - `grant_workspace_membership`、`change_workspace_membership`、`revoke_workspace_membership`：先通过标准 workspace 授权入口保持 `resource_not_visible` 语义，再按 workspace → principal → role binding → task/resource 锁序重新校验 `WORKSPACE_MANAGE`；原子修改 binding 并追加审计，重复操作返回稳定的 unchanged 结果。
@@ -98,13 +98,27 @@ python -m llm_labeling_scaffold.cli db materialize \
 
 短 drain 只协助处理并轮询独立 status，不改变 publish operation 的成功 replay 语义。完整状态机和故障矩阵见 [Task revision 物化状态机](task_revision_materialization.md)。
 
+## Task lifecycle
+
+`tasks.lifecycle_state` 的初始值为 `active`。允许的状态转换为：`active -> disabled/archived`、`disabled -> active/archived`、`archived -> active`；同状态请求是幂等 no-op，其他转换由服务层和数据库触发器拒绝。`archived` 只能通过恢复回到 `active`，不能直接变成 `disabled`。
+
+Panel control 模式提供以下专用端点：
+
+- `POST /api/tasks/{task_id}/disable`
+- `POST /api/tasks/{task_id}/archive`
+- `POST /api/tasks/{task_id}/restore`
+
+每次请求都必须通过 task ACL，提交非空 `reason`、`confirm=true` 和幂等 key。服务层把 actor、caller、workspace、request fingerprint 和 response 保存到现有幂等记录，并在同一事务写入 `task.lifecycle_changed` 审计事件；重复请求回放原响应。缺少 reason 返回 `422`，非法状态转换返回 `409`。
+
+停用和归档只改变控制面状态，不删除 runs、R2 权威对象、task snapshot、兼容缓存或任何 task revision。Panel 默认列表排除 archived；`include_archived=true` 可用于状态管理。disabled/archived 任务不会通过 active revision loader 进入执行、导入、任务检查或资产读取入口，恢复后才重新允许 active 入口。
+
 ## Membership lifecycle
 
 membership grant/change/revoke 在取得 workspace 锁后重新读取 actor 权限；已有 binding 的变更统一使用 role binding → workspace 锁序，首次 grant 初读不存在 binding 时以 workspace 锁串行化并锁后重读。grant/change 要求 target principal 仍为 active；revoke 允许清理 inactive target。最后管理员只统计 active principal 的 workspace-scoped `admin`，服务层和 SQLite/PostgreSQL 触发器都会拒绝删除或降级最后一个 active admin，直接 SQL 也不能绕过。存在 role binding 的 principal 不能直接删除，必须先通过 revoke 解除成员关系。mutation 与对应审计事件在同一事务内提交；unchanged 不追加事件。task-scoped ACL 独立存在，撤销 workspace membership 不会隐式删除显式 task ACL。
 
 ## 迁移
 
-迁移链为 `20260713_0001` → `20260714_0002`（task revision 与 materialization）→ `20260715_0003`（membership lifecycle）→ `20260716_0004`（allocation schema）→ `20260716_0005`（sensitive JSON/idempotency）。`20260714_0002` 保留为 task revision authority，membership lifecycle、allocation 和 sensitive JSON/idempotency 均作为其后续迁移。
+迁移链为 `20260713_0001` → `20260714_0002`（task revision 与 materialization）→ `20260715_0003`（membership lifecycle）→ `20260716_0004`（allocation schema）→ `20260716_0005`（sensitive JSON/idempotency）→ `20260717_0006`（annotation jobs）→ `20260717_0007`（task lifecycle）。`20260714_0002` 保留为 task revision authority；membership lifecycle、allocation、sensitive JSON/idempotency、annotation jobs 和 task lifecycle 均作为其后续迁移。
 
 Docker Compose 会等待 `scaffold-postgres` 健康，再由一次性 `migrate` 服务执行：
 

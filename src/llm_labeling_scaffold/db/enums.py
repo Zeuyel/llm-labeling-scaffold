@@ -28,6 +28,12 @@ class TaskMaterializationState(str, Enum):
     FAILED = "failed"
 
 
+class TaskLifecycle(str, Enum):
+    ACTIVE = "active"
+    DISABLED = "disabled"
+    ARCHIVED = "archived"
+
+
 class ArgillaBindingState(str, Enum):
     ACTIVE = "active"
     DISABLED = "disabled"

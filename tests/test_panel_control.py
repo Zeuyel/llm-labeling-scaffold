@@ -38,7 +38,7 @@ from llm_labeling_scaffold.db import (
 )
 from llm_labeling_scaffold.db.base import Base
 from llm_labeling_scaffold.db.database import create_database_engine
-from llm_labeling_scaffold.db.enums import AuditChannel
+from llm_labeling_scaffold.db.enums import AuditChannel, TaskLifecycle
 from llm_labeling_scaffold.db.migration import upgrade_database
 from llm_labeling_scaffold.db.models import (
     AuditEvent,
@@ -460,6 +460,135 @@ def test_read_only_roles_see_only_active_revision_and_cannot_read_draft(
     assert "draft" not in json.dumps(detail).lower()
     assert "ETag" not in detail_headers
     assert (draft_status, draft["code"]) == (403, "permission_denied")
+
+
+def test_panel_task_lifecycle_endpoints_are_idempotent_and_gate_execution(
+    control_database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    service = control_database["service"]
+    loader = FakeActiveTaskLoader({("workspace-a", "panel-control-task"): _active_revision()})
+    run_file = tmp_path / "runs" / "workspace-a" / "panel-control-task" / "run-1" / "result.json"
+    run_file.parent.mkdir(parents=True)
+    run_file.write_text("preserve", encoding="utf-8")
+    context = ActorContext.direct(_auth_principal("experimenter"))
+
+    with _panel_server(tmp_path, context=context, service=service, loader=loader) as base_url:
+        missing_reason_status, missing_reason, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/disable",
+            method="POST",
+            body={"confirm": True, "idempotency_key": "panel-lifecycle-no-reason", "workspace": "workspace-a"},
+        )
+        disable_status, disabled, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/disable",
+            method="POST",
+            body={
+                "confirm": True,
+                "idempotency_key": "panel-lifecycle-disable-001",
+                "reason": "pause panel execution",
+                "workspace": "workspace-a",
+            },
+        )
+        replay_status, replay, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/disable",
+            method="POST",
+            body={
+                "confirm": True,
+                "idempotency_key": "panel-lifecycle-disable-001",
+                "reason": "pause panel execution",
+                "workspace": "workspace-a",
+            },
+        )
+        disabled_list_status, disabled_list, _ = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a",
+        )
+        execution_status, execution, _ = _request(
+            base_url,
+            "/api/task/runs?task_id=panel-control-task&workspace=workspace-a",
+        )
+        archive_status, archived, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/archive",
+            method="POST",
+            body={
+                "confirm": True,
+                "idempotency_key": "panel-lifecycle-archive-001",
+                "reason": "retain panel history",
+                "workspace": "workspace-a",
+            },
+        )
+        default_archived_list_status, default_archived_list, _ = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a",
+        )
+        all_list_status, all_list, _ = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a&include_archived=true",
+        )
+        invalid_restore_status, invalid_restore, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/disable",
+            method="POST",
+            body={
+                "confirm": True,
+                "idempotency_key": "panel-lifecycle-invalid-001",
+                "reason": "invalid archived transition",
+                "workspace": "workspace-a",
+            },
+        )
+        restore_status, restored, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/restore",
+            method="POST",
+            body={
+                "confirm": True,
+                "idempotency_key": "panel-lifecycle-restore-001",
+                "reason": "resume panel execution",
+                "workspace": "workspace-a",
+            },
+        )
+
+    assert (missing_reason_status, missing_reason["code"]) == (422, "task_lifecycle_reason_required")
+    assert disable_status == 200
+    assert disabled["task"]["lifecycle_state"] == TaskLifecycle.DISABLED.value
+    assert disabled["lifecycle"]["changed"] is True
+    assert replay_status == 200
+    assert replay["replayed"] is True
+    assert replay["lifecycle"]["audit_event_id"] == disabled["lifecycle"]["audit_event_id"]
+    assert disabled_list_status == 200
+    listed_disabled = next(item for item in disabled_list["tasks"] if item["task_id"] == "panel-control-task")
+    assert listed_disabled["status"] == TaskLifecycle.DISABLED.value
+    assert (execution_status, execution["code"]) == (409, "task_not_active")
+    assert archive_status == 200
+    assert archived["task"]["lifecycle_state"] == TaskLifecycle.ARCHIVED.value
+    assert default_archived_list_status == 200
+    assert "panel-control-task" not in {item["task_id"] for item in default_archived_list["tasks"]}
+    assert all_list_status == 200
+    listed_archived = next(item for item in all_list["tasks"] if item["task_id"] == "panel-control-task")
+    assert listed_archived["status"] == TaskLifecycle.ARCHIVED.value
+    assert (invalid_restore_status, invalid_restore["code"]) == (409, "task_lifecycle_conflict")
+    assert restore_status == 200
+    assert restored["task"]["lifecycle_state"] == TaskLifecycle.ACTIVE.value
+    assert run_file.read_text(encoding="utf-8") == "preserve"
+
+    with Session(control_database["engine"]) as session:
+        task = session.scalar(select(Task).where(Task.task_key == "panel-control-task"))
+        assert task.lifecycle_state == TaskLifecycle.ACTIVE
+        events = session.scalars(
+            select(AuditEvent).where(AuditEvent.event_type == "task.lifecycle_changed")
+        ).all()
+        assert len(events) == 3
+        assert session.scalar(
+            select(func.count()).select_from(IdempotencyRecord).where(
+                IdempotencyRecord.operation == "task.lifecycle",
+            )
+        ) == 3
 
 
 def test_draft_etag_publish_errors_and_audit_context(control_database, tmp_path: Path, monkeypatch):

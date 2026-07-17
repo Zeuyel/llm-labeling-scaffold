@@ -70,7 +70,7 @@ ALLOCATION_TABLES = {
     "annotation_jobs",
 }
 
-EXPECTED_ALEMBIC_HEAD = "20260717_0006"
+EXPECTED_ALEMBIC_HEAD = "20260717_0007"
 
 EXPECTED_ALLOCATION_ENUMS = {
     "argilla_binding_state": ("active", "disabled"),
@@ -620,6 +620,25 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
         } <= idempotency_columns
         assert "idempotency_key" not in idempotency_columns
         assert "current_revision_id" in {column["name"] for column in inspect(engine).get_columns("tasks")}
+        task_columns = {column["name"] for column in inspect(engine).get_columns("tasks")}
+        assert "lifecycle_state" in task_columns
+        task_indexes = {
+            index["name"]: index["column_names"]
+            for index in inspect(engine).get_indexes("tasks")
+        }
+        assert task_indexes["ix_tasks_workspace_lifecycle"] == [
+            "workspace_id",
+            "lifecycle_state",
+            "updated_at",
+        ]
+        task_checks = {
+            constraint["name"]: constraint["sqltext"]
+            for constraint in inspect(engine).get_check_constraints("tasks")
+        }
+        assert any(
+            all(f"'{value}'" in sqltext for value in ("active", "disabled", "archived"))
+            for sqltext in task_checks.values()
+        )
         assert "lease_expires_at" in {
             column["name"] for column in inspect(engine).get_columns("task_revision_materializations")
         }
@@ -641,6 +660,10 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
                     text("SELECT name FROM sqlite_master WHERE type = 'trigger'"),
                 )
             )
+        assert {
+            "trg_tasks_lifecycle_guard",
+            "trg_tasks_lifecycle_update_guard",
+        } <= triggers
         assert {
             "trg_idempotency_records_sensitive_json_insert",
             "trg_idempotency_records_sensitive_json_update",
@@ -780,6 +803,47 @@ def test_task_revision_schema_rejects_cross_task_pointer_and_parent_delete(tmp_p
         with pytest.raises(DBAPIError):
             with engine.begin() as connection:
                 connection.execute(delete(Task).where(Task.id == task_b_id))
+    finally:
+        engine.dispose()
+
+
+def test_task_lifecycle_schema_rejects_invalid_transition(tmp_path: Path):
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'task-lifecycle-schema.db'}"
+    command.upgrade(build_alembic_config(database_url), "head")
+    engine = create_database_engine(database_url)
+    try:
+        with Session(engine) as session:
+            bootstrap = bootstrap_admin(
+                session,
+                issuer="https://task-lifecycle-schema.example",
+                subject="admin",
+                workspace_slug="task-lifecycle-schema",
+                workspace_name="Task Lifecycle Schema",
+            )
+        with Session(engine) as session, session.begin():
+            task = Task(
+                workspace_id=bootstrap.workspace_id,
+                task_key="lifecycle-schema-task",
+                name="Lifecycle Schema Task",
+                created_by_principal_id=bootstrap.principal_id,
+            )
+            session.add(task)
+            session.flush()
+            task_id = task.id
+
+        with engine.begin() as connection:
+            connection.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(lifecycle_state="archived")
+            )
+        with pytest.raises(DBAPIError):
+            with engine.begin() as connection:
+                connection.execute(
+                    update(Task)
+                    .where(Task.id == task_id)
+                    .values(lifecycle_state="disabled")
+                )
     finally:
         engine.dispose()
 

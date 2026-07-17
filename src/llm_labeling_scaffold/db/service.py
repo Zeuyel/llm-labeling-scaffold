@@ -18,7 +18,14 @@ from sqlalchemy.orm import Session
 
 from .audit import append_audit_event
 from .database import create_database_engine, create_session_factory
-from .enums import AuditChannel, IdempotencyState, PrincipalType, Role, TaskMaterializationState
+from .enums import (
+    AuditChannel,
+    IdempotencyState,
+    PrincipalType,
+    Role,
+    TaskLifecycle,
+    TaskMaterializationState,
+)
 from .models import (
     AuditEvent,
     IdempotencyRecord,
@@ -88,6 +95,7 @@ class TaskRef:
     current_revision_id: uuid.UUID | None = None
     draft_version: int | None = None
     draft_fingerprint: str | None = None
+    lifecycle_state: TaskLifecycle = TaskLifecycle.ACTIVE
 
 
 @dataclass(frozen=True)
@@ -227,6 +235,21 @@ class TaskPublishResult:
     replayed: bool
 
 
+@dataclass(frozen=True)
+class TaskLifecycleResult:
+    workspace_id: uuid.UUID
+    task_id: uuid.UUID
+    task_key: str
+    previous_state: TaskLifecycle
+    lifecycle_state: TaskLifecycle
+    reason: str
+    changed: bool
+    audit_event_id: uuid.UUID
+    idempotency_record_id: uuid.UUID
+    response_status: int
+    replayed: bool
+
+
 class MembershipMutationAction(str, Enum):
     GRANTED = "granted"
     CHANGED = "changed"
@@ -316,6 +339,29 @@ class TaskPublishInProgress(RuntimeError):
         super().__init__(self.code)
 
 
+class TaskLifecycleReasonRequired(ValueError):
+    code = "task_lifecycle_reason_required"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
+class TaskLifecycleConflict(RuntimeError):
+    code = "task_lifecycle_conflict"
+
+    def __init__(self, current_state: TaskLifecycle, requested_state: TaskLifecycle):
+        self.current_state = current_state
+        self.requested_state = requested_state
+        super().__init__(self.code)
+
+
+class TaskLifecycleInProgress(RuntimeError):
+    code = "task_lifecycle_in_progress"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
 class MembershipConflict(RuntimeError):
     pass
 
@@ -378,6 +424,7 @@ class DatabaseService:
         *,
         limit: int,
         after_task_key: str | None = None,
+        include_archived: bool = False,
     ) -> TaskAccessPage:
         with self.transaction() as transaction:
             return transaction.list_authorized_tasks(
@@ -385,6 +432,7 @@ class DatabaseService:
                 workspace_slug,
                 limit=limit,
                 after_task_key=after_task_key,
+                include_archived=include_archived,
             )
 
     def authorize_workspace(
@@ -677,6 +725,104 @@ class DatabaseService:
                 request_id=request_id,
             )
 
+    def transition_task_lifecycle(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        target_state: TaskLifecycle,
+        reason: str,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> TaskLifecycleResult:
+        with self.transaction() as transaction:
+            return transaction.transition_task_lifecycle(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+                target_state=target_state,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=request_id,
+            )
+
+    def disable_task(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        reason: str,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> TaskLifecycleResult:
+        return self.transition_task_lifecycle(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            task_key=task_key,
+            target_state=TaskLifecycle.DISABLED,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            channel=channel,
+            request_id=request_id,
+        )
+
+    def archive_task(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        reason: str,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> TaskLifecycleResult:
+        return self.transition_task_lifecycle(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            task_key=task_key,
+            target_state=TaskLifecycle.ARCHIVED,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            channel=channel,
+            request_id=request_id,
+        )
+
+    def restore_task(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        reason: str,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> TaskLifecycleResult:
+        return self.transition_task_lifecycle(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            task_key=task_key,
+            target_state=TaskLifecycle.ACTIVE,
+            reason=reason,
+            idempotency_key=idempotency_key,
+            channel=channel,
+            request_id=request_id,
+        )
+
 
 class DatabaseTransaction:
     def __init__(self, session: Session):
@@ -739,6 +885,7 @@ class DatabaseTransaction:
         *,
         limit: int,
         after_task_key: str | None = None,
+        include_archived: bool = False,
     ) -> TaskAccessPage:
         if limit < 1 or limit > MAX_AUTHORIZED_TASKS_PAGE_SIZE:
             raise ValueError(f"limit must be between 1 and {MAX_AUTHORIZED_TASKS_PAGE_SIZE}")
@@ -763,6 +910,8 @@ class DatabaseTransaction:
 
         workspace_roles = self._roles(principal.id, workspace.id)
         task_query = select(Task).where(Task.workspace_id == workspace.id)
+        if not include_archived:
+            task_query = task_query.where(Task.lifecycle_state != TaskLifecycle.ARCHIVED)
         if not workspace_roles:
             task_query = task_query.join(
                 RoleBinding,
@@ -1317,6 +1466,112 @@ class DatabaseTransaction:
             response_body=response_body,
         )
         return _task_publish_result_from_claim(completed, replayed=False)
+
+    def transition_task_lifecycle(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str,
+        target_state: TaskLifecycle,
+        reason: str,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> TaskLifecycleResult:
+        try:
+            target_state = (
+                target_state
+                if isinstance(target_state, TaskLifecycle)
+                else TaskLifecycle(str(target_state))
+            )
+        except ValueError as exc:
+            raise ValueError("target_state must be active, disabled, or archived") from exc
+        normalized_reason = str(reason or "").strip()
+        if not normalized_reason:
+            raise TaskLifecycleReasonRequired()
+        if not idempotency_key.strip():
+            raise ValueError("idempotency_key must not be blank")
+        _require_task_write_channel(channel)
+        normalized_task_key = _require_task_key(task_key)
+
+        claim = self.claim_idempotency(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            required_permission=Permission.TASK_EDIT,
+            operation="task.lifecycle",
+            idempotency_key=idempotency_key,
+            request_payload={
+                "workspace": workspace_slug,
+                "task": normalized_task_key,
+                "target_state": target_state.value,
+                "reason": normalized_reason,
+                "channel": channel.value,
+            },
+            channel=channel,
+            task_key=normalized_task_key,
+        )
+        if claim.status == IdempotencyClaimStatus.REPLAY:
+            if claim.state != IdempotencyState.SUCCEEDED:
+                raise IdempotencyConflict()
+            return _task_lifecycle_result_from_claim(claim, replayed=True)
+        if claim.status == IdempotencyClaimStatus.PENDING:
+            raise TaskLifecycleInProgress()
+
+        task = self._lock_task_by_id(claim.workspace_id, normalized_task_key)
+        previous_state = task.lifecycle_state
+        if not _task_lifecycle_transition_allowed(previous_state, target_state):
+            raise TaskLifecycleConflict(previous_state, target_state)
+
+        changed = previous_state != target_state
+        if changed:
+            task.lifecycle_state = target_state
+            self._session.flush()
+
+        actor = self._session.get(Principal, claim.actor_principal_id)
+        caller = self._session.get(Principal, claim.caller_principal_id)
+        if actor is None or caller is None:
+            raise AuthorizationUnavailable("lifecycle principals disappeared during transaction")
+        audit_event = append_audit_event(
+            self._session,
+            workspace_id=task.workspace_id,
+            event_type="task.lifecycle_changed",
+            actor=actor,
+            caller=caller,
+            channel=channel,
+            resource_type="task",
+            resource_id=task.id,
+            request_id=request_id,
+            details={
+                "task_key": task.task_key,
+                "previous_state": previous_state.value,
+                "lifecycle_state": target_state.value,
+                "reason": normalized_reason,
+                "changed": changed,
+                "idempotency_record_id": str(claim.record_id),
+            },
+        )
+        self._session.flush()
+        response_body = _task_lifecycle_response(
+            task,
+            previous_state=previous_state,
+            target_state=target_state,
+            reason=normalized_reason,
+            changed=changed,
+            audit_event_id=audit_event.id,
+            idempotency_record_id=claim.record_id,
+        )
+        completed = self.complete_idempotency(
+            claim,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            response_status=200,
+            response_body=response_body,
+            request_id=request_id,
+        )
+        return _task_lifecycle_result_from_claim(completed, replayed=False)
 
     def claim_idempotency(
         self,
@@ -2314,6 +2569,7 @@ def _task_ref(task: Task, *, draft: TaskDraft | None = None) -> TaskRef:
         current_revision_id=task.current_revision_id,
         draft_version=draft.version if draft is not None else None,
         draft_fingerprint=draft.fingerprint if draft is not None else None,
+        lifecycle_state=task.lifecycle_state,
     )
 
 
@@ -2509,6 +2765,68 @@ def _task_publish_result_from_claim(
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise AuthorizationUnavailable("task publish idempotency response is invalid") from exc
+
+
+def _task_lifecycle_response(
+    task: Task,
+    *,
+    previous_state: TaskLifecycle,
+    target_state: TaskLifecycle,
+    reason: str,
+    changed: bool,
+    audit_event_id: uuid.UUID,
+    idempotency_record_id: uuid.UUID,
+) -> dict[str, Any]:
+    return {
+        "kind": "task_lifecycle_v1",
+        "workspace_id": str(task.workspace_id),
+        "task_id": str(task.id),
+        "task_key": task.task_key,
+        "previous_state": previous_state.value,
+        "lifecycle_state": target_state.value,
+        "reason": reason,
+        "changed": changed,
+        "audit_event_id": str(audit_event_id),
+        "idempotency_record_id": str(idempotency_record_id),
+    }
+
+
+def _task_lifecycle_result_from_claim(
+    claim: IdempotencyClaim,
+    *,
+    replayed: bool,
+) -> TaskLifecycleResult:
+    body = claim.response_body
+    if claim.response_status != 200 or body is None or body.get("kind") != "task_lifecycle_v1":
+        raise AuthorizationUnavailable("task lifecycle idempotency response is invalid")
+    try:
+        return TaskLifecycleResult(
+            workspace_id=uuid.UUID(body["workspace_id"]),
+            task_id=uuid.UUID(body["task_id"]),
+            task_key=str(body["task_key"]),
+            previous_state=TaskLifecycle(body["previous_state"]),
+            lifecycle_state=TaskLifecycle(body["lifecycle_state"]),
+            reason=str(body["reason"]),
+            changed=bool(body["changed"]),
+            audit_event_id=uuid.UUID(body["audit_event_id"]),
+            idempotency_record_id=uuid.UUID(body["idempotency_record_id"]),
+            response_status=claim.response_status,
+            replayed=replayed,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuthorizationUnavailable("task lifecycle idempotency response is invalid") from exc
+
+
+def _task_lifecycle_transition_allowed(
+    current_state: TaskLifecycle,
+    target_state: TaskLifecycle,
+) -> bool:
+    allowed_targets = {
+        TaskLifecycle.ACTIVE: {TaskLifecycle.ACTIVE, TaskLifecycle.DISABLED, TaskLifecycle.ARCHIVED},
+        TaskLifecycle.DISABLED: {TaskLifecycle.ACTIVE, TaskLifecycle.DISABLED, TaskLifecycle.ARCHIVED},
+        TaskLifecycle.ARCHIVED: {TaskLifecycle.ACTIVE, TaskLifecycle.ARCHIVED},
+    }
+    return target_state in allowed_targets[current_state]
 
 
 def _membership_result(

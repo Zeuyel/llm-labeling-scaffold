@@ -53,6 +53,7 @@ from .enums import (
     MigrationStatus,
     PrincipalType,
     Role,
+    TaskLifecycle,
     TaskMaterializationState,
 )
 from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS
@@ -150,6 +151,7 @@ class Task(Base):
         UniqueConstraint("task_key", name="uq_tasks_task_key"),
         CheckConstraint("length(trim(task_key)) > 0", name="task_key_not_blank"),
         CheckConstraint("length(trim(name)) > 0", name="name_not_blank"),
+        Index("ix_tasks_workspace_lifecycle", "workspace_id", "lifecycle_state", "updated_at"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -162,6 +164,12 @@ class Task(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     current_revision_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    lifecycle_state: Mapped[TaskLifecycle] = mapped_column(
+        _enum_type(TaskLifecycle, "task_lifecycle"),
+        nullable=False,
+        default=TaskLifecycle.ACTIVE,
+        server_default=TaskLifecycle.ACTIVE.value,
+    )
     created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("principals.id", ondelete="RESTRICT"),
@@ -177,6 +185,41 @@ class Task(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+
+event.listen(
+    Task.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_tasks_lifecycle_guard
+        BEFORE INSERT ON tasks
+        WHEN NEW.lifecycle_state <> 'active'
+        BEGIN
+            SELECT RAISE(ABORT, 'task must start as active');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    Task.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_tasks_lifecycle_update_guard
+        BEFORE UPDATE ON tasks
+        WHEN NOT (
+            NEW.lifecycle_state IS OLD.lifecycle_state
+            OR (OLD.lifecycle_state = 'active' AND NEW.lifecycle_state IN ('disabled', 'archived'))
+            OR (OLD.lifecycle_state = 'disabled' AND NEW.lifecycle_state IN ('active', 'archived'))
+            OR (OLD.lifecycle_state = 'archived' AND NEW.lifecycle_state = 'active')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'task lifecycle transition is invalid');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
 
 
 class RoleBinding(Base):

@@ -37,6 +37,7 @@ from llm_labeling_scaffold.db.base import Base
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
 from llm_labeling_scaffold.db.database import create_database_engine, resolve_database_url
 from llm_labeling_scaffold.db.enums import AuditActorType, IdempotencyState
+from llm_labeling_scaffold.db.enums import TaskLifecycle
 from llm_labeling_scaffold.db.models import (
     AuditEvent,
     IdempotencyRecord,
@@ -49,6 +50,7 @@ from llm_labeling_scaffold.db.models import (
     TaskRevisionMaterialization,
     Workspace,
 )
+from llm_labeling_scaffold.db.service import TaskLifecycleConflict, TaskLifecycleReasonRequired
 
 
 @pytest.fixture
@@ -1884,6 +1886,153 @@ def test_task_writes_resolve_actor_and_caller_principals(seeded_service, engine)
             if_match=saved.draft.etag,
             channel=AuditChannel.MCP,
         )
+
+
+def test_task_lifecycle_is_acl_idempotent_reversible_and_non_destructive(seeded_service, engine):
+    service = seeded_service["service"]
+    draft = service.save_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        definition={"task_id": "shared-key"},
+        rendered_task="task_id: shared-key\n",
+        if_match=None,
+        channel=AuditChannel.API,
+        if_none_match="*",
+    ).draft
+    published = service.publish_task_draft(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        if_match=draft.etag,
+        reason="lifecycle fixture revision",
+        idempotency_key="lifecycle-fixture-publish",
+        channel=AuditChannel.API,
+    )
+    with Session(engine) as session, session.begin():
+        task = session.get(Task, published.task_id)
+        task.current_revision_id = published.revision_id
+        revision_count = session.scalar(select(func.count()).select_from(TaskRevision))
+
+    disabled = service.disable_task(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        reason="pause controlled execution",
+        idempotency_key="lifecycle-disable-001",
+        channel=AuditChannel.API,
+    )
+    assert disabled.previous_state == TaskLifecycle.ACTIVE
+    assert disabled.lifecycle_state == TaskLifecycle.DISABLED
+    assert disabled.changed is True
+    assert disabled.replayed is False
+
+    replay = service.disable_task(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        reason="pause controlled execution",
+        idempotency_key="lifecycle-disable-001",
+        channel=AuditChannel.API,
+    )
+    assert replay.replayed is True
+    assert replay.audit_event_id == disabled.audit_event_id
+    assert replay.idempotency_record_id == disabled.idempotency_record_id
+
+    archived = service.archive_task(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        reason="retain history without execution",
+        idempotency_key="lifecycle-archive-001",
+        channel=AuditChannel.API,
+    )
+    assert archived.previous_state == TaskLifecycle.DISABLED
+    assert archived.lifecycle_state == TaskLifecycle.ARCHIVED
+
+    default_page = service.list_authorized_tasks(
+        seeded_service["experimenter"],
+        "workspace-a",
+        limit=20,
+    )
+    assert "shared-key" not in {item.task.task_key for item in default_page.items}
+    archived_page = service.list_authorized_tasks(
+        seeded_service["experimenter"],
+        "workspace-a",
+        limit=20,
+        include_archived=True,
+    )
+    archived_access = next(item for item in archived_page.items if item.task.task_key == "shared-key")
+    assert archived_access.task.lifecycle_state == TaskLifecycle.ARCHIVED
+
+    with pytest.raises(TaskLifecycleConflict) as invalid:
+        service.disable_task(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            reason="invalid archived transition",
+            idempotency_key="lifecycle-disable-archived-001",
+            channel=AuditChannel.API,
+        )
+    assert invalid.value.current_state == TaskLifecycle.ARCHIVED
+    assert invalid.value.requested_state == TaskLifecycle.DISABLED
+
+    restored = service.restore_task(
+        actor_identity=seeded_service["experimenter"],
+        caller_identity=seeded_service["experimenter"],
+        workspace_slug="workspace-a",
+        task_key="shared-key",
+        reason="resume controlled execution",
+        idempotency_key="lifecycle-restore-001",
+        channel=AuditChannel.API,
+    )
+    assert restored.previous_state == TaskLifecycle.ARCHIVED
+    assert restored.lifecycle_state == TaskLifecycle.ACTIVE
+
+    with pytest.raises(TaskLifecycleReasonRequired):
+        service.disable_task(
+            actor_identity=seeded_service["experimenter"],
+            caller_identity=seeded_service["experimenter"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            reason="   ",
+            idempotency_key="lifecycle-disable-no-reason",
+            channel=AuditChannel.API,
+        )
+    with pytest.raises(AuthorizationDenied):
+        service.disable_task(
+            actor_identity=seeded_service["viewer"],
+            caller_identity=seeded_service["viewer"],
+            workspace_slug="workspace-a",
+            task_key="shared-key",
+            reason="viewer cannot mutate lifecycle",
+            idempotency_key="lifecycle-viewer-denied",
+            channel=AuditChannel.API,
+        )
+
+    with Session(engine) as session:
+        task = session.scalar(select(Task).where(Task.task_key == "shared-key"))
+        assert task.lifecycle_state == TaskLifecycle.ACTIVE
+        assert task.current_revision_id == published.revision_id
+        assert session.scalar(select(func.count()).select_from(TaskRevision)) == revision_count
+        lifecycle_events = session.scalars(
+            select(AuditEvent)
+            .where(AuditEvent.event_type == "task.lifecycle_changed")
+            .order_by(AuditEvent.occurred_at, AuditEvent.id)
+        ).all()
+        assert len(lifecycle_events) == 3
+        assert {event.details["lifecycle_state"] for event in lifecycle_events} == {
+            "disabled",
+            "archived",
+            "active",
+        }
+        assert all(event.details["reason"] for event in lifecycle_events)
 
 
 def test_task_draft_and_publish_enforce_acl_and_preconditions(seeded_service):
