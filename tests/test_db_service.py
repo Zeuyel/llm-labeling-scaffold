@@ -30,6 +30,9 @@ from llm_labeling_scaffold.db import (
     PrincipalType,
     Role,
     TaskDraftConflict,
+    TaskLifecycleReasonRequired,
+    TaskLifecycleState,
+    TaskLifecycleTransitionInvalid,
     TaskPreconditionRequired,
     TaskMaterializationState,
 )
@@ -2100,6 +2103,67 @@ def test_task_publish_is_atomic_immutable_and_replays_original_snapshot(seeded_s
     with pytest.raises(DBAPIError):
         with Session(engine) as session, session.begin():
             session.execute(delete(TaskRevision).where(TaskRevision.id == published.revision_id))
+
+
+def test_task_lifecycle_is_acl_idempotent_audited_and_restorable(seeded_service, engine):
+    service = seeded_service["service"]
+    common = {
+        "workspace_slug": "workspace-a",
+        "task_key": "shared-key",
+        "actor_identity": seeded_service["experimenter"],
+        "caller_identity": seeded_service["experimenter"],
+        "channel": AuditChannel.API,
+    }
+
+    with pytest.raises(TaskLifecycleReasonRequired):
+        service.disable_task(**common, reason=" ", idempotency_key="lifecycle-blank")
+
+    disabled = service.disable_task(**common, reason="pause intake", idempotency_key="lifecycle-disable")
+    replay = service.disable_task(**common, reason="pause intake", idempotency_key="lifecycle-disable")
+    assert disabled.previous_state == TaskLifecycleState.ACTIVE
+    assert disabled.lifecycle_state == TaskLifecycleState.DISABLED
+    assert disabled.changed is True
+    assert replay.replayed is True
+    assert replay.audit_event_id == disabled.audit_event_id
+
+    archived = service.archive_task(**common, reason="retention complete", idempotency_key="lifecycle-archive")
+    assert archived.previous_state == TaskLifecycleState.DISABLED
+    assert archived.lifecycle_state == TaskLifecycleState.ARCHIVED
+
+    with pytest.raises(TaskLifecycleTransitionInvalid):
+        service.disable_task(**common, reason="invalid", idempotency_key="lifecycle-invalid")
+
+    with pytest.raises(AuthorizationDenied):
+        service.restore_task(
+            **{**common, "actor_identity": seeded_service["viewer"], "caller_identity": seeded_service["viewer"]},
+            reason="viewer restore",
+            idempotency_key="lifecycle-viewer",
+        )
+
+    restored = service.restore_task(**common, reason="reopen task", idempotency_key="lifecycle-restore")
+    assert restored.previous_state == TaskLifecycleState.ARCHIVED
+    assert restored.lifecycle_state == TaskLifecycleState.ACTIVE
+
+    with Session(engine) as session:
+        task = session.scalar(select(Task).where(Task.task_key == "shared-key"))
+        assert task.lifecycle_state == TaskLifecycleState.ACTIVE
+        events = session.scalars(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == str(task.id),
+                AuditEvent.event_type.like("task.lifecycle_%"),
+            )
+        ).all()
+        assert [event.details["reason"] for event in events] == [
+            "pause intake",
+            "retention complete",
+            "reopen task",
+        ]
+        assert session.scalar(
+            select(func.count()).select_from(IdempotencyRecord).where(
+                IdempotencyRecord.operation == "task.lifecycle",
+                IdempotencyRecord.resource_id == task.id,
+            )
+        ) == 3
 
 
 def test_audit_events_are_append_only_in_orm(engine):

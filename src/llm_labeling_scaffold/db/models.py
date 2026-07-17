@@ -53,6 +53,7 @@ from .enums import (
     MigrationStatus,
     PrincipalType,
     Role,
+    TaskLifecycleState,
     TaskMaterializationState,
 )
 from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS
@@ -150,6 +151,7 @@ class Task(Base):
         UniqueConstraint("task_key", name="uq_tasks_task_key"),
         CheckConstraint("length(trim(task_key)) > 0", name="task_key_not_blank"),
         CheckConstraint("length(trim(name)) > 0", name="name_not_blank"),
+        Index("ix_tasks_workspace_lifecycle", "workspace_id", "lifecycle_state"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -161,6 +163,12 @@ class Task(Base):
     task_key: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
+    lifecycle_state: Mapped[TaskLifecycleState] = mapped_column(
+        _enum_type(TaskLifecycleState, "task_lifecycle_state"),
+        nullable=False,
+        default=TaskLifecycleState.ACTIVE,
+        server_default=TaskLifecycleState.ACTIVE.value,
+    )
     current_revision_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
     created_by_principal_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
@@ -2597,6 +2605,65 @@ event.listen(
         BEFORE DELETE ON annotation_jobs
         BEGIN
             SELECT RAISE(ABORT, 'annotation jobs are not directly deletable');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+
+
+event.listen(
+    Task.__table__,
+    "before_create",
+    DDL(
+        """
+        CREATE OR REPLACE FUNCTION lls_enforce_task_lifecycle_transition()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            IF NEW.lifecycle_state::text = OLD.lifecycle_state::text
+               OR (OLD.lifecycle_state::text = 'active'
+                   AND NEW.lifecycle_state::text IN ('disabled', 'archived'))
+               OR (OLD.lifecycle_state::text = 'disabled'
+                   AND NEW.lifecycle_state::text IN ('active', 'archived'))
+               OR (OLD.lifecycle_state::text = 'archived'
+                   AND NEW.lifecycle_state::text = 'active')
+            THEN
+                RETURN NEW;
+            END IF;
+            RAISE EXCEPTION 'task lifecycle transition is invalid'
+                USING ERRCODE = '22000';
+        END;
+        $$
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    Task.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_tasks_lifecycle_transition
+        BEFORE UPDATE OF lifecycle_state ON tasks
+        FOR EACH ROW EXECUTE FUNCTION lls_enforce_task_lifecycle_transition()
+        """
+    ).execute_if(dialect="postgresql"),
+)
+event.listen(
+    Task.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_tasks_lifecycle_transition
+        BEFORE UPDATE OF lifecycle_state ON tasks
+        WHEN NOT (
+            NEW.lifecycle_state IS OLD.lifecycle_state
+            OR (OLD.lifecycle_state = 'active' AND NEW.lifecycle_state IN ('disabled', 'archived'))
+            OR (OLD.lifecycle_state = 'disabled' AND NEW.lifecycle_state IN ('active', 'archived'))
+            OR (OLD.lifecycle_state = 'archived' AND NEW.lifecycle_state = 'active')
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'task lifecycle transition is invalid');
         END
         """
     ).execute_if(dialect="sqlite"),

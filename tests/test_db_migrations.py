@@ -70,7 +70,7 @@ ALLOCATION_TABLES = {
     "annotation_jobs",
 }
 
-EXPECTED_ALEMBIC_HEAD = "20260717_0006"
+EXPECTED_ALEMBIC_HEAD = "20260717_0007"
 
 EXPECTED_ALLOCATION_ENUMS = {
     "argilla_binding_state": ("active", "disabled"),
@@ -620,6 +620,16 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
         } <= idempotency_columns
         assert "idempotency_key" not in idempotency_columns
         assert "current_revision_id" in {column["name"] for column in inspect(engine).get_columns("tasks")}
+        task_columns = {column["name"] for column in inspect(engine).get_columns("tasks")}
+        assert "lifecycle_state" in task_columns
+        task_checks = {
+            constraint["name"]: constraint["sqltext"]
+            for constraint in inspect(engine).get_check_constraints("tasks")
+        }
+        lifecycle_check = next(
+            sql for name, sql in task_checks.items() if name.endswith("task_lifecycle_state")
+        )
+        assert all(value in lifecycle_check for value in ("active", "disabled", "archived"))
         assert "lease_expires_at" in {
             column["name"] for column in inspect(engine).get_columns("task_revision_materializations")
         }
@@ -641,6 +651,7 @@ def test_clean_database_upgrades_to_head_and_cli_upgrade_records_runs(tmp_path: 
                     text("SELECT name FROM sqlite_master WHERE type = 'trigger'"),
                 )
             )
+        assert "trg_tasks_lifecycle_transition" in triggers
         assert {
             "trg_idempotency_records_sensitive_json_insert",
             "trg_idempotency_records_sensitive_json_update",
