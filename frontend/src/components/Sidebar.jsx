@@ -29,6 +29,10 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
         <span className="nav-short">设</span>
         <span className="nav-label">系统设置</span>
       </Link>
+      <Link to="/data-assets" className={activePage === "data-assets" ? "nav-item active" : "nav-item"} title="数据资产">
+        <span className="nav-short">资</span>
+        <span className="nav-label">数据资产</span>
+      </Link>
       <Link to="/" className={!activeTaskId && activePage === "tasks" ? "nav-item active" : "nav-item"} title="全部任务">
         <span className="nav-short">全</span>
         <span className="nav-label">全部任务</span>

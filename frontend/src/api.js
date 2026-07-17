@@ -122,6 +122,7 @@ export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifact
 export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
 export const getAuditEvents = (taskId) => req(`/api/task/audit?${q({ task_id: taskId })}`);
 export const getDataLakeStatus = (taskId) => req(`/api/task/data_lake?${q({ task_id: taskId })}`);
+export const getDataLakeCatalog = (datasetId = "") => req(`/api/data_lake/catalog?${q({ dataset_id: datasetId })}`);
 export const getArgillaStatus = () => req("/api/argilla/status");
 export const getTaskArchivePlan = (taskId) => req(`/api/task/archive_plan?${q({ task_id: taskId })}`);
 

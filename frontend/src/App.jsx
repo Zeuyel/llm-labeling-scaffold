@@ -14,10 +14,12 @@ import ModelsPage from "./pages/ModelsPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
 import TaskArchivePage from "./pages/TaskArchivePage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
+import DataAssetsPage from "./pages/DataAssetsPage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
   { pattern: "/settings", page: "settings" },
+  { pattern: "/data-assets", page: "data-assets" },
   { pattern: "/task/:id", page: "overview" },
   { pattern: "/task/:id/canvas", page: "canvas" },
   { pattern: "/task/:id/imports", page: "imports" },
@@ -113,6 +115,7 @@ function Shell({ session, onLogout }) {
       {...common}
     />
   );
+  else if (matched.page === "data-assets") page = <DataAssetsPage {...common} />;
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "canvas") page = <TaskCanvasPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "imports") page = (
