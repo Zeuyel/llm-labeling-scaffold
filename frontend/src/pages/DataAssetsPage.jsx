@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 
@@ -42,8 +42,6 @@ export default function DataAssetsPage({ onError }) {
     }
   }
 
-  useEffect(() => { reload(); }, []);
-
   return (
     <div>
       <div className="crumbs"><Link to="/">全部任务</Link> / 数据资产</div>
@@ -68,6 +66,7 @@ export default function DataAssetsPage({ onError }) {
         </div>
       )}
 
+      {!catalog && !busy && <div className="empty">点击“刷新目录”读取已登记的数据资产。</div>}
       {!catalog && busy && <div className="empty">正在读取数据资产目录...</div>}
       {catalog && !(catalog.datasets || []).length && <div className="empty">登记表中暂无数据集。</div>}
       {catalog && (catalog.datasets || []).length > 0 && (
