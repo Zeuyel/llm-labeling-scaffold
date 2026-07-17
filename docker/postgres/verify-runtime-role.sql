@@ -533,6 +533,7 @@ WITH expected(function_name, identity_arguments) AS (
         ('lls_argilla_connection_binding_freeze', ''),
         ('lls_assignment_contract', ''),
         ('lls_assignment_item_create_binding', ''),
+        ('lls_annotation_job_guard', ''),
         ('lls_canonical_sensitive_json_text', 'document json'),
         ('lls_cohort_member_guard', ''),
         ('lls_cohort_revision_guard', ''),
@@ -623,7 +624,6 @@ WITH app_role AS (
         VALUES
             ('lls_canonical_sensitive_json_text'::name, 'document json'::text),
             ('lls_complete_idempotency'::name, 'p_record_id uuid, p_workspace_id uuid, p_actor_principal_id uuid, p_caller_principal_id uuid, p_operation text, p_idempotency_key_hash text, p_request_fingerprint text, p_required_permission text, p_resource_type text, p_resource_id uuid, p_channel text, p_response_status integer, p_response_body text, p_succeeded boolean, p_request_id text'::text),
-            ('lls_annotation_job_guard'::name, ''::text),
             ('lls_sensitive_json_node_is_valid'::name, 'document json, current_depth integer'::text),
             ('lls_sensitive_json_object_is_valid'::name, 'document json'::text),
             ('lls_sensitive_json_string_is_safe'::name, 'value text'::text),

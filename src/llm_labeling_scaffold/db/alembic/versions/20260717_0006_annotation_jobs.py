@@ -480,7 +480,7 @@ def _configure_postgres_runtime_role() -> None:
         f"GRANT SELECT, INSERT, UPDATE ON TABLE public.annotation_jobs TO {role_identifier}",
         f"REVOKE DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE public.annotation_jobs FROM {role_identifier}",
         "REVOKE EXECUTE ON FUNCTION public.lls_annotation_job_guard() FROM PUBLIC",
-        f"GRANT EXECUTE ON FUNCTION public.lls_annotation_job_guard() TO {role_identifier}",
+        f"REVOKE EXECUTE ON FUNCTION public.lls_annotation_job_guard() FROM {role_identifier}",
     ):
         op.execute(statement)
 

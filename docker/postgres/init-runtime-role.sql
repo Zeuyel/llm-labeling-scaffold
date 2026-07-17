@@ -432,8 +432,7 @@ WITH expected_functions(function_name, argument_types) AS (
         ('lls_sensitive_json_node_is_valid', 'json, integer'),
         ('lls_sensitive_json_object_is_valid', 'json'),
         ('lls_sensitive_json_string_is_safe', 'text'),
-        ('lls_validate_allocation_plan_graph', 'uuid'),
-        ('lls_annotation_job_guard', '')
+        ('lls_validate_allocation_plan_graph', 'uuid')
 )
 SELECT format(
     'GRANT EXECUTE ON FUNCTION public.%I(%s) TO %I',
