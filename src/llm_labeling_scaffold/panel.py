@@ -56,6 +56,11 @@ from .db.migration import build_alembic_config
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
+from .panel_allocation import (
+    AllocationPreviewDTOError,
+    parse_allocation_preview_json,
+    preview_allocation_dto,
+)
 from .redaction import redact_text
 
 API_CONTRACT_VERSION = "2026-07-17"
@@ -733,6 +738,30 @@ def _contract_capabilities(
             },
             {
                 "method": "POST",
+                "path": "/api/allocation/preview",
+                "action": "allocation_preview",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "request_schema": {
+                    "type": "object",
+                    "required": ["scope", "request"],
+                    "properties": {
+                        "scope": {
+                            "type": "object",
+                            "required": ["workspace", "task_id", "revision_id", "revision_hash"],
+                        },
+                        "request": {"type": "object"},
+                    },
+                    "additionalProperties": False,
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["schema_version", "scope", "ready", "blocking_errors", "warnings"],
+                },
+            },
+            {
+                "method": "POST",
                 "path": "/api/suggestions/import",
                 "action": "suggestions_import",
                 "side_effects": True,
@@ -867,6 +896,8 @@ def _mcp_route_allowed(method: str, path: str) -> bool:
             return True
         return _contract_task_path(path) is not None
     if method == "POST":
+        if path == "/api/allocation/preview":
+            return True
         if path == "/api/import/data_lake" or _contract_task_path(path, suffix="check") is not None:
             return True
         if not _mcp_writes_enabled():
@@ -896,7 +927,7 @@ def _database_authorized_route(method: str, path: str) -> bool:
         return _contract_task_path(path) is not None
     if method == "POST":
         return (
-            path in {"/api/tasks", "/api/import/data_lake"}
+            path in {"/api/tasks", "/api/import/data_lake", "/api/allocation/preview"}
             or _contract_task_path(path, suffix="publish") is not None
             or _contract_task_path(path, suffix="check") is not None
             or _contract_task_lifecycle_path(path) is not None
@@ -1483,6 +1514,12 @@ class _Handler(BaseHTTPRequestHandler):
                 headers=exc.headers,
             )
             return
+        if isinstance(exc, AllocationPreviewDTOError):
+            payload = {"error": exc.message, "code": exc.code}
+            if exc.field is not None:
+                payload["field"] = exc.field
+            self._json(payload, status=HTTPStatus.UNPROCESSABLE_ENTITY, sort_keys=True)
+            return
         if isinstance(exc, AuthorizationDenied):
             reason = exc.decision.reason
             if reason in {
@@ -1603,8 +1640,15 @@ class _Handler(BaseHTTPRequestHandler):
             status=HTTPStatus.SERVICE_UNAVAILABLE,
         )
 
-    def _json(self, obj, status: int = 200, headers: dict[str, str] | None = None) -> None:
-        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    def _json(
+        self,
+        obj,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+        *,
+        sort_keys: bool = False,
+    ) -> None:
+        body = json.dumps(obj, ensure_ascii=False, sort_keys=sort_keys).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -1622,6 +1666,46 @@ class _Handler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except Exception:
             return {}
+
+    def _read_allocation_preview_body(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            raise AllocationPreviewDTOError("invalid_json", "请求体不能为空")
+        if length > 10 * 1024 * 1024:
+            raise AllocationPreviewDTOError("request_too_large", "allocation preview 请求体超过 10 MiB")
+        return parse_allocation_preview_json(self.rfile.read(length))
+
+    def _allocation_preview(self) -> None:
+        try:
+            if not _control_task_source_enabled():
+                raise _PanelRouteError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "allocation_preview_unavailable",
+                    "allocation preview 需要 scaffold 控制面",
+                )
+            service, actor_identity, _, _ = self._authorization_context()
+            request = self._read_allocation_preview_body()
+            service.require_task(
+                actor_identity,
+                request.workspace,
+                request.task_id,
+                Permission.ANNOTATION_REVIEW,
+            )
+            try:
+                payload = preview_allocation_dto(request)
+            except Exception as exc:
+                raise _PanelRouteError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "allocation_preview_unavailable",
+                    "allocation preview 暂时不可用",
+                ) from exc
+            self._json(
+                payload,
+                status=HTTPStatus.OK if payload["ready"] else HTTPStatus.UNPROCESSABLE_ENTITY,
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
 
     def _resolve_run(self, params) -> Path | None:
         task = params.get("task", params.get("task_id", [""]))[0]
@@ -2842,6 +2926,8 @@ class _Handler(BaseHTTPRequestHandler):
                 "note": body.get("note", ""),
             })
             self._json({"ok": True, "decisions": count})
+        elif path == "/api/allocation/preview":
+            self._allocation_preview()
         elif path == "/api/action":
             body = self._read_body()
             task_path = body.get("task")
