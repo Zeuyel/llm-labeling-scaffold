@@ -17,7 +17,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -40,7 +40,15 @@ from llm_labeling_scaffold.db.base import Base
 from llm_labeling_scaffold.db.database import create_database_engine
 from llm_labeling_scaffold.db.enums import AuditChannel
 from llm_labeling_scaffold.db.migration import upgrade_database
-from llm_labeling_scaffold.db.models import AuditEvent, Principal, RoleBinding, Task, Workspace
+from llm_labeling_scaffold.db.models import (
+    AuditEvent,
+    IdempotencyRecord,
+    Principal,
+    RoleBinding,
+    Task,
+    TaskDraft,
+    Workspace,
+)
 from llm_labeling_scaffold.mcp_server import (
     McpServerConfig,
     PanelApiClient,
@@ -458,76 +466,86 @@ def test_draft_etag_publish_errors_and_audit_context(control_database, tmp_path:
     monkeypatch.setenv("LLS_TASK_SOURCE", "control")
     service = control_database["service"]
     context = ActorContext.direct(_auth_principal("experimenter"))
+    task_id = "created-control-task"
+    spec = {**_draft_spec(), "task_id": task_id}
 
     with _panel_server(tmp_path, context=context, service=service, loader=FakeActiveTaskLoader()) as base_url:
         create_status, created, create_headers = _request(
             base_url,
             "/api/tasks",
             method="POST",
-            body=_draft_spec(),
+            body={**spec, "idempotency_key": "create-control-task-001"},
         )
+        capabilities_status, capabilities, _ = _request(base_url, "/api/capabilities")
         etag = create_headers["ETag"]
         draft_status, draft, draft_headers = _request(
             base_url,
-            "/api/task/control?task_id=panel-control-task",
+            f"/api/task/control?task_id={task_id}",
         )
         missing_status, missing, _ = _request(
             base_url,
-            "/api/tasks/panel-control-task",
+            f"/api/tasks/{task_id}",
             method="PUT",
-            body={**_draft_spec(), "annotation_guidelines": "missing"},
+            body={**spec, "annotation_guidelines": "missing"},
         )
         weak_status, weak, _ = _request(
             base_url,
-            "/api/tasks/panel-control-task",
+            f"/api/tasks/{task_id}",
             method="PUT",
-            body={**_draft_spec(), "annotation_guidelines": "weak"},
+            body={**spec, "annotation_guidelines": "weak"},
             headers={"If-Match": f"W/{etag}"},
         )
         invalid_status, invalid, _ = _request(
             base_url,
-            "/api/tasks/panel-control-task",
+            f"/api/tasks/{task_id}",
             method="PUT",
-            body={**_draft_spec(), "text_fields": []},
+            body={**spec, "text_fields": []},
             headers={"If-Match": etag},
         )
         update_status, updated, update_headers = _request(
             base_url,
-            "/api/tasks/panel-control-task",
+            f"/api/tasks/{task_id}",
             method="PUT",
-            body={**_draft_spec(), "annotation_guidelines": "updated"},
+            body={**spec, "annotation_guidelines": "updated"},
             headers={"If-Match": etag},
         )
         current_etag = update_headers["ETag"]
         stale_status, stale, stale_headers = _request(
             base_url,
-            "/api/tasks/panel-control-task",
+            f"/api/tasks/{task_id}",
             method="PUT",
-            body={**_draft_spec(), "annotation_guidelines": "stale"},
+            body={**spec, "annotation_guidelines": "stale"},
             headers={"If-Match": etag},
         )
         no_reason_status, no_reason, _ = _request(
             base_url,
-            "/api/tasks/panel-control-task/publish",
+            f"/api/tasks/{task_id}/publish",
             method="POST",
             body={"confirm": True, "idempotency_key": "publish-001"},
             headers={"If-Match": current_etag},
         )
         no_match_status, no_match, _ = _request(
             base_url,
-            "/api/tasks/panel-control-task/publish",
+            f"/api/tasks/{task_id}/publish",
             method="POST",
             body={"confirm": True, "idempotency_key": "publish-001", "reason": "release"},
         )
         publish_status, published, _ = _request(
             base_url,
-            "/api/tasks/panel-control-task/publish",
+            f"/api/tasks/{task_id}/publish",
             method="POST",
             body={"confirm": True, "idempotency_key": "publish-001", "reason": "release"},
             headers={"If-Match": current_etag},
         )
 
-    assert create_status == 200
+    assert create_status == 201
+    assert capabilities_status == 200
+    publish_endpoint = next(
+        item
+        for item in capabilities["endpoints"]
+        if item["method"] == "POST" and item["path"] == "/api/tasks/{task_id}/publish"
+    )
+    assert "reason" in publish_endpoint["request_schema"]["required"]
     assert etag.startswith('"task-draft-v1-') and etag.endswith('"')
     assert draft_status == 200
     assert draft_headers["ETag"] == etag
@@ -540,7 +558,7 @@ def test_draft_etag_publish_errors_and_audit_context(control_database, tmp_path:
     assert current_etag != etag
     assert (stale_status, stale["code"]) == (412, "task_draft_conflict")
     assert stale_headers["ETag"] == current_etag
-    assert (no_reason_status, no_reason["code"]) == (422, "invalid_definition")
+    assert (no_reason_status, no_reason["code"]) == (422, "task_publish_reason_required")
     assert (no_match_status, no_match["code"]) == (428, "task_precondition_required")
     assert publish_status == 202
     assert published["published"]["materialization_state"] == "pending"
@@ -553,6 +571,104 @@ def test_draft_etag_publish_errors_and_audit_context(control_database, tmp_path:
     assert callers == {"experimenter"}
     assert {event.channel for event in events} == {AuditChannel.PANEL}
     assert not (tmp_path / "runs" / "_system" / "task_control" / "registry.json").exists()
+
+
+def test_control_task_create_is_idempotent_and_audited(control_database, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    service = control_database["service"]
+    context = ActorContext.direct(_auth_principal("experimenter"))
+    task_id = "idempotent-created-task"
+    spec = {**_draft_spec(), "task_id": task_id}
+
+    with _panel_server(tmp_path, context=context, service=service, loader=FakeActiveTaskLoader()) as base_url:
+        first_status, first, first_headers = _request(
+            base_url,
+            "/api/tasks",
+            method="POST",
+            body={**spec, "idempotency_key": "task-create-001"},
+        )
+        replay_status, replay, replay_headers = _request(
+            base_url,
+            "/api/tasks",
+            method="POST",
+            body={**spec, "idempotency_key": "task-create-001"},
+        )
+        conflict_status, conflict, _ = _request(
+            base_url,
+            "/api/tasks",
+            method="POST",
+            body={**spec, "idempotency_key": "task-create-002"},
+        )
+        fingerprint_conflict_status, fingerprint_conflict, _ = _request(
+            base_url,
+            "/api/tasks",
+            method="POST",
+            body={
+                **spec,
+                "annotation_guidelines": "different request",
+                "idempotency_key": "task-create-001",
+            },
+        )
+
+    assert first_status == 201
+    assert first["action"] == "created"
+    assert replay_status == 201
+    assert replay["action"] == "replayed"
+    assert replay_headers["ETag"] == first_headers["ETag"]
+    assert (conflict_status, conflict["code"]) == (409, "task_create_conflict")
+    assert (fingerprint_conflict_status, fingerprint_conflict["code"]) == (409, "idempotency_conflict")
+
+    with Session(control_database["engine"]) as session:
+        task = session.scalar(select(Task).where(Task.task_key == task_id))
+        assert task is not None
+        assert session.scalar(select(TaskDraft).where(TaskDraft.task_id == task.id)) is not None
+        assert session.scalar(
+            select(func.count()).select_from(Task).where(Task.task_key == task_id)
+        ) == 1
+        assert session.scalar(
+            select(func.count()).select_from(IdempotencyRecord).where(
+                IdempotencyRecord.operation == "task.create"
+            )
+        ) == 1
+        event_types = {
+            event.event_type
+            for event in session.scalars(
+                select(AuditEvent).where(AuditEvent.resource_id == str(task.id))
+            )
+        }
+    assert {"task.created", "task.draft_created"}.issubset(event_types)
+
+
+def test_control_task_list_reports_published_with_draft(control_database, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    service = control_database["service"]
+    definition = {**_draft_spec(), "annotation_guidelines": "changed draft"}
+    rendered_task = "task_id: panel-control-task\nannotation: changed\n"
+    service.save_task_draft(
+        actor_identity=ExternalIdentity("urn:lls:basic-dev", "experimenter"),
+        caller_identity=ExternalIdentity("urn:lls:basic-dev", "experimenter"),
+        workspace_slug="workspace-a",
+        task_key="panel-control-task",
+        definition=definition,
+        rendered_task=rendered_task,
+        if_match=None,
+        if_none_match="*",
+        channel=AuditChannel.PANEL,
+    )
+    loader = FakeActiveTaskLoader({("workspace-a", "panel-control-task"): _active_revision()})
+
+    with _panel_server(
+        tmp_path,
+        context=ActorContext.direct(_auth_principal("experimenter")),
+        service=service,
+        loader=loader,
+    ) as base_url:
+        status, payload, _ = _request(base_url, "/api/tasks?workspace=workspace-a")
+
+    item = next(item for item in payload["tasks"] if item["task_id"] == "panel-control-task")
+    assert status == 200
+    assert item["status"] == "published_with_draft"
+    assert item["draft_version"] == 1
 
 
 def test_visibility_permission_loader_and_context_errors(control_database, tmp_path: Path, monkeypatch):
@@ -614,6 +730,7 @@ def test_mcp_delegation_records_actor_caller_and_server_channel(control_database
     monkeypatch.setenv("LLS_TASK_SOURCE", "control")
     monkeypatch.setenv("LLS_MCP_ENABLE_WRITES", "1")
     context = ActorContext(actor=_auth_principal("experimenter"), caller=_mcp_principal())
+    spec = {**_draft_spec(), "task_id": "mcp-created-task"}
 
     with _panel_server(
         tmp_path,
@@ -621,9 +738,9 @@ def test_mcp_delegation_records_actor_caller_and_server_channel(control_database
         service=control_database["service"],
         loader=FakeActiveTaskLoader(),
     ) as base_url:
-        status, created, _ = _request(base_url, "/api/tasks", method="POST", body=_draft_spec())
+        status, created, _ = _request(base_url, "/api/tasks", method="POST", body=spec)
 
-    assert status == 200
+    assert status == 201
     assert created["action"] == "created"
     with Session(control_database["engine"]) as session:
         event = session.scalar(select(AuditEvent).where(AuditEvent.event_type == "task.draft_created"))
@@ -691,7 +808,10 @@ def test_mcp_asgi_tool_to_panel_http_preserves_delegated_actor_and_independent_a
                                 await session.initialize()
                                 valid = await session.call_tool(
                                     "scaffold_task_draft_create",
-                                    {"spec": _draft_spec(), "workspace": "workspace-a"},
+                                    {
+                                        "spec": {**_draft_spec(), "task_id": "mcp-asgi-created-task"},
+                                        "workspace": "workspace-a",
+                                    },
                                 )
                         wrong_audience = await client.post(
                             "/mcp",
