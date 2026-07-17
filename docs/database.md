@@ -9,7 +9,7 @@ Scaffold 使用独立 PostgreSQL 保存身份、工作空间、授权和审计�
 - `principals`：用户和服务身份，唯一键固定为 `(issuer, subject)`；邮箱仅是可选展示属性。
 - `workspaces`：租户和资源隔离边界。
 - `role_bindings`：工作空间级或任务级角色绑定；任务绑定使用复合外键保证任务属于同一工作空间。
-- `tasks`：只提供 workspace-scoped `TaskRef` 与 task ACL 所需基础，不定义 draft、revision 或可见状态。由于现有 `runs/<task_id>`、`tasks/<task_id>` 文件路径尚未按 workspace 分区，初始 schema 暂时强制 `task_key` 全局唯一；授权查询仍必须同时携带 workspace。
+- `tasks`：保存 workspace-scoped `TaskRef`、task ACL 和 `lifecycle_state`。生命周期为 `active`、`disabled`、`archived`；停用或归档只更新数据库状态，不删除 runs、R2 对象或 task revision。默认任务列表排除 archived，恢复只能回到 active。
 - `idempotency_records`、`workspace_settings`：工作空间级幂等记录和设置；数据库只保存 idempotency key 的 SHA-256，不保存或回显原 key，并同时绑定 actor、caller 和规范化 request fingerprint，重复键不能由其他主体重放。0003 对旧记录的新增授权上下文列保持 nullable，无法推断的旧 claim 保留原状态和响应但不能被 completion 重新授权。
 - `audit_events`：带 actor 身份快照的追加式审计事件；不保存 email snapshot。
 - `migration_runs`：`lls db upgrade` 的执行记录；Alembic revision 仍由 `alembic_version` 管理。
@@ -28,6 +28,8 @@ revision `20260716_0004` 将 allocation planner 的确定性输出和 Argilla �
 - `allocation_collection_receipts` 只接受已确认 plan 上、与 record binding 一致的远端响应。`accepted` receipt 必须匹配直接 assignee 或 cohort pool 中的 respondent，同一 assignment/respondent 只能接受一次；`quarantined` receipt 必须记录原因。receipt 是 append-only。
 
 PostgreSQL 使用原生 enum、`JSONB`、行级触发器和 `BEFORE TRUNCATE` 触发器执行这些约束；SQLite migration 与 `Base.metadata.create_all` 测试路径使用等价的 enum check 和行级触发器。downgrade 到 `20260714_0002` 会删除全部 allocation 表、触发器、函数和原生 enum，因此执行前必须先保留需要的 allocation 数据。
+
+任务生命周期变更通过 `DatabaseService.disable_task`、`archive_task` 和 `restore_task` 完成。每次请求必须通过 task ACL，提交 reason 和幂等键，并追加 `task.lifecycle_changed` 审计事件；相同幂等键会回放原响应，非法转移返回冲突。Panel 控制面对应端点为 `POST /api/tasks/{task_id}/disable`、`/archive` 和 `/restore`。
 
 不会创建密码、session、OAuth client、authorization code、access token 或 refresh token 表。
 

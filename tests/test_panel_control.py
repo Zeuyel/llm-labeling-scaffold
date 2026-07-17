@@ -671,6 +671,74 @@ def test_control_task_list_reports_published_with_draft(control_database, tmp_pa
     assert item["draft_version"] == 1
 
 
+def test_control_task_lifecycle_routes_are_idempotent_and_hide_archived_tasks(
+    control_database,
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    service = control_database["service"]
+    loader = FakeActiveTaskLoader({("workspace-a", "panel-control-task"): _active_revision()})
+
+    with _panel_server(
+        tmp_path,
+        context=ActorContext.direct(_auth_principal("experimenter")),
+        service=service,
+        loader=loader,
+    ) as base_url:
+        disable_status, disabled, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/disable?workspace=workspace-a",
+            method="POST",
+            body={"reason": "pause", "idempotency_key": "panel-disable-1"},
+        )
+        disable_replay_status, disable_replay, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/disable?workspace=workspace-a",
+            method="POST",
+            body={"reason": "pause", "idempotency_key": "panel-disable-1"},
+        )
+        archive_status, archived, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/archive?workspace=workspace-a",
+            method="POST",
+            body={"reason": "retention", "idempotency_key": "panel-archive-1"},
+        )
+        invalid_status, invalid, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/disable?workspace=workspace-a",
+            method="POST",
+            body={"reason": "invalid", "idempotency_key": "panel-invalid-1"},
+        )
+        list_status, listed, _ = _request(base_url, "/api/tasks?workspace=workspace-a")
+        archived_list_status, archived_list, _ = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a&include_archived=true",
+        )
+        detail_status, detail, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task?workspace=workspace-a",
+        )
+        restore_status, restored, _ = _request(
+            base_url,
+            "/api/tasks/panel-control-task/restore?workspace=workspace-a",
+            method="POST",
+            body={"reason": "reopen", "idempotency_key": "panel-restore-1"},
+        )
+
+    assert (disable_status, disabled["task"]["lifecycle_state"]) == (200, "disabled")
+    assert (disable_replay_status, disable_replay["replayed"]) == (200, True)
+    assert (archive_status, archived["task"]["lifecycle_state"]) == (200, "archived")
+    assert (invalid_status, invalid["code"]) == (409, "task_lifecycle_transition_invalid")
+    assert list_status == 200
+    assert not any(item["task_id"] == "panel-control-task" for item in listed["tasks"])
+    assert archived_list_status == 200
+    archived_item = next(item for item in archived_list["tasks"] if item["task_id"] == "panel-control-task")
+    assert archived_item["lifecycle_state"] == "archived"
+    assert (detail_status, detail["code"]) == (409, "task_lifecycle_not_active")
+    assert (restore_status, restored["task"]["lifecycle_state"]) == (200, "active")
+
+
 def test_visibility_permission_loader_and_context_errors(control_database, tmp_path: Path, monkeypatch):
     monkeypatch.setenv("LLS_TASK_SOURCE", "control")
     service = control_database["service"]

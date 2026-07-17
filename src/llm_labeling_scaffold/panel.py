@@ -40,6 +40,12 @@ from .db import (
     TaskCreateInProgress,
     TaskDraftConflict,
     TaskDraftNotFound,
+    TaskLifecycleInProgress,
+    TaskLifecycleNotActive,
+    TaskLifecycleReasonRequired,
+    TaskLifecycleState,
+    TaskLifecycleStateInvalid,
+    TaskLifecycleTransitionInvalid,
     TaskPreconditionRequired,
     TaskPublishReasonRequired,
     TaskPublishInProgress,
@@ -546,6 +552,27 @@ def _contract_capabilities(
                 "required_headers": {"If-Match": {"type": "string", "format": "strong-etag"}},
                 "response_schema": {"type": "object", "required": ["ok", "task", "published"]},
             },
+            *[
+                {
+                    "method": "POST",
+                    "path": f"/api/tasks/{{task_id}}/{action}",
+                    "action": f"task_{action}",
+                    "side_effects": True,
+                    "requires_task_source": "control",
+                    "path_params": {"task_id": {"type": "string"}},
+                    "request_schema": {
+                        "type": "object",
+                        "required": ["idempotency_key", "reason", "workspace"],
+                        "properties": {
+                            "idempotency_key": {"type": "string"},
+                            "reason": {"type": "string"},
+                            "workspace": {"type": "string"},
+                        },
+                    },
+                    "response_schema": {"type": "object", "required": ["ok", "task", "replayed"]},
+                }
+                for action in ("disable", "archive", "restore")
+            ],
             {
                 "method": "POST",
                 "path": "/api/tasks/{task_id}/check",
@@ -815,6 +842,14 @@ def _contract_task_path(path: str, *, suffix: str = "") -> str | None:
     return task_id if _safe_segment(task_id) else None
 
 
+def _contract_task_lifecycle_path(path: str) -> tuple[str, str] | None:
+    for action in ("disable", "archive", "restore"):
+        task_id = _contract_task_path(path, suffix=action)
+        if task_id is not None:
+            return task_id, action
+    return None
+
+
 def _mcp_route_allowed(method: str, path: str) -> bool:
     if method == "GET":
         if path in {
@@ -864,6 +899,7 @@ def _database_authorized_route(method: str, path: str) -> bool:
             path in {"/api/tasks", "/api/import/data_lake"}
             or _contract_task_path(path, suffix="publish") is not None
             or _contract_task_path(path, suffix="check") is not None
+            or _contract_task_lifecycle_path(path) is not None
         )
     return method == "PUT" and _contract_task_path(path) is not None
 
@@ -992,16 +1028,24 @@ def _active_task_raw(active: ActiveTaskRevision) -> dict[str, Any]:
 
 
 def _active_task_summary(workspace_slug: str, access, active: ActiveTaskRevision | None) -> dict[str, Any]:
+    lifecycle_state = access.task.lifecycle_state
+    if not isinstance(lifecycle_state, TaskLifecycleState):
+        lifecycle_state = TaskLifecycleState(lifecycle_state)
     summary = {
         "task_id": access.task.task_key,
         "workspace": workspace_slug,
         "source": "scaffold 控制面",
         "source_type": "control",
+        "lifecycle_state": lifecycle_state.value,
         "deletable": False,
         "editable": Permission.TASK_EDIT in access.capabilities,
         "capabilities": [permission.value for permission in access.capabilities],
         "roles": [role.value for role in access.roles],
     }
+    if lifecycle_state != TaskLifecycleState.ACTIVE:
+        summary.update({"status": lifecycle_state.value, "active": False, "revision": 0})
+        return summary
+    summary["active"] = True
     draft_fingerprint = getattr(access.task, "draft_fingerprint", None)
     draft_version = getattr(access.task, "draft_version", None)
     if active is None:
@@ -1390,7 +1434,11 @@ class _Handler(BaseHTTPRequestHandler):
             actor_identity,
             self._workspace_selector(params, body),
         )
-        service.require_task(actor_identity, workspace_slug, task_id, permission)
+        decision = service.require_task(actor_identity, workspace_slug, task_id, permission)
+        if decision.task is None:
+            raise _PanelRouteError(HTTPStatus.NOT_FOUND, "resource_not_found", "任务不可见")
+        if decision.task.lifecycle_state != TaskLifecycleState.ACTIVE:
+            raise TaskLifecycleNotActive(decision.task.lifecycle_state)
         active = self._load_active_revision(workspace_slug, task_id)
         if active is None:
             raise _PanelRouteError(
@@ -1483,6 +1531,35 @@ class _Handler(BaseHTTPRequestHandler):
                 status=HTTPStatus.UNPROCESSABLE_ENTITY,
             )
             return
+        if isinstance(exc, TaskLifecycleReasonRequired):
+            self._json(
+                {"error": "任务生命周期变更必须提供 reason", "code": exc.code},
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+            return
+        if isinstance(exc, TaskLifecycleStateInvalid):
+            self._json(
+                {"error": str(exc), "code": exc.code},
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+            return
+        if isinstance(exc, TaskLifecycleTransitionInvalid):
+            self._json(
+                {
+                    "error": "任务生命周期状态转移非法",
+                    "code": exc.code,
+                    "previous_state": exc.previous_state.value,
+                    "target_state": exc.target_state.value,
+                },
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, TaskLifecycleNotActive):
+            self._json(
+                {"error": "任务当前未启用", "code": exc.code, "lifecycle_state": exc.state.value},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
         if isinstance(exc, TaskDraftConflict):
             headers = {"ETag": exc.current_etag} if exc.current_etag is not None else None
             self._json(
@@ -1509,7 +1586,7 @@ class _Handler(BaseHTTPRequestHandler):
                 status=HTTPStatus.CONFLICT,
             )
             return
-        if isinstance(exc, (IdempotencyConflict, TaskPublishInProgress)):
+        if isinstance(exc, (IdempotencyConflict, TaskPublishInProgress, TaskLifecycleInProgress)):
             self._json(
                 {"error": "请求与现有幂等操作冲突", "code": exc.code},
                 status=HTTPStatus.CONFLICT,
@@ -1614,11 +1691,13 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 raise ValueError("limit 必须是整数") from exc
             after_task_key = str(params.get("after", [""])[0] or "").strip() or None
+            include_archived = _truthy_value(params.get("include_archived", [""])[0])
             page = service.list_authorized_tasks(
                 actor_identity,
                 workspace_slug,
                 limit=limit,
                 after_task_key=after_task_key,
+                include_archived=include_archived,
             )
             if page.workspace is None:
                 raise _PanelRouteError(
@@ -1630,7 +1709,9 @@ class _Handler(BaseHTTPRequestHandler):
             for access in page.items:
                 if Permission.TASK_READ not in access.capabilities:
                     continue
-                active = self._load_active_revision(workspace_slug, access.task.task_key)
+                active = None
+                if access.task.lifecycle_state == TaskLifecycleState.ACTIVE:
+                    active = self._load_active_revision(workspace_slug, access.task.task_key)
                 if active is None and Permission.TASK_EDIT not in access.capabilities:
                     continue
                 tasks.append(_active_task_summary(workspace_slug, access, active))
@@ -1654,7 +1735,11 @@ class _Handler(BaseHTTPRequestHandler):
                 actor_identity,
                 self._workspace_selector(params),
             )
-            service.require_task(actor_identity, workspace_slug, task_id, Permission.TASK_READ)
+            decision = service.require_task(actor_identity, workspace_slug, task_id, Permission.TASK_READ)
+            if decision.task is None:
+                raise _PanelRouteError(HTTPStatus.NOT_FOUND, "resource_not_found", "任务不可见")
+            if decision.task.lifecycle_state != TaskLifecycleState.ACTIVE:
+                raise TaskLifecycleNotActive(decision.task.lifecycle_state)
             active = self._load_active_revision(workspace_slug, task_id)
             if active is None:
                 raise _PanelRouteError(
@@ -1845,6 +1930,70 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._route_error(exc)
 
+    def _control_task_lifecycle(
+        self,
+        task_id: str,
+        action: str,
+        params,
+        body: dict[str, Any],
+    ) -> None:
+        try:
+            if not _safe_segment(task_id):
+                raise ValueError("task_id 必须是单段安全标识符")
+            if not isinstance(body, dict):
+                raise ValueError("任务生命周期请求必须是 JSON 对象")
+            forbidden = {"actor", "actor_id", "caller", "caller_id", "channel"}
+            supplied = sorted(forbidden.intersection(body))
+            if supplied:
+                raise ValueError(f"身份与 channel 由服务端推导，不能提交: {', '.join(supplied)}")
+            target_state = {
+                "disable": TaskLifecycleState.DISABLED,
+                "archive": TaskLifecycleState.ARCHIVED,
+                "restore": TaskLifecycleState.ACTIVE,
+            }.get(action)
+            if target_state is None:
+                raise TaskLifecycleStateInvalid(action)
+            reason = body.get("reason")
+            idempotency_key = str(
+                body.get("idempotency_key") or self.headers.get("Idempotency-Key") or "",
+            ).strip()
+            if not _valid_idempotency_key(idempotency_key):
+                raise ValueError("任务生命周期变更必须提供有效的 idempotency_key 或 Idempotency-Key header")
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params, body),
+            )
+            result = service.transition_task_lifecycle(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_id,
+                target_state=target_state,
+                reason=reason,
+                idempotency_key=idempotency_key,
+                channel=channel,
+            )
+            self._json(
+                {
+                    "ok": True,
+                    "task": {
+                        "task_id": result.task_key,
+                        "workspace": workspace_slug,
+                        "previous_state": result.previous_state.value,
+                        "lifecycle_state": result.lifecycle_state.value,
+                        "changed": result.changed,
+                    },
+                    "reason": result.reason,
+                    "audit_event_id": str(result.audit_event_id) if result.audit_event_id else None,
+                    "replayed": result.replayed,
+                },
+                status=result.response_status,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
     def _control_data_lake_import(self, params) -> None:
         try:
             body = self._read_body()
@@ -1895,7 +2044,11 @@ class _Handler(BaseHTTPRequestHandler):
                 actor_identity,
                 self._workspace_selector(params, body),
             )
-            service.require_task(actor_identity, workspace_slug, task_id, Permission.IMPORT_SUBMIT)
+            decision = service.require_task(actor_identity, workspace_slug, task_id, Permission.IMPORT_SUBMIT)
+            if decision.task is None:
+                raise _PanelRouteError(HTTPStatus.NOT_FOUND, "resource_not_found", "任务不可见")
+            if decision.task.lifecycle_state != TaskLifecycleState.ACTIVE:
+                raise TaskLifecycleNotActive(decision.task.lifecycle_state)
             active = self._load_active_revision(workspace_slug, task_id)
             if active is None:
                 raise _PanelRouteError(
@@ -2034,6 +2187,11 @@ class _Handler(BaseHTTPRequestHandler):
         if _control_task_source_enabled():
             service, actor_identity, _, _ = self._authorization_context()
             workspace_slug = self._resolve_workspace(service, actor_identity, None)
+            decision = service.require_task(actor_identity, workspace_slug, task_id, Permission.TASK_READ)
+            if decision.task is None:
+                raise ValueError(f"任务不可见: {task_id}")
+            if decision.task.lifecycle_state != TaskLifecycleState.ACTIVE:
+                raise TaskLifecycleNotActive(decision.task.lifecycle_state)
             active = self._load_active_revision(workspace_slug, task_id)
             if active is None:
                 raise ValueError(f"任务尚未发布或不存在: {task_id}")
@@ -2645,6 +2803,7 @@ class _Handler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
         contract_check_task_id = _contract_task_path(path, suffix="check")
         publish_task_id = _contract_task_path(path, suffix="publish")
+        lifecycle_path = _contract_task_lifecycle_path(path)
         if contract_check_task_id is not None:
             if _control_task_source_enabled():
                 self._control_task_check(contract_check_task_id, params, self._read_body())
@@ -2655,6 +2814,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "只有 scaffold 控制面任务来源模式支持发布任务 revision"}, status=400)
                 return
             self._control_publish(publish_task_id, params, self._read_body())
+        elif lifecycle_path is not None:
+            if not _control_task_source_enabled():
+                self._json({"error": "只有 scaffold 控制面任务来源模式支持任务生命周期变更"}, status=400)
+                return
+            task_id, action = lifecycle_path
+            self._control_task_lifecycle(task_id, action, params, self._read_body())
         elif path == "/api/tasks/sync":
             self._sync_tasks_from_registry()
         elif path.startswith("/api/tasks/"):
