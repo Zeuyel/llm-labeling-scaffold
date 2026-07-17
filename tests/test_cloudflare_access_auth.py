@@ -20,15 +20,18 @@ from llm_labeling_scaffold.auth import (
     CloudflareAccessVerifier,
     Identity,
     JwksUnavailableError,
+    PanelAuthenticationError,
     PanelAuthenticator,
     Principal,
     TokenForbiddenError,
     TokenVerificationError,
     build_panel_authenticator,
 )
+from llm_labeling_scaffold.db import AuthorizationSession
 
 ISSUER = "https://team.cloudflareaccess.com"
 EXPECTED_AUDIENCE = "configured-application-audience"
+MCP_EXPECTED_AUDIENCE = "configured-mcp-application-audience"
 SUBJECT = "7335d417-61da-459d-899c-0a01c76a2f94"
 
 
@@ -136,11 +139,12 @@ def _verifier(
     *,
     fetcher=None,
     max_jwks_keys: int = 8,
+    expected_audience: str = EXPECTED_AUDIENCE,
     **kwargs,
 ) -> CloudflareAccessVerifier:
     return CloudflareAccessVerifier(
         ISSUER,
-        EXPECTED_AUDIENCE,
+        expected_audience,
         jwks_fetcher=fetcher or _SequenceFetcher({"keys": [jwk]}),
         max_jwks_keys=max_jwks_keys,
         **kwargs,
@@ -447,16 +451,57 @@ def test_verifier_rejects_non_finite_security_timing_values(kwargs: dict):
         ("LLS_CF_ACCESS_HTTP_TIMEOUT_SECONDS", "-inf"),
         ("LLS_CF_ACCESS_CLOCK_SKEW_SECONDS", "nan"),
         ("LLS_CF_ACCESS_CLOCK_SKEW_SECONDS", "inf"),
+        ("LLS_MCP_CF_ACCESS_JWKS_TTL_SECONDS", "nan"),
+        ("LLS_MCP_CF_ACCESS_HTTP_TIMEOUT_SECONDS", "-inf"),
+        ("LLS_MCP_CF_ACCESS_CLOCK_SKEW_SECONDS", "inf"),
     ],
 )
 def test_environment_rejects_non_finite_access_timing_values(monkeypatch, name: str, value: str):
     monkeypatch.setenv("LLS_PANEL_AUTH_MODE", "cloudflare_access")
     monkeypatch.setenv("LLS_CF_ACCESS_ISSUER", ISSUER)
     monkeypatch.setenv("LLS_CF_ACCESS_AUD", EXPECTED_AUDIENCE)
+    if name.startswith("LLS_MCP_"):
+        monkeypatch.setenv("LLS_MCP_CF_ACCESS_ISSUER", ISSUER)
+        monkeypatch.setenv("LLS_MCP_CF_ACCESS_AUD", MCP_EXPECTED_AUDIENCE)
     monkeypatch.setenv(name, value)
 
     with pytest.raises(ValueError, match=name):
         build_panel_authenticator()
+
+
+def test_panel_builds_distinct_panel_and_mcp_access_verifiers(monkeypatch):
+    monkeypatch.setenv("LLS_PANEL_AUTH_MODE", "cloudflare_access")
+    monkeypatch.setenv("LLS_CF_ACCESS_ISSUER", ISSUER)
+    monkeypatch.setenv("LLS_CF_ACCESS_AUD", EXPECTED_AUDIENCE)
+    monkeypatch.setenv("LLS_MCP_CF_ACCESS_ISSUER", ISSUER)
+    monkeypatch.setenv("LLS_MCP_CF_ACCESS_AUD", MCP_EXPECTED_AUDIENCE)
+
+    authenticator = build_panel_authenticator()
+
+    assert authenticator._cloudflare_verifier.expected_audience == EXPECTED_AUDIENCE
+    assert authenticator._mcp_cloudflare_verifier.expected_audience == MCP_EXPECTED_AUDIENCE
+
+
+def test_panel_rejects_incomplete_or_reused_mcp_access_audience(monkeypatch):
+    monkeypatch.setenv("LLS_PANEL_AUTH_MODE", "cloudflare_access")
+    monkeypatch.setenv("LLS_CF_ACCESS_ISSUER", ISSUER)
+    monkeypatch.setenv("LLS_CF_ACCESS_AUD", EXPECTED_AUDIENCE)
+    monkeypatch.setenv("LLS_MCP_CF_ACCESS_ISSUER", ISSUER)
+
+    with pytest.raises(ValueError, match="LLS_MCP_CF_ACCESS_AUD"):
+        build_panel_authenticator()
+
+    monkeypatch.setenv("LLS_MCP_CF_ACCESS_AUD", EXPECTED_AUDIENCE)
+    with pytest.raises(ValueError, match="不同"):
+        build_panel_authenticator()
+
+    _, jwk = _signing_key("key-1")
+    with pytest.raises(ValueError, match="不同"):
+        PanelAuthenticator(
+            mode="cloudflare_access",
+            cloudflare_verifier=_verifier(jwk),
+            mcp_cloudflare_verifier=_verifier(jwk),
+        )
 
 
 def test_non_finite_clock_skew_cannot_bypass_expired_token_validation():
@@ -519,7 +564,13 @@ def test_panel_returns_stable_status_for_invalid_access_assertions(
         cloudflare_verifier=_verifier(jwk),
     )
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
+    with _panel_server(
+        tmp_path / "runs",
+        tmp_path / "tasks",
+        authenticator,
+        authorization_service=_EmptyAuthorizationService(),
+        authorization_ready=True,
+    ) as base_url:
         status, body = _request(
             base_url,
             "/api/session",
@@ -529,18 +580,37 @@ def test_panel_returns_stable_status_for_invalid_access_assertions(
     assert (status, body["code"]) == (expected_status, expected_code)
 
 
+class _EmptyAuthorizationService:
+    def get_session(self, identity) -> AuthorizationSession:
+        return AuthorizationSession(principal=None, workspaces=())
+
+
 @contextmanager
-def _panel_server(runs_root: Path, tasks_root: Path, authenticator: PanelAuthenticator):
+def _panel_server(
+    runs_root: Path,
+    tasks_root: Path,
+    authenticator: PanelAuthenticator,
+    *,
+    authorization_service=None,
+    authorization_ready: bool = False,
+    active_task_loader=None,
+):
     old = {
         "runs_root": panel._Handler.runs_root,
         "tasks_root": panel._Handler.tasks_root,
         "static_dir": panel._Handler.static_dir,
         "authenticator": panel._Handler.authenticator,
+        "authorization_service": panel._Handler.authorization_service,
+        "authorization_ready": panel._Handler.authorization_ready,
+        "active_task_loader": panel._Handler.active_task_loader,
     }
     panel._Handler.runs_root = runs_root
     panel._Handler.tasks_root = tasks_root
     panel._Handler.static_dir = None
     panel._Handler.authenticator = authenticator
+    panel._Handler.authorization_service = authorization_service
+    panel._Handler.authorization_ready = authorization_ready
+    panel._Handler.active_task_loader = active_task_loader
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), panel._Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -615,7 +685,13 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
         "X-User-Email": "attacker@example.com",
     }
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
+    with _panel_server(
+        tmp_path / "runs",
+        tmp_path / "tasks",
+        authenticator,
+        authorization_service=_EmptyAuthorizationService(),
+        authorization_ready=True,
+    ) as base_url:
         status, session, session_headers = _request_with_headers(base_url, "/api/session", headers=headers)
         health_status, health = _request(base_url, "/api/health", headers=headers)
         capabilities_status, capabilities = _request(base_url, "/api/capabilities", headers=headers)
@@ -637,7 +713,7 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
             "email": "alice@example.com",
         },
         "authentication": {"method": "cloudflare_access"},
-        "authorization": {"state": "unavailable"},
+        "authorization": {"state": "ready", "workspaces": []},
     }
     assert "issuer" not in session["user"]
     assert "subject" not in session["user"]
@@ -649,10 +725,19 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
     assert session_headers["Pragma"] == "no-cache"
     assert (health_status, health["ok"]) == (200, True)
     assert capabilities_status == 200
-    assert capabilities["authorization"] == {"state": "unavailable"}
-    assert (settings_status, settings_body["code"]) == (503, "authorization_unavailable")
-    assert (read_status, read_body["code"]) == (503, "authorization_unavailable")
-    assert (create_status, create_body["code"]) == (503, "authorization_unavailable")
+    assert capabilities["authorization"] == {"state": "ready"}
+    advertised = {(item["method"], item["path"]) for item in capabilities["endpoints"]}
+    assert ("POST", "/api/tasks/{task_id}/check") in advertised
+    assert ("GET", "/api/task/imports") in advertised
+    assert ("GET", "/api/import/detail") in advertised
+    assert ("GET", "/api/task/data_lake") in advertised
+    assert ("GET", "/api/jobs") in advertised
+    assert ("GET", "/api/task/annotation_jobs") not in advertised
+    assert ("POST", "/api/action") not in advertised
+    assert settings_status == 200
+    assert "settings" in settings_body
+    assert (read_status, read_body["code"]) == (404, "resource_not_found")
+    assert (create_status, create_body["code"]) == (404, "resource_not_found")
     assert not (tmp_path / "runs" / "_system" / "task_control" / "registry.json").exists()
 
 
@@ -679,7 +764,101 @@ def test_actor_context_separates_actor_from_caller_and_mcp_checks_caller():
     assert panel._Handler._is_mcp_request(holder) is True
 
 
-def test_authorization_gate_uses_actor_for_delegated_mcp_context():
+def test_internal_mcp_bearer_only_delegates_to_a_verified_access_actor():
+    private_key, jwk = _signing_key("key-1")
+    panel_token = _assertion(private_key, "key-1")
+    mcp_token = _assertion(
+        private_key,
+        "key-1",
+        claims={"aud": [MCP_EXPECTED_AUDIENCE]},
+    )
+    internal_token = "mcp-internal-0123456789-abcdef-012"
+    authenticator = PanelAuthenticator(
+        mode="cloudflare_access",
+        cloudflare_verifier=_verifier(jwk),
+        mcp_cloudflare_verifier=_verifier(jwk, expected_audience=MCP_EXPECTED_AUDIENCE),
+        internal_token=internal_token,
+    )
+
+    service_only = authenticator.authenticate(
+        {
+            "Authorization": f"Bearer {internal_token}",
+            "X-Actor": SUBJECT,
+            "X-User-Email": "alice@example.com",
+        },
+    )
+    delegated = authenticator.authenticate(
+        {
+            "Authorization": f"Bearer {internal_token}",
+            "Cf-Access-Jwt-Assertion": mcp_token,
+            "X-Actor": "attacker",
+        },
+    )
+
+    with pytest.raises(PanelAuthenticationError) as delegated_panel_audience:
+        authenticator.authenticate(
+            {
+                "Authorization": f"Bearer {internal_token}",
+                "Cf-Access-Jwt-Assertion": panel_token,
+            },
+        )
+    with pytest.raises(PanelAuthenticationError) as direct_mcp_audience:
+        authenticator.authenticate({"Cf-Access-Jwt-Assertion": mcp_token})
+
+    assert service_only.actor is service_only.caller
+    assert service_only.actor.kind == "service"
+    assert delegated.actor.kind == "user"
+    assert delegated.actor.identity.identity_key == (ISSUER, SUBJECT)
+    assert delegated.caller.kind == "service"
+    assert delegated.caller.is_static_mcp_service is True
+    assert delegated_panel_audience.value.code == "access_assertion_not_for_application"
+    assert delegated_panel_audience.value.status == 403
+    assert direct_mcp_audience.value.code == "access_assertion_not_for_application"
+    assert direct_mcp_audience.value.status == 403
+
+
+def test_internal_mcp_bearer_cannot_select_a_user_with_headers(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    private_key, jwk = _signing_key("key-1")
+    internal_token = "mcp-internal-0123456789-abcdef-012"
+    authenticator = PanelAuthenticator(
+        mode="cloudflare_access",
+        cloudflare_verifier=_verifier(jwk),
+        mcp_cloudflare_verifier=_verifier(jwk, expected_audience=MCP_EXPECTED_AUDIENCE),
+        internal_token=internal_token,
+    )
+
+    with _panel_server(
+        tmp_path / "runs",
+        tmp_path / "tasks",
+        authenticator,
+        authorization_service=_EmptyAuthorizationService(),
+        authorization_ready=True,
+    ) as base_url:
+        missing_status, missing = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a",
+            headers={
+                "Authorization": f"Bearer {internal_token}",
+                "X-Actor": SUBJECT,
+                "X-User-Email": "alice@example.com",
+            },
+        )
+        invalid_status, invalid = _request(
+            base_url,
+            "/api/tasks?workspace=workspace-a",
+            headers={
+                "Authorization": f"Bearer {internal_token}",
+                "Cf-Access-Jwt-Assertion": _assertion(private_key, "key-1"),
+            },
+        )
+
+    assert (missing_status, missing["code"]) == (403, "delegated_actor_required")
+    assert (invalid_status, invalid["code"]) == (403, "access_assertion_not_for_application")
+
+
+def test_authorization_gate_uses_actor_for_delegated_mcp_context(monkeypatch):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
     user = Principal(
         kind="user",
         authentication_method="cloudflare_access",
@@ -707,16 +886,16 @@ def test_authorization_gate_uses_actor_for_delegated_mcp_context():
             self.response = (body, status, headers)
 
     delegated = HandlerStub(ActorContext(actor=user, caller=service))
-    assert panel._Handler._require_auth(delegated) is False
-    assert delegated.response == (
-        {"error": "授权层尚不可用", "code": "authorization_unavailable"},
-        503,
-        None,
-    )
+    assert panel._Handler._require_auth(delegated) is True
+    assert delegated._request_context == ActorContext(actor=user, caller=service)
 
     static_service = HandlerStub(ActorContext.direct(service))
-    assert panel._Handler._require_auth(static_service) is True
-    assert static_service._request_context == ActorContext.direct(service)
+    assert panel._Handler._require_auth(static_service) is False
+    assert static_service.response == (
+        {"error": "MCP 请求缺少经过验证的用户 actor", "code": "delegated_actor_required"},
+        403,
+        None,
+    )
 
 
 def test_cloudflare_mode_rejects_missing_assertion_and_does_not_fall_back_to_basic(tmp_path: Path):
@@ -727,7 +906,13 @@ def test_cloudflare_mode_rejects_missing_assertion_and_does_not_fall_back_to_bas
     )
     basic = "Basic " + base64.b64encode(b"admin:secret").decode("ascii")
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
+    with _panel_server(
+        tmp_path / "runs",
+        tmp_path / "tasks",
+        authenticator,
+        authorization_service=_EmptyAuthorizationService(),
+        authorization_ready=True,
+    ) as base_url:
         missing_status, missing = _request(base_url, "/api/session")
         basic_status, basic_body = _request(base_url, "/api/session", headers={"Authorization": basic})
 
@@ -743,7 +928,13 @@ def test_basic_auth_remains_available_only_in_explicit_development_mode(tmp_path
     )
     basic = "Basic " + base64.b64encode(b"admin:secret").decode("ascii")
 
-    with _panel_server(tmp_path / "runs", tmp_path / "tasks", authenticator) as base_url:
+    with _panel_server(
+        tmp_path / "runs",
+        tmp_path / "tasks",
+        authenticator,
+        authorization_service=_EmptyAuthorizationService(),
+        authorization_ready=True,
+    ) as base_url:
         status, session = _request(base_url, "/api/session", headers={"Authorization": basic})
 
     assert status == 200
@@ -751,7 +942,7 @@ def test_basic_auth_remains_available_only_in_explicit_development_mode(tmp_path
         "authenticated": True,
         "user": {"display_name": "admin"},
         "authentication": {"method": "basic_dev"},
-        "authorization": {"state": "unavailable"},
+        "authorization": {"state": "ready", "workspaces": []},
     }
 
 

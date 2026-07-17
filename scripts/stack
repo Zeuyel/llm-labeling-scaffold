@@ -89,12 +89,51 @@ case "$cmd" in
 esac
 
 if [ "$enable_mcp" -eq 1 ] && [ "$apply_config" -eq 1 ]; then
-  mcp_bearer_token="$(env_value LLS_MCP_BEARER_TOKEN "")"
+  mcp_auth_mode="$(env_value LLS_MCP_AUTH_MODE cloudflare_access)"
   mcp_internal_token="$(env_value LLS_MCP_INTERNAL_TOKEN "")"
-  if [ "${#mcp_bearer_token}" -lt 32 ] || [[ "$mcp_bearer_token" =~ [[:space:]] ]] || [ "${#mcp_internal_token}" -lt 32 ] || [[ "$mcp_internal_token" =~ [[:space:]] ]] || [ "$mcp_bearer_token" = "$mcp_internal_token" ]; then
-    echo "启用 MCP 前必须设置彼此不同、至少 32 个非空白字符的 LLS_MCP_BEARER_TOKEN 和 LLS_MCP_INTERNAL_TOKEN。" >&2
+  mcp_bind_host="$(env_value MCP_BIND_HOST 127.0.0.1)"
+  if [ "${#mcp_internal_token}" -lt 32 ] || [[ "$mcp_internal_token" =~ [[:space:]] ]]; then
+    echo "启用 MCP 前必须设置至少 32 个非空白字符的 LLS_MCP_INTERNAL_TOKEN。" >&2
     exit 2
   fi
+  case "$mcp_bind_host" in
+    127.0.0.1)
+      ;;
+    localhost)
+      mcp_bind_host="127.0.0.1"
+      ;;
+    *)
+      echo "MCP 宿主发布地址只允许 MCP_BIND_HOST 使用 127.0.0.1 或 localhost。" >&2
+      exit 2
+      ;;
+  esac
+  case "${mcp_auth_mode,,}" in
+    cloudflare_access)
+      mcp_issuer="$(env_value LLS_MCP_CF_ACCESS_ISSUER "")"
+      mcp_audience="$(env_value LLS_MCP_CF_ACCESS_AUD "")"
+      panel_audience="$(env_value LLS_CF_ACCESS_AUD "")"
+      if [ -z "$mcp_issuer" ] || [ -z "$mcp_audience" ]; then
+        echo "MCP cloudflare_access 模式必须设置 LLS_MCP_CF_ACCESS_ISSUER 和 LLS_MCP_CF_ACCESS_AUD。" >&2
+        exit 2
+      fi
+      if [ -n "$panel_audience" ] && [ "$mcp_audience" = "$panel_audience" ]; then
+        echo "LLS_MCP_CF_ACCESS_AUD 必须与 LLS_CF_ACCESS_AUD 使用不同的 Access application AUD。" >&2
+        exit 2
+      fi
+      ;;
+    static_dev)
+      mcp_bearer_token="$(env_value LLS_MCP_BEARER_TOKEN "")"
+      if [ "${#mcp_bearer_token}" -lt 32 ] || [[ "$mcp_bearer_token" =~ [[:space:]] ]] || [ "$mcp_bearer_token" = "$mcp_internal_token" ]; then
+        echo "MCP static_dev 模式必须设置与内部 token 不同、至少 32 个非空白字符的 LLS_MCP_BEARER_TOKEN。" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "LLS_MCP_AUTH_MODE 只能是 cloudflare_access 或 static_dev。" >&2
+      exit 2
+      ;;
+  esac
+  export MCP_BIND_HOST="$mcp_bind_host"
 fi
 
 panel_auth_mode="$(env_value LLS_PANEL_AUTH_MODE cloudflare_access)"
@@ -190,7 +229,7 @@ print_urls() {
   fi
   if [ "$enable_mcp" -eq 0 ]; then
     echo
-    echo "默认未启动 MCP；需要时先配置 LLS_MCP_BEARER_TOKEN 和 LLS_MCP_INTERNAL_TOKEN，再运行：scripts/stack up --mcp"
+    echo "默认未启动 MCP；需要时先配置独立 MCP Access application 和 LLS_MCP_INTERNAL_TOKEN，再运行：scripts/stack up --mcp"
   fi
   case "${task_source,,}" in
     r2|data_lake|registry)

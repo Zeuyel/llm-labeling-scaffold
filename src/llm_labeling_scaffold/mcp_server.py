@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -16,6 +18,13 @@ from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
+
+from .auth.cloudflare_access import (
+    CloudflareAccessVerifier,
+    JwksUnavailableError,
+    TokenForbiddenError,
+    TokenVerificationError,
+)
 
 
 class McpConfigurationError(ValueError):
@@ -32,11 +41,60 @@ def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise McpConfigurationError(f"{name} 必须是数字") from exc
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        raise McpConfigurationError(f"{name} 必须在 {minimum} 到 {maximum} 之间")
+    return value
+
+
+def resolve_mcp_auth_mode(explicit: str | None = None) -> str:
+    mode = str(explicit or os.environ.get("LLS_MCP_AUTH_MODE") or "cloudflare_access").strip().lower()
+    if mode not in {"cloudflare_access", "static_dev"}:
+        raise McpConfigurationError("LLS_MCP_AUTH_MODE 只能是 cloudflare_access 或 static_dev")
+    return mode
+
+
+@dataclass(frozen=True, slots=True)
+class McpRequestContext:
+    authentication_method: str
+    issuer: str
+    subject: str
+    access_assertion: str | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def identity_key(self) -> tuple[str, str]:
+        return self.issuer, self.subject
+
+
+_MCP_REQUEST_CONTEXT: ContextVar[McpRequestContext | None] = ContextVar(
+    "lls_mcp_request_context",
+    default=None,
+)
+
+
+def current_mcp_request_context() -> McpRequestContext | None:
+    return _MCP_REQUEST_CONTEXT.get()
+
+
 @dataclass(frozen=True)
 class McpServerConfig:
     panel_url: str
-    bearer_token: str | None = field(repr=False)
-    internal_token: str = field(repr=False)
+    bearer_token: str | None = field(default=None, repr=False)
+    internal_token: str = field(default="", repr=False)
+    auth_mode: str = "cloudflare_access"
+    cloudflare_issuer: str | None = None
+    cloudflare_audience: str | None = field(default=None, repr=False)
+    panel_cloudflare_audience: str | None = field(default=None, repr=False)
+    cloudflare_jwks_ttl_seconds: float = 300.0
+    cloudflare_http_timeout_seconds: float = 5.0
+    cloudflare_clock_skew_seconds: float = 0.0
     enable_writes: bool = False
     timeout_seconds: float = 15.0
 
@@ -45,8 +103,11 @@ class McpServerConfig:
         cls,
         *,
         panel_url: str | None = None,
+        auth_mode: str | None = None,
         bearer_token: str | None = None,
         internal_token: str | None = None,
+        cloudflare_issuer: str | None = None,
+        cloudflare_audience: str | None = None,
         enable_writes: bool | None = None,
         timeout_seconds: float | None = None,
     ) -> "McpServerConfig":
@@ -54,6 +115,7 @@ class McpServerConfig:
         parsed = urlparse(resolved_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise McpConfigurationError("LLS_MCP_PANEL_URL 必须是完整的 HTTP(S) Panel 地址")
+        resolved_auth_mode = resolve_mcp_auth_mode(auth_mode)
         resolved_token = str(bearer_token or os.environ.get("LLS_MCP_BEARER_TOKEN") or "").strip() or None
         resolved_internal_token = str(internal_token or os.environ.get("LLS_MCP_INTERNAL_TOKEN") or "").strip()
         if len(resolved_internal_token) < 32 or any(char.isspace() for char in resolved_internal_token):
@@ -69,6 +131,34 @@ class McpServerConfig:
             panel_url=resolved_url,
             bearer_token=resolved_token,
             internal_token=resolved_internal_token,
+            auth_mode=resolved_auth_mode,
+            cloudflare_issuer=(
+                str(cloudflare_issuer or os.environ.get("LLS_MCP_CF_ACCESS_ISSUER") or "").strip() or None
+            ),
+            cloudflare_audience=(
+                str(cloudflare_audience or os.environ.get("LLS_MCP_CF_ACCESS_AUD") or "").strip() or None
+            ),
+            panel_cloudflare_audience=(
+                str(os.environ.get("LLS_CF_ACCESS_AUD") or "").strip() or None
+            ),
+            cloudflare_jwks_ttl_seconds=_bounded_float_env(
+                "LLS_MCP_CF_ACCESS_JWKS_TTL_SECONDS",
+                300,
+                30,
+                3600,
+            ),
+            cloudflare_http_timeout_seconds=_bounded_float_env(
+                "LLS_MCP_CF_ACCESS_HTTP_TIMEOUT_SECONDS",
+                5,
+                0.5,
+                15,
+            ),
+            cloudflare_clock_skew_seconds=_bounded_float_env(
+                "LLS_MCP_CF_ACCESS_CLOCK_SKEW_SECONDS",
+                0,
+                0,
+                60,
+            ),
             enable_writes=resolved_writes,
             timeout_seconds=resolved_timeout,
         )
@@ -77,10 +167,11 @@ class McpServerConfig:
 class PanelApiClient:
     def __init__(self, config: McpServerConfig, *, transport: httpx.AsyncBaseTransport | None = None):
         self.config = config
+        self._authorization = f"Bearer {config.internal_token}"
         self._client = httpx.AsyncClient(
             base_url=config.panel_url,
             headers={
-                "Authorization": f"Bearer {config.internal_token}",
+                "Authorization": self._authorization,
                 "Accept": "application/json",
             },
             timeout=httpx.Timeout(config.timeout_seconds),
@@ -122,13 +213,34 @@ class PanelApiClient:
         if not path.startswith("/"):
             raise ValueError("Panel API 路径必须以 / 开头")
         params = {key: value for key, value in (query or {}).items() if value not in (None, "")}
+        request_headers = httpx.Headers(headers or {})
+        request_headers["Authorization"] = self._authorization
+        request_headers.pop("Cf-Access-Jwt-Assertion", None)
+        context = current_mcp_request_context()
+        access_assertion = context.access_assertion if context is not None else None
+        if resolve_mcp_auth_mode(self.config.auth_mode) == "cloudflare_access" and (
+            context is None
+            or context.authentication_method != "cloudflare_access"
+            or not access_assertion
+        ):
+            raise PanelApiError("Managed MCP 请求缺少 request-scoped Access assertion")
+        if access_assertion:
+            request_headers["Cf-Access-Jwt-Assertion"] = access_assertion
         try:
-            response = await self._client.request(method, path, params=params or None, json=payload, headers=headers)
+            response = await self._client.request(
+                method,
+                path,
+                params=params or None,
+                json=payload,
+                headers=request_headers,
+            )
         except httpx.RequestError as exc:
-            raise PanelApiError(f"无法连接 Panel API: {exc}") from exc
+            details = self._redact(str(exc), access_assertion)
+            raise PanelApiError(f"无法连接 Panel API: {details}") from exc
         raw = response.text
         if response.is_error:
-            raise PanelApiError(f"Panel API {response.status_code}: {self._error_details(raw)}")
+            details = self._redact(self._error_details(raw), access_assertion)
+            raise PanelApiError(f"Panel API {response.status_code}: {details}")
         return self._parse_response(raw, response.status_code)
 
     async def aclose(self) -> None:
@@ -154,33 +266,166 @@ class PanelApiClient:
             return str(payload["error"])
         return raw[:500] or "请求失败"
 
+    def _redact(self, value: str, access_assertion: str | None = None) -> str:
+        redacted = value
+        for secret in (self.config.internal_token, self.config.bearer_token, access_assertion):
+            if secret:
+                redacted = redacted.replace(secret, "[REDACTED]")
+        return redacted
 
-class BearerTokenMiddleware:
-    def __init__(self, app, bearer_token: str):
+
+class McpAuthenticationMiddleware:
+    def __init__(
+        self,
+        app,
+        config: McpServerConfig,
+        *,
+        cloudflare_verifier: CloudflareAccessVerifier | None = None,
+    ):
         self.app = app
-        self.bearer_token = bearer_token
+        self.config = config
+        self.auth_mode = resolve_mcp_auth_mode(config.auth_mode)
+        self._cloudflare_verifier = cloudflare_verifier
 
     async def __call__(self, scope, receive, send) -> None:
-        if scope["type"] == "http" and scope.get("path") != "/healthz":
-            header = next((value for key, value in scope.get("headers", []) if key.lower() == b"authorization"), b"")
-            parts = header.decode("latin-1").split()
-            token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else ""
-            if not token or not hmac.compare_digest(token, self.bearer_token):
-                response = JSONResponse({"error": "MCP bearer token 无效"}, status_code=401, headers={"WWW-Authenticate": "Bearer"})
-                await response(scope, receive, send)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        sanitized_scope = _without_sensitive_auth_headers(scope)
+        if scope.get("path") == "/healthz":
+            await self.app(sanitized_scope, receive, send)
+            return
+
+        if self.auth_mode == "static_dev":
+            if not self._valid_static_token(scope):
+                await _send_auth_error(
+                    scope,
+                    receive,
+                    send,
+                    status_code=401,
+                    code="invalid_static_dev_token",
+                    challenge="Bearer",
+                )
                 return
-        await self.app(scope, receive, send)
+            context = McpRequestContext(
+                authentication_method="static_dev",
+                issuer="urn:lls:mcp-static-dev",
+                subject="static-dev",
+            )
+        else:
+            assertions = _header_values(scope, b"cf-access-jwt-assertion")
+            if len(assertions) != 1:
+                await _send_auth_error(
+                    scope,
+                    receive,
+                    send,
+                    status_code=401,
+                    code="missing_access_assertion",
+                )
+                return
+            assertion = assertions[0].decode("latin-1").strip()
+            verifier = self._cloudflare_verifier
+            if verifier is None:
+                await _send_auth_error(
+                    scope,
+                    receive,
+                    send,
+                    status_code=503,
+                    code="authentication_not_configured",
+                )
+                return
+            try:
+                identity = await asyncio.to_thread(verifier.verify, assertion)
+            except TokenForbiddenError as exc:
+                await _send_auth_error(scope, receive, send, status_code=403, code=exc.code)
+                return
+            except JwksUnavailableError as exc:
+                await _send_auth_error(scope, receive, send, status_code=503, code=exc.code)
+                return
+            except TokenVerificationError as exc:
+                await _send_auth_error(scope, receive, send, status_code=401, code=exc.code)
+                return
+            context = McpRequestContext(
+                authentication_method="cloudflare_access",
+                issuer=identity.issuer,
+                subject=identity.subject,
+                access_assertion=assertion,
+            )
+
+        context_token = _MCP_REQUEST_CONTEXT.set(context)
+        try:
+            await self.app(sanitized_scope, receive, send)
+        finally:
+            _MCP_REQUEST_CONTEXT.reset(context_token)
+
+    def _valid_static_token(self, scope) -> bool:
+        headers = _header_values(scope, b"authorization")
+        if len(headers) != 1 or self.config.bearer_token is None:
+            return False
+        parts = headers[0].decode("latin-1").split()
+        token = parts[1] if len(parts) == 2 and parts[0].lower() == "bearer" else ""
+        return bool(token) and hmac.compare_digest(token, self.config.bearer_token)
+
+def _header_values(scope, name: bytes) -> list[bytes]:
+    return [value for key, value in scope.get("headers", []) if key.lower() == name]
+
+
+def _without_sensitive_auth_headers(scope):
+    sanitized = dict(scope)
+    sanitized["headers"] = [
+        (key, value)
+        for key, value in scope.get("headers", [])
+        if key.lower() not in {b"authorization", b"cf-access-jwt-assertion"}
+    ]
+    return sanitized
+
+
+async def _send_auth_error(
+    scope,
+    receive,
+    send,
+    *,
+    status_code: int,
+    code: str,
+    challenge: str | None = None,
+) -> None:
+    headers = {"WWW-Authenticate": challenge} if challenge else None
+    response = JSONResponse(
+        {"error": "MCP authentication failed", "code": code},
+        status_code=status_code,
+        headers=headers,
+    )
+    await response(scope, receive, send)
 
 
 def _safe_segment(value: str, label: str) -> str:
     text = str(value or "").strip()
-    if not text or ".." in text or "/" in text or "\\" in text or any(ord(char) < 32 for char in text):
+    if (
+        not text
+        or text == "."
+        or ".." in text
+        or "/" in text
+        or "\\" in text
+        or any(ord(char) < 32 for char in text)
+    ):
         raise ValueError(f"{label} 必须是单段安全标识符")
     return text
 
 
 def _path_segment(value: str, label: str) -> str:
     return quote(_safe_segment(value, label), safe="")
+
+
+def _with_workspace(payload: dict[str, Any], workspace: str) -> dict[str, Any]:
+    return {**payload, "workspace": _safe_segment(workspace, "workspace")}
+
+
+def _strong_etag(value: str) -> str:
+    text = str(value or "").strip()
+    if text.startswith("W/") or len(text) < 2 or text[0] != '"' or text[-1] != '"' or "," in text:
+        raise ValueError("expected_draft_etag 必须是 GET draft 返回的完整强 ETag")
+    return text
 
 
 def _require_confirmed_idempotency(confirm: bool, idempotency_key: str, action: str) -> str:
@@ -234,118 +479,238 @@ def create_mcp_server(config: McpServerConfig, *, panel_client: Any | None = Non
         return {"health": health, "version": version, "settings": settings}
 
     @server.tool(description="列出当前可见任务及其发布状态。草稿任务不可执行。", annotations=READ_ONLY)
-    async def scaffold_task_list() -> dict[str, Any]:
-        return await client.get("/api/tasks")
+    async def scaffold_task_list(workspace: str) -> dict[str, Any]:
+        return await client.get("/api/tasks", _with_workspace({}, workspace))
 
     @server.tool(description="读取已发布任务的字段、标签、流程预设和数据湖摘要。", annotations=READ_ONLY)
-    async def scaffold_task_detail(task_id: str) -> dict[str, Any]:
-        return await client.get(f"/api/tasks/{_path_segment(task_id, '任务编号')}")
+    async def scaffold_task_detail(task_id: str, workspace: str) -> dict[str, Any]:
+        return await client.get(
+            f"/api/tasks/{_path_segment(task_id, '任务编号')}",
+            _with_workspace({}, workspace),
+        )
 
-    @server.tool(description="读取 Scaffold 控制面中的任务草稿、草稿指纹、revision 与发布记录。仅 control 模式可用。", annotations=READ_ONLY)
-    async def scaffold_task_draft_detail(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/task/control", {"task_id": _safe_segment(task_id, "任务编号")})
+    @server.tool(description="读取 Scaffold 控制面中的任务草稿、强 ETag、revision 与发布记录。仅 control 模式可用。", annotations=READ_ONLY)
+    async def scaffold_task_draft_detail(task_id: str, workspace: str) -> dict[str, Any]:
+        return await client.get(
+            "/api/task/control",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     @server.tool(description="检查任务配置、流程预设和数据湖来源是否可用。该工具不写入数据。", annotations=READ_EXTERNAL)
-    async def scaffold_task_check(task_id: str) -> dict[str, Any]:
-        return await client.post(f"/api/tasks/{_path_segment(task_id, '任务编号')}/check", {})
+    async def scaffold_task_check(task_id: str, workspace: str) -> dict[str, Any]:
+        return await client.post(
+            f"/api/tasks/{_path_segment(task_id, '任务编号')}/check",
+            _with_workspace({}, workspace),
+        )
 
     @server.tool(description="列出任务的本地导入资产和审计摘要。", annotations=READ_ONLY)
-    async def scaffold_import_list(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/task/imports", {"task_id": _safe_segment(task_id, "任务编号")})
+    async def scaffold_import_list(task_id: str, workspace: str) -> dict[str, Any]:
+        return await client.get(
+            "/api/task/imports",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     @server.tool(description="读取一个导入资产的 manifest、字段、依赖和可用性摘要。", annotations=READ_ONLY)
-    async def scaffold_import_detail(task_id: str, import_id: str) -> dict[str, Any]:
+    async def scaffold_import_detail(task_id: str, import_id: str, workspace: str) -> dict[str, Any]:
         return await client.get(
             "/api/import/detail",
-            {"task_id": _safe_segment(task_id, "任务编号"), "import_id": _safe_segment(import_id, "导入编号")},
+            _with_workspace(
+                {
+                    "task_id": _safe_segment(task_id, "任务编号"),
+                    "import_id": _safe_segment(import_id, "导入编号"),
+                },
+                workspace,
+            ),
         )
 
     @server.tool(description="预览任务在数据湖登记表中的来源对象与校验信息，不下载或写入数据。", annotations=READ_EXTERNAL)
-    async def scaffold_data_lake_preview(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/task/data_lake", {"task_id": _safe_segment(task_id, "任务编号")})
+    async def scaffold_data_lake_preview(task_id: str, workspace: str) -> dict[str, Any]:
+        return await client.get(
+            "/api/task/data_lake",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     @server.tool(description="对数据湖导入进行 dry-run，返回将要读取的受登记数据对象与导入编号。", annotations=READ_EXTERNAL)
-    async def scaffold_data_lake_import_dry_run(task_id: str, import_id: str = "") -> dict[str, Any]:
+    async def scaffold_data_lake_import_dry_run(
+        task_id: str,
+        workspace: str,
+        import_id: str = "",
+    ) -> dict[str, Any]:
         return await client.post(
             "/api/import/data_lake",
-            {"task_id": _safe_segment(task_id, "任务编号"), "import_id": import_id.strip(), "dry_run": True},
+            _with_workspace(
+                {
+                    "task_id": _safe_segment(task_id, "任务编号"),
+                    "import_id": import_id.strip(),
+                    "dry_run": True,
+                },
+                workspace,
+            ),
         )
 
     @server.tool(description="读取任务异步 job 的状态和结果摘要。", annotations=READ_ONLY)
-    async def scaffold_job_status(task_id: str) -> dict[str, Any]:
-        return await client.get("/api/jobs", {"task_id": _safe_segment(task_id, "任务编号")})
+    async def scaffold_job_status(task_id: str, workspace: str) -> dict[str, Any]:
+        return await client.get(
+            "/api/jobs",
+            _with_workspace({"task_id": _safe_segment(task_id, "任务编号")}, workspace),
+        )
 
     if config.enable_writes:
         @server.tool(description="创建任务草稿。此操作不会发布任务，也不会执行数据导入。", annotations=WRITE_CREATE)
-        async def scaffold_task_draft_create(spec: dict[str, Any]) -> dict[str, Any]:
+        async def scaffold_task_draft_create(spec: dict[str, Any], workspace: str) -> dict[str, Any]:
             if not isinstance(spec, dict):
                 raise ValueError("spec 必须是任务单对象")
             task_id = _safe_segment(str(spec.get("task_id") or ""), "任务编号")
-            return await client.post("/api/tasks", {**spec, "task_id": task_id})
+            return await client.post(
+                "/api/tasks",
+                _with_workspace({**spec, "task_id": task_id}, workspace),
+            )
 
-        @server.tool(description="更新既有任务草稿。必须提交读取草稿时获得的 draft_fingerprint；冲突时拒绝覆盖。", annotations=WRITE_UPDATE)
+        @server.tool(description="更新既有任务草稿。必须提交读取草稿时获得的完整强 ETag；冲突时拒绝覆盖。", annotations=WRITE_UPDATE)
         async def scaffold_task_draft_update(
             task_id: str,
             spec: dict[str, Any],
-            expected_draft_fingerprint: str,
+            expected_draft_etag: str,
+            workspace: str,
         ) -> dict[str, Any]:
             safe_task_id = _safe_segment(task_id, "任务编号")
             if not isinstance(spec, dict) or str(spec.get("task_id") or "").strip() != safe_task_id:
                 raise ValueError("spec.task_id 必须与 task_id 一致")
             return await client.put(
                 f"/api/tasks/{_path_segment(safe_task_id, '任务编号')}",
-                {**spec, "task_id": safe_task_id},
-                headers={"If-Match": expected_draft_fingerprint.strip()},
+                _with_workspace({**spec, "task_id": safe_task_id}, workspace),
+                headers={"If-Match": _strong_etag(expected_draft_etag)},
             )
 
-        @server.tool(description="发布任务草稿为新 revision。必须提交草稿指纹、显式确认和稳定 idempotency_key。", annotations=WRITE_IDEMPOTENT)
+        @server.tool(description="发布任务草稿为新 revision。必须提交强 ETag、reason、显式确认和稳定 idempotency_key。", annotations=WRITE_IDEMPOTENT)
         async def scaffold_task_publish(
             task_id: str,
-            expected_draft_fingerprint: str,
+            expected_draft_etag: str,
+            reason: str,
+            workspace: str,
             confirm: bool = False,
             idempotency_key: str = "",
         ) -> dict[str, Any]:
             key = _require_confirmed_idempotency(confirm, idempotency_key, "发布任务")
+            normalized_reason = str(reason or "").strip()
+            if not normalized_reason:
+                raise ValueError("发布任务必须提供 reason")
             return await client.post(
                 f"/api/tasks/{_path_segment(task_id, '任务编号')}/publish",
-                {"confirm": True, "idempotency_key": key},
-                headers={"If-Match": expected_draft_fingerprint.strip()},
+                _with_workspace(
+                    {
+                        "confirm": True,
+                        "idempotency_key": key,
+                        "reason": normalized_reason,
+                    },
+                    workspace,
+                ),
+                headers={"If-Match": _strong_etag(expected_draft_etag)},
             )
 
         @server.tool(description="提交数据湖导入异步任务。必须显式确认并使用稳定 idempotency_key。", annotations=WRITE_EXTERNAL_IDEMPOTENT)
         async def scaffold_data_lake_import_submit(
             task_id: str,
             idempotency_key: str,
+            workspace: str,
             import_id: str = "",
             confirm: bool = False,
         ) -> dict[str, Any]:
             key = _require_confirmed_idempotency(confirm, idempotency_key, "数据湖导入")
             return await client.post(
                 "/api/import/data_lake",
-                {
-                    "task_id": _safe_segment(task_id, "任务编号"),
-                    "import_id": import_id.strip(),
-                    "confirm": True,
-                    "idempotency_key": key,
-                },
+                _with_workspace(
+                    {
+                        "task_id": _safe_segment(task_id, "任务编号"),
+                        "import_id": import_id.strip(),
+                        "confirm": True,
+                        "idempotency_key": key,
+                    },
+                    workspace,
+                ),
             )
 
     return server
 
 
-def create_streamable_http_app(config: McpServerConfig, *, panel_client: Any | None = None):
-    if not config.bearer_token or len(config.bearer_token) < 32 or any(char.isspace() for char in config.bearer_token):
-        raise McpConfigurationError("Streamable HTTP MCP 必须配置至少 32 个非空白字符的 LLS_MCP_BEARER_TOKEN")
-    if hmac.compare_digest(config.bearer_token, config.internal_token):
-        raise McpConfigurationError("LLS_MCP_BEARER_TOKEN 不能与 LLS_MCP_INTERNAL_TOKEN 相同")
+def create_streamable_http_app(
+    config: McpServerConfig,
+    *,
+    panel_client: Any | None = None,
+    cloudflare_verifier: CloudflareAccessVerifier | None = None,
+):
+    mode = _validate_streamable_http_config(config)
+    verifier = cloudflare_verifier
+    if mode == "cloudflare_access" and verifier is None:
+        try:
+            verifier = CloudflareAccessVerifier(
+                config.cloudflare_issuer or "",
+                config.cloudflare_audience or "",
+                jwks_ttl_seconds=config.cloudflare_jwks_ttl_seconds,
+                http_timeout_seconds=config.cloudflare_http_timeout_seconds,
+                clock_skew_seconds=config.cloudflare_clock_skew_seconds,
+            )
+        except ValueError as exc:
+            raise McpConfigurationError(str(exc)) from exc
     app = create_mcp_server(config, panel_client=panel_client).streamable_http_app()
-    return BearerTokenMiddleware(app, config.bearer_token)
+    return McpAuthenticationMiddleware(app, config, cloudflare_verifier=verifier)
 
 
-def serve_mcp(config: McpServerConfig, *, transport: str, host: str, port: int) -> None:
+def _validate_streamable_http_config(config: McpServerConfig) -> str:
+    mode = resolve_mcp_auth_mode(config.auth_mode)
+    internal_token = config.internal_token
+    if len(internal_token) < 32 or any(char.isspace() for char in internal_token):
+        raise McpConfigurationError("MCP 必须配置至少 32 个非空白字符的 LLS_MCP_INTERNAL_TOKEN")
+    if mode == "cloudflare_access":
+        if not config.cloudflare_issuer or not config.cloudflare_audience:
+            raise McpConfigurationError(
+                "cloudflare_access 模式必须设置 LLS_MCP_CF_ACCESS_ISSUER 和 LLS_MCP_CF_ACCESS_AUD"
+            )
+        if (
+            config.panel_cloudflare_audience
+            and config.cloudflare_audience == config.panel_cloudflare_audience
+        ):
+            raise McpConfigurationError(
+                "LLS_MCP_CF_ACCESS_AUD 必须与 LLS_CF_ACCESS_AUD 使用不同的 Access application AUD"
+            )
+        return mode
+    token = config.bearer_token or ""
+    if len(token) < 32 or any(char.isspace() for char in token):
+        raise McpConfigurationError(
+            "static_dev 模式必须配置至少 32 个非空白字符的 LLS_MCP_BEARER_TOKEN"
+        )
+    if hmac.compare_digest(token, config.internal_token):
+        raise McpConfigurationError("LLS_MCP_BEARER_TOKEN 不能与 LLS_MCP_INTERNAL_TOKEN 相同")
+    return mode
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower().removeprefix("[").removesuffix("]")
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def serve_mcp(
+    config: McpServerConfig,
+    *,
+    transport: str,
+    host: str,
+    port: int,
+    published_host: str | None = None,
+) -> None:
     if transport == "stdio":
         create_mcp_server(config).run(transport="stdio")
         return
     if transport != "streamable-http":
         raise McpConfigurationError(f"不支持的 MCP transport: {transport}")
+    exposure_host = published_host or host
+    if not _is_loopback_host(exposure_host):
+        mode = resolve_mcp_auth_mode(config.auth_mode)
+        if mode == "static_dev":
+            raise McpConfigurationError("static_dev 模式只能监听回环地址")
+        raise McpConfigurationError("cloudflare_access 模式必须通过 Tunnel-only 回环源站发布 MCP")
     uvicorn.run(create_streamable_http_app(config), host=host, port=port, log_level="info")
