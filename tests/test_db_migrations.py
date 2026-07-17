@@ -67,9 +67,10 @@ ALLOCATION_TABLES = {
     "allocation_record_bindings",
     "allocation_assignments",
     "allocation_collection_receipts",
+    "annotation_jobs",
 }
 
-EXPECTED_ALEMBIC_HEAD = "20260716_0005"
+EXPECTED_ALEMBIC_HEAD = "20260717_0006"
 
 EXPECTED_ALLOCATION_ENUMS = {
     "argilla_binding_state": ("active", "disabled"),
@@ -84,6 +85,18 @@ EXPECTED_ALLOCATION_ENUMS = {
     "allocation_plan_lifecycle": ("draft", "confirmed"),
     "allocation_dataset_state": ("pending", "materializing", "ready", "failed"),
     "collection_disposition": ("accepted", "quarantined"),
+    "annotation_job_lifecycle": (
+        "draft",
+        "ready",
+        "dispatching",
+        "dispatched",
+        "collecting",
+        "completed",
+        "failed",
+        "archived",
+    ),
+    "annotation_dispatch_state": ("pending", "running", "succeeded", "failed"),
+    "annotation_collection_state": ("pending", "running", "succeeded", "failed"),
 }
 
 EXPECTED_SQLITE_ALLOCATION_ENUMS = {
@@ -101,6 +114,9 @@ EXPECTED_SQLITE_ALLOCATION_ENUMS = {
     ("allocation_assignments", "allocation_phase"),
     ("allocation_assignments", "allocation_assignment_role"),
     ("allocation_collection_receipts", "collection_disposition"),
+    ("annotation_jobs", "annotation_job_lifecycle"),
+    ("annotation_jobs", "annotation_dispatch_state"),
+    ("annotation_jobs", "annotation_collection_state"),
 }
 
 EXPECTED_SQLITE_ALLOCATION_TRIGGERS = {
@@ -141,6 +157,9 @@ EXPECTED_SQLITE_ALLOCATION_TRIGGERS = {
     "trg_allocation_collection_receipts_contract",
     "trg_allocation_collection_receipts_append_only_update",
     "trg_allocation_collection_receipts_append_only_delete",
+    "trg_annotation_jobs_contract_insert",
+    "trg_annotation_jobs_contract_update",
+    "trg_annotation_jobs_reject_delete",
 } | {
     f"trg_{table_name}_confirmed_{operation}"
     for table_name in (
@@ -170,6 +189,7 @@ EXPECTED_POSTGRES_ALLOCATION_TRIGGERS = {
     "trg_10_allocation_assignments_contract",
     "trg_allocation_collection_receipts_contract",
     "trg_allocation_collection_receipts_append_only",
+    "trg_annotation_jobs_guard",
 } | {
     f"trg_00_{table_name}_confirmed_guard"
     for table_name in (

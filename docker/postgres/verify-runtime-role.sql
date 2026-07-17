@@ -145,6 +145,7 @@ WITH expected(relation_name, relation_kind) AS (
         ('allocation_record_bindings', 'r'),
         ('allocation_assignments', 'r'),
         ('allocation_collection_receipts', 'r'),
+        ('annotation_jobs', 'r'),
         ('audit_events', 'r'),
         ('migration_runs', 'r'),
         ('alembic_version', 'r')
@@ -187,6 +188,7 @@ WITH expected(relation_name, relation_kind) AS (
         ('allocation_record_bindings', 'r'),
         ('allocation_assignments', 'r'),
         ('allocation_collection_receipts', 'r'),
+        ('annotation_jobs', 'r'),
         ('audit_events', 'r'),
         ('migration_runs', 'r'),
         ('alembic_version', 'r')
@@ -230,6 +232,7 @@ WITH expected(relation_name, relation_kind, can_select, can_insert, can_update, 
         ('allocation_record_bindings', 'r', true, false, true, false),
         ('allocation_assignments', 'r', true, true, true, false),
         ('allocation_collection_receipts', 'r', true, true, false, false),
+        ('annotation_jobs', 'r', true, true, true, false),
         ('audit_events', 'r', true, true, false, false),
         ('migration_runs', 'r', false, false, false, false),
         ('alembic_version', 'r', false, false, false, false)
@@ -279,6 +282,7 @@ WITH app_role AS (
         ('allocation_record_bindings', true, false, true, false),
         ('allocation_assignments', true, true, true, false),
         ('allocation_collection_receipts', true, true, false, false),
+        ('annotation_jobs', true, true, true, false),
         ('audit_events', true, true, false, false),
         ('migration_runs', false, false, false, false),
         ('alembic_version', false, false, false, false)
@@ -347,6 +351,7 @@ WITH expected_relations(table_name, can_select, can_insert, can_update) AS (
         ('allocation_record_bindings', true, false, true),
         ('allocation_assignments', true, true, true),
         ('allocation_collection_receipts', true, true, false),
+        ('annotation_jobs', true, true, true),
         ('audit_events', true, true, false),
         ('migration_runs', false, false, false),
         ('alembic_version', false, false, false)
@@ -478,6 +483,7 @@ WITH expected(function_name, identity_arguments) AS (
         ('lls_argilla_connection_binding_freeze', ''),
         ('lls_assignment_contract', ''),
         ('lls_assignment_item_create_binding', ''),
+        ('lls_annotation_job_guard', ''),
         ('lls_canonical_sensitive_json_text', 'document json'),
         ('lls_cohort_member_guard', ''),
         ('lls_cohort_revision_guard', ''),
@@ -617,6 +623,7 @@ WITH app_role AS (
         VALUES
             ('lls_canonical_sensitive_json_text'::name, 'document json'::text),
             ('lls_complete_idempotency'::name, 'p_record_id uuid, p_workspace_id uuid, p_actor_principal_id uuid, p_caller_principal_id uuid, p_operation text, p_idempotency_key_hash text, p_request_fingerprint text, p_required_permission text, p_resource_type text, p_resource_id uuid, p_channel text, p_response_status integer, p_response_body text, p_succeeded boolean, p_request_id text'::text),
+            ('lls_annotation_job_guard'::name, ''::text),
             ('lls_sensitive_json_node_is_valid'::name, 'document json, current_depth integer'::text),
             ('lls_sensitive_json_object_is_valid'::name, 'document json'::text),
             ('lls_sensitive_json_string_is_safe'::name, 'value text'::text),

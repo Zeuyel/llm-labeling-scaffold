@@ -23,6 +23,7 @@ from sqlalchemy import (
     Uuid,
     event,
     func,
+    inspect as sa_inspect,
     text,
 )
 from sqlalchemy.dialects import postgresql
@@ -38,6 +39,9 @@ from .enums import (
     AllocationPlanLifecycle,
     AllocationStrategy,
     AllocationWorkspaceMode,
+    AnnotationCollectionState,
+    AnnotationDispatchState,
+    AnnotationJobLifecycle,
     AnnotatorCohortState,
     AnnotatorMappingState,
     AnnotatorVerificationState,
@@ -1283,6 +1287,126 @@ class AllocationCollectionReceipt(Base):
     )
 
 
+class AnnotationJob(Base):
+    __tablename__ = "annotation_jobs"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["workspace_id", "task_id"],
+            ["tasks.workspace_id", "tasks.id"],
+            name="fk_annotation_jobs_workspace_task",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "task_id", "task_revision_id"],
+            ["task_revisions.workspace_id", "task_revisions.task_id", "task_revisions.id"],
+            name="fk_annotation_jobs_task_revision",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "connection_binding_id"],
+            ["argilla_connection_bindings.workspace_id", "argilla_connection_bindings.id"],
+            name="fk_annotation_jobs_connection_binding",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "cohort_revision_id"],
+            ["annotator_cohort_revisions.workspace_id", "annotator_cohort_revisions.id"],
+            name="fk_annotation_jobs_cohort_revision",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["workspace_id", "allocation_plan_id"],
+            ["allocation_plans.workspace_id", "allocation_plans.id"],
+            name="fk_annotation_jobs_allocation_plan",
+            ondelete="RESTRICT",
+        ),
+        UniqueConstraint("workspace_id", "id", name="uq_annotation_jobs_workspace_id"),
+        UniqueConstraint(
+            "workspace_id",
+            "logical_job_id",
+            name="uq_annotation_jobs_workspace_logical_id",
+        ),
+        UniqueConstraint("remote_dataset_id", name="uq_annotation_jobs_remote_dataset_id"),
+        UniqueConstraint("idempotency_record_id", name="uq_annotation_jobs_idempotency"),
+        CheckConstraint("length(trim(logical_job_id)) > 0", name="logical_job_id_not_blank"),
+        CheckConstraint("length(trim(dataset_name)) > 0", name="dataset_name_not_blank"),
+        CheckConstraint(
+            "length(trim(source_manifest_id)) > 0",
+            name="source_manifest_id_not_blank",
+        ),
+        CheckConstraint("length(source_manifest_hash) = 64", name="source_manifest_hash_sha256"),
+        CheckConstraint(
+            "remote_dataset_id IS NULL OR dispatch_state = 'succeeded'",
+            name="remote_dataset_requires_dispatch",
+        ),
+        CheckConstraint(
+            "collection_state <> 'succeeded' OR dispatch_state = 'succeeded'",
+            name="collection_requires_dispatch",
+        ),
+        CheckConstraint(
+            "lifecycle_state <> 'completed' OR "
+            "(dispatch_state = 'succeeded' AND collection_state = 'succeeded')",
+            name="completed_requires_collection",
+        ),
+        Index("ix_annotation_jobs_workspace_task_created", "workspace_id", "task_id", "created_at"),
+        Index(
+            "ix_annotation_jobs_workspace_lifecycle_updated",
+            "workspace_id",
+            "lifecycle_state",
+            "updated_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("workspaces.id", ondelete="RESTRICT"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    task_revision_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    source_manifest_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_manifest_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    connection_binding_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    cohort_revision_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    allocation_plan_id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    logical_job_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    dataset_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    remote_dataset_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(as_uuid=True))
+    lifecycle_state: Mapped[AnnotationJobLifecycle] = mapped_column(
+        _enum_type(AnnotationJobLifecycle, "annotation_job_lifecycle"),
+        nullable=False,
+        default=AnnotationJobLifecycle.DRAFT,
+        server_default=AnnotationJobLifecycle.DRAFT.value,
+    )
+    dispatch_state: Mapped[AnnotationDispatchState] = mapped_column(
+        _enum_type(AnnotationDispatchState, "annotation_dispatch_state"),
+        nullable=False,
+        default=AnnotationDispatchState.PENDING,
+        server_default=AnnotationDispatchState.PENDING.value,
+    )
+    collection_state: Mapped[AnnotationCollectionState] = mapped_column(
+        _enum_type(AnnotationCollectionState, "annotation_collection_state"),
+        nullable=False,
+        default=AnnotationCollectionState.PENDING,
+        server_default=AnnotationCollectionState.PENDING.value,
+    )
+    created_by_principal_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("principals.id", name="fk_annotation_jobs_creator", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    idempotency_record_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("idempotency_records.id", name="fk_annotation_jobs_idempotency", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AuditEvent(Base):
     __tablename__ = "audit_events"
     __table_args__ = (
@@ -1358,6 +1482,10 @@ class ImmutableAuditEventError(RuntimeError):
 
 
 class ImmutableTaskRevisionError(RuntimeError):
+    pass
+
+
+class ImmutableAnnotationJobError(RuntimeError):
     pass
 
 
@@ -2344,6 +2472,134 @@ _listen_sqlite_allocation_ddl(
         SELECT RAISE(ABORT, 'allocation_collection_receipts is append-only');
     END
     """
+    )
+
+
+event.listen(
+    AnnotationJob.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_annotation_jobs_contract_insert
+        BEFORE INSERT ON annotation_jobs
+        BEGIN
+            SELECT RAISE(ABORT, 'annotation job must start as draft')
+            WHERE NEW.lifecycle_state <> 'draft'
+               OR NEW.dispatch_state <> 'pending'
+               OR NEW.collection_state <> 'pending'
+               OR NEW.remote_dataset_id IS NOT NULL;
+            SELECT RAISE(ABORT, 'annotation job allocation plan binding is invalid')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM allocation_plans plan
+                JOIN allocation_plan_states state
+                  ON state.plan_id = plan.id
+                 AND state.workspace_id = plan.workspace_id
+                WHERE plan.id = NEW.allocation_plan_id
+                  AND plan.workspace_id = NEW.workspace_id
+                  AND plan.task_id = NEW.task_id
+                  AND plan.task_revision_id = NEW.task_revision_id
+                  AND plan.connection_binding_id = NEW.connection_binding_id
+                  AND plan.cohort_revision_id = NEW.cohort_revision_id
+                  AND plan.source_manifest_id = NEW.source_manifest_id
+                  AND plan.source_manifest_hash = NEW.source_manifest_hash
+                  AND state.lifecycle_state = 'confirmed'
+            );
+            SELECT RAISE(ABORT, 'annotation job idempotency authorization is invalid')
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM idempotency_records record
+                WHERE record.id = NEW.idempotency_record_id
+                  AND record.workspace_id = NEW.workspace_id
+                  AND record.actor_principal_id = NEW.created_by_principal_id
+                  AND record.required_permission = 'annotation:review'
+                  AND record.resource_type = 'task'
+                  AND record.resource_id = NEW.task_id
+                  AND record.state = 'pending'
+            );
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    AnnotationJob.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_annotation_jobs_contract_update
+        BEFORE UPDATE ON annotation_jobs
+        BEGIN
+            SELECT RAISE(ABORT, 'annotation job identity is immutable')
+            WHERE NEW.id IS NOT OLD.id
+               OR NEW.workspace_id IS NOT OLD.workspace_id
+               OR NEW.task_id IS NOT OLD.task_id
+               OR NEW.task_revision_id IS NOT OLD.task_revision_id
+               OR NEW.source_manifest_id IS NOT OLD.source_manifest_id
+               OR NEW.source_manifest_hash IS NOT OLD.source_manifest_hash
+               OR NEW.connection_binding_id IS NOT OLD.connection_binding_id
+               OR NEW.cohort_revision_id IS NOT OLD.cohort_revision_id
+               OR NEW.allocation_plan_id IS NOT OLD.allocation_plan_id
+               OR NEW.logical_job_id IS NOT OLD.logical_job_id
+               OR NEW.dataset_name IS NOT OLD.dataset_name
+               OR NEW.created_by_principal_id IS NOT OLD.created_by_principal_id
+               OR NEW.idempotency_record_id IS NOT OLD.idempotency_record_id
+               OR NEW.created_at IS NOT OLD.created_at;
+            SELECT RAISE(ABORT, 'annotation job remote dataset binding is immutable')
+            WHERE OLD.remote_dataset_id IS NOT NULL
+              AND NEW.remote_dataset_id IS NOT OLD.remote_dataset_id;
+            SELECT RAISE(ABORT, 'annotation job lifecycle transition is invalid')
+            WHERE NOT (
+                NEW.lifecycle_state IS OLD.lifecycle_state
+                OR (OLD.lifecycle_state = 'draft' AND NEW.lifecycle_state IN ('ready', 'dispatching', 'failed'))
+                OR (OLD.lifecycle_state = 'ready' AND NEW.lifecycle_state IN ('dispatching', 'failed'))
+                OR (OLD.lifecycle_state = 'dispatching' AND NEW.lifecycle_state IN ('dispatched', 'failed'))
+                OR (OLD.lifecycle_state = 'dispatched' AND NEW.lifecycle_state IN ('collecting', 'completed', 'failed'))
+                OR (OLD.lifecycle_state = 'collecting' AND NEW.lifecycle_state IN ('completed', 'failed'))
+                OR (OLD.lifecycle_state = 'failed' AND NEW.lifecycle_state IN ('ready', 'dispatching', 'collecting', 'archived'))
+                OR (OLD.lifecycle_state = 'completed' AND NEW.lifecycle_state = 'archived')
+            );
+            SELECT RAISE(ABORT, 'annotation job lifecycle/state mismatch')
+            WHERE NOT (
+                (NEW.lifecycle_state IN ('draft', 'ready')
+                    AND NEW.dispatch_state = 'pending'
+                    AND NEW.collection_state = 'pending'
+                    AND NEW.remote_dataset_id IS NULL)
+                OR (NEW.lifecycle_state = 'dispatching'
+                    AND NEW.dispatch_state = 'running'
+                    AND NEW.collection_state = 'pending'
+                    AND NEW.remote_dataset_id IS NULL)
+                OR (NEW.lifecycle_state = 'dispatched'
+                    AND NEW.dispatch_state = 'succeeded'
+                    AND NEW.collection_state IN ('pending', 'running', 'succeeded', 'failed')
+                    AND NEW.remote_dataset_id IS NOT NULL)
+                OR (NEW.lifecycle_state = 'collecting'
+                    AND NEW.dispatch_state = 'succeeded'
+                    AND NEW.collection_state = 'running'
+                    AND NEW.remote_dataset_id IS NOT NULL)
+                OR (NEW.lifecycle_state = 'completed'
+                    AND NEW.dispatch_state = 'succeeded'
+                    AND NEW.collection_state = 'succeeded'
+                    AND NEW.remote_dataset_id IS NOT NULL)
+                OR (NEW.lifecycle_state = 'failed'
+                    AND (NEW.dispatch_state = 'failed' OR NEW.collection_state = 'failed'))
+                OR NEW.lifecycle_state = 'archived'
+            );
+        END
+        """
+    ).execute_if(dialect="sqlite"),
+)
+event.listen(
+    AnnotationJob.__table__,
+    "after_create",
+    DDL(
+        """
+        CREATE TRIGGER trg_annotation_jobs_reject_delete
+        BEFORE DELETE ON annotation_jobs
+        BEGIN
+            SELECT RAISE(ABORT, 'annotation jobs are not directly deletable');
+        END
+        """
+    ).execute_if(dialect="sqlite"),
 )
 
 
@@ -2570,3 +2826,31 @@ def _reject_audit_event_mutation(mapper, connection, target) -> None:
 @event.listens_for(TaskRevision, "before_delete")
 def _reject_task_revision_mutation(mapper, connection, target) -> None:
     raise ImmutableTaskRevisionError("task revisions are immutable")
+
+
+@event.listens_for(AnnotationJob, "before_update")
+def _reject_annotation_job_identity_update(mapper, connection, target) -> None:
+    state = sa_inspect(target)
+    immutable_fields = (
+        "id",
+        "workspace_id",
+        "task_id",
+        "task_revision_id",
+        "source_manifest_id",
+        "source_manifest_hash",
+        "connection_binding_id",
+        "cohort_revision_id",
+        "allocation_plan_id",
+        "logical_job_id",
+        "dataset_name",
+        "created_by_principal_id",
+        "idempotency_record_id",
+        "created_at",
+    )
+    if any(state.attrs[field].history.has_changes() for field in immutable_fields):
+        raise ImmutableAnnotationJobError("annotation job identity is immutable")
+
+
+@event.listens_for(AnnotationJob, "before_delete")
+def _reject_annotation_job_delete(mapper, connection, target) -> None:
+    raise ImmutableAnnotationJobError("annotation jobs are not directly deletable")

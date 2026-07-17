@@ -95,6 +95,31 @@ class CollectionDisposition(str, Enum):
     QUARANTINED = "quarantined"
 
 
+class AnnotationJobLifecycle(str, Enum):
+    DRAFT = "draft"
+    READY = "ready"
+    DISPATCHING = "dispatching"
+    DISPATCHED = "dispatched"
+    COLLECTING = "collecting"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    ARCHIVED = "archived"
+
+
+class AnnotationDispatchState(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+class AnnotationCollectionState(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
 class AuditActorType(str, Enum):
     PRINCIPAL = "principal"
     SYSTEM = "system"
