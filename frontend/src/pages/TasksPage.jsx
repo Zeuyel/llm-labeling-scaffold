@@ -121,6 +121,9 @@ export default function TasksPage({
   const [notice, setNotice] = useState("");
   const [form, setForm] = useState(emptyForm);
   const [auxiliary, setAuxiliary] = useState([]);
+  const [catalog, setCatalog] = useState(null);
+  const [catalogBusy, setCatalogBusy] = useState(false);
+  const [selectedAsset, setSelectedAsset] = useState(null);
 
   function update(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -146,6 +149,48 @@ export default function TasksPage({
   function closeEditor() {
     resetForm();
     setOpen(false);
+    setSelectedAsset(null);
+  }
+
+  async function loadCatalog() {
+    setCatalogBusy(true);
+    try {
+      const next = await api.getDataLakeCatalog();
+      setCatalog(next);
+      setNotice("数据资产目录已读取，请选择登记的数据集。");
+    } catch (error) {
+      onError(String(error));
+    } finally {
+      setCatalogBusy(false);
+    }
+  }
+
+  async function chooseDataset(datasetId) {
+    const item = (catalog?.datasets || []).find((dataset) => dataset.dataset_id === datasetId);
+    if (!item) {
+      setSelectedAsset(null);
+      update("source_dataset_id", "");
+      update("source_manifest_uri", "");
+      update("source_object_path", "");
+      return;
+    }
+    setSelectedAsset(item);
+    update("source_dataset_id", item.dataset_id);
+    update("source_manifest_uri", item.manifest_uri || "");
+    update("lake_registry_uri", taskRegistryUri || "");
+    try {
+      const detailResponse = await api.getDataLakeCatalog(item.dataset_id);
+      const detail = (detailResponse.datasets || []).find((dataset) => dataset.dataset_id === item.dataset_id);
+      setSelectedAsset(detail || item);
+      const objects = detail?.manifest?.objects || [];
+      if (objects.length === 1) update("source_object_path", objects[0].path || "");
+      if (!form.default_import_id.trim()) {
+        const suffix = String(objects[0]?.path || "v001").split("/").filter(Boolean).pop() || "v001";
+        update("default_import_id", `${form.task_id || "task"}_${item.dataset_id}_${suffix.replace(/\.[^.]+$/, "")}`.replace(/[^A-Za-z0-9_.-]+/g, "_"));
+      }
+    } catch (error) {
+      onError(String(error));
+    }
   }
 
   function payloadFromForm() {
@@ -224,7 +269,7 @@ export default function TasksPage({
         if (!currentFingerprint) throw new Error("服务端未返回草稿指纹，请刷新后重试");
         setDraftFingerprint(currentFingerprint);
         if (publishNow) {
-          await api.publishTask(taskId, currentFingerprint);
+          await api.publishTask(taskId, currentFingerprint, editingTaskId ? "面板发布任务修订" : "面板首次发布任务");
           closeEditor();
           setNotice("任务单已发布为新 revision，可进入执行流程。");
         } else {
@@ -264,7 +309,7 @@ export default function TasksPage({
     try {
       const fingerprint = task.draft_fingerprint || (await api.getTaskControl(task.task_id)).draft_fingerprint;
       if (!fingerprint) throw new Error("服务端未返回草稿指纹，请刷新后重试");
-      await api.publishTask(task.task_id, fingerprint);
+      await api.publishTask(task.task_id, fingerprint, "面板发布任务草稿");
       await onReload();
       setNotice(`任务单 ${task.task_id} 已发布为新 revision。`);
     } catch (requestError) {
@@ -375,24 +420,30 @@ export default function TasksPage({
             {showDataLakeFields && (
               <>
                 <div className="field field-wide">
-                  <label>数据湖登记表地址</label>
-                  <input value={form.lake_registry_uri} onChange={(event) => update("lake_registry_uri", event.target.value)} placeholder="可留空，使用系统设置中的默认 R2 登记表" />
-                </div>
-                <div className="field">
-                  <label>源数据集编号</label>
-                  <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 raw_feedback_records" />
+                  <label>数据资产来源</label>
+                  <div className="action-row">
+                    <select value={form.source_dataset_id} disabled={!catalog} onChange={(event) => chooseDataset(event.target.value)}>
+                      <option value="">{catalog ? "请选择已登记数据集" : "请先读取数据资产目录"}</option>
+                      {(catalog?.datasets || []).map((item) => <option key={item.dataset_id} value={item.dataset_id}>{item.name || item.dataset_id} · {item.dataset_id}</option>)}
+                    </select>
+                    <button className="btn btn-sm" type="button" disabled={catalogBusy} onClick={loadCatalog}>{catalogBusy ? "读取中..." : "读取资产目录"}</button>
+                  </div>
+                  {selectedAsset && <span className="hint">已选择：{selectedAsset.name || selectedAsset.dataset_id}；来源由登记表解析。</span>}
                 </div>
                 <div className="field">
                   <label>默认导入编号</label>
-                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="例如 manual_seed_20260627" />
+                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="选择数据集后自动生成，可调整" />
                 </div>
                 <div className="field field-wide">
                   <label>源清单文件地址</label>
-                  <input value={form.source_manifest_uri} onChange={(event) => update("source_manifest_uri", event.target.value)} placeholder="可留空，按源数据集编号从数据湖登记表解析" />
+                  <input value={form.source_manifest_uri} readOnly placeholder="选择数据集后由登记表确定" />
                 </div>
                 <div className="field field-wide">
                   <label>源对象路径</label>
-                  <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="清单对象中的相对路径，用于唯一选中数据文件" />
+                  <select value={form.source_object_path} disabled={!selectedAsset?.manifest?.objects?.length} onChange={(event) => update("source_object_path", event.target.value)}>
+                    <option value="">请选择清单对象</option>
+                    {(selectedAsset?.manifest?.objects || []).map((item) => <option key={item.path} value={item.path}>{item.path} · {item.rows ?? "-"} 行</option>)}
+                  </select>
                 </div>
                 <div className="field field-wide">
                   <label>标签回写根地址</label>

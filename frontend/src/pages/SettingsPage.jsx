@@ -5,7 +5,7 @@ import { Link } from "./../router.jsx";
 const DEFAULT_SETTINGS = {
   task_registry_uri: "",
   data_lake_r2_prefix: "",
-  task_source: "r2",
+  task_source: "control",
   rclone_config_path: "",
   allow_data_lake_overrides: false,
   allow_manual_imports: false,

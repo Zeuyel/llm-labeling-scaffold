@@ -4,7 +4,7 @@ import { Link } from "./../router.jsx";
 const TASK_PAGES = [
   { key: "overview", label: "概览", short: "概", suffix: "" },
   { key: "canvas", label: "流程画布", short: "流", suffix: "/canvas" },
-  { key: "imports", label: "数据导入", short: "导", suffix: "/imports" },
+  { key: "imports", label: "任务输入", short: "入", suffix: "/imports" },
   { key: "samples", label: "样本管理", short: "样", suffix: "/samples" },
   { key: "annotations", label: "标注分发", short: "标", suffix: "/annotations" },
   { key: "jobs", label: "执行记录", short: "记", suffix: "/jobs" },
@@ -12,7 +12,7 @@ const TASK_PAGES = [
   { key: "models", label: "模型管理", short: "模", suffix: "/models" },
 ];
 
-export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, onToggle }) {
+export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, onToggle, user, onLogout }) {
   return (
     <aside className={collapsed ? "sidebar is-collapsed" : "sidebar"}>
       <div className="sidebar-head">
@@ -28,6 +28,10 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
       <Link to="/settings" className={activePage === "settings" ? "nav-item active" : "nav-item"} title="系统设置">
         <span className="nav-short">设</span>
         <span className="nav-label">系统设置</span>
+      </Link>
+      <Link to="/data-assets" className={activePage === "data-assets" ? "nav-item active" : "nav-item"} title="数据资产">
+        <span className="nav-short">资</span>
+        <span className="nav-label">数据资产</span>
       </Link>
       <Link to="/" className={!activeTaskId && activePage === "tasks" ? "nav-item active" : "nav-item"} title="全部任务">
         <span className="nav-short">全</span>
@@ -60,6 +64,14 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
           ))}
         </>
       )}
+      <div className="sidebar-account">
+        <div className="sidebar-account-name" title={user?.display_name || user?.email || "当前用户"}>
+          {user?.display_name || user?.email || "当前用户"}
+        </div>
+        <button className="sidebar-logout" type="button" onClick={onLogout} title="退出登录">
+          退出登录
+        </button>
+      </div>
     </aside>
   );
 }

@@ -1,11 +1,67 @@
+const AUTH_TOKEN_KEY = "lls.basicAuthToken";
+
+function storage() {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+let authToken = storage()?.getItem(AUTH_TOKEN_KEY) || "";
+
+function requestHeaders(headers = {}) {
+  const next = {};
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    headers.forEach((value, key) => { next[key] = value; });
+  } else {
+    Object.assign(next, headers);
+  }
+  next.Accept = next.Accept || "application/json";
+  if (authToken && !Object.keys(next).some((key) => key.toLowerCase() === "authorization")) {
+    next.Authorization = `Basic ${authToken}`;
+  }
+  return next;
+}
+
+function encodeBasicCredentials(username, password) {
+  const bytes = new TextEncoder().encode(`${username}:${password}`);
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary);
+}
+
+function notifyUnauthorized() {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("lls:unauthorized"));
+  }
+}
+
 async function req(path, opts = {}) {
-  const res = await fetch(path, opts);
+  const res = await fetch(path, { ...opts, headers: requestHeaders(opts.headers) });
+  if (res.status === 401) notifyUnauthorized();
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 160)}`);
   }
   return res.json();
 }
+
+export const login = async (username, password) => {
+  const token = encodeBasicCredentials(username, password);
+  const data = await req("/api/session", { headers: { Authorization: `Basic ${token}` } });
+  authToken = token;
+  storage()?.setItem(AUTH_TOKEN_KEY, token);
+  return data;
+};
+
+export const logout = () => {
+  authToken = "";
+  storage()?.removeItem(AUTH_TOKEN_KEY);
+};
+
+export const getSession = () => req("/api/session");
 
 const q = (obj) =>
   Object.entries(obj)
@@ -66,6 +122,7 @@ export const getDecisionArtifacts = (taskId) => req(`/api/task/decision_artifact
 export const getJobs = (taskId) => req(`/api/jobs?${q({ task_id: taskId })}`);
 export const getAuditEvents = (taskId) => req(`/api/task/audit?${q({ task_id: taskId })}`);
 export const getDataLakeStatus = (taskId) => req(`/api/task/data_lake?${q({ task_id: taskId })}`);
+export const getDataLakeCatalog = (datasetId = "") => req(`/api/data_lake/catalog?${q({ dataset_id: datasetId })}`);
 export const getArgillaStatus = () => req("/api/argilla/status");
 export const getTaskArchivePlan = (taskId) => req(`/api/task/archive_plan?${q({ task_id: taskId })}`);
 
@@ -83,13 +140,14 @@ export const updateTask = (taskId, payload, draftFingerprint) =>
     body: JSON.stringify(payload),
   });
 
-export const publishTask = (taskId, draftFingerprint) =>
+export const publishTask = (taskId, draftFingerprint, reason = "面板发布任务") =>
   req(`/api/tasks/${encodeURIComponent(taskId)}/publish`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "If-Match": draftFingerprint },
     body: JSON.stringify({
       confirm: true,
       idempotency_key: taskPublishIdempotencyKey(taskId, draftFingerprint),
+      reason,
     }),
   });
 

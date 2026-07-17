@@ -447,6 +447,19 @@ def _contract_capabilities(
             },
             {
                 "method": "GET",
+                "path": "/api/data_lake/catalog",
+                "action": "data_lake_catalog",
+                "side_effects": False,
+                "query_params": {
+                    "dataset_id": {"type": "string", "required": False},
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["backend", "registry_uri", "datasets"],
+                },
+            },
+            {
+                "method": "GET",
                 "path": "/api/tasks/{task_id}",
                 "action": "task_detail",
                 "side_effects": False,
@@ -814,6 +827,7 @@ def _mcp_route_allowed(method: str, path: str) -> bool:
             "/api/import/detail",
             "/api/task/data_lake",
             "/api/jobs",
+            "/api/data_lake/catalog",
         }:
             return True
         return _contract_task_path(path) is not None
@@ -841,6 +855,7 @@ def _database_authorized_route(method: str, path: str) -> bool:
             "/api/import/detail",
             "/api/task/data_lake",
             "/api/jobs",
+            "/api/data_lake/catalog",
         }:
             return True
         return _contract_task_path(path) is not None
@@ -874,6 +889,68 @@ def _safe_data_lake_summary(data_lake: dict[str, Any]) -> dict[str, Any]:
         "lake_registry_uri_configured": bool(data_lake.get("lake_registry_uri")),
         "source_manifest_uri_configured": bool(data_lake.get("source_manifest_uri")),
         "output_base_uri_configured": bool(data_lake.get("output_base_uri")),
+    }
+
+
+def _data_lake_catalog_payload(*, detail_dataset_id: str | None = None) -> dict[str, Any]:
+    from .data_lake import default_registry_uri, read_json_uri, read_yaml_uri
+
+    registry_uri = default_registry_uri()
+    registry = read_yaml_uri(registry_uri)
+    datasets = registry.get("datasets")
+    if not isinstance(datasets, dict):
+        raise ValueError("数据湖登记表缺少 datasets")
+
+    items: list[dict[str, Any]] = []
+    for dataset_id, raw in sorted(datasets.items()):
+        if not isinstance(raw, dict):
+            continue
+        item = {
+            "dataset_id": str(dataset_id),
+            "name": str(raw.get("name") or dataset_id),
+            "description": str(raw.get("description") or ""),
+            "layer": str(raw.get("layer") or ""),
+            "domain": str(raw.get("domain") or ""),
+            "status": str(raw.get("status") or "active"),
+            "manifest_uri": str(raw.get("manifest") or ""),
+            "canonical_uri": str(raw.get("canonical_uri") or ""),
+            "asset_type": str(raw.get("asset_type") or ""),
+        }
+        if detail_dataset_id and str(dataset_id) == detail_dataset_id:
+            manifest_uri = item["manifest_uri"]
+            if not manifest_uri:
+                raise ValueError(f"数据集缺少 manifest URI: {dataset_id}")
+            manifest = read_json_uri(manifest_uri)
+            objects = manifest.get("objects")
+            if not isinstance(objects, list):
+                raise ValueError(f"数据集 manifest 缺少 objects: {dataset_id}")
+            item["manifest"] = {
+                "dataset_id": str(manifest.get("dataset_id") or ""),
+                "version": str(manifest.get("version") or manifest.get("revision") or ""),
+                "created_at": str(manifest.get("created_at") or ""),
+                "object_count": len(objects),
+                "objects": [
+                    {
+                        "path": str(obj.get("path") or ""),
+                        "storage_uri": str(obj.get("storage_uri") or ""),
+                        "asset_type": str(obj.get("asset_type") or ""),
+                        "rows": obj.get("rows"),
+                        "bytes": obj.get("bytes"),
+                        "sha256": str(obj.get("sha256") or obj.get("content_sha256") or ""),
+                        "id_field": str(obj.get("id_field") or ""),
+                    }
+                    for obj in objects
+                    if isinstance(obj, dict)
+                ],
+            }
+        items.append(item)
+    if detail_dataset_id and not any(item["dataset_id"] == detail_dataset_id for item in items):
+        raise ValueError(f"数据湖登记表中没有数据集: {detail_dataset_id}")
+    return {
+        "backend": "r2",
+        "registry_uri": registry_uri,
+        "registry_version": str(registry.get("version") or registry.get("revision") or ""),
+        "datasets": items,
     }
 
 
@@ -943,6 +1020,7 @@ def _active_task_summary(workspace_slug: str, access, active: ActiveTaskRevision
             "path": str(active.task_config.path) if active.task_config is not None else None,
             "profile": raw["profile"],
             "id_field": raw["id_field"],
+            "data_lake": _safe_data_lake_summary(raw.get("data_lake") or {}),
         },
     )
     if status == "published_with_draft":
@@ -1143,7 +1221,12 @@ class _Handler(BaseHTTPRequestHandler):
             context = self._authenticate()
         except PanelAuthenticationError as exc:
             headers = {}
-            if self.authenticator is not None and self.authenticator.challenge:
+            request_path = urlparse(self.path).path
+            if (
+                self.authenticator is not None
+                and self.authenticator.challenge
+                and not request_path.startswith("/api/")
+            ):
                 headers["WWW-Authenticate"] = self.authenticator.challenge
             self._json({"error": exc.message, "code": exc.code}, status=exc.status, headers=headers)
             return False
@@ -2142,10 +2225,12 @@ class _Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self) -> None:
-        if not self._require_auth():
-            return
         parsed = urlparse(self.path)
         path = parsed.path
+        if not path.startswith("/api/") and self._serve_static(path):
+            return
+        if not self._require_auth():
+            return
         params = parse_qs(parsed.query)
         contract_task_id = _contract_task_path(path)
         if path == "/api/health":
@@ -2170,6 +2255,15 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 settings = _apply_runtime_settings(self.runs_root)
                 self._json(_public_settings_response(settings))
+            except Exception as exc:
+                self._json({"error": str(exc)}, status=400)
+        elif path == "/api/data_lake/catalog":
+            try:
+                _apply_runtime_settings(self.runs_root)
+                dataset_id = str(params.get("dataset_id", [""])[0] or "").strip()
+                if dataset_id and not _safe_segment(dataset_id):
+                    raise ValueError("dataset_id 必须是单段安全标识符")
+                self._json(_data_lake_catalog_payload(detail_dataset_id=dataset_id or None))
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
         elif contract_task_id is not None:

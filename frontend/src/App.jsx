@@ -13,10 +13,13 @@ import GoldPage from "./pages/GoldPage.jsx";
 import ModelsPage from "./pages/ModelsPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
 import TaskArchivePage from "./pages/TaskArchivePage.jsx";
+import LoginPage from "./pages/LoginPage.jsx";
+import DataAssetsPage from "./pages/DataAssetsPage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
   { pattern: "/settings", page: "settings" },
+  { pattern: "/data-assets", page: "data-assets" },
   { pattern: "/task/:id", page: "overview" },
   { pattern: "/task/:id/canvas", page: "canvas" },
   { pattern: "/task/:id/imports", page: "imports" },
@@ -38,7 +41,7 @@ const DEFAULT_SETTINGS = {
   task_source: "r2",
 };
 
-function Shell() {
+function Shell({ session, onLogout }) {
   const { path } = useRouter();
   const [tasks, setTasks] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
@@ -112,6 +115,7 @@ function Shell() {
       {...common}
     />
   );
+  else if (matched.page === "data-assets") page = <DataAssetsPage {...common} />;
   else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "canvas") page = <TaskCanvasPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "imports") page = (
@@ -148,6 +152,8 @@ function Shell() {
         activePage={matched.page}
         collapsed={sidebarCollapsed}
         onToggle={toggleSidebar}
+        user={session?.user}
+        onLogout={onLogout}
       />
       <div className="content">
         {err && <div className="error">{err} <button className="btn btn-sm" onClick={() => setErr("")}>关闭</button></div>}
@@ -158,9 +164,59 @@ function Shell() {
 }
 
 export default function App() {
+  const [session, setSession] = useState(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [authError, setAuthError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    const handleUnauthorized = () => {
+      api.logout();
+      if (!active) return;
+      setSession(null);
+      setAuthError("登录已失效，请重新登录");
+    };
+    window.addEventListener("lls:unauthorized", handleUnauthorized);
+    api.getSession()
+      .then((data) => {
+        if (active) {
+          setSession(data);
+          setAuthError("");
+        }
+      })
+      .catch(() => {
+        if (active) setSession(null);
+      })
+      .finally(() => {
+        if (active) setAuthReady(true);
+      });
+    return () => {
+      active = false;
+      window.removeEventListener("lls:unauthorized", handleUnauthorized);
+    };
+  }, []);
+
+  async function handleLogin(username, password) {
+    const nextSession = await api.login(username, password);
+    setSession(nextSession);
+    setAuthError("");
+  }
+
+  function handleLogout() {
+    api.logout();
+    setSession(null);
+    setAuthError("");
+  }
+
+  if (!authReady) {
+    return <main className="auth-page"><div className="auth-loading">正在检查登录状态...</div></main>;
+  }
+  if (!session) {
+    return <LoginPage onLogin={handleLogin} error={authError} />;
+  }
   return (
     <RouterProvider>
-      <Shell />
+      <Shell session={session} onLogout={handleLogout} />
     </RouterProvider>
   );
 }

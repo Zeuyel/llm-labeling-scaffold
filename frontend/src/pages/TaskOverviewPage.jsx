@@ -271,7 +271,7 @@ export default function TaskOverviewPage({ task, taskId, onError }) {
 
   const cards = [
     { key: "canvas", label: "流程画布", val: "查看", to: `/task/${encodeURIComponent(taskId)}/canvas` },
-    { key: "imports", label: "导入数据", val: counts.imports, to: `/task/${encodeURIComponent(taskId)}/imports` },
+    { key: "imports", label: "任务输入", val: counts.imports, to: `/task/${encodeURIComponent(taskId)}/imports` },
     { key: "samples", label: "样本", val: counts.samples, to: `/task/${encodeURIComponent(taskId)}/samples` },
     { key: "decisions", label: "标注结果", val: counts.decisions, to: `/task/${encodeURIComponent(taskId)}/annotations` },
     { key: "gold", label: "训练集版本", val: counts.gold, to: `/task/${encodeURIComponent(taskId)}/gold` },
