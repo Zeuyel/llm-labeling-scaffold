@@ -51,6 +51,19 @@ function parseList(value) {
     .filter(Boolean);
 }
 
+async function readDataLakeCatalog(datasetId = "") {
+  const query = datasetId ? `?dataset_id=${encodeURIComponent(datasetId)}` : "";
+  const response = await fetch(`/api/data_lake/catalog${query}`);
+  if (!response.ok) throw new Error(`读取数据湖资产目录失败：${response.status}`);
+  return response.json();
+}
+
+function generatedImportId(taskId, datasetId, objectPath) {
+  const suffix = String(objectPath || "v001").split("/").filter(Boolean).pop() || "v001";
+  return `${taskId || "task"}_${datasetId || "dataset"}_${suffix.replace(/\.[^.]+$/, "")}`
+    .replace(/[^A-Za-z0-9_.-]+/g, "_");
+}
+
 function listText(value) {
   return Array.isArray(value) ? value.join("\n") : String(value || "");
 }
@@ -103,27 +116,22 @@ function taskStatusLabel(status) {
 export default function TasksPage({
   tasks,
   onReload,
-  onSync,
   onError,
-  allowDataLakeOverrides = false,
-  taskSource = "local",
-  taskRegistryUri = "",
 }) {
   const { navigate } = useRouter();
-  const r2TaskSource = taskSource === "r2";
-  const controlTaskSource = taskSource === "control";
-  const showDataLakeFields = controlTaskSource || allowDataLakeOverrides;
+  const controlTaskSource = true;
+  const showDataLakeFields = true;
   const [open, setOpen] = useState(false);
   const [editingTaskId, setEditingTaskId] = useState("");
   const [draftFingerprint, setDraftFingerprint] = useState("");
   const [busy, setBusy] = useState(false);
-  const [syncing, setSyncing] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [notice, setNotice] = useState("");
   const [form, setForm] = useState(emptyForm);
-  const [auxiliary, setAuxiliary] = useState([]);
   const [catalog, setCatalog] = useState(null);
   const [catalogBusy, setCatalogBusy] = useState(false);
   const [selectedAsset, setSelectedAsset] = useState(null);
+  const [auxiliary, setAuxiliary] = useState([]);
 
   function update(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -138,6 +146,7 @@ export default function TasksPage({
     setAuxiliary([]);
     setEditingTaskId("");
     setDraftFingerprint("");
+    setSelectedAsset(null);
   }
 
   function openNewTask() {
@@ -149,48 +158,6 @@ export default function TasksPage({
   function closeEditor() {
     resetForm();
     setOpen(false);
-    setSelectedAsset(null);
-  }
-
-  async function loadCatalog() {
-    setCatalogBusy(true);
-    try {
-      const next = await api.getDataLakeCatalog();
-      setCatalog(next);
-      setNotice("数据资产目录已读取，请选择登记的数据集。");
-    } catch (error) {
-      onError(String(error));
-    } finally {
-      setCatalogBusy(false);
-    }
-  }
-
-  async function chooseDataset(datasetId) {
-    const item = (catalog?.datasets || []).find((dataset) => dataset.dataset_id === datasetId);
-    if (!item) {
-      setSelectedAsset(null);
-      update("source_dataset_id", "");
-      update("source_manifest_uri", "");
-      update("source_object_path", "");
-      return;
-    }
-    setSelectedAsset(item);
-    update("source_dataset_id", item.dataset_id);
-    update("source_manifest_uri", item.manifest_uri || "");
-    update("lake_registry_uri", taskRegistryUri || "");
-    try {
-      const detailResponse = await api.getDataLakeCatalog(item.dataset_id);
-      const detail = (detailResponse.datasets || []).find((dataset) => dataset.dataset_id === item.dataset_id);
-      setSelectedAsset(detail || item);
-      const objects = detail?.manifest?.objects || [];
-      if (objects.length === 1) update("source_object_path", objects[0].path || "");
-      if (!form.default_import_id.trim()) {
-        const suffix = String(objects[0]?.path || "v001").split("/").filter(Boolean).pop() || "v001";
-        update("default_import_id", `${form.task_id || "task"}_${item.dataset_id}_${suffix.replace(/\.[^.]+$/, "")}`.replace(/[^A-Za-z0-9_.-]+/g, "_"));
-      }
-    } catch (error) {
-      onError(String(error));
-    }
   }
 
   function payloadFromForm() {
@@ -217,16 +184,14 @@ export default function TasksPage({
           required: item.required,
         })),
     };
-    if (showDataLakeFields) {
-      payload.data_lake = {
-        lake_registry_uri: form.lake_registry_uri.trim(),
-        source_dataset_id: form.source_dataset_id.trim(),
-        source_manifest_uri: form.source_manifest_uri.trim(),
-        source_object_path: form.source_object_path.trim(),
-        default_import_id: form.default_import_id.trim(),
-        output_base_uri: form.output_base_uri.trim(),
-      };
-    }
+    payload.data_lake = {
+      lake_registry_uri: form.lake_registry_uri.trim(),
+      source_dataset_id: form.source_dataset_id.trim(),
+      source_manifest_uri: form.source_manifest_uri.trim(),
+      source_object_path: form.source_object_path.trim(),
+      default_import_id: form.default_import_id.trim(),
+      output_base_uri: form.output_base_uri.trim(),
+    };
     return payload;
   }
 
@@ -252,29 +217,23 @@ export default function TasksPage({
     setBusy(true);
     setNotice("");
     try {
-      if (!controlTaskSource) {
-        await api.createTask(payload);
-        closeEditor();
-        setNotice("任务已保存。");
+      const taskId = editingTaskId || payload.task_id;
+      let result;
+      if (editingTaskId) {
+        result = await api.updateTask(taskId, payload, draftFingerprint);
       } else {
-        const taskId = editingTaskId || payload.task_id;
-        let result;
-        if (editingTaskId) {
-          result = await api.updateTask(taskId, payload, draftFingerprint);
-        } else {
-          result = await api.createTask(payload);
-          setEditingTaskId(taskId);
-        }
-        const currentFingerprint = result?.record?.draft_fingerprint || result?.task?.draft_fingerprint;
-        if (!currentFingerprint) throw new Error("服务端未返回草稿指纹，请刷新后重试");
-        setDraftFingerprint(currentFingerprint);
-        if (publishNow) {
-          await api.publishTask(taskId, currentFingerprint, editingTaskId ? "面板发布任务修订" : "面板首次发布任务");
-          closeEditor();
-          setNotice("任务单已发布为新 revision，可进入执行流程。");
-        } else {
-          setNotice("草稿已保存。发布后才会成为可执行任务。");
-        }
+        result = await api.createTask(payload);
+        setEditingTaskId(taskId);
+      }
+      const currentFingerprint = result?.record?.draft_fingerprint || result?.task?.draft_fingerprint;
+      if (!currentFingerprint) throw new Error("服务端未返回草稿指纹，请刷新后重试");
+      setDraftFingerprint(currentFingerprint);
+      if (publishNow) {
+        await api.publishTask(taskId, currentFingerprint);
+        closeEditor();
+        setNotice("任务单已发布为新 revision，可进入执行流程。");
+      } else {
+        setNotice("草稿已保存。发布后才会成为可执行任务。");
       }
       await onReload();
     } catch (requestError) {
@@ -309,7 +268,7 @@ export default function TasksPage({
     try {
       const fingerprint = task.draft_fingerprint || (await api.getTaskControl(task.task_id)).draft_fingerprint;
       if (!fingerprint) throw new Error("服务端未返回草稿指纹，请刷新后重试");
-      await api.publishTask(task.task_id, fingerprint, "面板发布任务草稿");
+      await api.publishTask(task.task_id, fingerprint);
       await onReload();
       setNotice(`任务单 ${task.task_id} 已发布为新 revision。`);
     } catch (requestError) {
@@ -319,53 +278,81 @@ export default function TasksPage({
     }
   }
 
-  async function reloadTasks() {
-    setSyncing(true);
+  async function loadCatalog() {
+    setCatalogBusy(true);
     try {
-      if (r2TaskSource) {
-        await (onSync || onReload)();
-      } else {
-        await onReload();
-      }
+      const next = await readDataLakeCatalog();
+      setCatalog(next);
+      setForm((current) => ({
+        ...current,
+        lake_registry_uri: current.lake_registry_uri || next.registry_uri || "",
+      }));
+    } catch (error) {
+      onError(String(error));
     } finally {
-      setSyncing(false);
+      setCatalogBusy(false);
     }
   }
 
-  function openArchiveWizard(task) {
-    if (!task?.task_id) return;
-    navigate(`/task/${encodeURIComponent(task.task_id)}/archive`);
+  async function chooseDataset(datasetId) {
+    const item = (catalog?.datasets || []).find((dataset) => dataset.dataset_id === datasetId);
+    if (!item) {
+      setSelectedAsset(null);
+      setForm((current) => ({
+        ...current,
+        source_dataset_id: "",
+        source_manifest_uri: "",
+        source_object_path: "",
+      }));
+      return;
+    }
+
+    setSelectedAsset(item);
+    try {
+      const response = await readDataLakeCatalog(item.dataset_id);
+      const detail = (response.datasets || []).find((dataset) => dataset.dataset_id === item.dataset_id) || item;
+      const objects = detail.manifest?.objects || [];
+      setSelectedAsset(detail);
+      setForm((current) => ({
+        ...current,
+        lake_registry_uri: current.lake_registry_uri || catalog.registry_uri || "",
+        source_dataset_id: detail.dataset_id,
+        source_manifest_uri: detail.manifest_uri || "",
+        source_object_path: objects.length === 1 ? objects[0].path || "" : current.source_object_path,
+        default_import_id: current.default_import_id || generatedImportId(current.task_id, detail.dataset_id, objects[0]?.path),
+      }));
+    } catch (error) {
+      onError(String(error));
+    }
   }
 
-  const description = r2TaskSource
-    ? "任务配置来自 R2 登记表，本地只缓存执行配置。"
-    : controlTaskSource
-      ? "任务单由 Scaffold 控制面创建、编辑和发布；R2 只保存数据湖来源与输出。"
-      : "选择一个标注任务进入其数据流水线。";
+  async function reloadTasks() {
+    setRefreshing(true);
+    try {
+      await onReload();
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   return (
     <div>
       <div className="page-header">
         <h2>全部任务</h2>
-        <p>{description}</p>
+        <p>任务单由 Scaffold 控制面管理；R2 仅提供数据湖资产与任务产物。</p>
       </div>
       {notice && <div className="status-banner">{notice}</div>}
       <div className="toolbar">
         <div className="toolbar-stack">
-          <span className="muted">{tasks.length} 个任务{r2TaskSource && taskRegistryUri ? ` · ${taskRegistryUri}` : ""}</span>
-          {r2TaskSource && <span className="status-line">从 registry/data_lake.yaml 同步 task_id 到 task_uri，再读取任务配置。</span>}
+          <span className="muted">{tasks.length} 个任务 · 控制面</span>
           {controlTaskSource && <span className="status-line">草稿可以反复修改；每次发布都会保存独立 revision 快照。</span>}
         </div>
         <div className="action-row">
-          {!r2TaskSource && (
-            <button className="btn btn-sm" disabled={busy} onClick={openNewTask}>新建任务单</button>
-          )}
-          <button className={r2TaskSource ? "btn btn-sm btn-primary" : "btn btn-sm"} disabled={syncing || busy} onClick={reloadTasks}>
-            {r2TaskSource ? (syncing ? "同步中..." : "同步任务配置") : "刷新"}
-          </button>
+          <button className="btn btn-sm" disabled={busy} onClick={openNewTask}>新建任务单</button>
+          <button className="btn btn-sm" disabled={refreshing || busy} onClick={reloadTasks}>{refreshing ? "刷新中..." : "刷新任务"}</button>
         </div>
       </div>
-      {open && !r2TaskSource && (
+      {open && (
         <div className="card section-card">
           <div className="toolbar">
             <div>
@@ -420,34 +407,40 @@ export default function TasksPage({
             {showDataLakeFields && (
               <>
                 <div className="field field-wide">
-                  <label>数据资产来源</label>
+                  <label>数据湖资产目录</label>
                   <div className="action-row">
                     <select value={form.source_dataset_id} disabled={!catalog} onChange={(event) => chooseDataset(event.target.value)}>
-                      <option value="">{catalog ? "请选择已登记数据集" : "请先读取数据资产目录"}</option>
+                      <option value="">{catalog ? "请选择已登记数据集" : "请先读取数据湖资产目录"}</option>
                       {(catalog?.datasets || []).map((item) => <option key={item.dataset_id} value={item.dataset_id}>{item.name || item.dataset_id} · {item.dataset_id}</option>)}
                     </select>
                     <button className="btn btn-sm" type="button" disabled={catalogBusy} onClick={loadCatalog}>{catalogBusy ? "读取中..." : "读取资产目录"}</button>
                   </div>
-                  {selectedAsset && <span className="hint">已选择：{selectedAsset.name || selectedAsset.dataset_id}；来源由登记表解析。</span>}
+                  <span className="hint">从已登记的数据湖资产选择任务输入来源；任务单保存数据集和对象引用，不保存原始数据。</span>
+                  {selectedAsset && <span className="hint">已选择：{selectedAsset.name || selectedAsset.dataset_id} · {selectedAsset.layer || "未标注层级"} · {selectedAsset.domain || "未标注领域"}</span>}
                 </div>
                 <div className="field">
-                  <label>默认导入编号</label>
-                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="选择数据集后自动生成，可调整" />
+                  <label>源数据集编号</label>
+                  <input value={form.source_dataset_id} onChange={(event) => update("source_dataset_id", event.target.value)} placeholder="例如 raw_feedback_records" />
+                </div>
+                <div className="field">
+                  <label>默认输入编号</label>
+                  <input value={form.default_import_id} onChange={(event) => update("default_import_id", event.target.value)} placeholder="选择资产后自动生成，可调整" />
                 </div>
                 <div className="field field-wide">
-                  <label>源清单文件地址</label>
-                  <input value={form.source_manifest_uri} readOnly placeholder="选择数据集后由登记表确定" />
+                  <label>资产清单地址</label>
+                  <input value={form.source_manifest_uri} onChange={(event) => update("source_manifest_uri", event.target.value)} placeholder="选择资产后由数据湖目录填充" />
                 </div>
                 <div className="field field-wide">
                   <label>源对象路径</label>
-                  <select value={form.source_object_path} disabled={!selectedAsset?.manifest?.objects?.length} onChange={(event) => update("source_object_path", event.target.value)}>
-                    <option value="">请选择清单对象</option>
-                    {(selectedAsset?.manifest?.objects || []).map((item) => <option key={item.path} value={item.path}>{item.path} · {item.rows ?? "-"} 行</option>)}
-                  </select>
+                  <input value={form.source_object_path} onChange={(event) => update("source_object_path", event.target.value)} placeholder="清单对象中的路径，用于唯一选中数据文件" />
                 </div>
                 <div className="field field-wide">
-                  <label>标签回写根地址</label>
+                  <label>产物写回根地址</label>
                   <input value={form.output_base_uri} onChange={(event) => update("output_base_uri", event.target.value)} placeholder="例如 r2:bucket/path/labels/<task_id>/" />
+                </div>
+                <div className="field field-wide">
+                  <label>资产目录来源</label>
+                  <input value={form.lake_registry_uri || "由数据湖资产目录提供"} readOnly />
                 </div>
               </>
             )}
@@ -506,18 +499,17 @@ export default function TasksPage({
           </div>
         </div>
       )}
-      {!tasks.length && <div className="empty">{r2TaskSource ? "R2 登记表暂无启用任务" : controlTaskSource ? "尚未创建任务单" : "未发现任务，可新建任务或检查任务目录"}</div>}
+      {!tasks.length && <div className="empty">尚未创建任务单，可新建任务单或检查控制面连接。</div>}
       <div className="grid grid-cards">
         {tasks.map((task) => {
-          const canEnter = !controlTaskSource || (Number(task.revision || 0) > 0 && Boolean(task.path));
-          const hasDraftToPublish = controlTaskSource && ["draft", "published_with_draft"].includes(task.status);
+          const canEnter = Number(task.revision || 0) > 0 && Boolean(task.path);
+          const hasDraftToPublish = ["draft", "published_with_draft"].includes(task.status);
           return (
             <div key={task.task_id || task.path} className="card task-card">
               <div className="task-card-head">
                 {canEnter ? (
                   <Link to={`/task/${encodeURIComponent(task.task_id)}`} className="task-title-link"><h3>{task.task_id || "(无效)"}</h3></Link>
                 ) : <h3>{task.task_id || "(无效)"}</h3>}
-                {!controlTaskSource && <button className="btn btn-sm" onClick={() => openArchiveWizard(task)}>归档向导</button>}
               </div>
               {task.error ? (
                 <span className="badge badge-red">{task.error}</span>
@@ -526,15 +518,14 @@ export default function TasksPage({
                   <div>记录编号字段：{task.id_field}</div>
                   <div>主标签：{task.primary_label ? task.primary_label.name : "-"}</div>
                   <div>来源：{task.source || "-"}</div>
-                  {controlTaskSource && <div>状态：{taskStatusLabel(task.status)}{task.revision ? ` · revision ${task.revision}` : ""}</div>}
+                  <div>状态：{taskStatusLabel(task.status)}{task.revision ? ` · revision ${task.revision}` : ""}</div>
                 </div>
               )}
               <div className="action-row task-card-actions">
                 {canEnter && <button className="btn btn-sm" onClick={() => navigate(`/task/${encodeURIComponent(task.task_id)}`)}>进入</button>}
-                {controlTaskSource && <button className="btn btn-sm" disabled={busy} onClick={() => openEditor(task)}>编辑任务单</button>}
+                <button className="btn btn-sm" disabled={busy} onClick={() => openEditor(task)}>编辑任务单</button>
                 {hasDraftToPublish && <button className="btn btn-sm btn-primary" disabled={busy} onClick={() => publishExistingTask(task)}>发布草稿</button>}
-                {controlTaskSource && !canEnter && <span className="badge badge-gray">发布后可执行</span>}
-                {!controlTaskSource && !task.deletable && <span className="badge badge-gray">{r2TaskSource ? "数据湖" : "只读"}</span>}
+                {!canEnter && <span className="badge badge-gray">发布后可执行</span>}
               </div>
             </div>
           );

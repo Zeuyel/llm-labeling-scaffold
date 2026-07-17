@@ -3,23 +3,18 @@ import * as api from "./../api.js";
 import { Link } from "./../router.jsx";
 
 const DEFAULT_SETTINGS = {
-  task_registry_uri: "",
   data_lake_r2_prefix: "",
   task_source: "control",
   rclone_config_path: "",
   allow_data_lake_overrides: false,
-  allow_manual_imports: false,
 };
 
 function mergeSettings(value) {
   return { ...DEFAULT_SETTINGS, ...(value || {}) };
 }
 
-function sourceLabel(value) {
-  if (value === "r2") return "R2 登记表";
-  if (value === "control") return "Scaffold 控制面";
-  if (value === "local") return "本地任务目录";
-  return value || "-";
+function sourceLabel() {
+  return "Scaffold 控制面";
 }
 
 function boolLabel(value) {
@@ -28,9 +23,7 @@ function boolLabel(value) {
 
 export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoadError, onError }) {
   const normalized = useMemo(() => mergeSettings(settings), [settings]);
-  const controlTaskSource = normalized.task_source === "control";
   const [form, setForm] = useState({
-    task_registry_uri: normalized.task_registry_uri,
     data_lake_r2_prefix: normalized.data_lake_r2_prefix,
   });
   const [busy, setBusy] = useState(false);
@@ -38,10 +31,9 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
 
   useEffect(() => {
     setForm({
-      task_registry_uri: normalized.task_registry_uri,
       data_lake_r2_prefix: normalized.data_lake_r2_prefix,
     });
-  }, [normalized.task_registry_uri, normalized.data_lake_r2_prefix]);
+  }, [normalized.data_lake_r2_prefix]);
 
   function update(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -52,7 +44,6 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
     setNotice("");
     try {
       const payload = {
-        task_registry_uri: form.task_registry_uri.trim(),
         data_lake_r2_prefix: form.data_lake_r2_prefix.trim(),
       };
       const saved = await api.updateSettings(payload);
@@ -91,7 +82,7 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
       </div>
       <div className="page-header">
         <h2>系统设置</h2>
-        <p>{controlTaskSource ? "任务单由 Scaffold 控制面管理；这里配置 R2 数据湖的默认登记表和可访问范围。" : "配置 R2 任务登记表和数据湖导入使用的共享位置，保存后任务列表会按新配置刷新。"}</p>
+        <p>任务单由 Scaffold 控制面管理；这里配置数据湖资产和产物的默认存储位置。</p>
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
@@ -103,22 +94,13 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
         </div>
         <div className="form-grid">
           <div className="field field-wide">
-            <label>{controlTaskSource ? "数据湖登记表地址" : "任务登记表地址"} <span className="field-key">task_registry_uri</span></label>
-            <input
-              value={form.task_registry_uri}
-              onChange={(event) => update("task_registry_uri", event.target.value)}
-              placeholder="r2:bucket/registry/data_lake.yaml"
-            />
-            <span className="hint">{controlTaskSource ? "填写数据湖 registry/data_lake.yaml 的地址。任务单在 Scaffold 中创建和发布，R2 不再登记 task.yaml。" : "填写数据湖 registry/data_lake.yaml 的地址。这个文件登记 task_id 到 task_uri 的映射；task_uri 才指向具体任务配置，不能直接填写某个 task.yaml。"}</span>
-          </div>
-          <div className="field field-wide">
-            <label>数据湖根路径 <span className="field-key">data_lake_r2_prefix</span></label>
+            <label>数据湖资产与产物根路径 <span className="field-key">data_lake_r2_prefix</span></label>
             <input
               value={form.data_lake_r2_prefix}
               onChange={(event) => update("data_lake_r2_prefix", event.target.value)}
               placeholder="r2:bucket/path/..."
             />
-            <span className="hint">作为数据湖导入的默认 R2 前缀；任务也可以在登记表中声明更具体的数据源。</span>
+            <span className="hint">用于读取数据湖资产清单、生成任务输入，并保存任务产物；任务单本身不写入 R2。</span>
           </div>
         </div>
         <div className="action-row form-actions">
@@ -130,16 +112,12 @@ export default function SettingsPage({ settings, onSettingsSaved, onSettingsLoad
         <h3>当前运行状态</h3>
         <div className="form-grid readonly-grid">
           <div className="field">
-            <label>任务来源 <span className="field-key">task_source</span></label>
-            <input value={`${sourceLabel(normalized.task_source)} (${normalized.task_source || "-"})`} readOnly />
+            <label>任务单来源</label>
+            <input value={sourceLabel()} readOnly />
           </div>
           <div className="field">
-            <label>允许执行时覆盖数据湖来源 <span className="field-key">allow_data_lake_overrides</span></label>
+            <label>允许任务单指定数据湖来源 <span className="field-key">allow_data_lake_overrides</span></label>
             <input value={boolLabel(Boolean(normalized.allow_data_lake_overrides))} readOnly />
-          </div>
-          <div className="field">
-            <label>允许手动导入 <span className="field-key">allow_manual_imports</span></label>
-            <input value={boolLabel(Boolean(normalized.allow_manual_imports || normalized.manual_imports_enabled))} readOnly />
           </div>
           <div className="field field-wide">
             <label>Rclone 配置文件路径 <span className="field-key">rclone_config_path</span></label>
