@@ -27,41 +27,6 @@ export function hasEffectiveDataLakeConfig(dataLake) {
   return DATA_LAKE_SOURCE_FIELDS.some((field) => typeof dataLake[field] === "string" && dataLake[field].trim() !== "");
 }
 
-export function truthyFlag(value) {
-  if (value === true) return true;
-  if (typeof value === "number") return value === 1;
-  if (typeof value === "string") return ["1", "true", "yes", "on", "enabled"].includes(value.trim().toLowerCase());
-  return false;
-}
-
-export function usesR2TaskSource(taskSource, task) {
-  const sources = [taskSource, task?.task_source, task?.source_type, task?.source];
-  return sources.some((value) => {
-    const normalized = String(value || "").trim().toLowerCase();
-    return normalized === "r2" || normalized.startsWith("r2:");
-  });
-}
-
-export function usesLocalTaskSource(taskSource, task) {
-  const sources = [taskSource, task?.task_source, task?.source_type, task?.source];
-  return sources.some((value) => {
-    const normalized = String(value || "").trim().toLowerCase();
-    return normalized === "local" || normalized.startsWith("local:");
-  });
-}
-
-export function backendAllowsManualImports(task, allowManualImports) {
-  return [
-    allowManualImports,
-    task?.allow_manual_imports,
-    task?.allow_manual_import,
-    task?.manual_imports_enabled,
-    task?.features?.allow_manual_imports,
-    task?.capabilities?.allow_manual_imports,
-    task?.permissions?.allow_manual_imports,
-  ].some(truthyFlag);
-}
-
 export function sourceLabel(item) {
   const source = String(item?.source || "").trim().toLowerCase();
   const hasDataLakeSource = DATA_LAKE_SOURCE_FIELDS.some((field) => {
@@ -71,8 +36,7 @@ export function sourceLabel(item) {
   if (source === "data_lake" || hasDataLakeSource) {
     return "数据湖";
   }
-  if (source === "upload") return "手动上传";
-  if (source === "manual") return "手动导入";
+  if (source === "upload" || source === "manual") return "已有输入";
   return source || "-";
 }
 
@@ -113,28 +77,22 @@ export function importActionState(item, { busy = false } = {}) {
     archiveDisabledReason: canArchive
       ? ""
       : linkedSamples.length
-        ? `导入数据已被样本使用：${linkedSamples.map((sample) => sample.sample_id).filter(Boolean).join(", ")}`
+        ? `任务输入已被样本使用：${linkedSamples.map((sample) => sample.sample_id).filter(Boolean).join(", ")}`
         : item?.state === "archived"
-          ? "导入数据已归档"
+          ? "任务输入已归档"
           : busy
             ? "当前有操作正在执行"
-            : "缺少导入编号",
+            : "缺少输入编号",
   };
 }
 
-export function createImportActions({ hasDataLakeConfig = false, showManualImports = false } = {}) {
+export function createImportActions({ hasDataLakeConfig = false } = {}) {
   return [
     {
       key: "data_lake",
-      label: "从数据湖导入",
+      label: "生成任务输入",
       visible: hasDataLakeConfig,
       primary: hasDataLakeConfig,
-    },
-    {
-      key: "manual",
-      label: "手动上传",
-      visible: showManualImports,
-      primary: !hasDataLakeConfig && showManualImports,
     },
   ].filter((action) => action.visible);
 }

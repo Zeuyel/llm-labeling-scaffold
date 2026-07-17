@@ -7,7 +7,6 @@ import {
   importActionState,
   sourceLabel,
   summarizeImportAsset,
-  usesLocalTaskSource,
 } from "./importsPageState.js";
 
 test("summarizes import assets for list-first rows", () => {
@@ -31,15 +30,16 @@ test("summarizes import assets for list-first rows", () => {
   assert.equal(summary.contentHash, "abcdef123456...");
 });
 
-test("manual upload action is hidden when production R2 gating does not allow it", () => {
+test("only the data lake task-input action is exposed", () => {
   assert.deepEqual(
-    createImportActions({ hasDataLakeConfig: true, showManualImports: false }).map((action) => action.key),
+    createImportActions({ hasDataLakeConfig: true, showManualImports: true }).map((action) => action.key),
     ["data_lake"],
   );
   assert.deepEqual(
-    createImportActions({ hasDataLakeConfig: false, showManualImports: false }).map((action) => action.key),
+    createImportActions({ hasDataLakeConfig: false, showManualImports: true }).map((action) => action.key),
     [],
   );
+  assert.equal(createImportActions({ hasDataLakeConfig: true })[0].label, "生成任务输入");
 });
 
 test("archive action is blocked when an import has linked samples", () => {
@@ -58,15 +58,14 @@ test("data lake config detection requires an effective source field", () => {
   assert.equal(hasEffectiveDataLakeConfig(null), false);
 });
 
-test("manual import source detection mirrors task field fallbacks", () => {
-  assert.equal(usesLocalTaskSource("", { task_source: "local" }), true);
-  assert.equal(usesLocalTaskSource("", { source_type: "local:disk" }), true);
-  assert.equal(usesLocalTaskSource("", { source: "r2" }), false);
-});
-
 test("data lake source labels cover all effective source fields", () => {
   assert.equal(sourceLabel({ source_object_uri: "r2://bucket/raw.jsonl" }), "数据湖");
   assert.equal(sourceLabel({ lake_registry_uri: "r2://bucket/registry.json" }), "数据湖");
+});
+
+test("data lake asset fields identify an existing input asset", () => {
+  assert.equal(summarizeImportAsset({ source_object_uri: "r2://bucket/raw.jsonl" }).source, "数据湖");
+  assert.equal(summarizeImportAsset({ lake_registry_uri: "r2://bucket/catalog.yaml" }).source, "数据湖");
 });
 
 test("import detail audit log filters by import asset", () => {
