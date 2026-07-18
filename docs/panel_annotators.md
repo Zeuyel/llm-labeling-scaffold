@@ -6,7 +6,7 @@
 
 所有管理请求都必须带 `workspace`。服务默认使用 `Permission.WORKSPACE_MANAGE.value`，即 `workspace:manage`。授权器在服务端接收真实 actor；请求体中的 `actor`、`caller`、`channel`、`permission` 等字段会被拒绝。
 
-资源不可见统一映射为 `404 resource_not_found`，权限不足映射为 `403 permission_denied`，授权/资料库不可用映射为 `503`。异常响应只使用模块定义的安全错误文本，不代理 repository 或外部 adapter 的原始异常内容。
+资源不可见统一映射为 `404 resource_not_found`，权限不足映射为 `403 permission_denied`，授权/资料库不可用映射为 `503`。请求 DTO 错误返回 `422`；repository 返回的损坏记录或响应序列化失败返回 `500 service_unavailable`，不把内部记录问题伪装成用户请求错误。布尔字段只接受 JSON `true/false` 或整数 `0/1`，其他值视为损坏数据。异常响应只使用模块定义的安全错误文本，不代理 repository 或外部 adapter 的原始异常内容。
 
 ## 请求白名单
 
@@ -50,7 +50,7 @@ verification 使用稳定代码和中文标签：
 3. 账号不是 owner；
 4. verification 状态为 `verified`。
 
-repository 仍负责 revision/并发约束，服务通过 `expected_revision` 将冲突留给统一错误映射。
+repository 仍负责 revision/并发约束，服务通过 `expected_revision` 将冲突留给统一错误映射。若 repository 实现可选的 `BatchAnnotatorRepository.get_annotators(workspace, annotator_ids)`，成员校验使用一次批量读取；当前未改动 repository，未提供该能力时服务保留逐项 `get_annotator` fallback，后续 repository 接入批量方法后即可消除该降级路径。
 
 ## 一次性初始密码
 
@@ -59,6 +59,6 @@ repository 仍负责 revision/并发约束，服务通过 `expected_revision` �
 1. 不进入 repository 的参数或返回记录；
 2. 不出现在响应 DTO、`safe_dict()`、日志或服务错误文本中；
 3. 不提供读取当前密码或验证密码的接口；
-4. adapter 失败时只返回通用 `external_service_unavailable` 错误。
+4. adapter 失败时只返回通用 `external_service_unavailable` 错误；不会保留可能含密码/token 的异常链供日志或响应输出。
 
 调用方应在敏感表单提交后立即丢弃原始请求对象，浏览器不得持久化该字段。

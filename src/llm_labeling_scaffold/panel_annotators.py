@@ -132,6 +132,19 @@ class SensitiveInputError(AnnotatorDTOError):
         )
 
 
+class CorruptRecordError(ValueError):
+    pass
+
+
+class InternalServiceError(PanelAnnotatorError):
+    def __init__(self) -> None:
+        super().__init__(
+            "service_unavailable",
+            "标注人员服务暂时不可用",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+
+
 class WorkspaceResourceNotFound(RuntimeError):
     code = "resource_not_found"
 
@@ -241,9 +254,12 @@ class VerificationState:
 def serialize_verification(
     value: VerificationState | VerificationStatus | str | Mapping[str, Any],
 ) -> dict[str, Any]:
-    if isinstance(value, str):
-        return VerificationState(status=VerificationStatus.parse(value)).to_dict()
-    return VerificationState.from_source(value).to_dict()
+    try:
+        if isinstance(value, str):
+            return VerificationState(status=VerificationStatus.parse(value)).to_dict()
+        return VerificationState.from_source(value).to_dict()
+    except Exception:
+        raise _internal_service_error() from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -485,32 +501,35 @@ class AnnotatorResponse:
 
     @classmethod
     def from_record(cls, record: Any, *, workspace: str) -> "AnnotatorResponse":
-        _assert_record_workspace(record, workspace)
-        membership = _membership_from_record(record)
-        return cls(
-            annotator_id=_record_id(record, "annotator_id", "id", "mapping_id"),
-            workspace=workspace,
-            scaffold_user_id=_record_id(
-                record, "scaffold_user_id", "principal_id", "user_id"
-            ),
-            argilla_user_id=_optional_id(
-                record, "argilla_user_id", "argilla_user_uuid"
-            ),
-            argilla_username=_optional_text_value(
-                record, "argilla_username", "username"
-            ),
-            argilla_role=_optional_role(record, "argilla_role", "role"),
-            personal_workspace_id=_optional_id(
-                record,
-                "personal_workspace_id",
-                "personal_argilla_workspace_id",
-                "argilla_workspace_id",
-            ),
-            membership=membership,
-            verification=_verification_from_record(record),
-            created_at=_safe_timestamp(_source_value(record, "created_at")),
-            updated_at=_safe_timestamp(_source_value(record, "updated_at")),
-        )
+        try:
+            _assert_record_workspace(record, workspace)
+            membership = _membership_from_record(record)
+            return cls(
+                annotator_id=_record_id(record, "annotator_id", "id", "mapping_id"),
+                workspace=workspace,
+                scaffold_user_id=_record_id(
+                    record, "scaffold_user_id", "principal_id", "user_id"
+                ),
+                argilla_user_id=_optional_id(
+                    record, "argilla_user_id", "argilla_user_uuid"
+                ),
+                argilla_username=_optional_text_value(
+                    record, "argilla_username", "username"
+                ),
+                argilla_role=_optional_role(record, "argilla_role", "role"),
+                personal_workspace_id=_optional_id(
+                    record,
+                    "personal_workspace_id",
+                    "personal_argilla_workspace_id",
+                    "argilla_workspace_id",
+                ),
+                membership=membership,
+                verification=_verification_from_record(record),
+                created_at=_safe_timestamp(_source_value(record, "created_at")),
+                updated_at=_safe_timestamp(_source_value(record, "updated_at")),
+            )
+        except Exception:
+            raise _internal_service_error() from None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -542,47 +561,48 @@ class CohortResponse:
 
     @classmethod
     def from_record(cls, record: Any, *, workspace: str) -> "CohortResponse":
-        _assert_record_workspace(record, workspace)
-        member_ids = _source_value(
-            record, "member_annotator_ids", "annotator_ids", "members"
-        )
-        if isinstance(member_ids, Mapping):
-            member_ids = list(member_ids)
-        if member_ids is None:
-            member_ids = []
-        if not isinstance(member_ids, Sequence) or isinstance(
-            member_ids, (str, bytes, bytearray)
-        ):
-            raise AnnotatorDTOError(
-                "invalid_repository_record",
-                "人员组记录无效",
-                field="member_annotator_ids",
+        try:
+            _assert_record_workspace(record, workspace)
+            member_ids = _source_value(
+                record, "member_annotator_ids", "annotator_ids", "members"
             )
-        parsed_members: list[str] = []
-        for value in member_ids:
-            parsed_members.append(_safe_identifier(value, "member_annotator_ids"))
-        capacity = _source_value(record, "default_capacity", "capacity")
-        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
-            raise AnnotatorDTOError(
-                "invalid_repository_record", "人员组记录无效", field="default_capacity"
+            if isinstance(member_ids, Mapping):
+                member_ids = list(member_ids)
+            if member_ids is None:
+                member_ids = []
+            if not isinstance(member_ids, Sequence) or isinstance(
+                member_ids, (str, bytes, bytearray)
+            ):
+                raise CorruptRecordError()
+            parsed_members: list[str] = []
+            for value in member_ids:
+                parsed_members.append(_safe_identifier(value, "member_annotator_ids"))
+            capacity = _source_value(record, "default_capacity", "capacity")
+            if (
+                isinstance(capacity, bool)
+                or not isinstance(capacity, int)
+                or capacity <= 0
+            ):
+                raise CorruptRecordError()
+            revision = _source_value(record, "revision", "version")
+            if revision is not None and (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 0
+            ):
+                raise CorruptRecordError()
+            return cls(
+                cohort_id=_record_id(record, "cohort_id", "id"),
+                workspace=workspace,
+                name=_required_text(_source_value(record, "name"), "name"),
+                default_capacity=capacity,
+                member_annotator_ids=tuple(parsed_members),
+                revision=revision,
+                created_at=_safe_timestamp(_source_value(record, "created_at")),
+                updated_at=_safe_timestamp(_source_value(record, "updated_at")),
             )
-        revision = _source_value(record, "revision", "version")
-        if revision is not None and (
-            isinstance(revision, bool) or not isinstance(revision, int) or revision < 0
-        ):
-            raise AnnotatorDTOError(
-                "invalid_repository_record", "人员组记录无效", field="revision"
-            )
-        return cls(
-            cohort_id=_record_id(record, "cohort_id", "id"),
-            workspace=workspace,
-            name=_required_text(_source_value(record, "name"), "name"),
-            default_capacity=capacity,
-            member_annotator_ids=tuple(parsed_members),
-            revision=revision,
-            created_at=_safe_timestamp(_source_value(record, "created_at")),
-            updated_at=_safe_timestamp(_source_value(record, "updated_at")),
-        )
+        except Exception:
+            raise _internal_service_error() from None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -730,6 +750,12 @@ class AnnotatorRepository(Protocol):
         member_annotator_ids: Sequence[str],
         expected_revision: int | None,
     ) -> Any: ...
+
+
+class BatchAnnotatorRepository(Protocol):
+    def get_annotators(
+        self, *, workspace: str, annotator_ids: Sequence[str]
+    ) -> Iterable[Any]: ...
 
 
 class AnnotatorAdapter(Protocol):
@@ -1115,6 +1141,34 @@ class PanelAnnotatorService:
         return snapshot
 
     def _validate_members(self, workspace: str, member_ids: Sequence[str]) -> None:
+        for record in self._member_records(workspace, member_ids):
+            self._validate_member_record(record)
+
+    def _member_records(self, workspace: str, member_ids: Sequence[str]) -> list[Any]:
+        batch_method = getattr(self.repository, "get_annotators", None)
+        if callable(batch_method):
+            records = self._repository_call(
+                "get_annotators",
+                workspace=workspace,
+                annotator_ids=tuple(member_ids),
+            )
+            try:
+                by_id: dict[str, Any] = {}
+                for record in records:
+                    _assert_record_workspace(record, workspace)
+                    annotator_id = _record_id(
+                        record, "annotator_id", "id", "mapping_id"
+                    )
+                    if annotator_id in by_id:
+                        raise CorruptRecordError()
+                    by_id[annotator_id] = record
+            except Exception:
+                raise _internal_service_error() from None
+            if any(annotator_id not in by_id for annotator_id in member_ids):
+                raise _not_found()
+            return [by_id[annotator_id] for annotator_id in member_ids]
+
+        records = []
         for annotator_id in member_ids:
             record = self._repository_call(
                 "get_annotator",
@@ -1123,27 +1177,36 @@ class PanelAnnotatorService:
             )
             if record is None:
                 raise _not_found()
+            records.append(record)
+        return records
+
+    def _validate_member_record(self, record: Any) -> None:
+        try:
             role = _optional_role(record, "argilla_role", "role")
             owner = _bool_value(_source_value(record, "is_owner", "owner"))
-            if owner or role == "owner":
-                raise PanelAnnotatorError(
-                    "owner_account_forbidden",
-                    "owner 账号不能加入人员组",
-                    HTTPStatus.UNPROCESSABLE_ENTITY,
-                )
-            if role != "annotator":
-                raise PanelAnnotatorError(
-                    "annotator_role_required",
-                    "人员组成员必须是 annotator",
-                    HTTPStatus.UNPROCESSABLE_ENTITY,
-                )
             verification = _verification_from_record(record)
-            if verification.status != VerificationStatus.VERIFIED:
-                raise PanelAnnotatorError(
-                    "annotator_not_verified",
-                    "未验证的标注人员不能加入人员组",
-                    HTTPStatus.CONFLICT,
-                )
+        except Exception:
+            raise _internal_service_error() from None
+        if role is None:
+            raise _internal_service_error()
+        if owner or role == "owner":
+            raise PanelAnnotatorError(
+                "owner_account_forbidden",
+                "owner 账号不能加入人员组",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+        if role != "annotator":
+            raise PanelAnnotatorError(
+                "annotator_role_required",
+                "人员组成员必须是 annotator",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+        if verification.status != VerificationStatus.VERIFIED:
+            raise PanelAnnotatorError(
+                "annotator_not_verified",
+                "未验证的标注人员不能加入人员组",
+                HTTPStatus.CONFLICT,
+            )
 
 
 AnnotatorService = PanelAnnotatorService
@@ -1355,11 +1418,13 @@ def _optional_role_value(value: Any) -> str | None:
 
 
 def _bool_value(value: Any) -> bool:
+    if value is None:
+        return False
     if isinstance(value, bool):
         return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return False
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    raise CorruptRecordError()
 
 
 def _safe_timestamp(value: Any) -> str | None:
@@ -1390,10 +1455,13 @@ def _membership_from_record(record: Any) -> WorkspaceMembershipResponse:
 
 
 def _verification_from_record(record: Any) -> VerificationState:
-    nested = _source_value(record, "verification")
-    if nested is not None:
-        return VerificationState.from_source(nested)
-    return VerificationState.from_source(record)
+    try:
+        nested = _source_value(record, "verification")
+        if nested is not None:
+            return VerificationState.from_source(nested)
+        return VerificationState.from_source(record)
+    except Exception:
+        raise _internal_service_error() from None
 
 
 def _assert_record_workspace(record: Any, workspace: str) -> None:
@@ -1474,6 +1542,10 @@ def _external_unavailable() -> PanelAnnotatorError:
     )
 
 
+def _internal_service_error() -> InternalServiceError:
+    return InternalServiceError()
+
+
 __all__ = [
     "ANNOTATOR_BIND_REQUEST_FIELDS",
     "ANNOTATOR_CREATE_REQUEST_FIELDS",
@@ -1484,6 +1556,7 @@ __all__ = [
     "AnnotatorRepository",
     "AnnotatorResponse",
     "AnnotatorService",
+    "BatchAnnotatorRepository",
     "BindAnnotatorRequest",
     "COHORT_CREATE_REQUEST_FIELDS",
     "COHORT_MEMBERS_REQUEST_FIELDS",
@@ -1493,6 +1566,8 @@ __all__ = [
     "CreateAnnotatorRequest",
     "CreateCohortRequest",
     "ExternalAnnotatorSnapshot",
+    "CorruptRecordError",
+    "InternalServiceError",
     "PanelAnnotatorError",
     "PanelAnnotatorService",
     "REQUEST_FIELD_ALLOWLISTS",

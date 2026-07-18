@@ -71,6 +71,7 @@ class _Repository:
     def __init__(self, annotators: list[dict] | None = None):
         self.annotators = {item["annotator_id"]: item for item in annotators or []}
         self.cohorts: dict[str, dict] = {}
+        self.get_annotator_calls: list[dict] = []
         self.create_annotator_calls: list[dict] = []
         self.create_cohort_calls: list[dict] = []
         self.verification_calls: list[dict] = []
@@ -83,6 +84,9 @@ class _Repository:
         ]
 
     def get_annotator(self, *, workspace: str, annotator_id: str):
+        self.get_annotator_calls.append(
+            {"workspace": workspace, "annotator_id": annotator_id}
+        )
         item = self.annotators.get(annotator_id)
         if item is None or item.get("workspace") != workspace:
             return None
@@ -146,6 +150,22 @@ class _Repository:
         record["member_annotator_ids"] = list(kwargs["member_annotator_ids"])
         record["revision"] += 1
         return record
+
+
+class _BatchRepository(_Repository):
+    def __init__(self, annotators: list[dict] | None = None):
+        super().__init__(annotators)
+        self.batch_calls: list[dict] = []
+
+    def get_annotators(self, *, workspace: str, annotator_ids):
+        self.batch_calls.append(
+            {"workspace": workspace, "annotator_ids": tuple(annotator_ids)}
+        )
+        return [
+            item
+            for annotator_id, item in self.annotators.items()
+            if annotator_id in annotator_ids and item.get("workspace") == workspace
+        ]
 
 
 class _Adapter:
@@ -332,6 +352,41 @@ def test_response_is_whitelisted_and_missing_verification_defaults_unverified():
     assert "active" not in payload
 
 
+@pytest.mark.parametrize("value", [2, -1, 0.0, 1.0, "true", "0"])
+def test_bool_value_rejects_non_boolean_and_non_binary_values(value):
+    with pytest.raises(api.CorruptRecordError):
+        api._bool_value(value)
+
+
+def test_bool_value_accepts_bool_binary_and_missing_values():
+    assert api._bool_value(True) is True
+    assert api._bool_value(False) is False
+    assert api._bool_value(1) is True
+    assert api._bool_value(0) is False
+    assert api._bool_value(None) is False
+
+
+def test_corrupt_repository_records_map_to_internal_error_without_secret_text():
+    secret = "repository-password"
+    record = _annotator_record()
+    record["membership"]["present"] = 2
+    record["password"] = secret
+
+    with pytest.raises(api.PanelAnnotatorError) as exc_info:
+        api.serialize_annotator(record, workspace="workspace-a")
+
+    assert exc_info.value.status == 500
+    assert exc_info.value.code == "service_unavailable"
+    assert secret not in str(exc_info.value)
+    assert secret not in json.dumps(exc_info.value.to_payload(), ensure_ascii=False)
+
+    with pytest.raises(api.PanelAnnotatorError) as verification_error:
+        api.serialize_verification({"status": "not-a-status", "token": secret})
+    assert verification_error.value.status == 500
+    assert verification_error.value.code == "service_unavailable"
+    assert secret not in str(verification_error.value)
+
+
 @pytest.mark.parametrize(
     ("snapshot", "status"),
     [
@@ -430,6 +485,26 @@ def test_cohort_accepts_only_verified_annotators_and_keeps_workspace_scope():
     assert response.workspace == "workspace-a"
     assert response.member_annotator_ids == ("annotator-1",)
     assert repository.create_cohort_calls[0]["workspace"] == "workspace-a"
+
+
+def test_cohort_uses_optional_batch_repository_path_without_n_plus_one_reads():
+    repository = _BatchRepository([_annotator_record(status="verified")])
+    service = api.PanelAnnotatorService(repository)
+
+    response = service.create_cohort(
+        {
+            "workspace": "workspace-a",
+            "name": "reviewers",
+            "default_capacity": 3,
+            "member_annotator_ids": ["annotator-1"],
+        }
+    )
+
+    assert response.member_annotator_ids == ("annotator-1",)
+    assert repository.batch_calls == [
+        {"workspace": "workspace-a", "annotator_ids": ("annotator-1",)}
+    ]
+    assert repository.get_annotator_calls == []
 
 
 def test_workspace_scope_errors_map_to_safe_http_contract():
