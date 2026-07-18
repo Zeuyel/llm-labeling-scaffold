@@ -150,15 +150,21 @@ class _ContextAuthenticator:
         )
 
 
+_TASK_UNSET = object()
+
+
 class _PreviewAuthorizationService:
-    def __init__(self, *, allowed: bool = True):
+    def __init__(self, *, allowed: bool = True, task=_TASK_UNSET, reason=AuthorizationReason.ROLE_DENIED):
         self.allowed = allowed
+        self.task = object() if task is _TASK_UNSET and allowed else task
+        self.reason = reason
         self.calls: list[tuple[str, str, Permission]] = []
 
     def require_task(self, identity, workspace_slug: str, task_key: str, permission: Permission):
         self.calls.append((workspace_slug, task_key, permission))
         if not self.allowed:
-            raise AuthorizationDenied(SimpleNamespace(reason=AuthorizationReason.ROLE_DENIED))
+            raise AuthorizationDenied(SimpleNamespace(reason=self.reason))
+        return SimpleNamespace(task=self.task)
 
 
 @contextmanager
@@ -233,6 +239,39 @@ def test_preview_route_maps_permission_denial_to_403(monkeypatch, tmp_path: Path
 
     assert status == 403
     assert response["code"] == "permission_denied"
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        _PreviewAuthorizationService(task=None),
+        _PreviewAuthorizationService(
+            allowed=False,
+            reason=AuthorizationReason.RESOURCE_NOT_VISIBLE,
+        ),
+    ],
+    ids=["missing_task_on_decision", "invisible_task"],
+)
+def test_preview_route_fails_closed_for_missing_or_invisible_task(
+    monkeypatch,
+    tmp_path: Path,
+    service: _PreviewAuthorizationService,
+):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    preview_called = False
+
+    def fail_preview(*args, **kwargs):
+        nonlocal preview_called
+        preview_called = True
+        raise AssertionError("invisible or missing tasks must not reach preview_allocation_dto")
+
+    monkeypatch.setattr(panel, "preview_allocation_dto", fail_preview)
+    with _panel_server(service, tmp_path) as base_url:
+        status, response = _request(base_url, _payload())
+
+    assert status == 404
+    assert response["code"] == "resource_not_found"
+    assert preview_called is False
 
 
 def test_preview_route_maps_unavailable_authorization_to_503(monkeypatch, tmp_path: Path):

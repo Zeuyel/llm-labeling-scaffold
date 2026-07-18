@@ -1685,12 +1685,18 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             service, actor_identity, _, _ = self._authorization_context()
             request = self._read_allocation_preview_body()
-            service.require_task(
+            decision = service.require_task(
                 actor_identity,
                 request.workspace,
                 request.task_id,
                 Permission.ANNOTATION_REVIEW,
             )
+            if decision.task is None:
+                raise _PanelRouteError(
+                    HTTPStatus.NOT_FOUND,
+                    "resource_not_found",
+                    "任务不可见",
+                )
             try:
                 payload = preview_allocation_dto(request)
             except Exception as exc:
