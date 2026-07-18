@@ -2,6 +2,26 @@
 
 `llm_labeling_scaffold.panel_annotators` 是供后续总 Panel 路由调用的纯 DTO/服务适配层。本模块不注册路由、不调用 Argilla，也不依赖具体数据库 repository；数据库和外部服务通过 `AnnotatorRepository`、`AnnotatorAdapter` 与 `WorkspaceAuthorizer` Protocol 注入。
 
+## 专用 HTTP 路由
+
+人员控制 API 只在 Scaffold control-plane 且数据库授权运行时就绪时开放。所有请求必须显式绑定 `workspace`，查询使用 query 参数，写入使用 JSON body。不可见 workspace/resource 返回 `404`，权限不足返回 `403`，授权或运行时不可用返回 `503`。
+
+| method | path | purpose |
+| --- | --- | --- |
+| `GET` | `/api/annotators?workspace=...` | 标注人员列表 |
+| `GET` | `/api/annotators/{annotator_id}?workspace=...` | 标注人员详情 |
+| `POST` | `/api/annotators/provision` | 使用一次性密码创建并绑定身份 |
+| `POST` | `/api/annotators/bind` | 绑定已有 Argilla 身份 |
+| `POST` | `/api/annotators/{annotator_id}/verify` | 重新验证身份 |
+| `GET` | `/api/cohorts?workspace=...` | 人员组列表 |
+| `GET` | `/api/cohorts/{cohort_id}?workspace=...` | 人员组详情 |
+| `POST` | `/api/cohorts` | 创建人员组及初始 revision |
+| `PUT` | `/api/cohorts/{cohort_id}` | 更新名称/默认容量并创建 revision |
+| `PUT` | `/api/cohorts/{cohort_id}/members` | 替换成员并创建 revision |
+| `POST` | `/api/cohorts/{cohort_id}/revisions` | 显式创建不可变 revision |
+
+所有写操作都必须提供非空、合法的 `Idempotency-Key` header。相同 key 及相同请求会重放已保存响应；相同 key 对应不同请求返回 `409 idempotency_conflict`。缺失或非法 header 返回 `422`。`initial_password` 只允许出现在 provisioning 请求体中，不会出现在 response、repository、idempotency fingerprint/response、audit details 或日志中。
+
 ## Workspace 与权限
 
 所有管理请求都必须带 `workspace`。服务默认使用 `Permission.WORKSPACE_MANAGE.value`，即 `workspace:manage`。授权器在服务端接收真实 actor；请求体中的 `actor`、`caller`、`channel`、`permission` 等字段会被拒绝。

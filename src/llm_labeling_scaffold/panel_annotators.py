@@ -82,7 +82,13 @@ COHORT_UPDATE_REQUEST_FIELDS = frozenset(
     {"workspace", "cohort_id", "name", "default_capacity", "expected_revision"}
 )
 COHORT_MEMBERS_REQUEST_FIELDS = frozenset(
-    {"workspace", "cohort_id", "member_annotator_ids", "expected_revision"}
+    {
+        "workspace",
+        "cohort_id",
+        "member_annotator_ids",
+        "default_capacity",
+        "expected_revision",
+    }
 )
 REQUEST_FIELD_ALLOWLISTS = {
     "annotator_create": ANNOTATOR_CREATE_REQUEST_FIELDS,
@@ -327,6 +333,7 @@ class CohortMembersRequest:
     workspace: str
     cohort_id: str
     member_annotator_ids: tuple[str, ...]
+    default_capacity: int | None = None
     expected_revision: int | None = None
 
 
@@ -462,6 +469,11 @@ def parse_cohort_members_request(payload: Any) -> CohortMembersRequest:
         cohort_id=_required_text(root.get("cohort_id"), "cohort_id"),
         member_annotator_ids=_identifier_list(
             root.get("member_annotator_ids"), "member_annotator_ids"
+        ),
+        default_capacity=(
+            _positive_int(root.get("default_capacity"), "default_capacity")
+            if root.get("default_capacity") is not None
+            else None
         ),
         expected_revision=(
             _nonnegative_int(expected_revision, "expected_revision")
@@ -748,6 +760,7 @@ class AnnotatorRepository(Protocol):
         workspace: str,
         cohort_id: str,
         member_annotator_ids: Sequence[str],
+        default_capacity: int | None,
         expected_revision: int | None,
     ) -> Any: ...
 
@@ -1027,6 +1040,7 @@ class PanelAnnotatorService:
             workspace=request.workspace,
             cohort_id=request.cohort_id,
             member_annotator_ids=request.member_annotator_ids,
+            default_capacity=request.default_capacity,
             expected_revision=request.expected_revision,
         )
         if record is None:

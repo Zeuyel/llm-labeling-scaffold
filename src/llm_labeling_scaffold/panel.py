@@ -34,10 +34,19 @@ from .db import (
     AllocationRepositoryError,
     AllocationRepositoryValidationError,
     AllocationResourceNotFound,
+    AnnotatorControlRepository,
+    AnnotatorNaturalKeyConflict,
+    AnnotatorNotReady,
+    AnnotatorOperationInProgress,
+    AnnotatorRepositoryError,
+    AnnotatorRepositoryValidationError,
+    AnnotatorResourceNotFound,
+    AnnotatorVerificationRejected,
     AuditChannel,
     AuthorizationDenied,
     AuthorizationReason,
     AuthorizationUnavailable,
+    CohortMemberInput,
     ControlTaskSnapshotLoader,
     DatabaseService,
     ExternalIdentity,
@@ -64,6 +73,11 @@ from .db.migration import build_alembic_config
 from .io import read_json, read_jsonl, write_jsonl
 from . import pipeline
 from . import panel_settings
+from .integrations.argilla_admin import (
+    ArgillaAdminAdapter,
+    ArgillaProvisioningError,
+    derive_personal_workspace_name,
+)
 from .panel_allocation import (
     AllocationPreviewDTOError,
     parse_allocation_plan_confirm_json,
@@ -73,6 +87,16 @@ from .panel_allocation import (
     serialize_allocation_plan_result,
     serialize_allocation_progress,
     preview_allocation_dto,
+)
+from .panel_annotators import (
+    AnnotatorLookup,
+    AnnotatorResponse,
+    ExternalAnnotatorSnapshot,
+    PanelAnnotatorError,
+    PanelAnnotatorService,
+    VerificationState,
+    VerificationStatus,
+    WORKSPACE_MANAGE_PERMISSION,
 )
 from .redaction import redact_text
 
@@ -279,6 +303,686 @@ def _external_identity(principal) -> ExternalIdentity:
     )
 
 
+def _annotator_uuid(value: Any, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value).strip())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise PanelAnnotatorError(
+            "invalid_uuid",
+            f"{field} 必须是合法 UUID",
+            HTTPStatus.UNPROCESSABLE_ENTITY,
+            field=field,
+        ) from exc
+
+
+def _annotator_enum_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    return str(getattr(value, "value", value) or "").strip().lower() or None
+
+
+def _map_annotator_dependency_error(exc: BaseException) -> PanelAnnotatorError:
+    if isinstance(exc, PanelAnnotatorError):
+        return exc
+    if isinstance(exc, AuthorizationDenied):
+        reason = _annotator_enum_value(getattr(getattr(exc, "decision", None), "reason", None))
+        if reason in {
+            AuthorizationReason.UNKNOWN_PRINCIPAL.value,
+            AuthorizationReason.INACTIVE_PRINCIPAL.value,
+            AuthorizationReason.RESOURCE_NOT_VISIBLE.value,
+            AuthorizationReason.INACTIVE_WORKSPACE.value,
+        }:
+            return PanelAnnotatorError(
+                "resource_not_found", "资源不存在", HTTPStatus.NOT_FOUND
+            )
+        if reason in {
+            AuthorizationReason.ROLE_DENIED.value,
+            AuthorizationReason.INVALID_AUDIT_CONTEXT.value,
+        }:
+            return PanelAnnotatorError(
+                "permission_denied", "权限不足", HTTPStatus.FORBIDDEN
+            )
+        return PanelAnnotatorError(
+            "authorization_unavailable",
+            "数据库授权暂时不可用",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    if isinstance(exc, AuthorizationUnavailable):
+        return PanelAnnotatorError(
+            "authorization_unavailable",
+            "数据库授权暂时不可用",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    if isinstance(exc, AnnotatorResourceNotFound):
+        return PanelAnnotatorError(
+            "resource_not_found", "资源不存在", HTTPStatus.NOT_FOUND
+        )
+    if isinstance(exc, AnnotatorVerificationRejected):
+        reason = str(exc.reason or "verification_rejected").strip().lower()
+        if "role" in reason:
+            code = "role_error"
+            message = "Argilla 用户角色校验失败"
+        elif "membership" in reason:
+            code = "membership_missing"
+            message = "Argilla 工作区成员关系缺失"
+        elif "mismatch" in reason or "already_mapped" in reason:
+            code = "identity_drift"
+            message = "Argilla 用户身份校验失败"
+        else:
+            code = "verification_rejected"
+            message = "标注人员验证未通过"
+        return PanelAnnotatorError(code, message, HTTPStatus.CONFLICT)
+    if isinstance(exc, AnnotatorNaturalKeyConflict):
+        return PanelAnnotatorError(
+            "resource_conflict", "资源状态冲突", HTTPStatus.CONFLICT
+        )
+    if isinstance(exc, IdempotencyConflict):
+        return PanelAnnotatorError(
+            "idempotency_conflict", "请求与现有幂等操作冲突", HTTPStatus.CONFLICT
+        )
+    if isinstance(exc, AnnotatorOperationInProgress):
+        return PanelAnnotatorError(
+            "operation_in_progress",
+            "操作正在处理中，请稍后重试",
+            HTTPStatus.CONFLICT,
+        )
+    if isinstance(exc, AnnotatorNotReady):
+        return PanelAnnotatorError(
+            "annotator_not_ready", "标注人员控制资源尚未就绪", HTTPStatus.CONFLICT
+        )
+    if isinstance(exc, AnnotatorRepositoryValidationError) or isinstance(exc, ValueError):
+        return PanelAnnotatorError(
+            "invalid_request", "请求定义无效", HTTPStatus.UNPROCESSABLE_ENTITY
+        )
+    if isinstance(exc, AnnotatorRepositoryError):
+        return PanelAnnotatorError(
+            "repository_unavailable",
+            "标注人员资料库暂时不可用",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+    return PanelAnnotatorError(
+        "service_unavailable",
+        "标注人员服务暂时不可用",
+        HTTPStatus.SERVICE_UNAVAILABLE,
+    )
+
+
+class _PanelAnnotatorAuthorizer:
+    def __init__(self, service: DatabaseService):
+        self.service = service
+
+    def require_workspace(self, *, workspace: str, actor: Any, permission: str) -> Any:
+        if permission != WORKSPACE_MANAGE_PERMISSION or not isinstance(actor, ExternalIdentity):
+            raise PanelAnnotatorError("permission_denied", "权限不足", HTTPStatus.FORBIDDEN)
+        try:
+            return self.service.require_workspace(
+                actor,
+                workspace,
+                Permission.WORKSPACE_MANAGE,
+            )
+        except Exception as exc:
+            raise _map_annotator_dependency_error(exc) from None
+
+
+class _PanelAnnotatorRepositoryFacade:
+    def __init__(
+        self,
+        repository: AnnotatorControlRepository,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        channel: AuditChannel,
+        idempotency_key: str = "",
+        request_id: str | None = None,
+    ) -> None:
+        self.repository = repository
+        self.actor_identity = actor_identity
+        self.caller_identity = caller_identity
+        self.channel = channel
+        self.idempotency_key = idempotency_key
+        self.request_id = request_id
+        self.default_capacity = 1
+        self.expected_revision: int | None = None
+        self.pending_verification_snapshot: ExternalAnnotatorSnapshot | None = None
+        self.last_status = HTTPStatus.OK
+        self.last_replayed = False
+
+    def _call(self, method_name: str, **kwargs: Any) -> Any:
+        method = getattr(self.repository, method_name, None)
+        if not callable(method):
+            raise PanelAnnotatorError(
+                "repository_unavailable",
+                "标注人员资料库暂时不可用",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        try:
+            return method(**kwargs)
+        except Exception as exc:
+            raise _map_annotator_dependency_error(exc) from None
+
+    def _binding(self, workspace: str) -> Any:
+        bindings = self._call(
+            "list_workspace_bindings",
+            workspace_slug=workspace,
+            identity=self.actor_identity,
+        )
+        if len(bindings) != 1:
+            raise PanelAnnotatorError(
+                "repository_unavailable",
+                "Argilla workspace binding 尚未唯一确定",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        return bindings[0]
+
+    @staticmethod
+    def _mapping_record(
+        mapping: Any,
+        workspace: str,
+        *,
+        role: str | None = None,
+        membership_verified: bool | None = None,
+    ) -> dict[str, Any]:
+        verification = _annotator_enum_value(getattr(mapping, "verification_state", None))
+        if verification not in {item.value for item in VerificationStatus}:
+            verification = VerificationStatus.UNVERIFIED.value
+        role = role or _annotator_enum_value(getattr(mapping, "argilla_role", None)) or "annotator"
+        if membership_verified is None:
+            membership_verified = bool(
+                getattr(mapping, "membership_verified", None)
+                if getattr(mapping, "membership_verified", None) is not None
+                else verification == VerificationStatus.VERIFIED.value
+            )
+        scaffold_user_id = getattr(mapping, "principal_subject", None)
+        if scaffold_user_id is None:
+            scaffold_user_id = getattr(mapping, "principal_id", None)
+        return {
+            "workspace": workspace,
+            "annotator_id": str(mapping.id),
+            "scaffold_user_id": str(scaffold_user_id),
+            "argilla_user_id": (
+                str(mapping.argilla_user_id)
+                if mapping.argilla_user_id is not None
+                else None
+            ),
+            "argilla_username": str(mapping.username),
+            "argilla_role": role,
+            "personal_workspace_id": (
+                str(mapping.personal_argilla_workspace_id)
+                if mapping.personal_argilla_workspace_id is not None
+                else None
+            ),
+            "membership": {
+                "workspace_id": (
+                    str(mapping.personal_argilla_workspace_id)
+                    if mapping.personal_argilla_workspace_id is not None
+                    else None
+                ),
+                "present": bool(membership_verified),
+                "role": role,
+            },
+            "verification": {
+                "status": verification,
+                "last_verified_at": (
+                    mapping.verified_at.isoformat()
+                    if getattr(mapping, "verified_at", None) is not None
+                    else None
+                ),
+            },
+        }
+
+    @classmethod
+    def _cohort_record(cls, cohort: Any, workspace: str) -> dict[str, Any]:
+        revision = getattr(cohort, "latest_revision", None)
+        members = tuple(getattr(revision, "members", ()) or ())
+        capacities = [int(member.default_capacity) for member in members]
+        return {
+            "workspace": workspace,
+            "cohort_id": str(cohort.id),
+            "name": str(cohort.name),
+            "default_capacity": capacities[0] if capacities else 1,
+            "member_annotator_ids": [str(member.mapping.id) for member in members],
+            "member_capacities": capacities,
+            "revision": (
+                int(revision.revision_number) if revision is not None else None
+            ),
+        }
+
+    def list_annotators(self, *, workspace: str) -> list[dict[str, Any]]:
+        mappings = self._call(
+            "list_annotators",
+            workspace_slug=workspace,
+            identity=self.actor_identity,
+        )
+        return [self._mapping_record(item, workspace) for item in mappings]
+
+    def get_annotator(self, *, workspace: str, annotator_id: str) -> dict[str, Any] | None:
+        mapping = self._call(
+            "get_annotator",
+            workspace_slug=workspace,
+            identity=self.actor_identity,
+            mapping_id=_annotator_uuid(annotator_id, "annotator_id"),
+        )
+        return self._mapping_record(mapping, workspace) if mapping is not None else None
+
+    def create_annotator(
+        self,
+        *,
+        workspace: str,
+        scaffold_user_id: str,
+        external: ExternalAnnotatorSnapshot,
+    ) -> dict[str, Any]:
+        user_id = _annotator_uuid(external.argilla_user_id, "argilla_user_id")
+        personal_workspace_id = (
+            _annotator_uuid(external.personal_workspace_id, "personal_workspace_id")
+            if external.personal_workspace_id is not None
+            else None
+        )
+        membership_verified = bool(external.membership_present and personal_workspace_id is not None)
+        result = self._call(
+            "create_annotator_mapping",
+            workspace_slug=workspace,
+            binding_id=self._binding(workspace).id,
+            principal_identity=ExternalIdentity(
+                self.actor_identity.issuer,
+                scaffold_user_id,
+            ),
+            username=external.argilla_username,
+            actor_identity=self.actor_identity,
+            caller_identity=self.caller_identity,
+            idempotency_key=self.idempotency_key,
+            argilla_user_id=user_id,
+            personal_argilla_workspace_id=personal_workspace_id,
+            argilla_role=external.role,
+            membership_verified=membership_verified,
+            channel=self.channel,
+            request_id=self.request_id,
+        )
+        self.last_status = int(result.response_status)
+        self.last_replayed = bool(result.replayed)
+        return self._mapping_record(
+            result.mapping,
+            workspace,
+            role=external.role,
+            membership_verified=membership_verified,
+        )
+
+    def update_annotator_verification(
+        self,
+        *,
+        workspace: str,
+        annotator_id: str,
+        verification: VerificationState,
+    ) -> dict[str, Any] | None:
+        snapshot = self.pending_verification_snapshot
+        self.pending_verification_snapshot = None
+        if snapshot is None:
+            raise PanelAnnotatorError(
+                "external_service_unavailable",
+                "外部标注服务暂时不可用",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        result = self._call(
+            "verify_annotator",
+            workspace_slug=workspace,
+            mapping_id=_annotator_uuid(annotator_id, "annotator_id"),
+            argilla_user_id=_annotator_uuid(snapshot.argilla_user_id, "argilla_user_id"),
+            username=snapshot.argilla_username,
+            personal_argilla_workspace_id=(
+                _annotator_uuid(snapshot.personal_workspace_id, "personal_workspace_id")
+                if snapshot.personal_workspace_id is not None
+                else None
+            ),
+            membership_verified=bool(snapshot.membership_present),
+            argilla_role=snapshot.role,
+            actor_identity=self.actor_identity,
+            caller_identity=self.caller_identity,
+            idempotency_key=self.idempotency_key,
+            channel=self.channel,
+            request_id=self.request_id,
+        )
+        self.last_status = int(result.response_status)
+        self.last_replayed = bool(result.replayed)
+        return self._mapping_record(
+            result.mapping,
+            workspace,
+            role=snapshot.role,
+            membership_verified=snapshot.membership_present,
+        )
+
+    def list_cohorts(self, *, workspace: str) -> list[dict[str, Any]]:
+        cohorts = self._call(
+            "list_cohorts",
+            workspace_slug=workspace,
+            identity=self.actor_identity,
+        )
+        return [self._cohort_record(item, workspace) for item in cohorts]
+
+    def get_cohort(self, *, workspace: str, cohort_id: str) -> dict[str, Any] | None:
+        cohort = self._call(
+            "get_cohort",
+            workspace_slug=workspace,
+            identity=self.actor_identity,
+            cohort_id=_annotator_uuid(cohort_id, "cohort_id"),
+        )
+        return self._cohort_record(cohort, workspace) if cohort is not None else None
+
+    def create_cohort(
+        self,
+        *,
+        workspace: str,
+        name: str,
+        default_capacity: int,
+        member_annotator_ids: list[str] | tuple[str, ...],
+    ) -> dict[str, Any]:
+        members = tuple(
+            CohortMemberInput(_annotator_uuid(item, "member_annotator_ids"), default_capacity)
+            for item in member_annotator_ids
+        )
+        result = self._call(
+            "create_cohort",
+            workspace_slug=workspace,
+            name=name,
+            binding_id=self._binding(workspace).id,
+            members=members,
+            actor_identity=self.actor_identity,
+            caller_identity=self.caller_identity,
+            idempotency_key=self.idempotency_key,
+            channel=self.channel,
+            request_id=self.request_id,
+        )
+        self.last_status = int(result.response_status)
+        self.last_replayed = bool(result.replayed)
+        return self._cohort_record(result.cohort, workspace)
+
+    def replace_cohort_members(
+        self,
+        *,
+        workspace: str,
+        cohort_id: str,
+        member_annotator_ids: list[str] | tuple[str, ...],
+        default_capacity: int | None = None,
+        expected_revision: int | None = None,
+    ) -> dict[str, Any] | None:
+        normalized_cohort_id = _annotator_uuid(cohort_id, "cohort_id")
+        if expected_revision is not None:
+            revisions = self._call(
+                "list_cohort_revisions",
+                workspace_slug=workspace,
+                identity=self.actor_identity,
+                cohort_id=normalized_cohort_id,
+            )
+            latest = max(
+                (int(item.revision_number) for item in revisions),
+                default=0,
+            )
+            if latest != expected_revision:
+                raise PanelAnnotatorError(
+                    "revision_conflict",
+                    "人员组 revision 已变化，请重新读取",
+                    HTTPStatus.CONFLICT,
+                )
+        cohort = self._call(
+            "get_cohort",
+            workspace_slug=workspace,
+            identity=self.actor_identity,
+            cohort_id=normalized_cohort_id,
+        )
+        if cohort is None:
+            raise PanelAnnotatorError("resource_not_found", "资源不存在", HTTPStatus.NOT_FOUND)
+        existing_capacities = {
+            str(member.mapping.id): int(member.default_capacity)
+            for member in tuple(getattr(getattr(cohort, "latest_revision", None), "members", ()) or ())
+        }
+        fallback_capacity = (
+            default_capacity
+            if default_capacity is not None
+            else next(iter(existing_capacities.values()), self.default_capacity)
+        )
+        members = tuple(
+            CohortMemberInput(
+                mapping_id := _annotator_uuid(item, "member_annotator_ids"),
+                default_capacity
+                if default_capacity is not None
+                else existing_capacities.get(str(mapping_id), fallback_capacity),
+            )
+            for item in member_annotator_ids
+        )
+        result = self._call(
+            "create_cohort_revision",
+            workspace_slug=workspace,
+            cohort_id=normalized_cohort_id,
+            binding_id=self._binding(workspace).id,
+            members=members,
+            actor_identity=self.actor_identity,
+            caller_identity=self.caller_identity,
+            idempotency_key=self.idempotency_key,
+            channel=self.channel,
+            request_id=self.request_id,
+        )
+        self.last_status = int(result.response_status)
+        self.last_replayed = bool(result.replayed)
+        cohort = self._call(
+            "get_cohort",
+            workspace_slug=workspace,
+            identity=self.actor_identity,
+            cohort_id=normalized_cohort_id,
+        )
+        return self._cohort_record(cohort, workspace) if cohort is not None else None
+
+    def update_cohort(
+        self,
+        *,
+        workspace: str,
+        cohort_id: str,
+        name: str | None,
+        default_capacity: int | None,
+        expected_revision: int | None,
+    ) -> dict[str, Any] | None:
+        result = self._call(
+            "update_cohort",
+            workspace_slug=workspace,
+            cohort_id=_annotator_uuid(cohort_id, "cohort_id"),
+            name=name,
+            default_capacity=default_capacity,
+            expected_revision=expected_revision,
+            actor_identity=self.actor_identity,
+            caller_identity=self.caller_identity,
+            idempotency_key=self.idempotency_key,
+            channel=self.channel,
+            request_id=self.request_id,
+        )
+        self.last_status = int(result.response_status)
+        self.last_replayed = bool(result.replayed)
+        return self._cohort_record(result.cohort, workspace)
+
+
+class _PanelArgillaAdminFacade:
+    def __init__(
+        self,
+        adapter: ArgillaAdminAdapter,
+        *,
+        principal_issuer: str,
+        repository: _PanelAnnotatorRepositoryFacade | None = None,
+    ) -> None:
+        self.adapter = adapter
+        self.principal_issuer = principal_issuer
+        self.repository = repository
+
+    def _snapshot(
+        self,
+        result: Any,
+        *,
+        personal_workspace_id: str | None,
+        membership_present: bool,
+    ) -> ExternalAnnotatorSnapshot:
+        if isinstance(result, ExternalAnnotatorSnapshot):
+            source = result.to_safe_dict()
+        elif isinstance(result, dict):
+            source = {
+                "argilla_user_id": result.get("argilla_user_id", result.get("uuid")),
+                "argilla_username": result.get("argilla_username", result.get("username")),
+                "role": result.get("role", result.get("argilla_role")),
+            }
+        else:
+            source = {
+                "argilla_user_id": getattr(result, "uuid", getattr(result, "argilla_user_id", None)),
+                "argilla_username": getattr(result, "username", getattr(result, "argilla_username", None)),
+                "role": getattr(result, "role", getattr(result, "argilla_role", None)),
+            }
+        source.update(
+            {
+                "personal_workspace_id": personal_workspace_id,
+                "membership_present": membership_present,
+                "membership_role": "annotator",
+                "is_owner": str(source.get("role") or "").strip().lower() == "owner",
+            }
+        )
+        snapshot = ExternalAnnotatorSnapshot.from_source(source)
+        _annotator_uuid(snapshot.argilla_user_id, "argilla_user_id")
+        if snapshot.personal_workspace_id is not None:
+            _annotator_uuid(snapshot.personal_workspace_id, "personal_workspace_id")
+        return snapshot
+
+    def _ensure(
+        self,
+        *,
+        scaffold_user_id: str,
+        password: str | None,
+        personal_workspace_name: str | None,
+        expected_user_uuid: str | None = None,
+        expected_workspace_uuid: str | None = None,
+        membership_present: bool = True,
+    ) -> ExternalAnnotatorSnapshot:
+        if personal_workspace_name is not None:
+            expected_name = derive_personal_workspace_name(
+                self.principal_issuer,
+                scaffold_user_id,
+            )
+            if personal_workspace_name != expected_name:
+                raise PanelAnnotatorError(
+                    "invalid_personal_workspace_name",
+                    "personal workspace 名称必须由稳定 Scaffold 身份派生",
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    field="personal_workspace_name",
+                )
+        try:
+            result = self.adapter.ensure_annotator(
+                principal_issuer=self.principal_issuer,
+                principal_subject=scaffold_user_id,
+                password=password,
+                expected_user_uuid=(
+                    _annotator_uuid(expected_user_uuid, "argilla_user_id")
+                    if expected_user_uuid is not None
+                    else None
+                ),
+                expected_workspace_uuid=(
+                    _annotator_uuid(expected_workspace_uuid, "personal_workspace_id")
+                    if expected_workspace_uuid is not None
+                    else None
+                ),
+            )
+        except PanelAnnotatorError:
+            raise
+        except ArgillaProvisioningError:
+            raise PanelAnnotatorError(
+                "external_service_unavailable",
+                "外部标注服务暂时不可用",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from None
+        except Exception:
+            raise PanelAnnotatorError(
+                "external_service_unavailable",
+                "外部标注服务暂时不可用",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            ) from None
+        resolved_workspace_id = expected_workspace_uuid
+        if resolved_workspace_id is None:
+            if isinstance(result, ExternalAnnotatorSnapshot):
+                resolved_workspace_id = result.personal_workspace_id
+            elif isinstance(result, dict):
+                resolved_workspace_id = result.get(
+                    "personal_workspace_id",
+                    result.get("personal_argilla_workspace_id"),
+                )
+            else:
+                resolved_workspace_id = getattr(
+                    result,
+                    "personal_workspace_id",
+                    getattr(result, "personal_argilla_workspace_id", None),
+                )
+        if resolved_workspace_id is None:
+            workspace_lookup = getattr(self.adapter, "ensure_personal_workspace", None)
+            if callable(workspace_lookup):
+                try:
+                    resolved_workspace_id = workspace_lookup(
+                        principal_issuer=self.principal_issuer,
+                        principal_subject=scaffold_user_id,
+                    )
+                except Exception:
+                    raise PanelAnnotatorError(
+                        "external_service_unavailable",
+                        "外部标注服务暂时不可用",
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    ) from None
+        snapshot = self._snapshot(
+            result,
+            personal_workspace_id=resolved_workspace_id,
+            membership_present=membership_present,
+        )
+        return snapshot
+
+    def provision_annotator(
+        self,
+        *,
+        workspace: str,
+        scaffold_user_id: str,
+        personal_workspace_name: str | None,
+        initial_password: str,
+    ) -> ExternalAnnotatorSnapshot:
+        del workspace
+        return self._ensure(
+            scaffold_user_id=scaffold_user_id,
+            password=initial_password,
+            personal_workspace_name=personal_workspace_name,
+        )
+
+    def bind_annotator(
+        self,
+        *,
+        workspace: str,
+        scaffold_user_id: str,
+        argilla_user_id: str,
+        argilla_username: str | None,
+        personal_workspace_id: str | None,
+    ) -> ExternalAnnotatorSnapshot:
+        del workspace, argilla_username
+        return self._ensure(
+            scaffold_user_id=scaffold_user_id,
+            password=None,
+            personal_workspace_name=None,
+            expected_user_uuid=argilla_user_id,
+            expected_workspace_uuid=personal_workspace_id,
+        )
+
+    def verify_annotator(self, *, annotator: AnnotatorLookup) -> ExternalAnnotatorSnapshot:
+        if annotator.argilla_user_id is None or annotator.personal_workspace_id is None:
+            raise PanelAnnotatorError(
+                "identity_incomplete",
+                "标注人员缺少可验证的 Argilla UUID",
+                HTTPStatus.CONFLICT,
+            )
+        snapshot = self._ensure(
+            scaffold_user_id=annotator.scaffold_user_id,
+            password=None,
+            personal_workspace_name=None,
+            expected_user_uuid=annotator.argilla_user_id,
+            expected_workspace_uuid=annotator.personal_workspace_id,
+        )
+        if self.repository is not None:
+            self.repository.pending_verification_snapshot = snapshot
+        return snapshot
+
+
 def _workspace_access_payload(access) -> dict[str, Any]:
     return {
         "slug": access.workspace.slug,
@@ -399,6 +1103,125 @@ def _public_settings_response(settings: dict) -> dict:
     }
 
 
+def _annotator_contract_endpoints() -> list[dict[str, Any]]:
+    workspace_query = {"workspace": {"type": "string", "required": True}}
+    write_headers = {"Idempotency-Key": {"type": "string", "required": True}}
+    return [
+        {
+            "method": "GET",
+            "path": "/api/annotators",
+            "action": "annotators_list",
+            "side_effects": False,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "query_params": workspace_query,
+            "response_schema": {"type": "object", "required": ["annotators", "workspace"]},
+        },
+        {
+            "method": "GET",
+            "path": "/api/annotators/{annotator_id}",
+            "action": "annotator_detail",
+            "side_effects": False,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "path_params": {"annotator_id": {"type": "string", "format": "uuid"}},
+            "query_params": workspace_query,
+            "response_schema": {"type": "object", "required": ["annotator"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/annotators/provision",
+            "action": "annotator_provision",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "request_schema": {"type": "object", "required": ["workspace", "scaffold_user_id", "initial_password"]},
+            "response_schema": {"type": "object", "required": ["annotator", "replayed"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/annotators/bind",
+            "action": "annotator_bind",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "request_schema": {"type": "object", "required": ["workspace", "scaffold_user_id", "argilla_user_id"]},
+            "response_schema": {"type": "object", "required": ["annotator", "replayed"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/annotators/{annotator_id}/verify",
+            "action": "annotator_verify",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"annotator_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace", "annotator_id"]},
+            "response_schema": {"type": "object", "required": ["annotator", "replayed"]},
+        },
+        {
+            "method": "GET",
+            "path": "/api/cohorts",
+            "action": "cohorts_list",
+            "side_effects": False,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "query_params": workspace_query,
+            "response_schema": {"type": "object", "required": ["cohorts", "workspace"]},
+        },
+        {
+            "method": "GET",
+            "path": "/api/cohorts/{cohort_id}",
+            "action": "cohort_detail",
+            "side_effects": False,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "path_params": {"cohort_id": {"type": "string", "format": "uuid"}},
+            "query_params": workspace_query,
+            "response_schema": {"type": "object", "required": ["cohort"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/cohorts",
+            "action": "cohort_create",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "request_schema": {"type": "object", "required": ["workspace", "name", "default_capacity", "member_annotator_ids"]},
+            "response_schema": {"type": "object", "required": ["cohort", "replayed"]},
+        },
+        {
+            "method": "PUT",
+            "path": "/api/cohorts/{cohort_id}",
+            "action": "cohort_revision_create",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"cohort_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace", "cohort_id", "name", "default_capacity", "expected_revision"]},
+            "response_schema": {"type": "object", "required": ["cohort", "replayed"]},
+        },
+        {
+            "method": "PUT",
+            "path": "/api/cohorts/{cohort_id}/members",
+            "action": "cohort_revision_create",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"cohort_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace", "cohort_id", "member_annotator_ids", "expected_revision"]},
+            "response_schema": {"type": "object", "required": ["cohort", "replayed"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/cohorts/{cohort_id}/revisions",
+            "action": "cohort_revision_create",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"cohort_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace", "cohort_id", "member_annotator_ids", "expected_revision"]},
+            "response_schema": {"type": "object", "required": ["cohort", "replayed"]},
+        },
+    ]
+
+
 def _contract_capabilities(
     auth_mode: str = "unconfigured",
     authorization_state: str = AUTHORIZATION_UNAVAILABLE,
@@ -413,6 +1236,7 @@ def _contract_capabilities(
         },
         "authorization": {"state": authorization_state},
         "endpoints": [
+            *_annotator_contract_endpoints(),
             {
                 "method": "GET",
                 "path": "/api/health",
@@ -1079,6 +1903,67 @@ def _allocation_route_allowed(method: str, path: str) -> bool:
     return False
 
 
+def _panel_path_segment(value: str) -> str | None:
+    value = unquote(str(value or "")).strip()
+    if not _safe_segment(value) or "/" in value or "\\" in value:
+        return None
+    return value
+
+
+def _annotator_route_kind(method: str, path: str) -> tuple[str, str | None] | None:
+    if method == "GET":
+        if path == "/api/annotators":
+            return "annotators_list", None
+        if path == "/api/cohorts":
+            return "cohorts_list", None
+        prefix = "/api/annotators/"
+        if path.startswith(prefix):
+            value = _panel_path_segment(path[len(prefix):])
+            if value is not None and "/" not in value:
+                return "annotator_detail", value
+        prefix = "/api/cohorts/"
+        if path.startswith(prefix):
+            value = _panel_path_segment(path[len(prefix):])
+            if value is not None and "/" not in value:
+                return "cohort_detail", value
+        return None
+    if method == "POST":
+        if path == "/api/annotators/provision":
+            return "annotator_provision", None
+        if path == "/api/annotators/bind":
+            return "annotator_bind", None
+        prefix = "/api/annotators/"
+        if path.startswith(prefix) and path.endswith("/verify"):
+            value = _panel_path_segment(path[len(prefix):-len("/verify")])
+            if value is not None and "/" not in value:
+                return "annotator_verify", value
+        if path == "/api/cohorts":
+            return "cohort_create", None
+        prefix = "/api/cohorts/"
+        if path.startswith(prefix) and path.endswith("/revisions"):
+            value = _panel_path_segment(path[len(prefix):-len("/revisions")])
+            if value is not None and "/" not in value:
+                return "cohort_revision_create", value
+        return None
+    if method == "PUT":
+        prefix = "/api/cohorts/"
+        if not path.startswith(prefix):
+            return None
+        rest = path[len(prefix):]
+        if rest.endswith("/members"):
+            value = _panel_path_segment(rest[:-len("/members")])
+            if value is not None and "/" not in value:
+                return "cohort_members_replace", value
+        value = _panel_path_segment(rest)
+        if value is not None and "/" not in value:
+            return "cohort_update", value
+    return None
+
+
+def _annotator_route_allowed(method: str, path: str) -> bool:
+    return _annotator_route_kind(method, path) is not None
+
+
 def _mcp_route_allowed(method: str, path: str) -> bool:
     if method == "GET":
         if path in {
@@ -1117,6 +2002,8 @@ def _database_authorized_route(method: str, path: str) -> bool:
         return True
     if not _control_task_source_enabled():
         return False
+    if _annotator_route_allowed(method, path):
+        return True
     if method == "GET":
         if path in {
             "/api/tasks",
@@ -1476,6 +2363,8 @@ class _Handler(BaseHTTPRequestHandler):
     authenticator: PanelAuthenticator | None = None
     authorization_service: DatabaseService | None = None
     allocation_repository: TrustedAllocationRepository | None = None
+    annotator_repository: AnnotatorControlRepository | None = None
+    annotator_adapter: ArgillaAdminAdapter | None = None
     authorization_ready: bool = False
     active_task_loader: ActiveTaskLoader | None = None
 
@@ -1565,6 +2454,327 @@ class _Handler(BaseHTTPRequestHandler):
             )
         channel = AuditChannel.MCP if context.caller.is_static_mcp_service else AuditChannel.PANEL
         return service, _external_identity(context.actor), _external_identity(context.caller), channel
+
+    def _annotator_workspace(self, params, body: dict[str, Any] | None = None) -> str:
+        workspace = self._workspace_selector(params, body)
+        if workspace is None:
+            raise PanelAnnotatorError(
+                "workspace_required",
+                "标注人员管理必须显式提供 workspace",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                field="workspace",
+            )
+        return workspace
+
+    def _annotator_idempotency_key(self) -> str:
+        value = str(self.headers.get("Idempotency-Key") or "").strip()
+        if not _valid_idempotency_key(value):
+            raise PanelAnnotatorError(
+                "missing_idempotency_key",
+                "写入请求必须提供有效的 Idempotency-Key header",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                field="Idempotency-Key",
+            )
+        return value
+
+    def _annotator_request_id(self) -> str | None:
+        value = str(self.headers.get("X-Request-ID") or "").strip()
+        if not value:
+            return None
+        if len(value) > 255 or any(ord(char) < 32 for char in value):
+            raise PanelAnnotatorError(
+                "invalid_request_id",
+                "X-Request-ID 不是有效请求标识",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                field="X-Request-ID",
+            )
+        return value
+
+    def _annotator_runtime(
+        self,
+        *,
+        idempotency_key: str = "",
+        request_id: str | None = None,
+        require_adapter: bool = False,
+    ) -> tuple[PanelAnnotatorService, _PanelAnnotatorRepositoryFacade, ExternalIdentity]:
+        if not _control_task_source_enabled():
+            raise PanelAnnotatorError(
+                "authorization_unavailable",
+                "标注人员管理仅在 Scaffold control-plane 中可用",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        service, actor_identity, caller_identity, channel = self._authorization_context()
+        repository = self.annotator_repository
+        if repository is None:
+            raise PanelAnnotatorError(
+                "repository_unavailable",
+                "标注人员资料库暂时不可用",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        repository_facade = _PanelAnnotatorRepositoryFacade(
+            repository,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            channel=channel,
+            idempotency_key=idempotency_key,
+            request_id=request_id,
+        )
+        adapter_facade = None
+        if require_adapter:
+            adapter = self.annotator_adapter
+            if adapter is None:
+                raise PanelAnnotatorError(
+                    "external_service_unavailable",
+                    "外部标注服务暂时不可用",
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            adapter_facade = _PanelArgillaAdminFacade(
+                adapter,
+                principal_issuer=actor_identity.issuer,
+                repository=repository_facade,
+            )
+        return (
+            PanelAnnotatorService(
+                repository_facade,
+                adapter_facade,
+                _PanelAnnotatorAuthorizer(service),
+            ),
+            repository_facade,
+            actor_identity,
+        )
+
+    @staticmethod
+    def _annotator_body_id(
+        body: dict[str, Any],
+        *,
+        field: str,
+        path_value: str,
+    ) -> None:
+        body_value = body.get(field)
+        if body_value is None:
+            body[field] = path_value
+            return
+        if str(body_value).strip() != path_value:
+            raise PanelAnnotatorError(
+                "path_body_conflict",
+                f"路径中的 {field} 与请求体不一致",
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                field=field,
+            )
+
+    @staticmethod
+    def _annotator_dto_payload(value: Any) -> dict[str, Any]:
+        if isinstance(value, (AnnotatorResponse,)):
+            return value.to_dict()
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            return to_dict()
+        if isinstance(value, dict):
+            return dict(value)
+        raise PanelAnnotatorError(
+            "service_unavailable",
+            "标注人员服务暂时不可用",
+            HTTPStatus.SERVICE_UNAVAILABLE,
+        )
+
+    def _annotator_list(self, params) -> None:
+        try:
+            workspace = self._annotator_workspace(params)
+            service, _, actor = self._annotator_runtime()
+            records = service.list_annotators(workspace, actor=actor)
+            self._json(
+                {
+                    "workspace": workspace,
+                    "annotators": [self._annotator_dto_payload(item) for item in records],
+                },
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _annotator_detail(self, annotator_id: str, params) -> None:
+        try:
+            workspace = self._annotator_workspace(params)
+            service, _, actor = self._annotator_runtime()
+            record = service.get_annotator(workspace, annotator_id, actor=actor)
+            self._json(
+                {"workspace": workspace, "annotator": self._annotator_dto_payload(record)},
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _annotator_provision(self, params) -> None:
+        body = self._read_body()
+        try:
+            if not isinstance(body, dict):
+                raise PanelAnnotatorError(
+                    "invalid_request", "请求体必须是对象", HTTPStatus.UNPROCESSABLE_ENTITY
+                )
+            self._annotator_workspace(params, body)
+            idempotency_key = self._annotator_idempotency_key()
+            service, repository, actor = self._annotator_runtime(
+                idempotency_key=idempotency_key,
+                request_id=self._annotator_request_id(),
+                require_adapter=True,
+            )
+            record = service.create_annotator(body, actor=actor)
+            self._json(
+                {
+                    "workspace": body.get("workspace"),
+                    "annotator": self._annotator_dto_payload(record),
+                    "replayed": repository.last_replayed,
+                },
+                status=repository.last_status,
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+        finally:
+            if isinstance(body, dict):
+                body.pop("initial_password", None)
+
+    def _annotator_bind(self, params) -> None:
+        body = self._read_body()
+        try:
+            if not isinstance(body, dict):
+                raise PanelAnnotatorError(
+                    "invalid_request", "请求体必须是对象", HTTPStatus.UNPROCESSABLE_ENTITY
+                )
+            self._annotator_workspace(params, body)
+            idempotency_key = self._annotator_idempotency_key()
+            service, repository, actor = self._annotator_runtime(
+                idempotency_key=idempotency_key,
+                request_id=self._annotator_request_id(),
+                require_adapter=True,
+            )
+            record = service.bind_annotator(body, actor=actor)
+            self._json(
+                {
+                    "workspace": body.get("workspace"),
+                    "annotator": self._annotator_dto_payload(record),
+                    "replayed": repository.last_replayed,
+                },
+                status=repository.last_status,
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _annotator_verify(self, annotator_id: str, params) -> None:
+        body = self._read_body()
+        try:
+            if not isinstance(body, dict):
+                raise PanelAnnotatorError(
+                    "invalid_request",
+                    "请求体必须是对象",
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            self._annotator_body_id(body, field="annotator_id", path_value=annotator_id)
+            self._annotator_workspace(params, body)
+            idempotency_key = self._annotator_idempotency_key()
+            service, repository, actor = self._annotator_runtime(
+                idempotency_key=idempotency_key,
+                request_id=self._annotator_request_id(),
+                require_adapter=True,
+            )
+            record = service.verify_annotator(body, actor=actor)
+            self._json(
+                {
+                    "workspace": body.get("workspace"),
+                    "annotator": self._annotator_dto_payload(record),
+                    "replayed": repository.last_replayed,
+                },
+                status=repository.last_status,
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _cohort_list(self, params) -> None:
+        try:
+            workspace = self._annotator_workspace(params)
+            service, _, actor = self._annotator_runtime()
+            records = service.list_cohorts(workspace, actor=actor)
+            self._json(
+                {
+                    "workspace": workspace,
+                    "cohorts": [self._annotator_dto_payload(item) for item in records],
+                },
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _cohort_detail(self, cohort_id: str, params) -> None:
+        try:
+            workspace = self._annotator_workspace(params)
+            service, _, actor = self._annotator_runtime()
+            record = service.get_cohort(workspace, cohort_id, actor=actor)
+            self._json(
+                {"workspace": workspace, "cohort": self._annotator_dto_payload(record)},
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _cohort_create(self, params) -> None:
+        body = self._read_body()
+        try:
+            if not isinstance(body, dict):
+                raise PanelAnnotatorError(
+                    "invalid_request", "请求体必须是对象", HTTPStatus.UNPROCESSABLE_ENTITY
+                )
+            self._annotator_workspace(params, body)
+            idempotency_key = self._annotator_idempotency_key()
+            service, repository, actor = self._annotator_runtime(
+                idempotency_key=idempotency_key,
+                request_id=self._annotator_request_id(),
+            )
+            record = service.create_cohort(body, actor=actor)
+            self._json(
+                {
+                    "workspace": body.get("workspace"),
+                    "cohort": self._annotator_dto_payload(record),
+                    "replayed": repository.last_replayed,
+                },
+                status=repository.last_status,
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _cohort_revision(self, cohort_id: str, params, *, update_basics: bool = False) -> None:
+        body = self._read_body()
+        try:
+            if not isinstance(body, dict):
+                raise PanelAnnotatorError(
+                    "invalid_request",
+                    "请求体必须是对象",
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                )
+            self._annotator_body_id(body, field="cohort_id", path_value=cohort_id)
+            self._annotator_workspace(params, body)
+            idempotency_key = self._annotator_idempotency_key()
+            service, repository, actor = self._annotator_runtime(
+                idempotency_key=idempotency_key,
+                request_id=self._annotator_request_id(),
+            )
+            if update_basics:
+                record = service.update_cohort(body, actor=actor)
+            else:
+                record = service.replace_cohort_members(body, actor=actor)
+            self._json(
+                {
+                    "workspace": body.get("workspace"),
+                    "cohort": self._annotator_dto_payload(record),
+                    "replayed": repository.last_replayed,
+                },
+                status=repository.last_status,
+                sort_keys=True,
+            )
+        except Exception as exc:
+            self._route_error(exc)
 
     def _workspace_selector(self, params, body: dict[str, Any] | None = None) -> str | None:
         values: list[str] = []
@@ -1720,6 +2930,12 @@ class _Handler(BaseHTTPRequestHandler):
                 {"error": exc.message, "code": exc.code},
                 status=exc.status,
                 headers=exc.headers,
+            )
+            return
+        if isinstance(exc, PanelAnnotatorError):
+            self._json(
+                exc.to_payload(),
+                status=exc.status,
             )
             return
         if isinstance(exc, AllocationPreviewDTOError):
@@ -2941,6 +4157,18 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         params = parse_qs(parsed.query)
+        annotator_route = _annotator_route_kind(self.command, path)
+        if annotator_route is not None:
+            kind, resource_id = annotator_route
+            if kind == "annotators_list":
+                self._annotator_list(params)
+            elif kind == "annotator_detail":
+                self._annotator_detail(resource_id, params)
+            elif kind == "cohorts_list":
+                self._cohort_list(params)
+            elif kind == "cohort_detail":
+                self._cohort_detail(resource_id, params)
+            return
         contract_task_id = _contract_task_path(path)
         if path == "/api/health":
             self._json({"ok": True, "status": "ok", "service": "llm-labeling-scaffold"})
@@ -3368,6 +4596,20 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
+        annotator_route = _annotator_route_kind(self.command, path)
+        if annotator_route is not None:
+            kind, resource_id = annotator_route
+            if kind == "annotator_provision":
+                self._annotator_provision(params)
+            elif kind == "annotator_bind":
+                self._annotator_bind(params)
+            elif kind == "annotator_verify":
+                self._annotator_verify(resource_id, params)
+            elif kind == "cohort_create":
+                self._cohort_create(params)
+            elif kind == "cohort_revision_create":
+                self._cohort_revision(resource_id, params)
+            return
         contract_check_task_id = _contract_task_path(path, suffix="check")
         publish_task_id = _contract_task_path(path, suffix="publish")
         lifecycle_path = _contract_task_lifecycle_path(path)
@@ -3516,6 +4758,14 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
+        annotator_route = _annotator_route_kind(self.command, path)
+        if annotator_route is not None:
+            kind, resource_id = annotator_route
+            if kind == "cohort_update":
+                self._cohort_revision(resource_id, params, update_basics=True)
+            elif kind == "cohort_members_replace":
+                self._cohort_revision(resource_id, params)
+            return
         task_id = _contract_task_path(path)
         if task_id is None:
             self._json({"error": "not found"}, status=404)
@@ -3855,8 +5105,22 @@ def serve_panel(
             allocation_repository = TrustedAllocationRepository.from_url()
         except Exception:
             allocation_repository = None
+    annotator_repository = None
+    if authorization_service is not None and _control_task_source_enabled():
+        try:
+            annotator_repository = AnnotatorControlRepository.from_url()
+        except Exception:
+            annotator_repository = None
+    annotator_adapter = None
+    if _control_task_source_enabled():
+        try:
+            annotator_adapter = ArgillaAdminAdapter()
+        except Exception:
+            annotator_adapter = None
     _Handler.authorization_service = authorization_service
     _Handler.allocation_repository = allocation_repository
+    _Handler.annotator_repository = annotator_repository
+    _Handler.annotator_adapter = annotator_adapter
     _Handler.authorization_ready = _authorization_runtime_ready(authorization_service, active_task_loader)
     _Handler.active_task_loader = active_task_loader
     if static_dir is None:
@@ -3883,6 +5147,8 @@ def serve_panel(
         httpd.server_close()
         if allocation_repository is not None:
             allocation_repository.close()
+        if annotator_repository is not None:
+            annotator_repository.close()
         if authorization_service is not None:
             authorization_service.close()
         if owned_active_task_loader and active_task_loader is not None:
