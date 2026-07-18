@@ -235,7 +235,7 @@ WITH expected(relation_name, relation_kind, can_select, can_insert, can_update, 
         ('annotation_jobs', 'r', true, true, true, false),
         ('audit_events', 'r', true, true, false, false),
         ('migration_runs', 'r', false, false, false, false),
-        ('alembic_version', 'r', false, false, false, false)
+        ('alembic_version', 'r', true, false, false, false)
 )
 SELECT coalesce(bool_and(
     has_table_privilege(:'app_user', relation.oid, 'SELECT') = expected.can_select
@@ -285,7 +285,7 @@ WITH app_role AS (
         ('annotation_jobs', true, true, true, false),
         ('audit_events', true, true, false, false),
         ('migration_runs', false, false, false, false),
-        ('alembic_version', false, false, false, false)
+        ('alembic_version', true, false, false, false)
 ), expected(schema_name, relation_name, grantee, privilege_type, is_grantable) AS (
     SELECT 'public'::name,
            expected_relations.relation_name,
@@ -354,7 +354,7 @@ WITH expected_relations(table_name, can_select, can_insert, can_update) AS (
         ('annotation_jobs', true, true, true),
         ('audit_events', true, true, false),
         ('migration_runs', false, false, false),
-        ('alembic_version', false, false, false)
+        ('alembic_version', true, false, false)
 ), allowed_updates(table_name, column_name) AS (
     VALUES
         ('principals', 'display_name'),
