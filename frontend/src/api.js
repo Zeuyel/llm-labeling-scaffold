@@ -38,12 +38,78 @@ function notifyUnauthorized() {
   }
 }
 
+const API_ERROR_MESSAGES = {
+  resource_not_found: "资源不存在",
+  permission_denied: "权限不足",
+  authorization_unavailable: "授权服务暂时不可用",
+  repository_unavailable: "标注人员服务暂时不可用",
+  external_service_unavailable: "外部服务暂时不可用",
+  service_unavailable: "标注人员服务暂时不可用",
+  resource_conflict: "资源状态冲突，请刷新后重试",
+  workspace_required: "必须选择 Scaffold 工作区",
+  invalid_workspace: "Scaffold 工作区参数无效",
+  workspace_selector_conflict: "工作区选择参数不一致",
+  invalid_identifier: "资源标识无效",
+  invalid_request: "请求参数无效",
+  invalid_field: "请求字段无效",
+  unknown_field: "请求包含未允许的字段",
+  server_context_forbidden: "请求上下文字段由服务端确定",
+  sensitive_input_forbidden: "敏感字段只能通过专用一次性接口提交",
+  annotator_not_verified: "未验证的标注人员不能加入人员组",
+  owner_account_forbidden: "owner 账号不能加入人员组",
+  annotator_role_required: "人员组成员必须是 annotator",
+  empty_update: "人员组更新至少需要一个可变字段",
+  idempotency_key_required: "写操作缺少幂等键",
+  missing_idempotency_key: "写操作缺少幂等键",
+  invalid_idempotency_key: "幂等键无效",
+  idempotency_conflict: "幂等键与既有请求冲突，请刷新后重试",
+  idempotency_key_conflict: "幂等键与请求内容不一致，请重新提交",
+  idempotency_replay_mismatch: "幂等重试内容不一致，请重新提交",
+};
+
+const HTTP_ERROR_MESSAGES = {
+  401: "登录已失效，请重新登录",
+  403: "权限不足",
+  404: "资源不存在",
+  409: "资源状态冲突，请刷新后重试",
+  422: "请求参数无效",
+  500: "服务暂时不可用",
+  503: "服务暂时不可用",
+};
+
+function requestError(status, text) {
+  let payload = null;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    payload = null;
+  }
+  const code = typeof payload?.code === "string" ? payload.code : `http_${status}`;
+  const error = new Error(API_ERROR_MESSAGES[code] || HTTP_ERROR_MESSAGES[status] || `请求失败（HTTP ${status}）`);
+  error.code = code;
+  error.status = status;
+  if (typeof payload?.field === "string") error.field = payload.field;
+  return error;
+}
+
+function localRequestError(code, status, message) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = status;
+  return error;
+}
+
 async function req(path, opts = {}) {
-  const res = await fetch(path, { ...opts, headers: requestHeaders(opts.headers) });
+  let res;
+  try {
+    res = await fetch(path, { ...opts, headers: requestHeaders(opts.headers) });
+  } catch {
+    throw localRequestError("network_error", 0, "无法连接服务，请稍后重试");
+  }
   if (res.status === 401) notifyUnauthorized();
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`${res.status} ${res.statusText}: ${text.slice(0, 160)}`);
+    throw requestError(res.status, text);
   }
   return res.json();
 }
@@ -82,6 +148,13 @@ export const dataLakeImportIdempotencyKey = (taskId, importId = "") => {
     globalThis.crypto?.randomUUID?.()
     || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
   return `data-lake-import:${keyPart(taskId, "task")}:${keyPart(importId, "default")}:${random}`;
+};
+
+export const managementIdempotencyKey = (operation, workspace, resource = "") => {
+  const random =
+    globalThis.crypto?.randomUUID?.()
+    || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  return `annotator:${keyPart(operation, "operation").slice(0, 32)}:${keyPart(workspace, "workspace").slice(0, 48)}:${keyPart(resource, "resource").slice(0, 48)}:${random}`;
 };
 
 export const dataLakeImportPayload = (taskId, payload = {}) => {
@@ -125,6 +198,91 @@ export const getDataLakeStatus = (taskId) => req(`/api/task/data_lake?${q({ task
 export const getDataLakeCatalog = (datasetId = "") => req(`/api/data_lake/catalog?${q({ dataset_id: datasetId })}`);
 export const getArgillaStatus = () => req("/api/argilla/status");
 export const getTaskArchivePlan = (taskId) => req(`/api/task/archive_plan?${q({ task_id: taskId })}`);
+
+const ANNOTATORS_PATH = "/api/annotators";
+const COHORTS_PATH = "/api/cohorts";
+
+function managementWorkspace(workspace) {
+  const value = String(workspace || "").trim();
+  if (!value) throw localRequestError("workspace_required", 422, "必须选择 Scaffold 工作区");
+  return value;
+}
+
+function managementPath(path, workspace) {
+  return `${path}?${q({ workspace: managementWorkspace(workspace) })}`;
+}
+
+function jsonRequest(path, method, payload, options = {}) {
+  const idempotencyKey = String(options?.idempotencyKey || "").trim();
+  if (!idempotencyKey) {
+    throw localRequestError("missing_idempotency_key", 422, API_ERROR_MESSAGES.missing_idempotency_key);
+  }
+  return req(path, {
+    method,
+    headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
+    body: JSON.stringify(payload),
+  });
+}
+
+const annotatorPath = (annotatorId) =>
+  `${ANNOTATORS_PATH}/${encodeURIComponent(annotatorId)}`;
+
+const cohortPath = (cohortId) =>
+  `${COHORTS_PATH}/${encodeURIComponent(cohortId)}`;
+
+export const getAnnotators = (workspace) =>
+  req(managementPath(ANNOTATORS_PATH, workspace));
+
+export const getAnnotator = (annotatorId, workspace) =>
+  req(managementPath(annotatorPath(annotatorId), workspace));
+
+export const provisionAnnotator = (payload = {}, options = {}) =>
+  jsonRequest(`${ANNOTATORS_PATH}/provision`, "POST", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  }, options);
+
+export const createAnnotator = provisionAnnotator;
+
+export const bindAnnotator = (payload = {}, options = {}) =>
+  jsonRequest(`${ANNOTATORS_PATH}/bind`, "POST", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  }, options);
+
+export const verifyAnnotator = (annotatorId, workspace, options = {}) => {
+  const resolvedWorkspace = managementWorkspace(workspace);
+  return jsonRequest(`${annotatorPath(annotatorId)}/verify`, "POST", {
+    workspace: resolvedWorkspace,
+    annotator_id: annotatorId,
+  }, options);
+};
+
+export const getCohorts = (workspace) =>
+  req(managementPath(COHORTS_PATH, workspace));
+
+export const getCohort = (cohortId, workspace) =>
+  req(managementPath(cohortPath(cohortId), workspace));
+
+export const createCohort = (payload = {}, options = {}) =>
+  jsonRequest(COHORTS_PATH, "POST", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  }, options);
+
+export const updateCohort = (cohortId, payload = {}, options = {}) =>
+  jsonRequest(cohortPath(cohortId), "PUT", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+    cohort_id: payload.cohort_id || cohortId,
+  }, options);
+
+export const replaceCohortMembers = (cohortId, payload = {}, options = {}) =>
+  jsonRequest(`${cohortPath(cohortId)}/members`, "PUT", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+    cohort_id: payload.cohort_id || cohortId,
+  }, options);
 
 export const createTask = (payload) =>
   req("/api/tasks", {

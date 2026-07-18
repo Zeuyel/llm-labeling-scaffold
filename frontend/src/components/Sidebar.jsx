@@ -30,6 +30,14 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
         <span className="nav-short">设</span>
         <span className="nav-label">系统设置</span>
       </Link>
+      <Link to="/annotators" className={activePage === "annotators" ? "nav-item active" : "nav-item"} title="标注人员">
+        <span className="nav-short">人</span>
+        <span className="nav-label">标注人员</span>
+      </Link>
+      <Link to="/cohorts" className={activePage === "cohorts" ? "nav-item active" : "nav-item"} title="人员组">
+        <span className="nav-short">组</span>
+        <span className="nav-label">人员组</span>
+      </Link>
       <Link to="/data-assets" className={activePage === "data-assets" ? "nav-item active" : "nav-item"} title="数据资产">
         <span className="nav-short">资</span>
         <span className="nav-label">数据资产</span>
