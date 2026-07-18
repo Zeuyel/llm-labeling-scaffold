@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -108,6 +109,25 @@ class AllocationPreviewRequest:
         return self.allocation_request.task_revision.revision_hash
 
 
+@dataclass(frozen=True, slots=True)
+class AllocationPlanCreateRequest:
+    workspace: str
+    cohort_revision_id: uuid.UUID
+    allocation_request: AllocationRequest
+    idempotency_key: str | None
+
+    @property
+    def task_id(self) -> str:
+        return self.allocation_request.task_revision.task_id
+
+
+@dataclass(frozen=True, slots=True)
+class AllocationPlanConfirmRequest:
+    workspace: str | None
+    plan_fingerprint: str
+    idempotency_key: str | None
+
+
 def parse_allocation_preview_json(raw: str | bytes) -> AllocationPreviewRequest:
     try:
         payload = json.loads(raw)
@@ -167,6 +187,116 @@ def parse_allocation_preview_request(payload: Any) -> AllocationPreviewRequest:
         ),
     )
     return AllocationPreviewRequest(workspace=workspace, allocation_request=allocation_request)
+
+
+def parse_allocation_plan_create_json(raw: str | bytes) -> AllocationPlanCreateRequest:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AllocationPreviewDTOError("invalid_json", "请求体必须是合法 JSON") from exc
+    return parse_allocation_plan_create_request(payload)
+
+
+def parse_allocation_plan_create_request(payload: Any) -> AllocationPlanCreateRequest:
+    root = _mapping(payload, "request")
+    _reject_forbidden_fields(root)
+    _ensure_fields(
+        root,
+        _TOP_LEVEL_FIELDS | frozenset({"cohort_revision_id", "idempotency_key"}),
+        "request",
+    )
+    workspace, task_id, revision_id, revision_hash, cohort_revision_id = _parse_plan_scope(root)
+    request_payload = _mapping(root.get("request"), "request.request")
+    _reject_forbidden_fields(request_payload)
+    _ensure_fields(request_payload, _REQUEST_FIELDS, "request.request")
+    allocation_request = _parse_allocation_request(
+        request_payload,
+        task_id=task_id,
+        revision_id=revision_id,
+        revision_hash=revision_hash,
+    )
+    return AllocationPlanCreateRequest(
+        workspace=workspace,
+        cohort_revision_id=cohort_revision_id,
+        allocation_request=allocation_request,
+        idempotency_key=_optional_idempotency_key(root.get("idempotency_key"), "request.idempotency_key"),
+    )
+
+
+def parse_allocation_plan_confirm_json(raw: str | bytes) -> AllocationPlanConfirmRequest:
+    try:
+        payload = json.loads(raw)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise AllocationPreviewDTOError("invalid_json", "请求体必须是合法 JSON") from exc
+    return parse_allocation_plan_confirm_request(payload)
+
+
+def parse_allocation_plan_confirm_request(payload: Any) -> AllocationPlanConfirmRequest:
+    root = _mapping(payload, "request")
+    _reject_forbidden_fields(root)
+    _ensure_fields(root, {"workspace", "plan_fingerprint", "idempotency_key"}, "request")
+    workspace_value = root.get("workspace")
+    workspace = None if workspace_value is None else _identifier(workspace_value, "request.workspace")
+    if "plan_fingerprint" not in root:
+        raise AllocationPreviewDTOError(
+            "missing_field",
+            "缺少必填字段: plan_fingerprint",
+            field="request.plan_fingerprint",
+        )
+    return AllocationPlanConfirmRequest(
+        workspace=workspace,
+        plan_fingerprint=_sha256(root["plan_fingerprint"], "request.plan_fingerprint"),
+        idempotency_key=_optional_idempotency_key(root.get("idempotency_key"), "request.idempotency_key"),
+    )
+
+
+def _parse_allocation_request(
+    request_payload: Mapping[str, Any],
+    *,
+    task_id: str,
+    revision_id: str,
+    revision_hash: str,
+) -> AllocationRequest:
+    task_revision = TaskRevisionRef(
+        task_id=task_id,
+        revision_id=revision_id,
+        revision_hash=revision_hash,
+    )
+    submitted_task_revision = request_payload.get("task_revision")
+    if submitted_task_revision is not None:
+        parsed_task_revision = _parse_task_revision(submitted_task_revision, "request.request.task_revision")
+        if parsed_task_revision != task_revision:
+            raise AllocationPreviewDTOError(
+                "scope_revision_conflict",
+                "scope 与 request.task_revision 必须完全一致",
+                field="request.task_revision",
+            )
+    return AllocationRequest(
+        strategy=_parse_strategy(request_payload.get("strategy"), "request.request.strategy"),
+        task_revision=task_revision,
+        source_manifest=_parse_source_manifest(
+            request_payload.get("source_manifest"),
+            "request.request.source_manifest",
+        ),
+        records=_parse_records(request_payload.get("records"), "request.request.records"),
+        annotators=_parse_annotators(
+            request_payload.get("annotators"),
+            "request.request.annotators",
+        ),
+        seed=_integer(request_payload.get("seed"), "request.request.seed"),
+        algorithm_version=_algorithm_version(
+            request_payload.get("algorithm_version"),
+            "request.request.algorithm_version",
+        ),
+        overlap_rules=_parse_overlap_rules(
+            request_payload.get("overlap_rules", []),
+            "request.request.overlap_rules",
+        ),
+        calibration=_parse_calibration(
+            request_payload.get("calibration"),
+            "request.request.calibration",
+        ),
+    )
 
 
 def preview_allocation_dto(value: AllocationPreviewRequest) -> dict[str, Any]:
@@ -289,6 +419,50 @@ def serialize_allocation_preview_json(
     )
 
 
+def serialize_allocation_plan_result(result: Any) -> dict[str, Any]:
+    return {
+        "kind": "allocation_plan_v1",
+        "schema_version": "panel_allocation_plan_v1",
+        "plan_id": str(result.plan_id),
+        "workspace_id": str(result.workspace_id),
+        "task_id": str(result.task_id),
+        "task_revision_id": str(result.task_revision_id),
+        "cohort_revision_id": str(result.cohort_revision_id),
+        "fingerprint": result.fingerprint,
+        "input_fingerprint": result.input_fingerprint,
+        "lifecycle_state": result.lifecycle_state.value,
+        "replayed": bool(result.replayed),
+    }
+
+
+def serialize_allocation_confirmation_result(result: Any) -> dict[str, Any]:
+    return {
+        "kind": "allocation_confirmation_v1",
+        "schema_version": "panel_allocation_confirmation_v1",
+        "plan_id": str(result.plan_id),
+        "lifecycle_state": result.lifecycle_state.value,
+        "confirmed_at": result.confirmed_at.isoformat() if result.confirmed_at else None,
+        "replayed": bool(result.replayed),
+    }
+
+
+def serialize_allocation_progress(progress: Any) -> dict[str, Any]:
+    payload = {
+        "kind": "allocation_progress_v1",
+        "schema_version": "panel_allocation_progress_v1",
+        "plan_id": str(progress.plan_id),
+        "accepted_submissions": int(progress.accepted_submissions),
+        "required_submissions": int(progress.required_submissions),
+        "completed": bool(progress.completed),
+        "ratio": float(progress.ratio),
+    }
+    payload["progress"] = {
+        key: payload[key]
+        for key in ("accepted_submissions", "required_submissions", "completed", "ratio")
+    }
+    return payload
+
+
 def _parse_scope(root: Mapping[str, Any]) -> tuple[str, str, str, str]:
     scope = root.get("scope")
     if scope is not None:
@@ -319,6 +493,48 @@ def _parse_scope(root: Mapping[str, Any]) -> tuple[str, str, str, str]:
         _identifier(source["task_id"], f"{field_prefix}.task_id"),
         _identifier(source["revision_id"], f"{field_prefix}.revision_id"),
         _sha256(source["revision_hash"], f"{field_prefix}.revision_hash"),
+    )
+
+
+def _parse_plan_scope(root: Mapping[str, Any]) -> tuple[str, str, str, str, uuid.UUID]:
+    scope = root.get("scope")
+    if scope is not None:
+        _ensure_fields(root, {"scope", "request", "idempotency_key"}, "request")
+        scope_payload = _mapping(scope, "request.scope")
+        _reject_forbidden_fields(scope_payload)
+        _ensure_fields(scope_payload, _SCOPE_FIELDS | frozenset({"cohort_revision_id"}), "request.scope")
+        source = scope_payload
+        field_prefix = "request.scope"
+    else:
+        _ensure_fields(
+            root,
+            {
+                "workspace",
+                "task_id",
+                "revision_id",
+                "revision_hash",
+                "cohort_revision_id",
+                "request",
+                "idempotency_key",
+            },
+            "request",
+        )
+        source = root
+        field_prefix = "request"
+    required = ("workspace", "task_id", "revision_id", "revision_hash", "cohort_revision_id")
+    for name in required:
+        if name not in source:
+            raise AllocationPreviewDTOError(
+                "missing_field",
+                f"缺少必填字段: {name}",
+                field=f"{field_prefix}.{name}",
+            )
+    return (
+        _identifier(source["workspace"], f"{field_prefix}.workspace"),
+        _identifier(source["task_id"], f"{field_prefix}.task_id"),
+        _identifier(source["revision_id"], f"{field_prefix}.revision_id"),
+        _sha256(source["revision_hash"], f"{field_prefix}.revision_hash"),
+        _uuid(source["cohort_revision_id"], f"{field_prefix}.cohort_revision_id"),
     )
 
 
@@ -487,6 +703,14 @@ def _identifier(value: Any, field: str) -> str:
     return value
 
 
+def _uuid(value: Any, field: str) -> uuid.UUID:
+    value = _text(value, field)
+    try:
+        return uuid.UUID(value)
+    except ValueError as exc:
+        raise AllocationPreviewDTOError("invalid_uuid", "必须是合法 UUID", field=field) from exc
+
+
 def _sha256(value: Any, field: str) -> str:
     value = _text(value, field)
     if _SHA256_RE.fullmatch(value) is None:
@@ -520,6 +744,15 @@ def _algorithm_version(value: Any, field: str) -> str:
     value = _text(value, field)
     if len(value) > _MAX_ALGORITHM_VERSION_LENGTH or "/" in value or "\\" in value:
         raise AllocationPreviewDTOError("invalid_identifier", "algorithm_version 不是安全标识符", field=field)
+    return value
+
+
+def _optional_idempotency_key(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    value = _text(value, field)
+    if len(value) > 200:
+        raise AllocationPreviewDTOError("invalid_idempotency_key", "幂等键长度不能超过 200 个字符", field=field)
     return value
 
 
