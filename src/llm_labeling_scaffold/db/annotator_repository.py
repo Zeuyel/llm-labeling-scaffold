@@ -1049,10 +1049,155 @@ class AnnotatorControlRepository:
                 False,
             )
 
+    def update_cohort(
+        self,
+        *,
+        workspace_slug: str,
+        cohort_id: uuid.UUID | str,
+        name: str | None,
+        default_capacity: int | None,
+        expected_revision: int | None,
+        actor_identity: ExternalIdentity,
+        idempotency_key: str,
+        caller_identity: ExternalIdentity | None = None,
+        channel: AuditChannel = AuditChannel.API,
+        request_id: str | None = None,
+    ) -> CohortResult:
+        normalized_cohort_id = _uuid(cohort_id, "cohort_id")
+        normalized_name = _optional_text(name, "name")
+        if default_capacity is not None and (
+            type(default_capacity) is not int or default_capacity <= 0
+        ):
+            raise AnnotatorRepositoryValidationError(
+                "default_capacity must be a positive integer",
+            )
+        if expected_revision is not None and (
+            type(expected_revision) is not int or expected_revision < 0
+        ):
+            raise AnnotatorRepositoryValidationError(
+                "expected_revision must be a non-negative integer",
+            )
+        caller = caller_identity or actor_identity
+        payload = {
+            "cohort_id": str(normalized_cohort_id),
+            "name": normalized_name,
+            "default_capacity": default_capacity,
+            "expected_revision": expected_revision,
+        }
+        with self._transaction() as session:
+            transaction = DatabaseTransaction(session)
+            claim = _claim(
+                transaction,
+                actor_identity=actor_identity,
+                caller_identity=caller,
+                workspace_slug=workspace_slug,
+                operation="annotator.cohort.update",
+                idempotency_key=idempotency_key,
+                request_payload=payload,
+                channel=channel,
+            )
+            if claim.status == IdempotencyClaimStatus.REPLAY:
+                cohort, revision = _cohort_from_claim(session, claim)
+                return CohortResult(cohort, revision, claim.response_status or 200, True)
+            if claim.status == IdempotencyClaimStatus.PENDING:
+                raise AnnotatorOperationInProgress("cohort update is already in progress")
+
+            workspace = _workspace_from_claim(session, claim, workspace_slug, lock=True)
+            cohort = session.scalar(
+                select(AnnotatorCohort)
+                .where(
+                    AnnotatorCohort.workspace_id == workspace.id,
+                    AnnotatorCohort.id == normalized_cohort_id,
+                )
+                .with_for_update(),
+            )
+            if cohort is None:
+                raise AnnotatorResourceNotFound("cohort was not found")
+            revision = _latest_revision(session, workspace.id, cohort.id)
+            if revision is None:
+                raise AnnotatorNotReady("cohort has no revision")
+            if expected_revision is not None and revision.revision_number != expected_revision:
+                raise AnnotatorNaturalKeyConflict("cohort revision differs")
+
+            target_name = normalized_name or cohort.name
+            if target_name != cohort.name:
+                duplicate = session.scalar(
+                    select(AnnotatorCohort)
+                    .where(
+                        AnnotatorCohort.workspace_id == workspace.id,
+                        AnnotatorCohort.name == target_name,
+                        AnnotatorCohort.id != cohort.id,
+                    )
+                    .with_for_update(),
+                )
+                if duplicate is not None:
+                    raise AnnotatorNaturalKeyConflict("cohort name is already in use")
+
+            binding_id = revision.connection_binding_id
+            if binding_id is None:
+                raise AnnotatorNotReady("cohort revision has no active binding")
+            current_members = session.scalars(
+                select(AnnotatorCohortMember)
+                .where(
+                    AnnotatorCohortMember.workspace_id == workspace.id,
+                    AnnotatorCohortMember.cohort_revision_id == revision.id,
+                )
+                .order_by(AnnotatorCohortMember.annotator_mapping_id),
+            ).all()
+            members = tuple(
+                CohortMemberInput(
+                    member.annotator_mapping_id,
+                    default_capacity
+                    if default_capacity is not None
+                    else member.default_capacity,
+                )
+                for member in current_members
+            )
+            new_revision, reused = self._persist_revision(
+                session,
+                cohort=cohort,
+                binding_id=binding_id,
+                members=members,
+                claim=claim,
+            )
+            name_changed = target_name != cohort.name
+            cohort.name = target_name
+            session.flush()
+            response = {
+                "cohort_id": str(cohort.id),
+                "revision_id": str(new_revision.id),
+            }
+            completed = transaction.complete_idempotency(
+                claim,
+                actor_identity=actor_identity,
+                caller_identity=caller,
+                response_status=200 if reused else 201,
+                response_body=response,
+                request_id=request_id,
+            )
+            _audit(
+                session,
+                claim,
+                "annotator.cohort.updated",
+                "annotator_cohort",
+                cohort.id,
+                request_id,
+                {
+                    "revision_id": str(new_revision.id),
+                    "reused": reused,
+                    "name_changed": name_changed,
+                },
+            )
+            return CohortResult(
+                _cohort_ref(session, cohort),
+                _revision_ref(session, new_revision),
+                completed.response_status or (200 if reused else 201),
+                False,
+            )
+
     replace_cohort_members = create_cohort_revision
     update_cohort_members = create_cohort_revision
     replace_members = create_cohort_revision
-    update_cohort = create_cohort_revision
 
     def list_cohorts(
         self,

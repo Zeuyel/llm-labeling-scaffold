@@ -197,6 +197,19 @@ class ArgillaAdminAdapter:
         finally:
             create_input.clear()
 
+    def ensure_personal_workspace(
+        self,
+        *,
+        principal_issuer: str,
+        principal_subject: str,
+        expected_workspace_uuid: UUID | str | None = None,
+    ) -> str:
+        workspace = self._ensure_workspace(
+            name=derive_personal_workspace_name(principal_issuer, principal_subject),
+            expected_uuid=_expected_uuid(expected_workspace_uuid, "expected_workspace_uuid"),
+        )
+        return _canonical_uuid(getattr(workspace, "id", None), "personal workspace")
+
     def _read_operator(self) -> Any:
         operator = None
         failed = False
