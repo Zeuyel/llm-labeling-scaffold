@@ -404,7 +404,7 @@ WITH expected_relations(relation_name, can_select, can_insert, can_update, can_d
         ('annotation_jobs', true, true, true, false),
         ('audit_events', true, true, false, false),
         ('migration_runs', false, false, false, false),
-        ('alembic_version', false, false, false, false)
+        ('alembic_version', true, false, false, false)
 ), privileges(privilege_type) AS (
     VALUES ('SELECT'), ('INSERT'), ('UPDATE'), ('DELETE')
 )

@@ -461,7 +461,7 @@ def test_runtime_role_final_schema_acl_matches_service_dependencies(
         "annotation_jobs": (True, True, True, False),
         "audit_events": (True, True, False, False),
         "migration_runs": (False, False, False, False),
-        "alembic_version": (False, False, False, False),
+        "alembic_version": (True, False, False, False),
     }
     allowed_functions = {
         "lls_canonical_sensitive_json_text(document json)",
@@ -484,6 +484,22 @@ def test_runtime_role_final_schema_acl_matches_service_dependencies(
                 (database.app_user, relation_name) * 4,
             ).fetchone()
             assert actual_privileges == expected_privileges
+
+        with psycopg.connect(_render_psycopg_url(database.app_url)) as app_connection:
+            assert app_connection.execute(
+                """
+                SELECT has_table_privilege(current_user, 'public.alembic_version', 'SELECT'),
+                       has_table_privilege(current_user, 'public.alembic_version', 'INSERT'),
+                       has_table_privilege(current_user, 'public.alembic_version', 'UPDATE'),
+                       has_table_privilege(current_user, 'public.alembic_version', 'DELETE'),
+                       has_table_privilege(current_user, 'public.alembic_version', 'TRUNCATE'),
+                       has_table_privilege(current_user, 'public.alembic_version', 'REFERENCES'),
+                       has_table_privilege(current_user, 'public.alembic_version', 'TRIGGER')
+                """
+            ).fetchone() == (True, False, False, False, False, False, False)
+            assert app_connection.execute(
+                "SELECT version_num FROM public.alembic_version"
+            ).fetchone() is not None
 
         sequence_privileges = connection.execute(
             """
@@ -537,6 +553,34 @@ def test_runtime_role_final_schema_acl_matches_service_dependencies(
             (database.non_app_user, database.non_app_user),
         ).fetchone()
         assert non_app_completion_privileges == (False, False)
+
+
+def test_runtime_role_initialization_repairs_alembic_version_select_on_existing_database(
+    postgres_runtime_database: _RuntimeDatabase,
+):
+    database = postgres_runtime_database
+    app_identifier = _quoted_identifier(database.app_user)
+    _run_sql(
+        database.owner_url,
+        f"REVOKE SELECT ON TABLE public.alembic_version FROM {app_identifier}",
+    )
+    try:
+        drift = _run_verifier(database, check=False)
+        assert drift.returncode == 3
+        assert "runtime relation privilege verification failed" in drift.stdout
+        assert "runtime relation ACL catalog verification failed" in drift.stdout
+    finally:
+        _run_role_script(database, verify=True)
+
+    with psycopg.connect(_render_psycopg_url(database.app_url)) as connection:
+        assert connection.execute(
+            "SELECT version_num FROM public.alembic_version"
+        ).fetchone() is not None
+        assert connection.execute(
+            "SELECT has_table_privilege(current_user, 'public.migration_runs', 'SELECT')"
+        ).fetchone() == (False,)
+
+    _run_verifier(database)
 
 
 def test_runtime_role_verifier_rejects_completion_execute_grant_to_insert_capable_non_app(
