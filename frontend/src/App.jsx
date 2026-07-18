@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useState, useCallback } from "react";
 import * as api from "./api.js";
 import { RouterProvider, useRouter, matchRoute } from "./router.jsx";
 import Sidebar from "./components/Sidebar.jsx";
@@ -16,10 +16,16 @@ import TaskArchivePage from "./pages/TaskArchivePage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import DataAssetsPage from "./pages/DataAssetsPage.jsx";
 import AllocationPlansPage from "./pages/AllocationPlansPage.jsx";
+import AnnotatorsPage from "./pages/AnnotatorsPage.jsx";
+import CohortsPage from "./pages/CohortsPage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
   { pattern: "/settings", page: "settings" },
+  { pattern: "/annotators/:id", page: "annotators" },
+  { pattern: "/annotators", page: "annotators" },
+  { pattern: "/cohorts/:id", page: "cohorts" },
+  { pattern: "/cohorts", page: "cohorts" },
   { pattern: "/data-assets", page: "data-assets" },
   { pattern: "/task/:id", page: "overview" },
   { pattern: "/task/:id/canvas", page: "canvas" },
@@ -51,6 +57,32 @@ function Shell({ session, onLogout }) {
   const [settingsError, setSettingsError] = useState("");
   const [err, setErr] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("lls.sidebarCollapsed") === "1");
+  const [managementWorkspace, setManagementWorkspace] = useState("");
+
+  const managementWorkspaces = useMemo(() => {
+    const values = session?.authorization?.workspaces;
+    if (!Array.isArray(values)) return [];
+    return values
+      .filter((item) => item && typeof item.slug === "string" && item.slug.trim())
+      .map((item) => ({
+        ...item,
+        slug: item.slug.trim(),
+        workspace_capabilities: Array.isArray(item.workspace_capabilities) ? item.workspace_capabilities : [],
+      }));
+  }, [session]);
+
+  useEffect(() => {
+    setManagementWorkspace((current) => {
+      if (current && managementWorkspaces.some((item) => item.slug === current)) return current;
+      return managementWorkspaces.length === 1 ? managementWorkspaces[0].slug : "";
+    });
+  }, [managementWorkspaces]);
+
+  const selectedManagementWorkspace = managementWorkspaces.find((item) => item.slug === managementWorkspace);
+  const canManagePeople = Boolean(
+    selectedManagementWorkspace
+    && selectedManagementWorkspace.workspace_capabilities.includes("workspace:manage"),
+  );
 
   const loadTasks = useCallback(() =>
     api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
@@ -85,7 +117,8 @@ function Shell({ session, onLogout }) {
     const params = matchRoute(r.pattern, path);
     if (params) { matched = { page: r.page, params }; break; }
   }
-  const activeTaskId = matched.params.id || null;
+  const taskPages = new Set(["overview", "canvas", "imports", "samples", "allocation-plans", "annotations", "jobs", "gold", "models", "archive"]);
+  const activeTaskId = taskPages.has(matched.page) ? matched.params.id || null : null;
   const taskOf = (id) => tasks.find((t) => t.task_id === id) || null;
 
   async function handleSettingsSaved(next) {
@@ -114,6 +147,26 @@ function Shell({ session, onLogout }) {
       settings={settings}
       onSettingsSaved={handleSettingsSaved}
       onSettingsLoadError={handleSettingsLoadError}
+      {...common}
+    />
+  );
+  else if (matched.page === "annotators") page = (
+    <AnnotatorsPage
+      workspace={managementWorkspace}
+      workspaces={managementWorkspaces}
+      canManage={canManagePeople}
+      onWorkspaceChange={setManagementWorkspace}
+      detailId={matched.params.id || ""}
+      {...common}
+    />
+  );
+  else if (matched.page === "cohorts") page = (
+    <CohortsPage
+      workspace={managementWorkspace}
+      workspaces={managementWorkspaces}
+      canManage={canManagePeople}
+      onWorkspaceChange={setManagementWorkspace}
+      detailId={matched.params.id || ""}
       {...common}
     />
   );

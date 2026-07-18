@@ -126,6 +126,87 @@ export const getDataLakeCatalog = (datasetId = "") => req(`/api/data_lake/catalo
 export const getArgillaStatus = () => req("/api/argilla/status");
 export const getTaskArchivePlan = (taskId) => req(`/api/task/archive_plan?${q({ task_id: taskId })}`);
 
+const ANNOTATORS_PATH = "/api/annotators";
+const COHORTS_PATH = "/api/cohorts";
+
+function managementWorkspace(workspace) {
+  const value = String(workspace || "").trim();
+  if (!value) throw new Error("标注人员管理必须显式提供 Scaffold 工作区");
+  return value;
+}
+
+function managementPath(path, workspace) {
+  return `${path}?${q({ workspace: managementWorkspace(workspace) })}`;
+}
+
+function jsonRequest(path, method, payload) {
+  return req(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+const annotatorPath = (annotatorId) =>
+  `${ANNOTATORS_PATH}/${encodeURIComponent(annotatorId)}`;
+
+const cohortPath = (cohortId) =>
+  `${COHORTS_PATH}/${encodeURIComponent(cohortId)}`;
+
+export const getAnnotators = (workspace) =>
+  req(managementPath(ANNOTATORS_PATH, workspace));
+
+export const getAnnotator = (annotatorId, workspace) =>
+  req(managementPath(annotatorPath(annotatorId), workspace));
+
+export const createAnnotator = (payload = {}) =>
+  jsonRequest(ANNOTATORS_PATH, "POST", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  });
+
+export const provisionAnnotator = createAnnotator;
+
+export const bindAnnotator = (payload = {}) =>
+  jsonRequest(`${ANNOTATORS_PATH}/bind`, "POST", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  });
+
+export const verifyAnnotator = (annotatorId, workspace) => {
+  const resolvedWorkspace = managementWorkspace(workspace);
+  return jsonRequest(`${annotatorPath(annotatorId)}/verify`, "POST", {
+    workspace: resolvedWorkspace,
+    annotator_id: annotatorId,
+  });
+};
+
+export const getCohorts = (workspace) =>
+  req(managementPath(COHORTS_PATH, workspace));
+
+export const getCohort = (cohortId, workspace) =>
+  req(managementPath(cohortPath(cohortId), workspace));
+
+export const createCohort = (payload = {}) =>
+  jsonRequest(COHORTS_PATH, "POST", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  });
+
+export const updateCohort = (cohortId, payload = {}) =>
+  jsonRequest(cohortPath(cohortId), "PUT", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+    cohort_id: payload.cohort_id || cohortId,
+  });
+
+export const replaceCohortMembers = (cohortId, payload = {}) =>
+  jsonRequest(`${cohortPath(cohortId)}/members`, "PUT", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+    cohort_id: payload.cohort_id || cohortId,
+  });
+
 export const createTask = (payload) =>
   req("/api/tasks", {
     method: "POST",
