@@ -270,7 +270,7 @@ class _AllocationRepositoryStub:
     def confirm(self, plan_id, **kwargs):
         self.confirm_calls.append((plan_id, kwargs))
         return SimpleNamespace(
-            plan_id=uuid.UUID(plan_id),
+            plan_id=uuid.UUID(str(plan_id)),
             lifecycle_state=AllocationPlanLifecycle.CONFIRMED,
             confirmed_at=None,
             response_status=200,
@@ -280,7 +280,7 @@ class _AllocationRepositoryStub:
     def progress(self, plan_id, **kwargs):
         self.progress_calls.append((plan_id, kwargs))
         return AllocationProgress(
-            plan_id=uuid.UUID(plan_id),
+            plan_id=uuid.UUID(str(plan_id)),
             accepted_submissions=2,
             required_submissions=5,
             completed=False,
@@ -554,3 +554,48 @@ def test_plan_detail_maps_cross_workspace_resource_to_404(monkeypatch, tmp_path:
 
     assert status == 404
     assert response == {"code": "resource_not_found", "error": "allocation 资源不存在"}
+
+
+@pytest.mark.parametrize(
+    ("path", "method", "body", "headers"),
+    [
+        ("/api/allocation/plans/not-a-uuid?workspace=workspace-a", "GET", None, {}),
+        ("/api/allocation/plans/not-a-uuid/progress?workspace=workspace-a", "GET", None, {}),
+        ("/api/allocation/plans/not-a-uuid/assignments?workspace=workspace-a", "GET", None, {}),
+        ("/api/allocation/assignments/not-a-uuid?workspace=workspace-a", "GET", None, {}),
+        ("/api/allocation/plan/detail?plan_id=not-a-uuid&workspace=workspace-a", "GET", None, {}),
+        ("/api/allocation/assignment/detail?assignment_id=not-a-uuid&workspace=workspace-a", "GET", None, {}),
+        (
+            "/api/allocation/plans/not-a-uuid/confirm?workspace=workspace-a",
+            "POST",
+            {"plan_fingerprint": _hash("plan")},
+            {"Idempotency-Key": "confirm-invalid-plan"},
+        ),
+    ],
+)
+def test_allocation_routes_validate_uuid_before_repository(
+    monkeypatch,
+    tmp_path: Path,
+    path: str,
+    method: str,
+    body: dict | None,
+    headers: dict[str, str],
+):
+    monkeypatch.setenv("LLS_TASK_SOURCE", "control")
+    repository = _AllocationRepositoryStub()
+    with _panel_server(_PreviewAuthorizationService(), tmp_path, repository) as base_url:
+        status, response = _request_json(
+            base_url,
+            path,
+            body=body,
+            method=method,
+            headers=headers,
+        )
+
+    assert status == 422
+    assert response["code"] == "invalid_uuid"
+    assert repository.create_calls == []
+    assert repository.confirm_calls == []
+    assert repository.progress_calls == []
+    assert repository.detail_calls == []
+    assert repository.assignment_calls == []

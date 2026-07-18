@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -189,6 +190,26 @@ def _safe_segment(value: str) -> bool:
         and "\\" not in value
         and not any(ord(char) < 32 for char in value)
     )
+
+
+def _allocation_path_segment(value: str) -> str | None:
+    value = unquote(str(value or "")).strip()
+    if (
+        not value
+        or "/" in value
+        or "\\" in value
+        or ".." in value
+        or any(ord(char) < 32 for char in value)
+    ):
+        return None
+    return value
+
+
+def _allocation_uuid(value: str, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value).strip())
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise AllocationPreviewDTOError("invalid_uuid", f"{field} 必须是合法 UUID", field=field) from exc
 
 
 def _truthy_env(name: str) -> bool:
@@ -1025,16 +1046,14 @@ def _allocation_plan_path(path: str, *, suffix: str | None = None) -> str | None
         rest = rest[: -len(marker)]
     elif "/" in rest:
         return None
-    plan_id = unquote(rest).strip()
-    return plan_id if _safe_segment(plan_id) else None
+    return _allocation_path_segment(rest)
 
 
 def _allocation_assignment_path(path: str) -> str | None:
     prefix = "/api/allocation/assignments/"
     if not path.startswith(prefix) or "/" in path[len(prefix):]:
         return None
-    assignment_id = unquote(path[len(prefix):]).strip()
-    return assignment_id if _safe_segment(assignment_id) else None
+    return _allocation_path_segment(path[len(prefix):])
 
 
 def _allocation_route_allowed(method: str, path: str) -> bool:
@@ -2048,13 +2067,12 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             repository = self._allocation_repository_ready()
             _, actor_identity, caller_identity, channel = self._authorization_context()
-            if not _safe_segment(plan_id):
-                raise AllocationPreviewDTOError("invalid_uuid", "plan_id 必须是合法 UUID", field="plan_id")
+            plan_uuid = _allocation_uuid(plan_id, "plan_id")
             request = parse_allocation_plan_confirm_json(self._read_allocation_control_body())
             workspace_slug = self._allocation_workspace(params, request.workspace)
             idempotency_key = self._allocation_idempotency_key(request.idempotency_key)
             result = repository.confirm(
-                plan_id,
+                plan_uuid,
                 plan_fingerprint=request.plan_fingerprint,
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
@@ -2075,13 +2093,14 @@ class _Handler(BaseHTTPRequestHandler):
             task_key = str(params.get("task_id", [""])[0] or "").strip() or None
             if task_key is not None and not _safe_segment(task_key):
                 raise AllocationPreviewDTOError("invalid_identifier", "task_id 必须是单段安全标识符", field="task_id")
+            after_value = str(params.get("after", [""])[0] or "").strip() or None
             result = repository.list_plans(
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
                 workspace_slug=workspace_slug,
                 task_key=task_key,
                 limit=self._allocation_limit(params),
-                after_plan_id=str(params.get("after", [""])[0] or "").strip() or None,
+                after_plan_id=_allocation_uuid(after_value, "after") if after_value else None,
             )
             self._json(result, sort_keys=True)
         except Exception as exc:
@@ -2092,10 +2111,9 @@ class _Handler(BaseHTTPRequestHandler):
             repository = self._allocation_repository_ready()
             _, actor_identity, caller_identity, _ = self._authorization_context()
             resolved_plan_id = plan_id or str(params.get("plan_id", [""])[0] or "").strip()
-            if not _safe_segment(resolved_plan_id):
-                raise AllocationPreviewDTOError("invalid_uuid", "plan_id 必须是合法 UUID", field="plan_id")
+            plan_uuid = _allocation_uuid(resolved_plan_id, "plan_id")
             result = repository.get_plan(
-                resolved_plan_id,
+                plan_uuid,
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
                 workspace_slug=self._allocation_workspace(params),
@@ -2108,10 +2126,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             repository = self._allocation_repository_ready()
             _, actor_identity, _, _ = self._authorization_context()
-            if not _safe_segment(plan_id):
-                raise AllocationPreviewDTOError("invalid_uuid", "plan_id 必须是合法 UUID", field="plan_id")
+            plan_uuid = _allocation_uuid(plan_id, "plan_id")
             progress = repository.progress(
-                plan_id,
+                plan_uuid,
                 actor_identity=actor_identity,
                 workspace_slug=self._allocation_workspace(params),
             )
@@ -2124,15 +2141,15 @@ class _Handler(BaseHTTPRequestHandler):
             repository = self._allocation_repository_ready()
             _, actor_identity, caller_identity, _ = self._authorization_context()
             resolved_plan_id = plan_id or str(params.get("plan_id", [""])[0] or "").strip()
-            if not _safe_segment(resolved_plan_id):
-                raise AllocationPreviewDTOError("invalid_uuid", "plan_id 必须是合法 UUID", field="plan_id")
+            plan_uuid = _allocation_uuid(resolved_plan_id, "plan_id")
+            after_value = str(params.get("after", [""])[0] or "").strip() or None
             result = repository.list_assignments(
-                resolved_plan_id,
+                plan_uuid,
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
                 workspace_slug=self._allocation_workspace(params),
                 limit=self._allocation_limit(params),
-                after_assignment_id=str(params.get("after", [""])[0] or "").strip() or None,
+                after_assignment_id=_allocation_uuid(after_value, "after") if after_value else None,
             )
             self._json(result, sort_keys=True)
         except Exception as exc:
@@ -2143,21 +2160,15 @@ class _Handler(BaseHTTPRequestHandler):
             repository = self._allocation_repository_ready()
             _, actor_identity, caller_identity, _ = self._authorization_context()
             resolved_assignment_id = assignment_id or str(params.get("assignment_id", [""])[0] or "").strip()
-            if not _safe_segment(resolved_assignment_id):
-                raise AllocationPreviewDTOError(
-                    "invalid_uuid",
-                    "assignment_id 必须是合法 UUID",
-                    field="assignment_id",
-                )
+            assignment_uuid = _allocation_uuid(resolved_assignment_id, "assignment_id")
             plan_id = str(params.get("plan_id", [""])[0] or "").strip() or None
-            if plan_id is not None and not _safe_segment(plan_id):
-                raise AllocationPreviewDTOError("invalid_uuid", "plan_id 必须是合法 UUID", field="plan_id")
+            plan_uuid = _allocation_uuid(plan_id, "plan_id") if plan_id is not None else None
             result = repository.get_assignment(
-                resolved_assignment_id,
+                assignment_uuid,
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
                 workspace_slug=self._allocation_workspace(params),
-                plan_id=plan_id,
+                plan_id=plan_uuid,
             )
             self._json({"assignment": result}, sort_keys=True)
         except Exception as exc:

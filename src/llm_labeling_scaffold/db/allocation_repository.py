@@ -610,7 +610,7 @@ class TrustedAllocationRepository:
             rows = rows[:limit]
             return {
                 "workspace": workspace_slug,
-                "plans": [_plan_summary(session, plan, state) for plan, state in rows],
+                "plans": _plan_summaries(session, rows),
                 "next_cursor": str(rows[-1][0].id) if has_more and rows else None,
             }
 
@@ -707,7 +707,7 @@ class TrustedAllocationRepository:
             return {
                 "workspace": workspace_slug,
                 "plan_id": str(plan.id),
-                "assignments": [_assignment_detail(session, *row) for row in rows],
+                "assignments": _assignment_details(session, rows),
                 "next_cursor": str(rows[-1][0].id) if has_more and rows else None,
             }
 
@@ -774,7 +774,7 @@ class TrustedAllocationRepository:
                 workspace_slug=workspace_slug,
                 task=task,
             )
-            return _assignment_detail(session, *row)
+            return _assignment_details(session, [row])[0]
 
     def _authorized_plan_scope(
         self,
@@ -1453,14 +1453,98 @@ def _page_limit(value: int) -> int:
     return value
 
 
-def _plan_summary(session: Session, plan: AllocationPlan, state: AllocationPlanState) -> dict[str, Any]:
-    progress = _allocation_progress(session, plan.id)
-    assignment_count = session.scalar(
-        select(func.count()).where(
-            AllocationAssignment.workspace_id == plan.workspace_id,
-            AllocationAssignment.plan_id == plan.id,
-        )
+def _plan_summaries(
+    session: Session,
+    rows: list[tuple[AllocationPlan, AllocationPlanState]],
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    plans = [plan for plan, _ in rows]
+    plan_ids = [plan.id for plan in plans]
+    required_by_plan = {
+        plan_id: int(required or 0)
+        for plan_id, required in session.execute(
+            select(
+                AllocationAssignment.plan_id,
+                func.coalesce(func.sum(AllocationAssignment.required_submissions), 0),
+            )
+            .where(AllocationAssignment.plan_id.in_(plan_ids))
+            .group_by(AllocationAssignment.plan_id)
+        ).all()
+    }
+    accepted_by_plan = {
+        plan_id: int(accepted or 0)
+        for plan_id, accepted in session.execute(
+            select(
+                AllocationCollectionReceipt.plan_id,
+                func.count(),
+            )
+            .where(
+                AllocationCollectionReceipt.plan_id.in_(plan_ids),
+                AllocationCollectionReceipt.disposition == CollectionDisposition.ACCEPTED,
+            )
+            .group_by(AllocationCollectionReceipt.plan_id)
+        ).all()
+    }
+    assignment_count_by_plan = {
+        plan_id: int(count or 0)
+        for plan_id, count in session.execute(
+            select(AllocationAssignment.plan_id, func.count())
+            .where(AllocationAssignment.plan_id.in_(plan_ids))
+            .group_by(AllocationAssignment.plan_id)
+        ).all()
+    }
+    audit_by_plan = _audit_events_by_resource(
+        session,
+        plans[0].workspace_id,
+        "allocation_plan",
+        plan_ids,
     )
+    progress_by_plan = {
+        plan_id: AllocationProgress(
+            plan_id=plan_id,
+            accepted_submissions=accepted_by_plan.get(plan_id, 0),
+            required_submissions=required_by_plan.get(plan_id, 0),
+            completed=accepted_by_plan.get(plan_id, 0) >= required_by_plan.get(plan_id, 0),
+        )
+        for plan_id in plan_ids
+    }
+    return [
+        _plan_summary(
+            session,
+            plan,
+            state,
+            progress=progress_by_plan[plan.id],
+            assignment_count=assignment_count_by_plan.get(plan.id, 0),
+            audit_events=audit_by_plan.get(str(plan.id), []),
+        )
+        for plan, state in rows
+    ]
+
+
+def _plan_summary(
+    session: Session,
+    plan: AllocationPlan,
+    state: AllocationPlanState,
+    *,
+    progress: AllocationProgress | None = None,
+    assignment_count: int | None = None,
+    audit_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if progress is None:
+        progress = _allocation_progress(session, plan.id)
+    if assignment_count is None:
+        assignment_count = int(
+            session.scalar(
+                select(func.count()).where(
+                    AllocationAssignment.workspace_id == plan.workspace_id,
+                    AllocationAssignment.plan_id == plan.id,
+                )
+            )
+            or 0
+        )
+    if audit_events is None:
+        audit_events = _audit_events(session, plan.workspace_id, "allocation_plan", plan.id)
     return {
         "kind": "allocation_plan_v1",
         "plan_id": str(plan.id),
@@ -1479,10 +1563,10 @@ def _plan_summary(session: Session, plan: AllocationPlan, state: AllocationPlanS
         "fingerprint": plan.fingerprint,
         "input_fingerprint": plan.input_fingerprint,
         "lifecycle_state": state.lifecycle_state.value,
-        "assignment_count": int(assignment_count or 0),
+        "assignment_count": assignment_count,
         "progress": _progress_payload(progress),
         "created_at": _datetime_value(plan.created_at),
-        "audit_events": _audit_events(session, plan.workspace_id, "allocation_plan", plan.id),
+        "audit_events": audit_events,
     }
 
 
@@ -1567,26 +1651,31 @@ def _assignment_detail(
     dataset: AllocationDatasetGroup,
     workspace_group: AllocationWorkspaceGroup,
     record_binding: AllocationRecordBinding | None,
+    *,
+    receipts: list[AllocationCollectionReceipt] | None = None,
+    audit_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    receipts = session.scalars(
-        select(AllocationCollectionReceipt)
-        .where(
-            AllocationCollectionReceipt.workspace_id == assignment.workspace_id,
-            AllocationCollectionReceipt.plan_id == assignment.plan_id,
-            AllocationCollectionReceipt.item_id == item.id,
-            or_(
-                AllocationCollectionReceipt.assignment_id == assignment.id,
-                AllocationCollectionReceipt.assignment_id.is_(None),
-            ),
+    if receipts is None:
+        receipts = session.scalars(
+            select(AllocationCollectionReceipt)
+            .where(
+                AllocationCollectionReceipt.workspace_id == assignment.workspace_id,
+                AllocationCollectionReceipt.plan_id == assignment.plan_id,
+                AllocationCollectionReceipt.item_id == item.id,
+                or_(
+                    AllocationCollectionReceipt.assignment_id == assignment.id,
+                    AllocationCollectionReceipt.assignment_id.is_(None),
+                ),
+            )
+            .order_by(AllocationCollectionReceipt.created_at, AllocationCollectionReceipt.id)
+        ).all()
+    if audit_events is None:
+        audit_events = _audit_events(
+            session,
+            assignment.workspace_id,
+            "allocation_assignment",
+            assignment.id,
         )
-        .order_by(AllocationCollectionReceipt.created_at, AllocationCollectionReceipt.id)
-    ).all()
-    assignment_events = _audit_events(
-        session,
-        assignment.workspace_id,
-        "allocation_assignment",
-        assignment.id,
-    )
     return {
         "kind": "allocation_assignment_v1",
         "assignment_id": str(assignment.id),
@@ -1621,8 +1710,71 @@ def _assignment_detail(
             else None
         ),
         "receipts": [_receipt_detail(receipt) for receipt in receipts],
-        "audit_events": assignment_events,
+        "audit_events": audit_events,
     }
+
+
+def _assignment_details(
+    session: Session,
+    rows: list[tuple[
+        AllocationAssignment,
+        AllocationAssignmentItem,
+        AllocationDatasetGroup,
+        AllocationWorkspaceGroup,
+        AllocationRecordBinding | None,
+    ]],
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    assignments = [row[0] for row in rows]
+    items = [row[1] for row in rows]
+    assignment_ids = [assignment.id for assignment in assignments]
+    item_ids = [item.id for item in items]
+    first_assignment = assignments[0]
+    receipts = session.scalars(
+        select(AllocationCollectionReceipt)
+        .where(
+            AllocationCollectionReceipt.workspace_id == first_assignment.workspace_id,
+            AllocationCollectionReceipt.plan_id == first_assignment.plan_id,
+            AllocationCollectionReceipt.item_id.in_(item_ids),
+            or_(
+                AllocationCollectionReceipt.assignment_id.in_(assignment_ids),
+                AllocationCollectionReceipt.assignment_id.is_(None),
+            ),
+        )
+        .order_by(AllocationCollectionReceipt.created_at, AllocationCollectionReceipt.id)
+    ).all()
+    receipts_by_assignment: dict[uuid.UUID, list[AllocationCollectionReceipt]] = {}
+    receipts_by_item: dict[uuid.UUID, list[AllocationCollectionReceipt]] = {}
+    for receipt in receipts:
+        if receipt.assignment_id is None:
+            receipts_by_item.setdefault(receipt.item_id, []).append(receipt)
+        else:
+            receipts_by_assignment.setdefault(receipt.assignment_id, []).append(receipt)
+    audit_by_assignment = _audit_events_by_resource(
+        session,
+        first_assignment.workspace_id,
+        "allocation_assignment",
+        assignment_ids,
+    )
+    result = []
+    for assignment, item, dataset, workspace_group, record_binding in rows:
+        result.append(
+            _assignment_detail(
+                session,
+                assignment,
+                item,
+                dataset,
+                workspace_group,
+                record_binding,
+                receipts=(
+                    receipts_by_assignment.get(assignment.id, [])
+                    + receipts_by_item.get(item.id, [])
+                ),
+                audit_events=audit_by_assignment.get(str(assignment.id), []),
+            )
+        )
+    return result
 
 
 def _receipt_detail(receipt: AllocationCollectionReceipt) -> dict[str, Any]:
@@ -1654,28 +1806,44 @@ def _audit_events(
     resource_type: str,
     resource_id: uuid.UUID,
 ) -> list[dict[str, Any]]:
+    return _audit_events_by_resource(session, workspace_id, resource_type, [resource_id]).get(
+        str(resource_id),
+        [],
+    )
+
+
+def _audit_events_by_resource(
+    session: Session,
+    workspace_id: uuid.UUID,
+    resource_type: str,
+    resource_ids: list[uuid.UUID],
+) -> dict[str, list[dict[str, Any]]]:
+    if not resource_ids:
+        return {}
     events = session.scalars(
         select(AuditEvent)
         .where(
             AuditEvent.workspace_id == workspace_id,
             AuditEvent.resource_type == resource_type,
-            AuditEvent.resource_id == str(resource_id),
+            AuditEvent.resource_id.in_([str(resource_id) for resource_id in resource_ids]),
         )
         .order_by(AuditEvent.occurred_at, AuditEvent.id)
     ).all()
-    return [
-        {
-            "event_id": str(event.id),
-            "event_type": event.event_type,
-            "actor_principal_id": str(event.actor_principal_id) if event.actor_principal_id else None,
-            "caller_principal_id": str(event.caller_principal_id) if event.caller_principal_id else None,
-            "channel": event.channel.value,
-            "request_id": event.request_id,
-            "details": dict(event.details),
-            "occurred_at": _datetime_value(event.occurred_at),
-        }
-        for event in events
-    ]
+    result: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        result.setdefault(event.resource_id or "", []).append(
+            {
+                "event_id": str(event.id),
+                "event_type": event.event_type,
+                "actor_principal_id": str(event.actor_principal_id) if event.actor_principal_id else None,
+                "caller_principal_id": str(event.caller_principal_id) if event.caller_principal_id else None,
+                "channel": event.channel.value,
+                "request_id": event.request_id,
+                "details": dict(event.details),
+                "occurred_at": _datetime_value(event.occurred_at),
+            }
+        )
+    return result
 
 
 def _datetime_value(value: datetime | None) -> str | None:
