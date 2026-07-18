@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -11,7 +12,6 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from llm_labeling_scaffold.db import (
     AnnotatorControlRepository,
-    AnnotatorNaturalKeyConflict,
     AnnotatorNotReady,
     AnnotatorResourceNotFound,
     AnnotatorRepositoryValidationError,
@@ -19,11 +19,18 @@ from llm_labeling_scaffold.db import (
     AuditChannel,
     CohortMemberInput,
     ExternalIdentity,
+    Permission,
 )
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
 from llm_labeling_scaffold.db.database import create_database_engine
 from llm_labeling_scaffold.db.migration import upgrade_database
-from llm_labeling_scaffold.db.models import AuditEvent, AnnotatorCohortMember, IdempotencyRecord
+from llm_labeling_scaffold.db.models import (
+    AuditEvent,
+    AnnotatorCohort,
+    AnnotatorCohortMember,
+    IdempotencyRecord,
+)
+from llm_labeling_scaffold.db.service import DatabaseTransaction
 
 
 @pytest.fixture
@@ -317,3 +324,131 @@ def test_workspace_scope_blocks_cross_workspace_reads_and_writes(annotator_repos
             actor_identity=admin_b,
             idempotency_key="cross-workspace-revision",
         )
+
+
+def test_duplicate_fingerprint_savepoint_does_not_poison_outer_transaction(
+    annotator_repository,
+    monkeypatch,
+):
+    repository = annotator_repository["repository"]
+    engine = annotator_repository["engine"]
+    admin = annotator_repository["admin_a"]
+    binding = repository.ensure_workspace_binding(
+        workspace_slug="workspace-a",
+        connection_config_id="argilla-main",
+        server_version="2.8.0",
+        argilla_workspace_id=uuid.uuid4(),
+        argilla_workspace_name="workspace-a-remote",
+        actor_identity=admin,
+        idempotency_key="binding",
+    )
+    mapping = repository.create_annotator_mapping(
+        workspace_slug="workspace-a",
+        binding_id=binding.binding.id,
+        principal_identity=ExternalIdentity("https://annotator.test", "race"),
+        username="race",
+        argilla_user_id=uuid.uuid4(),
+        personal_argilla_workspace_id=uuid.uuid4(),
+        membership_verified=True,
+        actor_identity=admin,
+        idempotency_key="mapping",
+    )
+    first = repository.create_cohort(
+        workspace_slug="workspace-a",
+        name="race-cohort",
+        binding_id=binding.binding.id,
+        members=(CohortMemberInput(mapping.mapping.id, 4),),
+        actor_identity=admin,
+        idempotency_key="cohort",
+    )
+    duplicate = repository.create_cohort_revision(
+        workspace_slug="workspace-a",
+        cohort_id=first.cohort.id,
+        binding_id=binding.binding.id,
+        members=(CohortMemberInput(mapping.mapping.id, 4),),
+        actor_identity=admin,
+        idempotency_key="duplicate-fingerprint",
+    )
+    assert duplicate.revision.id == first.revision.id
+    assert duplicate.response_status == 200
+
+    with Session(engine) as session, session.begin():
+        transaction = DatabaseTransaction(session)
+        claim = transaction.claim_idempotency(
+            actor_identity=admin,
+            caller_identity=admin,
+            workspace_slug="workspace-a",
+            required_permission=Permission.WORKSPACE_MANAGE,
+            operation="annotator.cohort.revision.create",
+            idempotency_key="simulated-race",
+            request_payload={"cohort_id": str(first.cohort.id)},
+            channel=AuditChannel.API,
+        )
+        cohort = session.scalar(
+            select(AnnotatorCohort).where(
+                AnnotatorCohort.workspace_id == first.cohort.workspace_id,
+                AnnotatorCohort.id == first.cohort.id,
+            ),
+        )
+        assert cohort is not None
+        original_scalar = session.scalar
+        skipped_fingerprint_read = False
+
+        def scalar_with_race(statement, *args, **kwargs):
+            nonlocal skipped_fingerprint_read
+            if not skipped_fingerprint_read:
+                skipped_fingerprint_read = True
+                return None
+            return original_scalar(statement, *args, **kwargs)
+
+        monkeypatch.setattr(session, "scalar", scalar_with_race)
+        revision, reused = repository._persist_revision(
+            session,
+            cohort=cohort,
+            binding_id=binding.binding.id,
+            members=(CohortMemberInput(mapping.mapping.id, 4),),
+            claim=claim,
+        )
+        assert reused is True
+        assert revision.id == first.revision.id
+        assert not session.new
+        transaction.complete_idempotency(
+            claim,
+            actor_identity=admin,
+            caller_identity=admin,
+            response_status=200,
+            response_body={"revision_id": str(revision.id)},
+        )
+
+    with Session(engine) as session:
+        revisions = session.scalars(
+            select(AnnotatorCohortMember).where(
+                AnnotatorCohortMember.workspace_id == first.revision.workspace_id,
+                AnnotatorCohortMember.cohort_revision_id == first.revision.id,
+            ),
+        ).all()
+    assert len(revisions) == 1
+    assert revisions[0].default_capacity == 4
+
+    def create_concurrent_revision(key: str):
+        return repository.create_cohort_revision(
+            workspace_slug="workspace-a",
+            cohort_id=first.cohort.id,
+            binding_id=binding.binding.id,
+            members=(CohortMemberInput(mapping.mapping.id, 8),),
+            actor_identity=admin,
+            idempotency_key=key,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        concurrent_results = list(
+            executor.map(create_concurrent_revision, ("concurrent-a", "concurrent-b")),
+        )
+    assert concurrent_results[0].revision.id == concurrent_results[1].revision.id
+    assert len(
+        repository.list_cohort_revisions(
+            workspace_slug="workspace-a",
+            identity=admin,
+            cohort_id=first.cohort.id,
+        ),
+    ) == 2

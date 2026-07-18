@@ -1230,9 +1230,9 @@ class AnnotatorControlRepository:
             channel=claim.channel,
             idempotency_record_id=claim.record_id,
         )
-        session.add(revision)
         try:
             with session.begin_nested():
+                session.add(revision)
                 session.flush()
                 session.add_all(
                     [
