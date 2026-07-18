@@ -4,6 +4,8 @@ import { Link } from "../router.jsx";
 import {
   ALLOCATION_STRATEGIES,
   COLLECTION_LABELS,
+  allocationFormAvailability,
+  applyTrustedSource,
   collectionLabel,
   confirmAvailability,
   emptyAllocationForm,
@@ -12,16 +14,17 @@ import {
   allocationPreviewPayload,
   editAvailability,
   modeLabel,
-  normalizeAnnotator,
   normalizeAssignments,
   normalizePreview,
   phaseLabel,
   planId,
   planStatusLabel,
+  previewBlockingMessages,
   progressPercent,
   previewAvailability,
   statusBadgeClass,
   strategyLabel,
+  trustedAllocationSourceOptions,
   valueOrDash,
 } from "./allocationPlanState.js";
 
@@ -40,11 +43,6 @@ function extractPlans(data) {
   const values = data?.plans || data?.allocation_plans || data?.items;
   if (Array.isArray(values)) return values;
   throw new Error("服务端返回的分配计划列表格式不受支持");
-}
-
-function extractAnnotators(data) {
-  const values = Array.isArray(data) ? data : data?.annotators || data?.items || data?.users || [];
-  return values.map(normalizeAnnotator).filter((item) => item.annotator_id);
 }
 
 function extractAssignments(data) {
@@ -157,8 +155,8 @@ function PreviewSummary({ preview }) {
             <table>
               <thead><tr><th>标注人员</th><th>模式</th><th>容量</th><th>总行数</th><th>校准</th><th>正式</th><th>剩余容量</th></tr></thead>
               <tbody>
-                {data.annotator_loads.map((item) => (
-                  <tr key={item.annotator_id}>
+                {data.annotator_loads.map((item, index) => (
+                  <tr key={`${item.annotator_id || "unknown"}-${index}`}>
                     <td>{valueOrDash(item.annotator_id)}</td>
                     <td>{modeLabel(item.mode)}</td>
                     <td>{valueOrDash(item.capacity)}</td>
@@ -221,8 +219,8 @@ function PreviewSummary({ preview }) {
             <table>
               <thead><tr><th>工作区组</th><th>阶段</th><th>模式</th><th>人员组</th><th>负责人</th><th>成员</th></tr></thead>
               <tbody>
-                {data.workspace_requirements.map((item) => (
-                  <tr key={item.workspace_group_id}>
+                {data.workspace_requirements.map((item, index) => (
+                  <tr key={`${item.workspace_group_id || "unknown"}-${index}`}>
                     <td className="mono-cell">{valueOrDash(item.workspace_group_id)}</td>
                     <td>{phaseLabel(item.phase)}</td>
                     <td>{modeLabel(item.mode)}</td>
@@ -240,8 +238,8 @@ function PreviewSummary({ preview }) {
             <table>
               <thead><tr><th>数据集组</th><th>工作区组</th><th>阶段</th><th>最少提交</th><th>负责人/队列</th><th>记录数</th><th>批次数</th></tr></thead>
               <tbody>
-                {data.dataset_requirements.map((item) => (
-                  <tr key={item.dataset_group_id}>
+                {data.dataset_requirements.map((item, index) => (
+                  <tr key={`${item.dataset_group_id || "unknown"}-${index}`}>
                     <td className="mono-cell">{valueOrDash(item.dataset_group_id)}</td>
                     <td className="mono-cell">{valueOrDash(item.workspace_group_id)}</td>
                     <td>{phaseLabel(item.phase)}</td>
@@ -293,24 +291,22 @@ function ProgressPanel({ progress, error, onRetry, busy }) {
 function AllocationForm({
   form,
   setForm,
-  annotators,
-  optionsLoading,
-  optionsError,
+  trustedSources,
+  sourceLoading,
+  sourceError,
+  onReloadSources,
+  onSourceChange,
+  formAvailability,
   busyAction,
-  onAddAnnotator,
-  onRemoveAnnotator,
-  onAnnotatorChange,
-  onReloadAnnotators,
   onPreview,
   onSave,
   onClose,
   preview,
   editing,
 }) {
-  const cohortOptions = Array.from(new Set([
-    ...annotators.map((item) => item.cohort_id).filter(Boolean),
-    ...(form.annotators || []).map((item) => item.cohort_id).filter(Boolean),
-  ]));
+  const selectedSource = trustedSources.find((item) => item.key === form.trusted_source_key);
+  const actionDisabled = Boolean(busyAction) || !formAvailability.enabled;
+  const saveDisabled = actionDisabled || !preview?.ready || !preview?.plan_fingerprint;
   return (
     <div className="drawer-backdrop" onClick={onClose}>
       <aside className="drawer-panel drawer-panel-wide" onClick={(event) => event.stopPropagation()} role="dialog" aria-modal="true" aria-labelledby="allocation-form-title">
@@ -324,15 +320,18 @@ function AllocationForm({
 
         <form onSubmit={onSave}>
           <div className="form-grid drawer-form-grid">
-            <label className="field"><span>Scaffold 工作区</span><input value={form.workspace} onChange={(event) => setForm((current) => ({ ...current, workspace: event.target.value }))} required /></label>
-            <label className="field"><span>任务编号</span><input value={form.task_id} onChange={(event) => setForm((current) => ({ ...current, task_id: event.target.value }))} required /></label>
-            <label className="field"><span>任务版本</span><input value={form.revision_id} onChange={(event) => setForm((current) => ({ ...current, revision_id: event.target.value }))} required /></label>
-            <label className="field field-wide"><span>任务版本摘要（SHA-256）</span><input value={form.revision_hash} onChange={(event) => setForm((current) => ({ ...current, revision_hash: event.target.value }))} placeholder="64 位小写 SHA-256" required /></label>
-            <label className="field"><span>来源清单编号</span><input value={form.source_manifest_id} onChange={(event) => setForm((current) => ({ ...current, source_manifest_id: event.target.value }))} required /></label>
-            <label className="field"><span>来源清单 SHA-256</span><input value={form.source_manifest_hash} onChange={(event) => setForm((current) => ({ ...current, source_manifest_hash: event.target.value }))} placeholder="64 位小写 SHA-256" required /></label>
-            <label className="field"><span>来源类型</span><select value={form.source_manifest_kind} onChange={(event) => setForm((current) => ({ ...current, source_manifest_kind: event.target.value }))}><option value="sample">样本</option><option value="batch">批次</option></select></label>
-            <label className="field"><span>人员组</span><select value={form.cohort_id} onChange={(event) => setForm((current) => ({ ...current, cohort_id: event.target.value }))}><option value="">选择人员组</option>{cohortOptions.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+            <label className="field"><span>Scaffold 工作区</span><input value={form.workspace} readOnly /></label>
+            <label className="field"><span>任务编号</span><input value={form.task_id} readOnly /></label>
+            <label className="field"><span>任务版本</span><input value={form.revision_id} readOnly /></label>
+            <label className="field"><span>来源清单</span><input value={form.source_manifest_id} readOnly placeholder="请选择后端可信来源" /></label>
+            <label className="field"><span>来源类型</span><input value={form.source_manifest_kind === "batch" ? "批次" : "样本"} readOnly /></label>
+            <label className="field field-wide"><span>可信样本/批次</span><select value={form.trusted_source_key} onChange={(event) => onSourceChange(event.target.value)} disabled={sourceLoading || Boolean(busyAction) || !trustedSources.some((item) => item.available)}><option value="">{trustedSources.length ? "请选择后端返回的可信来源" : "暂无可用来源"}</option>{trustedSources.map((item) => <option key={item.key} value={item.key} disabled={!item.available}>{item.label}{item.available ? "" : "（不可用）"}</option>)}</select></label>
           </div>
+          <div className="status-line">任务 revision、revision hash、manifest hash 和记录内容只接受后端返回的可信来源，不能在此手工填写。</div>
+          {sourceLoading && <div className="status-line">正在读取任务、样本和批次来源...</div>}
+          {sourceError && <div className="stage-tip allocation-list-error">{sourceError}<button className="btn btn-sm" type="button" onClick={onReloadSources} disabled={Boolean(busyAction) || sourceLoading}>重试</button></div>}
+          {!sourceLoading && !sourceError && !trustedSources.length && <div className="empty">暂无可用来源</div>}
+          {selectedSource && !selectedSource.available && <div className="stage-tip">当前来源不可用：{selectedSource.disabled_reason}</div>}
 
           <div className="allocation-form-section">
             <div className="toolbar-stack"><h4>分配策略</h4><div className="status-line">策略由后端规划器解释，前端不计算分配结果。</div></div>
@@ -354,20 +353,17 @@ function AllocationForm({
 
           <div className="allocation-form-section">
             <div className="toolbar">
-              <div className="toolbar-stack"><h4>已有标注人员</h4><div className="status-line">只能选择后端返回的可用人员，不在浏览器创建人员。</div></div>
-              <button className="btn btn-sm" type="button" onClick={onAddAnnotator} disabled={Boolean(busyAction) || optionsLoading || !annotators.length}>添加人员</button>
+              <div className="toolbar-stack"><h4>人员组与标注人员</h4><div className="status-line">此入口依赖 #66 专用 API，当前版本未接入。</div></div>
             </div>
-            {optionsLoading && <div className="status-line">正在读取可用标注人员...</div>}
-            {optionsError && <div className="stage-tip allocation-list-error">{optionsError}<button className="btn btn-sm" type="button" onClick={onReloadAnnotators} disabled={Boolean(busyAction) || optionsLoading}>重试</button></div>}
-            {!optionsLoading && !optionsError && !annotators.length && <div className="empty">服务端未返回可选标注人员。</div>}
-            {form.annotators.map((item, index) => (
-              <div className="allocation-annotator-row" key={`${item.annotator_id || "new"}-${index}`}>
-                <label className="field"><span>标注人员</span><select value={item.annotator_id} onChange={(event) => onAnnotatorChange(index, event.target.value)} disabled={Boolean(busyAction)}><option value="">选择已有人员</option>{annotators.map((option) => <option key={option.annotator_id} value={option.annotator_id}>{option.display_name} · {option.annotator_id}</option>)}</select></label>
-                <label className="field"><span>所属人员组</span><input value={item.cohort_id || ""} readOnly /></label>
-                <label className="field"><span>容量</span><input type="number" min="0" value={item.capacity} onChange={(event) => setForm((current) => ({ ...current, annotators: current.annotators.map((row, rowIndex) => rowIndex === index ? { ...row, capacity: event.target.value } : row) }))} disabled={Boolean(busyAction)} /></label>
-                <button className="btn btn-sm btn-danger allocation-remove-button" type="button" onClick={() => onRemoveAnnotator(index)} disabled={Boolean(busyAction)}>移除</button>
+            {!form.annotators.length && <div className="empty">暂无可用人员组或标注人员</div>}
+            {form.annotators.length > 0 && (
+              <div className="table-wrap">
+                <table>
+                  <thead><tr><th>人员组</th><th>标注人员</th><th>容量</th></tr></thead>
+                  <tbody>{form.annotators.map((item, index) => <tr key={`${item.annotator_id || "unknown"}-${index}`}><td>{valueOrDash(item.cohort_id || form.cohort_id)}</td><td>{valueOrDash(item.annotator_id)}</td><td>{valueOrDash(item.capacity)}</td></tr>)}</tbody>
+                </table>
               </div>
-            ))}
+            )}
           </div>
 
           <div className="form-grid drawer-form-grid">
@@ -387,16 +383,10 @@ function AllocationForm({
             )}
           </div>
 
-          <details className="advanced-panel allocation-records-panel">
-            <summary>预览记录摘要</summary>
-            <p className="status-line">直接调用 `/api/allocation/preview` 时使用。留空由后端配置接口返回 `preview_request` 后再预览。</p>
-            <label className="field field-wide"><span>记录 JSON 数组</span><textarea rows="8" value={form.records_json} onChange={(event) => setForm((current) => ({ ...current, records_json: event.target.value }))} placeholder='[{"record_id":"...","content_hash":"...","batch_id":"..."}]' /></label>
-          </details>
-
           {preview && <PreviewSummary preview={preview} />}
           <div className="drawer-actions">
-            <button className="btn btn-primary" type="submit" disabled={Boolean(busyAction)}>{busyAction === "save" ? "保存中..." : editing ? "保存配置" : "保存草稿"}</button>
-            <button className="btn btn-accent" type="button" onClick={onPreview} disabled={Boolean(busyAction)}>{busyAction === "preview" ? "预览中..." : "生成只读预览"}</button>
+            <button className="btn btn-primary" type="submit" disabled={saveDisabled} title={saveDisabled && !preview?.plan_fingerprint ? "请先生成通过后端检查的只读预览" : formAvailability.disabledReason}>{busyAction === "save" ? "保存中..." : editing ? "保存配置" : "保存草稿"}</button>
+            <button className="btn btn-accent" type="button" onClick={onPreview} disabled={actionDisabled} title={formAvailability.disabledReason}>{busyAction === "preview" ? "预览中..." : "生成只读预览"}</button>
             <button className="btn" type="button" onClick={onClose} disabled={Boolean(busyAction)}>取消</button>
           </div>
         </form>
@@ -422,9 +412,9 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
   const [selectedAssignment, setSelectedAssignment] = useState(null);
   const [form, setForm] = useState(() => emptyAllocationForm(task, taskId));
   const [editingPlanId, setEditingPlanId] = useState("");
-  const [availableAnnotators, setAvailableAnnotators] = useState([]);
-  const [optionsLoading, setOptionsLoading] = useState(false);
-  const [optionsError, setOptionsError] = useState("");
+  const [trustedSources, setTrustedSources] = useState([]);
+  const [sourceLoading, setSourceLoading] = useState(false);
+  const [sourceError, setSourceError] = useState("");
   const [preview, setPreview] = useState(null);
   const [operation, setOperation] = useState({ state: "", message: "" });
   const [busyAction, setBusyAction] = useState("");
@@ -457,7 +447,14 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
   useEffect(() => { reload(); }, [reload]);
   useEffect(() => {
     setForm(emptyAllocationForm(task, taskId));
+    setTrustedSources([]);
+    setSourceError("");
   }, [task, taskId]);
+
+  const updateForm = useCallback((updater) => {
+    setForm(updater);
+    setPreview(null);
+  }, []);
 
   async function runOperation(action, label, callback) {
     if (busyRef.current) {
@@ -483,26 +480,51 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
     }
   }
 
-  async function loadAnnotatorOptions(currentScope = scope, existing = []) {
-    setOptionsLoading(true);
-    setOptionsError("");
+  async function loadTrustedSources() {
+    if (!taskId) return [];
+    const workspace = taskWorkspace(task);
+    if (!workspace) {
+      const message = "任务工作区不可用，无法读取可信来源。";
+      setSourceError(message);
+      setTrustedSources([]);
+      return [];
+    }
+    setSourceLoading(true);
+    setSourceError("");
     try {
-      const data = await api.getAllocationAnnotators(currentScope);
-      const next = extractAnnotators(data);
-      setAvailableAnnotators(next);
-      if (!next.length) setOptionsError("服务端未返回可选择的标注人员，请先完成标注人员配置。");
+      const [taskData, samplesData] = await Promise.all([
+        api.getTaskControl(taskId, workspace),
+        api.getTaskSamples(taskId, workspace),
+      ]);
+      const controlTask = taskData?.task || taskData;
+      const samples = Array.isArray(samplesData)
+        ? samplesData
+        : samplesData?.samples || samplesData?.items || [];
+      const next = trustedAllocationSourceOptions(samples, controlTask);
+      setTrustedSources(next);
+      setForm((current) => {
+        const selected = next.find((item) => item.key === current.trusted_source_key && item.available);
+        return selected ? applyTrustedSource(current, selected) : current;
+      });
       return next;
     } catch (error) {
-      const fallback = existing.map(normalizeAnnotator).filter((item) => item.annotator_id);
-      setAvailableAnnotators(fallback);
-      const message = fallback.length
-        ? `可用标注人员刷新失败，当前仅显示计划中已绑定的人员：${String(error)}`
-        : `可用标注人员读取失败：${String(error)}`;
-      setOptionsError(message);
-      return fallback;
+      const message = `可信来源读取失败：${String(error)}`;
+      setSourceError(message);
+      setTrustedSources([]);
+      return [];
     } finally {
-      setOptionsLoading(false);
+      setSourceLoading(false);
     }
+  }
+
+  function selectTrustedSource(sourceKey) {
+    const source = trustedSources.find((item) => item.key === sourceKey);
+    if (!source?.available) {
+      setOperation({ state: "error", message: source?.disabled_reason || "暂无可用来源。" });
+      return;
+    }
+    setForm((current) => applyTrustedSource(current, source));
+    setPreview(null);
   }
 
   function openCreate() {
@@ -510,10 +532,11 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
     setDetailPlan(null);
     setSelectedPlan(null);
     setPreview(null);
-    setOptionsError("");
+    setSourceError("");
+    setTrustedSources([]);
     setForm(emptyAllocationForm(task, taskId));
     setDrawer("create");
-    loadAnnotatorOptions({ ...scope, workspace: taskWorkspace(task) });
+    loadTrustedSources();
   }
 
   async function loadDetail(plan) {
@@ -575,53 +598,17 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
     setDetailPlan(null);
   }
 
-  function addAnnotator() {
-    const selected = new Set((form.annotators || []).map((item) => item.annotator_id));
-    const next = availableAnnotators.find((item) => !selected.has(item.annotator_id));
-    if (!next) {
-      setOperation({ state: "error", message: "没有可添加的未选择标注人员。" });
-      return;
-    }
-    setForm((current) => ({
-      ...current,
-      cohort_id: current.cohort_id || next.cohort_id,
-      annotators: [...current.annotators, {
-        annotator_id: next.annotator_id,
-        cohort_id: next.cohort_id,
-        capacity: next.default_capacity,
-      }],
-    }));
-  }
-
-  function removeAnnotator(index) {
-    setForm((current) => ({ ...current, annotators: current.annotators.filter((_, rowIndex) => rowIndex !== index) }));
-  }
-
-  function changeAnnotator(index, annotatorId) {
-    const next = availableAnnotators.find((item) => item.annotator_id === annotatorId);
-    setForm((current) => ({
-      ...current,
-      cohort_id: current.cohort_id || next?.cohort_id || "",
-      annotators: current.annotators.map((row, rowIndex) => rowIndex === index
-        ? { ...row, annotator_id: annotatorId, cohort_id: next?.cohort_id || row.cohort_id || "", capacity: next?.default_capacity ?? row.capacity }
-        : row),
-    }));
-  }
-
   function validateForm(currentForm) {
-    const required = [
-      ["workspace", "workspace"],
-      ["task_id", "任务编号"],
-      ["revision_id", "任务 revision"],
-      ["revision_hash", "revision SHA-256"],
-      ["source_manifest_id", "来源清单编号"],
-      ["source_manifest_hash", "来源清单 SHA-256"],
-      ["cohort_id", "人员组"],
-    ];
-    const missing = required.filter(([key]) => !String(currentForm[key] || "").trim()).map(([, label]) => label);
-    if (missing.length) return `请补全：${missing.join("、")}`;
+    const availability = allocationFormAvailability({
+      form: currentForm,
+      sourceLoading,
+      sourceError,
+      busy: Boolean(busyAction),
+    });
+    if (!availability.enabled) return availability.disabledReason;
+    if (!String(currentForm.workspace || "").trim() || !String(currentForm.task_id || "").trim() || !String(currentForm.revision_id || "").trim()) return "可信来源缺少完整任务范围。";
     if (!currentForm.annotators.length) return "至少选择一名已有标注人员。";
-    if (currentForm.annotators.some((item) => !item.annotator_id || !item.cohort_id || Number(item.capacity) < 0)) return "请补全标注人员、人员组和容量。";
+    if (currentForm.annotators.some((item) => !item.annotator_id || !item.cohort_id || item.capacity === "" || !Number.isFinite(Number(item.capacity)) || Number(item.capacity) < 0)) return "请补全标注人员、人员组和容量。";
     return "";
   }
 
@@ -649,17 +636,26 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
       setOperation({ state: "error", message: validationError });
       return;
     }
+    const currentPreview = normalizePreview(preview);
+    if (!preview || !currentPreview.ready || !currentPreview.plan_fingerprint) {
+      setOperation({ state: "error", message: previewBlockingMessages(currentPreview)[0] || "请先生成通过后端检查的只读预览。" });
+      return;
+    }
     let payload;
     try {
-      payload = allocationPlanPayload(form);
+      payload = allocationPlanPayload(form, preview);
     } catch (error) {
       setOperation({ state: "error", message: String(error) });
       return;
     }
+    const fingerprint = currentPreview.plan_fingerprint;
+    const idempotencyKey = editingPlanId
+      ? api.allocationPlanUpdateIdempotencyKey(editingPlanId, fingerprint)
+      : api.allocationPlanCreateIdempotencyKey(form.workspace, form.task_id, fingerprint);
     const result = await runOperation("save", editingPlanId ? "配置保存" : "草稿保存", async () => {
       const data = editingPlanId
-        ? await api.updateAllocationPlan(editingPlanId, payload)
-        : await api.createAllocationPlan(payload);
+        ? await api.updateAllocationPlan(editingPlanId, payload, { idempotencyKey })
+        : await api.createAllocationPlan(payload, { idempotencyKey });
       const next = extractPlan(data, editingPlanId);
       if (!next || !planId(next)) throw new Error("服务端未返回分配计划编号，不能显示成功状态。");
       setEditingPlanId(planId(next));
@@ -681,11 +677,11 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
     }
     const id = planId(plan);
     const fingerprint = preview?.plan_fingerprint || plan?.plan_fingerprint || "";
+    const idempotencyKey = api.allocationPlanConfirmIdempotencyKey(id, fingerprint);
     const result = await runOperation("confirm", "计划确认", async () => {
       const data = await api.confirmAllocationPlan(id, {
         plan_fingerprint: fingerprint,
-        preview_fingerprint: fingerprint,
-      });
+      }, { idempotencyKey });
       if (!(await reload())) throw new Error("计划已确认，但列表刷新失败。");
       if (!(await loadDetail({ ...plan, plan_id: id }))) throw new Error("计划已确认，但详情刷新失败。");
       return data;
@@ -720,7 +716,9 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
   });
   const currentPlan = detailPlan || selectedPlan;
   const editGate = editAvailability({ plan: currentPlan, busy: Boolean(busyAction) });
-  const previewGate = previewAvailability({ plan: currentPlan, busy: Boolean(busyAction) });
+  const formGate = allocationFormAvailability({ form, sourceLoading, sourceError, busy: Boolean(busyAction) });
+  const backendPreviewGate = previewAvailability({ plan: currentPlan, busy: Boolean(busyAction) });
+  const previewGate = formGate.enabled ? backendPreviewGate : formGate;
   const confirmGate = confirmAvailability({ plan: currentPlan, preview, busy: Boolean(busyAction) });
   const editing = Boolean(editingPlanId);
 
@@ -755,12 +753,12 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
             <table>
               <thead><tr><th>状态</th><th>策略</th><th>任务版本</th><th>样本/批次</th><th>人员组</th><th>远端工作区 / 数据集 UUID</th><th>进度</th><th>操作</th></tr></thead>
               <tbody>
-                {plans.map((plan) => {
+                {plans.map((plan, index) => {
                   const status = planStatusLabel(plan);
                   const progress = planProgress(plan);
                   const id = planId(plan);
                   return (
-                    <tr key={id || JSON.stringify(plan)} className={currentPlan && planId(currentPlan) === id ? "row-selected clickable-row" : "clickable-row"} onClick={() => loadDetail(plan)}>
+                    <tr key={id || `plan-${index}`} className={currentPlan && planId(currentPlan) === id ? "row-selected clickable-row" : "clickable-row"} onClick={() => loadDetail(plan)}>
                       <td><span className={`badge ${statusBadgeClass(status)}`}>{status}</span></td>
                       <td>{strategyLabel(plan.strategy)}</td>
                       <td className="mono-cell">{valueOrDash(firstValue(plan.revision_id, plan.task_revision_id, plan.task_revision?.revision_id))}</td>
@@ -781,15 +779,14 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
       {drawer === "create" && (
         <AllocationForm
           form={form}
-          setForm={setForm}
-          annotators={availableAnnotators}
-          optionsLoading={optionsLoading}
-          optionsError={optionsError}
+          setForm={updateForm}
+          trustedSources={trustedSources}
+          sourceLoading={sourceLoading}
+          sourceError={sourceError}
+          onReloadSources={loadTrustedSources}
+          onSourceChange={selectTrustedSource}
+          formAvailability={allocationFormAvailability({ form, sourceLoading, sourceError, busy: Boolean(busyAction) })}
           busyAction={busyAction}
-          onAddAnnotator={addAnnotator}
-          onRemoveAnnotator={removeAnnotator}
-          onAnnotatorChange={changeAnnotator}
-          onReloadAnnotators={() => loadAnnotatorOptions(scope, form.annotators)}
           onPreview={previewCurrent}
           onSave={savePlan}
           onClose={closeDrawer}
@@ -825,7 +822,7 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
 
                 <div className="drawer-actions allocation-detail-actions">
                   <button className="btn btn-sm" type="button" onClick={refreshDetail} disabled={Boolean(busyAction) || detailLoading}>刷新详情</button>
-                  <button className="btn btn-sm" type="button" onClick={() => { setEditingPlanId(planId(currentPlan)); setForm(formFromAllocationPlan(currentPlan, task, taskId)); loadAnnotatorOptions(scope, currentPlan.annotators || form.annotators); setDrawer("create"); }} disabled={!editGate.enabled} title={editGate.disabledReason}>编辑配置</button>
+                  <button className="btn btn-sm" type="button" onClick={() => { setEditingPlanId(planId(currentPlan)); setForm(formFromAllocationPlan(currentPlan, task, taskId)); setTrustedSources([]); setSourceError(""); setDrawer("create"); loadTrustedSources(); }} disabled={!editGate.enabled} title={editGate.disabledReason}>编辑配置</button>
                   <button className="btn btn-sm btn-accent" type="button" onClick={previewCurrent} disabled={!previewGate.enabled} title={previewGate.disabledReason || "请先补全配置和预览记录摘要"}>生成只读预览</button>
                   <button className="btn btn-primary" type="button" onClick={confirmPlan} disabled={!confirmGate.enabled} title={confirmGate.disabledReason}>{busyAction === "confirm" ? "确认中..." : "确认计划"}</button>
                 </div>
@@ -853,8 +850,8 @@ export default function AllocationPlansPage({ task, taskId, onError }) {
                       <table>
                         <thead><tr><th>分配编号</th><th>阶段</th><th>记录</th><th>批次</th><th>标注人员</th><th>工作区 UUID</th><th>数据集 UUID</th><th>回收状态</th></tr></thead>
                         <tbody>
-                          {visibleAssignments.map((item) => (
-                            <tr key={item.assignment_id || `${item.record_id}-${item.assignee_id}`} className={selectedAssignment === item ? "row-selected clickable-row" : "clickable-row"} onClick={() => setSelectedAssignment(item)}>
+                          {visibleAssignments.map((item, index) => (
+                            <tr key={item.assignment_id || `${item.record_id || "record"}-${item.assignee_id || "assignee"}-${index}`} className={selectedAssignment === item ? "row-selected clickable-row" : "clickable-row"} onClick={() => setSelectedAssignment(item)}>
                               <td className="mono-cell">{valueOrDash(item.assignment_id)}</td>
                               <td>{phaseLabel(item.phase)}</td>
                               <td>{valueOrDash(item.record_id)}</td>

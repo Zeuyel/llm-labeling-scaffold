@@ -1,44 +1,103 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  allocationFormAvailability,
+  allocationPlanPayload,
   allocationPreviewPayload,
+  applyTrustedSource,
   confirmAvailability,
   emptyAllocationForm,
   normalizeAssignments,
   normalizePreview,
   planStatusLabel,
+  trustedAllocationSourceOptions,
 } from "./allocationPlanState.js";
 
 const HASH = "a".repeat(64);
 
-function validForm() {
+function previewRequest() {
   return {
-    ...emptyAllocationForm({ workspace: "workspace-a" }, "task-a"),
-    revision_id: "revision-1",
-    revision_hash: HASH,
-    source_manifest_id: "manifest-1",
-    source_manifest_hash: HASH,
-    cohort_id: "cohort-1",
-    annotators: [{ annotator_id: "annotator-1", cohort_id: "cohort-1", capacity: 10 }],
-    records_json: JSON.stringify([{ record_id: "record-1", content_hash: HASH, batch_id: "batch-1" }]),
+    scope: {
+      workspace: "workspace-a",
+      task_id: "task-a",
+      revision_id: "revision-1",
+      revision_hash: HASH,
+    },
+    request: {
+      strategy: "shared_queue",
+      source_manifest: { manifest_id: "manifest-1", manifest_hash: HASH, kind: "sample" },
+      records: [{ record_id: "record-1", content_hash: HASH, batch_id: "batch-1" }],
+      annotators: [{ annotator_id: "annotator-1", cohort_id: "cohort-1", capacity: 10 }],
+      seed: 17,
+      algorithm_version: "allocation-v1",
+      overlap_rules: [],
+      calibration: null,
+    },
   };
 }
 
-test("allocation preview payload follows the documented scope/request contract", () => {
-  const payload = allocationPreviewPayload(validForm());
+function trustedForm() {
+  const source = {
+    key: "sample:sample-1",
+    kind: "sample",
+    sample_id: "sample-1",
+    manifest_id: "manifest-1",
+    manifest_hash: HASH,
+    preview_request: previewRequest(),
+    available: true,
+    disabled_reason: "",
+  };
+  return {
+    ...applyTrustedSource(emptyAllocationForm({ workspace: "workspace-a" }, "task-a"), source),
+    annotator_source_available: true,
+    cohort_id: "cohort-1",
+    annotators: [{ annotator_id: "annotator-1", cohort_id: "cohort-1", capacity: 10 }],
+  };
+}
 
-  assert.deepEqual(payload.scope, {
-    workspace: "workspace-a",
-    task_id: "task-a",
+test("trusted sources are only available when backend supplies a complete preview request", () => {
+  const options = trustedAllocationSourceOptions([
+    {
+      sample_id: "sample-1",
+      manifest: { manifest_id: "manifest-1", manifest_hash: HASH, preview_request: previewRequest() },
+      batch_manifests: [{ plan_id: "batch-1" }],
+    },
+  ]);
+
+  assert.equal(options.length, 2);
+  assert.equal(options[0].available, true);
+  assert.equal(options[1].available, false);
+  assert.match(options[1].disabled_reason, /可信 preview_request/);
+});
+
+test("preview and plan payloads use trusted backend records, never a hand-entered records field", () => {
+  const form = trustedForm();
+  const payload = allocationPreviewPayload({ ...form, records_json: "[{}]", revision_hash: "hand-entered" });
+  assert.deepEqual(payload.scope, previewRequest().scope);
+  assert.deepEqual(payload.request.records, previewRequest().request.records);
+  assert.equal("records_json" in payload, false);
+  assert.equal(payload.scope.revision_hash, HASH);
+
+  const planPayload = allocationPlanPayload(form, { ready: true, blocking_errors: [], plan_fingerprint: "plan-fingerprint" });
+  assert.equal(planPayload.plan_fingerprint, "plan-fingerprint");
+});
+
+test("missing trusted source and unimplemented #66 personnel API disable preview and save", () => {
+  const form = {
+    ...emptyAllocationForm({ workspace: "workspace-a" }, "task-a"),
     revision_id: "revision-1",
     revision_hash: HASH,
-  });
-  assert.equal(payload.request.strategy, "shared_queue");
-  assert.equal(payload.request.source_manifest.manifest_id, "manifest-1");
-  assert.equal(payload.request.annotators[0].capacity, 10);
-  assert.equal(payload.request.records[0].record_id, "record-1");
-  assert.equal("password" in payload, false);
-  assert.equal("api_key" in payload, false);
+    source_manifest_id: "manual-manifest",
+    source_manifest_hash: HASH,
+    records_json: "[]",
+  };
+  assert.throws(() => allocationPreviewPayload(form), /暂无可用来源/);
+  assert.equal(allocationFormAvailability({ form }).enabled, false);
+
+  const personnelUnavailable = trustedForm();
+  personnelUnavailable.annotator_source_available = false;
+  assert.equal(allocationFormAvailability({ form: personnelUnavailable }).enabled, false);
+  assert.match(allocationFormAvailability({ form: personnelUnavailable }).disabledReason, /人员组接口尚未接入/);
 });
 
 test("preview blocking errors and backend action state both disable confirmation", () => {

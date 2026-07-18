@@ -181,19 +181,6 @@ export function normalizeAnnotator(value) {
   };
 }
 
-export function parseRecordSpecs(value) {
-  const text = String(value || "").trim();
-  if (!text) return [];
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error("预览记录必须是合法 JSON 数组。");
-  }
-  if (!Array.isArray(parsed)) throw new Error("预览记录必须是 JSON 数组。");
-  return parsed;
-}
-
 export function emptyAllocationForm(task = {}, taskId = "") {
   task = task || {};
   return {
@@ -201,6 +188,8 @@ export function emptyAllocationForm(task = {}, taskId = "") {
     task_id: taskId || stringValue(task.task_id),
     revision_id: stringValue(task.revision_id, task.revision, task.active_revision_id),
     revision_hash: stringValue(task.revision_hash, task.active_revision_hash),
+    trusted_source_key: "",
+    trusted_source: null,
     source_manifest_id: "",
     source_manifest_hash: "",
     source_manifest_kind: "sample",
@@ -213,9 +202,143 @@ export function emptyAllocationForm(task = {}, taskId = "") {
     calibration_enabled: false,
     calibration_count: "",
     calibration_annotator_ids: "",
-    records_json: "",
+    annotator_source_available: false,
     annotators: [],
   };
+}
+
+function trustedSourceOption(sample, manifest, kind, task = {}) {
+  const sampleId = stringValue(sample?.sample_id);
+  const batchId = kind === "batch"
+    ? stringValue(manifest?.plan_id, manifest?.batch_id)
+    : "";
+  const trusted = manifest?.trusted_source || manifest?.allocation_source || sample?.trusted_source || {};
+  const previewRequest = trusted?.preview_request
+    || manifest?.preview_request
+    || sample?.preview_request
+    || null;
+  const sourceManifest = previewRequest?.request?.source_manifest || {};
+  const manifestId = stringValue(
+    trusted?.manifest_id,
+    manifest?.manifest_id,
+    manifest?.source_manifest_id,
+    sourceManifest.manifest_id,
+    kind === "batch" ? batchId : sampleId,
+  );
+  const manifestHash = stringValue(
+    trusted?.manifest_hash,
+    manifest?.manifest_hash,
+    manifest?.source_manifest_hash,
+    manifest?.source_manifest_sha256,
+    sourceManifest.manifest_hash,
+  );
+  const key = kind === "batch" ? `batch:${sampleId}:${batchId}` : `sample:${sampleId}`;
+  const scope = previewRequest?.scope || {};
+  const request = previewRequest?.request || {};
+  const taskWorkspace = stringValue(task?.workspace, task?.workspace_slug);
+  const taskId = stringValue(task?.task_id);
+  const taskRevision = stringValue(task?.revision_id, task?.revision, task?.active_revision_id);
+  const scopeMatchesTask = (!taskWorkspace || scope.workspace === taskWorkspace)
+    && (!taskId || scope.task_id === taskId)
+    && (!taskRevision || scope.revision_id === taskRevision);
+  const available = Boolean(
+    sampleId
+    && manifestId
+    && manifestHash
+    && scope.workspace
+    && scope.task_id
+    && scope.revision_id
+    && scope.revision_hash
+    && request.source_manifest
+    && Array.isArray(request.records)
+    && scopeMatchesTask,
+  );
+  return {
+    key,
+    kind,
+    sample_id: sampleId,
+    batch_id: batchId,
+    label: kind === "batch" ? `批次 · ${sampleId} / ${batchId || "未命名"}` : `样本 · ${sampleId}`,
+    manifest_id: manifestId,
+    manifest_hash: manifestHash,
+    preview_request: previewRequest,
+    available,
+    disabled_reason: available
+      ? ""
+      : scopeMatchesTask
+        ? "后端未返回可信 preview_request、revision hash 或 manifest hash。"
+        : "可信来源与当前任务范围不一致。",
+  };
+}
+
+export function trustedAllocationSourceOptions(samples = [], task = {}) {
+  return (Array.isArray(samples) ? samples : []).flatMap((sample) => {
+    if (!sample || String(sample.state || "").toLowerCase() === "archived") return [];
+    const options = [];
+    const sampleManifest = sample.manifest && typeof sample.manifest === "object"
+      ? sample.manifest
+      : sample.trusted_source && typeof sample.trusted_source === "object"
+        ? sample.trusted_source
+        : null;
+    if (sampleManifest) {
+      options.push(trustedSourceOption(sample, sampleManifest, "sample", task));
+    }
+    const batches = Array.isArray(sample.batch_manifests)
+      ? sample.batch_manifests
+      : Array.isArray(sample.batches) ? sample.batches : [];
+    batches.forEach((manifest) => {
+      if (manifest && typeof manifest === "object") options.push(trustedSourceOption(sample, manifest, "batch", task));
+    });
+    return options;
+  });
+}
+
+export function applyTrustedSource(form, source) {
+  if (!source) {
+    return {
+      ...form,
+      trusted_source_key: "",
+      trusted_source: null,
+      source_manifest_id: "",
+      source_manifest_hash: "",
+      source_manifest_kind: "sample",
+    };
+  }
+  const scope = source.preview_request?.scope || {};
+  return {
+    ...form,
+    trusted_source_key: source.key,
+    trusted_source: source,
+    workspace: stringValue(scope.workspace, form.workspace),
+    task_id: stringValue(scope.task_id, form.task_id),
+    revision_id: stringValue(scope.revision_id, form.revision_id),
+    revision_hash: stringValue(scope.revision_hash, form.revision_hash),
+    source_manifest_id: source.manifest_id,
+    source_manifest_hash: source.manifest_hash,
+    source_manifest_kind: source.kind,
+  };
+}
+
+export function allocationFormAvailability({ form, sourceLoading = false, sourceError = "", busy = false } = {}) {
+  if (busy) return { enabled: false, disabledReason: "当前有操作正在执行，请稍候。" };
+  if (sourceLoading) return { enabled: false, disabledReason: "正在读取可信来源。" };
+  if (sourceError) return { enabled: false, disabledReason: "可信来源读取失败，请重试。" };
+  if (!form?.trusted_source?.available) {
+    return { enabled: false, disabledReason: "暂无可用来源：请选择后端返回的可信样本或批次。" };
+  }
+  if (form.annotator_source_available !== true) {
+    return { enabled: false, disabledReason: "标注人员组接口尚未接入。" };
+  }
+  if (!String(form.cohort_id || "").trim()) {
+    return { enabled: false, disabledReason: "尚未选择后端返回的人员组。" };
+  }
+  if (!Array.isArray(form.annotators) || !form.annotators.length) {
+    return { enabled: false, disabledReason: "尚未选择后端返回的标注人员。" };
+  }
+  if (form.annotators.some((item) => item.capacity === "" || !Number.isFinite(Number(item.capacity)) || Number(item.capacity) < 0)) {
+    return { enabled: false, disabledReason: "后端返回的人员容量不可用。" };
+  }
+  return { enabled: true, disabledReason: "" };
 }
 
 function calibrationFromForm(form) {
@@ -237,43 +360,44 @@ function overlapRulesFromForm(form) {
 }
 
 export function allocationPreviewPayload(form) {
-  const records = parseRecordSpecs(form.records_json);
+  const payload = form.trusted_source?.preview_request;
+  if (!form.trusted_source?.available || !payload?.scope || !payload?.request) {
+    throw new Error("暂无可用来源：后端尚未返回可信的 allocation preview 请求。");
+  }
+  if (form.annotator_source_available !== true) {
+    throw new Error("人员组接口尚未接入，暂不能选择标注人员。");
+  }
   const annotators = (form.annotators || []).map((item) => ({
     annotator_id: item.annotator_id,
     cohort_id: item.cohort_id || form.cohort_id,
     capacity: Number(item.capacity),
   }));
+  if (!annotators.length) throw new Error("人员组接口尚未接入，暂不能选择标注人员。");
   return {
-    scope: {
-      workspace: String(form.workspace || "").trim(),
-      task_id: String(form.task_id || "").trim(),
-      revision_id: String(form.revision_id || "").trim(),
-      revision_hash: String(form.revision_hash || "").trim(),
-    },
+    scope: payload.scope,
     request: {
+      ...payload.request,
       strategy: form.strategy,
-      source_manifest: {
-        manifest_id: String(form.source_manifest_id || "").trim(),
-        manifest_hash: String(form.source_manifest_hash || "").trim(),
-        kind: form.source_manifest_kind || "sample",
-      },
-      records,
       annotators,
       seed: Number(form.seed),
       algorithm_version: String(form.algorithm_version || "allocation-v1").trim(),
-      overlap_rules: overlapRulesFromForm(form),
-      calibration: calibrationFromForm(form),
+      overlap_rules: form.overlap_required_submissions === ""
+        ? (Array.isArray(payload.request.overlap_rules) ? payload.request.overlap_rules : [])
+        : overlapRulesFromForm(form),
+      calibration: form.calibration_enabled ? calibrationFromForm(form) : null,
     },
   };
 }
 
-export function allocationPlanPayload(form) {
+export function allocationPlanPayload(form, preview) {
   const preview_request = allocationPreviewPayload(form);
+  const planFingerprint = stringValue(preview?.plan_fingerprint);
+  if (!planFingerprint) throw new Error("缺少后端 preview plan_fingerprint，不能创建正式计划。");
   return {
     ...preview_request,
+    plan_fingerprint: planFingerprint,
     cohort_id: String(form.cohort_id || "").trim(),
     min_submitted: Number(form.min_submitted),
-    preview_request,
   };
 }
 
@@ -307,7 +431,9 @@ export function formFromAllocationPlan(plan, task = {}, taskId = "") {
     calibration_annotator_ids: Array.isArray(calibration.expected_annotator_ids)
       ? calibration.expected_annotator_ids.join("\n")
       : "",
-    records_json: Array.isArray(request.records) ? JSON.stringify(request.records, null, 2) : "",
+    annotator_source_available: false,
+    trusted_source_key: stringValue(plan.trusted_source?.key, plan.trusted_source_key, plan.source_ref?.key),
+    trusted_source: plan.trusted_source || null,
     annotators,
   };
 }

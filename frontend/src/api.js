@@ -99,8 +99,8 @@ export const taskPublishIdempotencyKey = (taskId, draftFingerprint) =>
 
 export const getTasks = () => req("/api/tasks");
 export const syncTasks = () => req("/api/tasks/sync", { method: "POST" });
-export const getTaskControl = (taskId) =>
-  req(`/api/task/control?${q({ task_id: taskId })}`).then((data) => data.task || data);
+export const getTaskControl = (taskId, workspace = "") =>
+  req(`/api/task/control?${q({ task_id: taskId, workspace })}`).then((data) => data.task || data);
 const unwrapSettings = (data) => data.settings || data.config || data || {};
 
 export const getSettings = () => req("/api/settings").then(unwrapSettings);
@@ -110,7 +110,7 @@ export const getImportDetail = (taskId, importId) => req(`/api/import/detail?${q
 export const getImportRows = (taskId, importId, opts = {}) =>
   req(`/api/import/rows?${q({ task_id: taskId, import_id: importId, offset: opts.offset, limit: opts.limit, q: opts.query })}`);
 export const getTaskRuns = (taskId) => req(`/api/task/runs?${q({ task_id: taskId })}`);
-export const getTaskSamples = (taskId) => req(`/api/task/samples?${q({ task_id: taskId })}`);
+export const getTaskSamples = (taskId, workspace = "") => req(`/api/task/samples?${q({ task_id: taskId, workspace })}`);
 export const getTaskModels = (taskId) => req(`/api/task/models?${q({ task_id: taskId })}`);
 export const getTaskGoldVersions = (taskId) => req(`/api/task/gold_versions?${q({ task_id: taskId })}`);
 export const getProfilePresets = () => req("/api/profile/presets");
@@ -248,13 +248,13 @@ export const suggestionDownloadUrl = (taskId, annotationId, suggestionId, kind =
 const ALLOCATION_PLANS_PATH = "/api/allocation/plans";
 
 const allocationScopeQuery = (scope = {}) => q({
-  workspace: scope.workspace,
-  task_id: scope.taskId ?? scope.task_id,
-  revision_id: scope.revisionId ?? scope.revision_id,
-  phase: scope.phase,
-  status: scope.status,
-  limit: scope.limit,
-  cursor: scope.cursor,
+  workspace: scope?.workspace,
+  task_id: scope?.taskId ?? scope?.task_id,
+  revision_id: scope?.revisionId ?? scope?.revision_id,
+  phase: scope?.phase,
+  status: scope?.status,
+  limit: scope?.limit,
+  cursor: scope?.cursor,
 });
 
 const allocationScopedPath = (path, scope = {}) => {
@@ -268,6 +268,12 @@ const allocationPlanPath = (planId) =>
 export const allocationPlanConfirmIdempotencyKey = (planId, fingerprint = "") =>
   `allocation-plan-confirm:${keyPart(planId, "plan")}:${keyPart(fingerprint, "preview")}`;
 
+export const allocationPlanCreateIdempotencyKey = (workspace, taskId, fingerprint = "") =>
+  `allocation-plan-create:${keyPart(workspace, "workspace")}:${keyPart(taskId, "task")}:${keyPart(fingerprint, "preview")}`;
+
+export const allocationPlanUpdateIdempotencyKey = (planId, fingerprint = "") =>
+  `allocation-plan-update:${keyPart(planId, "plan")}:${keyPart(fingerprint, "preview")}`;
+
 export const getAllocationPlans = (scope = {}) =>
   req(allocationScopedPath(ALLOCATION_PLANS_PATH, scope));
 
@@ -276,19 +282,25 @@ export const listAllocationPlans = getAllocationPlans;
 export const getAllocationPlan = (planId, scope = {}) =>
   req(allocationScopedPath(allocationPlanPath(planId), scope));
 
-export const createAllocationPlan = (payload) =>
-  req(ALLOCATION_PLANS_PATH, {
+export const createAllocationPlan = (payload, options = {}) => {
+  const idempotencyKey = String(options?.idempotencyKey || "").trim();
+  if (!idempotencyKey) throw new Error("创建分配计划必须提供 Idempotency-Key");
+  return req(ALLOCATION_PLANS_PATH, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
     body: JSON.stringify(payload),
   });
+};
 
-export const updateAllocationPlan = (planId, payload) =>
-  req(allocationPlanPath(planId), {
+export const updateAllocationPlan = (planId, payload, options = {}) => {
+  const idempotencyKey = String(options?.idempotencyKey || "").trim();
+  if (!idempotencyKey) throw new Error("更新分配计划必须提供 Idempotency-Key");
+  return req(allocationPlanPath(planId), {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Idempotency-Key": idempotencyKey },
     body: JSON.stringify(payload),
   });
+};
 
 export const previewAllocation = (payload) =>
   req("/api/allocation/preview", {
@@ -297,18 +309,20 @@ export const previewAllocation = (payload) =>
     body: JSON.stringify(payload),
   });
 
-export const confirmAllocationPlan = (planId, payload = {}) => {
-  const fingerprint = payload.plan_fingerprint || payload.preview_fingerprint || "";
+export const confirmAllocationPlan = (planId, payload = {}, options = {}) => {
+  const fingerprint = payload.plan_fingerprint || "";
+  const idempotencyKey = String(options?.idempotencyKey || "").trim()
+    || allocationPlanConfirmIdempotencyKey(planId, fingerprint);
+  const { idempotency_key: _ignoredIdempotencyKey, preview_fingerprint: _ignoredPreviewFingerprint, ...body } = payload;
   return req(`${allocationPlanPath(planId)}/confirm`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(fingerprint ? { "If-Match": fingerprint } : {}),
+      "Idempotency-Key": idempotencyKey,
     },
     body: JSON.stringify({
-      ...payload,
+      ...body,
       confirm: true,
-      idempotency_key: payload.idempotency_key || allocationPlanConfirmIdempotencyKey(planId, fingerprint),
     }),
   });
 };
@@ -328,9 +342,3 @@ export const getAllocationAssignments = getAllocationPlanAssignments;
 
 export const getAllocationPlanCollection = (planId, scope = {}, status = "") =>
   req(allocationScopedPath(`${allocationPlanPath(planId)}/collection`, { ...scope, status }));
-
-export const getAllocationAnnotators = (scope = {}) =>
-  req(allocationScopedPath("/api/allocation/annotators", scope));
-
-export const getAllocationCohorts = (scope = {}) =>
-  req(allocationScopedPath("/api/allocation/cohorts", scope));
