@@ -511,6 +511,7 @@ export default function RunsPage({ task, taskId, onError }) {
             <div className="status-line">每一行是一条 Argilla 标注任务；点击行查看推送状态、批次血缘和后续动作。</div>
           </div>
           <div className="action-row">
+            <Link className="btn btn-sm" to={`/task/${encodeURIComponent(taskId)}/allocation-plans`}>分配计划</Link>
             <button className="btn btn-sm" type="button" onClick={reload} disabled={busy}>刷新</button>
             <button className="btn btn-sm btn-primary" type="button" onClick={openCreatePanel}>新增标注任务</button>
           </div>

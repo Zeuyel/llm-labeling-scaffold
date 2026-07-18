@@ -244,3 +244,93 @@ export const importDownloadUrl = (taskId, importId) =>
 
 export const suggestionDownloadUrl = (taskId, annotationId, suggestionId, kind = "template") =>
   `/api/suggestions/download?${q({ task_id: taskId, annotation_id: annotationId, suggestion_id: suggestionId, kind })}`;
+
+const ALLOCATION_PLANS_PATH = "/api/allocation/plans";
+
+const allocationScopeQuery = (scope = {}) => q({
+  workspace: scope.workspace,
+  task_id: scope.taskId ?? scope.task_id,
+  revision_id: scope.revisionId ?? scope.revision_id,
+  phase: scope.phase,
+  status: scope.status,
+  limit: scope.limit,
+  cursor: scope.cursor,
+});
+
+const allocationScopedPath = (path, scope = {}) => {
+  const query = allocationScopeQuery(scope);
+  return query ? `${path}?${query}` : path;
+};
+
+const allocationPlanPath = (planId) =>
+  `${ALLOCATION_PLANS_PATH}/${encodeURIComponent(planId)}`;
+
+export const allocationPlanConfirmIdempotencyKey = (planId, fingerprint = "") =>
+  `allocation-plan-confirm:${keyPart(planId, "plan")}:${keyPart(fingerprint, "preview")}`;
+
+export const getAllocationPlans = (scope = {}) =>
+  req(allocationScopedPath(ALLOCATION_PLANS_PATH, scope));
+
+export const listAllocationPlans = getAllocationPlans;
+
+export const getAllocationPlan = (planId, scope = {}) =>
+  req(allocationScopedPath(allocationPlanPath(planId), scope));
+
+export const createAllocationPlan = (payload) =>
+  req(ALLOCATION_PLANS_PATH, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+export const updateAllocationPlan = (planId, payload) =>
+  req(allocationPlanPath(planId), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+export const previewAllocation = (payload) =>
+  req("/api/allocation/preview", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+export const confirmAllocationPlan = (planId, payload = {}) => {
+  const fingerprint = payload.plan_fingerprint || payload.preview_fingerprint || "";
+  return req(`${allocationPlanPath(planId)}/confirm`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(fingerprint ? { "If-Match": fingerprint } : {}),
+    },
+    body: JSON.stringify({
+      ...payload,
+      confirm: true,
+      idempotency_key: payload.idempotency_key || allocationPlanConfirmIdempotencyKey(planId, fingerprint),
+    }),
+  });
+};
+
+export const getAllocationPlanProgress = (planId, scope = {}) =>
+  req(allocationScopedPath(`${allocationPlanPath(planId)}/progress`, scope));
+
+export const getAllocationProgress = getAllocationPlanProgress;
+
+export const getAllocationPlanAssignments = (planId, scope = {}, filters = {}) =>
+  req(allocationScopedPath(`${allocationPlanPath(planId)}/assignments`, {
+    ...scope,
+    ...filters,
+  }));
+
+export const getAllocationAssignments = getAllocationPlanAssignments;
+
+export const getAllocationPlanCollection = (planId, scope = {}, status = "") =>
+  req(allocationScopedPath(`${allocationPlanPath(planId)}/collection`, { ...scope, status }));
+
+export const getAllocationAnnotators = (scope = {}) =>
+  req(allocationScopedPath("/api/allocation/annotators", scope));
+
+export const getAllocationCohorts = (scope = {}) =>
+  req(allocationScopedPath("/api/allocation/cohorts", scope));

@@ -15,6 +15,7 @@ import SettingsPage from "./pages/SettingsPage.jsx";
 import TaskArchivePage from "./pages/TaskArchivePage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import DataAssetsPage from "./pages/DataAssetsPage.jsx";
+import AllocationPlansPage from "./pages/AllocationPlansPage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
@@ -24,6 +25,7 @@ const ROUTES = [
   { pattern: "/task/:id/canvas", page: "canvas" },
   { pattern: "/task/:id/imports", page: "imports" },
   { pattern: "/task/:id/samples", page: "samples" },
+  { pattern: "/task/:id/allocation-plans", page: "allocation-plans" },
   { pattern: "/task/:id/annotations", page: "annotations" },
   { pattern: "/task/:id/runs", page: "annotations" },
   { pattern: "/task/:id/jobs", page: "jobs" },
@@ -130,6 +132,7 @@ function Shell({ session, onLogout }) {
     />
   );
   else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "allocation-plans") page = <AllocationPlansPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "annotations") page = <RunsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "jobs") page = <JobsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
   else if (matched.page === "gold") page = <GoldPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
