@@ -6,6 +6,7 @@ const TASK_PAGES = [
   { key: "canvas", label: "流程画布", short: "流", suffix: "/canvas" },
   { key: "imports", label: "任务输入", short: "入", suffix: "/imports" },
   { key: "samples", label: "样本管理", short: "样", suffix: "/samples" },
+  { key: "allocation-plans", label: "分配计划", short: "分", suffix: "/allocation-plans" },
   { key: "annotations", label: "标注分发", short: "标", suffix: "/annotations" },
   { key: "jobs", label: "执行记录", short: "记", suffix: "/jobs" },
   { key: "gold", label: "训练集版本", short: "集", suffix: "/gold" },
