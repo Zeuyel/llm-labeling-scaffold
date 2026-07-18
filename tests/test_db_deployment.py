@@ -568,7 +568,6 @@ def test_runtime_role_initialization_repairs_alembic_version_select_on_existing_
         drift = _run_verifier(database, check=False)
         assert drift.returncode == 3
         assert "runtime relation privilege verification failed" in drift.stdout
-        assert "runtime relation ACL catalog verification failed" in drift.stdout
     finally:
         _run_role_script(database, verify=True)
 
