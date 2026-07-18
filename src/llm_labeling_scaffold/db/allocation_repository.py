@@ -9,7 +9,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable, Iterator
 
-from sqlalchemy import Engine, and_, func, select
+from sqlalchemy import Engine, and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -62,6 +62,7 @@ from .models import (
     AnnotatorCohortRevision,
     ArgillaAnnotatorMapping,
     ArgillaConnectionBinding,
+    AuditEvent,
     Principal,
     Task,
     TaskRevision,
@@ -570,6 +571,269 @@ class TrustedAllocationRepository:
             if decision.workspace.id != plan.workspace_id:
                 raise AllocationResourceNotFound("allocation plan was not found")
             return _allocation_progress(session, plan.id)
+
+    def list_plans(
+        self,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str | None = None,
+        limit: int = 100,
+        after_plan_id: uuid.UUID | str | None = None,
+    ) -> dict[str, Any]:
+        limit = _page_limit(limit)
+        with self._transaction() as session:
+            transaction = DatabaseTransaction(session)
+            task_ids, workspace_id = self._authorized_plan_scope(
+                session,
+                transaction,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+            )
+            if not task_ids:
+                return {"workspace": workspace_slug, "plans": [], "next_cursor": None}
+            statement = (
+                select(AllocationPlan, AllocationPlanState)
+                .join(AllocationPlanState, AllocationPlanState.plan_id == AllocationPlan.id)
+                .where(AllocationPlan.workspace_id == workspace_id)
+                .order_by(AllocationPlan.id.desc())
+                .limit(limit + 1)
+            )
+            statement = statement.where(AllocationPlan.task_id.in_(task_ids))
+            if after_plan_id is not None:
+                statement = statement.where(AllocationPlan.id < _require_uuid(after_plan_id, "after_plan_id"))
+            rows = session.execute(statement).all()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            return {
+                "workspace": workspace_slug,
+                "plans": _plan_summaries(session, rows),
+                "next_cursor": str(rows[-1][0].id) if has_more and rows else None,
+            }
+
+    def get_plan(
+        self,
+        plan_id: uuid.UUID | str,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+    ) -> dict[str, Any]:
+        plan_id = _require_uuid(plan_id, "plan_id")
+        with self._transaction() as session:
+            transaction = DatabaseTransaction(session)
+            plan, task = _load_plan_and_task(session, plan_id)
+            self._authorize_plan(
+                transaction,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task=task,
+            )
+            return _plan_detail(session, plan, _plan_state(session, plan.id))
+
+    def list_assignments(
+        self,
+        plan_id: uuid.UUID | str,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        limit: int = 100,
+        after_assignment_id: uuid.UUID | str | None = None,
+    ) -> dict[str, Any]:
+        plan_id = _require_uuid(plan_id, "plan_id")
+        limit = _page_limit(limit)
+        with self._transaction() as session:
+            transaction = DatabaseTransaction(session)
+            plan, task = _load_plan_and_task(session, plan_id)
+            self._authorize_plan(
+                transaction,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task=task,
+            )
+            statement = (
+                select(
+                    AllocationAssignment,
+                    AllocationAssignmentItem,
+                    AllocationDatasetGroup,
+                    AllocationWorkspaceGroup,
+                    AllocationRecordBinding,
+                )
+                .join(
+                    AllocationAssignmentItem,
+                    and_(
+                        AllocationAssignmentItem.workspace_id == AllocationAssignment.workspace_id,
+                        AllocationAssignmentItem.plan_id == AllocationAssignment.plan_id,
+                        AllocationAssignmentItem.id == AllocationAssignment.item_id,
+                    ),
+                )
+                .join(
+                    AllocationDatasetGroup,
+                    and_(
+                        AllocationDatasetGroup.workspace_id == AllocationAssignment.workspace_id,
+                        AllocationDatasetGroup.plan_id == AllocationAssignment.plan_id,
+                        AllocationDatasetGroup.id == AllocationAssignmentItem.dataset_group_id,
+                    ),
+                )
+                .join(
+                    AllocationWorkspaceGroup,
+                    and_(
+                        AllocationWorkspaceGroup.workspace_id == AllocationDatasetGroup.workspace_id,
+                        AllocationWorkspaceGroup.plan_id == AllocationDatasetGroup.plan_id,
+                        AllocationWorkspaceGroup.id == AllocationDatasetGroup.workspace_group_id,
+                    ),
+                )
+                .outerjoin(AllocationRecordBinding, AllocationRecordBinding.item_id == AllocationAssignmentItem.id)
+                .where(
+                    AllocationAssignment.workspace_id == plan.workspace_id,
+                    AllocationAssignment.plan_id == plan.id,
+                )
+                .order_by(AllocationAssignment.id.desc())
+                .limit(limit + 1)
+            )
+            if after_assignment_id is not None:
+                statement = statement.where(
+                    AllocationAssignment.id < _require_uuid(after_assignment_id, "after_assignment_id")
+                )
+            rows = session.execute(statement).all()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            return {
+                "workspace": workspace_slug,
+                "plan_id": str(plan.id),
+                "assignments": _assignment_details(session, rows),
+                "next_cursor": str(rows[-1][0].id) if has_more and rows else None,
+            }
+
+    def get_assignment(
+        self,
+        assignment_id: uuid.UUID | str,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        plan_id: uuid.UUID | str | None = None,
+    ) -> dict[str, Any]:
+        assignment_id = _require_uuid(assignment_id, "assignment_id")
+        with self._transaction() as session:
+            transaction = DatabaseTransaction(session)
+            statement = (
+                select(
+                    AllocationAssignment,
+                    AllocationAssignmentItem,
+                    AllocationDatasetGroup,
+                    AllocationWorkspaceGroup,
+                    AllocationRecordBinding,
+                )
+                .join(
+                    AllocationAssignmentItem,
+                    and_(
+                        AllocationAssignmentItem.workspace_id == AllocationAssignment.workspace_id,
+                        AllocationAssignmentItem.plan_id == AllocationAssignment.plan_id,
+                        AllocationAssignmentItem.id == AllocationAssignment.item_id,
+                    ),
+                )
+                .join(
+                    AllocationDatasetGroup,
+                    and_(
+                        AllocationDatasetGroup.workspace_id == AllocationAssignment.workspace_id,
+                        AllocationDatasetGroup.plan_id == AllocationAssignment.plan_id,
+                        AllocationDatasetGroup.id == AllocationAssignmentItem.dataset_group_id,
+                    ),
+                )
+                .join(
+                    AllocationWorkspaceGroup,
+                    and_(
+                        AllocationWorkspaceGroup.workspace_id == AllocationDatasetGroup.workspace_id,
+                        AllocationWorkspaceGroup.plan_id == AllocationDatasetGroup.plan_id,
+                        AllocationWorkspaceGroup.id == AllocationDatasetGroup.workspace_group_id,
+                    ),
+                )
+                .outerjoin(AllocationRecordBinding, AllocationRecordBinding.item_id == AllocationAssignmentItem.id)
+                .where(AllocationAssignment.id == assignment_id)
+            )
+            if plan_id is not None:
+                statement = statement.where(
+                    AllocationAssignment.plan_id == _require_uuid(plan_id, "plan_id")
+                )
+            row = session.execute(statement).first()
+            if row is None:
+                raise AllocationResourceNotFound("allocation assignment was not found")
+            assignment, _, _, _, _ = row
+            plan, task = _load_plan_and_task(session, assignment.plan_id)
+            self._authorize_plan(
+                transaction,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task=task,
+            )
+            return _assignment_details(session, [row])[0]
+
+    def _authorized_plan_scope(
+        self,
+        session: Session,
+        transaction: DatabaseTransaction,
+        *,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        workspace_slug: str,
+        task_key: str | None,
+    ) -> tuple[tuple[uuid.UUID, ...], uuid.UUID]:
+        if task_key is not None:
+            decision = transaction.authorize_task(
+                actor_identity,
+                workspace_slug,
+                task_key,
+                Permission.ANNOTATION_REVIEW,
+            )
+            transaction.require(decision)
+            if decision.task is None or decision.workspace is None or decision.principal is None:
+                raise AllocationResourceNotFound("allocation plan was not found")
+            transaction._require_caller(caller_identity, decision.principal.id, Permission.ANNOTATION_REVIEW)
+            return (decision.task.id,), decision.workspace.id
+
+        task_accesses = []
+        after_task_key = None
+        workspace = None
+        while True:
+            page = transaction.list_authorized_tasks(
+                actor_identity,
+                workspace_slug,
+                limit=100,
+                after_task_key=after_task_key,
+                include_archived=True,
+            )
+            if page.workspace is None:
+                break
+            workspace = page.workspace
+            task_accesses.extend(page.items)
+            if page.next_cursor is None:
+                break
+            after_task_key = page.next_cursor
+        if workspace is None:
+            raise AllocationResourceNotFound("allocation workspace was not found")
+        actor = session.scalar(
+            select(Principal).where(
+                Principal.issuer == actor_identity.issuer,
+                Principal.subject == actor_identity.subject,
+            )
+        )
+        if actor is None:
+            raise AllocationResourceNotFound("actor principal was not found")
+        transaction._require_caller(caller_identity, actor.id, Permission.ANNOTATION_REVIEW)
+        task_ids = tuple(
+            access.task.id
+            for access in task_accesses
+            if Permission.ANNOTATION_REVIEW in access.capabilities
+        )
+        return task_ids, workspace.id
 
     def _load_context(
         self,
@@ -1181,6 +1445,409 @@ def _allocation_progress(session: Session, plan_id: uuid.UUID) -> AllocationProg
         required_submissions=required_count,
         completed=accepted_count >= required_count,
     )
+
+
+def _page_limit(value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1 or value > 100:
+        raise AllocationRepositoryValidationError("limit must be between 1 and 100")
+    return value
+
+
+def _plan_summaries(
+    session: Session,
+    rows: list[tuple[AllocationPlan, AllocationPlanState]],
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    plans = [plan for plan, _ in rows]
+    plan_ids = [plan.id for plan in plans]
+    required_by_plan = {
+        plan_id: int(required or 0)
+        for plan_id, required in session.execute(
+            select(
+                AllocationAssignment.plan_id,
+                func.coalesce(func.sum(AllocationAssignment.required_submissions), 0),
+            )
+            .where(AllocationAssignment.plan_id.in_(plan_ids))
+            .group_by(AllocationAssignment.plan_id)
+        ).all()
+    }
+    accepted_by_plan = {
+        plan_id: int(accepted or 0)
+        for plan_id, accepted in session.execute(
+            select(
+                AllocationCollectionReceipt.plan_id,
+                func.count(),
+            )
+            .where(
+                AllocationCollectionReceipt.plan_id.in_(plan_ids),
+                AllocationCollectionReceipt.disposition == CollectionDisposition.ACCEPTED,
+            )
+            .group_by(AllocationCollectionReceipt.plan_id)
+        ).all()
+    }
+    assignment_count_by_plan = {
+        plan_id: int(count or 0)
+        for plan_id, count in session.execute(
+            select(AllocationAssignment.plan_id, func.count())
+            .where(AllocationAssignment.plan_id.in_(plan_ids))
+            .group_by(AllocationAssignment.plan_id)
+        ).all()
+    }
+    audit_by_plan = _audit_events_by_resource(
+        session,
+        plans[0].workspace_id,
+        "allocation_plan",
+        plan_ids,
+    )
+    progress_by_plan = {
+        plan_id: AllocationProgress(
+            plan_id=plan_id,
+            accepted_submissions=accepted_by_plan.get(plan_id, 0),
+            required_submissions=required_by_plan.get(plan_id, 0),
+            completed=accepted_by_plan.get(plan_id, 0) >= required_by_plan.get(plan_id, 0),
+        )
+        for plan_id in plan_ids
+    }
+    return [
+        _plan_summary(
+            session,
+            plan,
+            state,
+            progress=progress_by_plan[plan.id],
+            assignment_count=assignment_count_by_plan.get(plan.id, 0),
+            audit_events=audit_by_plan.get(str(plan.id), []),
+        )
+        for plan, state in rows
+    ]
+
+
+def _plan_summary(
+    session: Session,
+    plan: AllocationPlan,
+    state: AllocationPlanState,
+    *,
+    progress: AllocationProgress | None = None,
+    assignment_count: int | None = None,
+    audit_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if progress is None:
+        progress = _allocation_progress(session, plan.id)
+    if assignment_count is None:
+        assignment_count = int(
+            session.scalar(
+                select(func.count()).where(
+                    AllocationAssignment.workspace_id == plan.workspace_id,
+                    AllocationAssignment.plan_id == plan.id,
+                )
+            )
+            or 0
+        )
+    if audit_events is None:
+        audit_events = _audit_events(session, plan.workspace_id, "allocation_plan", plan.id)
+    return {
+        "kind": "allocation_plan_v1",
+        "plan_id": str(plan.id),
+        "workspace_id": str(plan.workspace_id),
+        "task_id": str(plan.task_id),
+        "task_revision_id": str(plan.task_revision_id),
+        "cohort_revision_id": str(plan.cohort_revision_id),
+        "source_manifest": {
+            "manifest_id": plan.source_manifest_id,
+            "kind": plan.source_manifest_kind.value,
+            "manifest_hash": plan.source_manifest_hash,
+        },
+        "strategy": plan.strategy.value,
+        "schema_version": plan.schema_version,
+        "algorithm_version": plan.algorithm_version,
+        "fingerprint": plan.fingerprint,
+        "input_fingerprint": plan.input_fingerprint,
+        "lifecycle_state": state.lifecycle_state.value,
+        "assignment_count": assignment_count,
+        "progress": _progress_payload(progress),
+        "created_at": _datetime_value(plan.created_at),
+        "audit_events": audit_events,
+    }
+
+
+def _plan_detail(session: Session, plan: AllocationPlan, state: AllocationPlanState) -> dict[str, Any]:
+    payload = _plan_summary(session, plan, state)
+    workspace_groups = session.scalars(
+        select(AllocationWorkspaceGroup)
+        .where(
+            AllocationWorkspaceGroup.workspace_id == plan.workspace_id,
+            AllocationWorkspaceGroup.plan_id == plan.id,
+        )
+        .order_by(AllocationWorkspaceGroup.planner_workspace_group_id)
+    ).all()
+    dataset_rows = session.execute(
+        select(AllocationDatasetGroup, AllocationDatasetGroupState)
+        .join(
+            AllocationDatasetGroupState,
+            and_(
+                AllocationDatasetGroupState.workspace_id == AllocationDatasetGroup.workspace_id,
+                AllocationDatasetGroupState.plan_id == AllocationDatasetGroup.plan_id,
+                AllocationDatasetGroupState.dataset_group_id == AllocationDatasetGroup.id,
+            ),
+        )
+        .where(
+            AllocationDatasetGroup.workspace_id == plan.workspace_id,
+            AllocationDatasetGroup.plan_id == plan.id,
+        )
+        .order_by(AllocationDatasetGroup.planner_dataset_group_id)
+    ).all()
+    payload.update(
+        {
+            "connection_binding_id": str(plan.connection_binding_id),
+            "task_revision_hash": plan.task_revision_hash,
+            "capacity_snapshot": list(plan.capacity_snapshot),
+            "qc_snapshot": dict(plan.qc_snapshot),
+            "workspace_groups": [
+                {
+                    "group_id": str(group.id),
+                    "planner_group_id": group.planner_workspace_group_id,
+                    "phase": group.phase.value,
+                    "mode": group.mode.value,
+                    "assignee_mapping_id": (
+                        str(group.assignee_mapping_id) if group.assignee_mapping_id is not None else None
+                    ),
+                    "member_mapping_ids": list(group.member_mapping_ids),
+                }
+                for group in workspace_groups
+            ],
+            "dataset_groups": [_dataset_group_payload(group, state_row) for group, state_row in dataset_rows],
+            "audit": {
+                "actor_principal_id": str(plan.actor_principal_id),
+                "caller_principal_id": str(plan.caller_principal_id),
+                "channel": plan.channel.value,
+                "events": payload["audit_events"],
+            },
+        }
+    )
+    return payload
+
+
+def _dataset_group_payload(group: AllocationDatasetGroup, state: AllocationDatasetGroupState) -> dict[str, Any]:
+    return {
+        "group_id": str(group.id),
+        "planner_group_id": group.planner_dataset_group_id,
+        "workspace_group_id": str(group.workspace_group_id),
+        "phase": group.phase.value,
+        "min_submitted": group.min_submitted,
+        "assignee_mapping_id": str(group.assignee_mapping_id) if group.assignee_mapping_id is not None else None,
+        "pool_id": str(group.pool_id) if group.pool_id is not None else None,
+        "materialization_state": state.materialization_state.value,
+        "argilla_workspace_id": str(state.argilla_workspace_id) if state.argilla_workspace_id is not None else None,
+        "argilla_dataset_id": str(state.argilla_dataset_id) if state.argilla_dataset_id is not None else None,
+        "materialized_at": _datetime_value(state.materialized_at),
+        "updated_at": _datetime_value(state.updated_at),
+    }
+
+
+def _assignment_detail(
+    session: Session,
+    assignment: AllocationAssignment,
+    item: AllocationAssignmentItem,
+    dataset: AllocationDatasetGroup,
+    workspace_group: AllocationWorkspaceGroup,
+    record_binding: AllocationRecordBinding | None,
+    *,
+    receipts: list[AllocationCollectionReceipt] | None = None,
+    audit_events: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    if receipts is None:
+        receipts = session.scalars(
+            select(AllocationCollectionReceipt)
+            .where(
+                AllocationCollectionReceipt.workspace_id == assignment.workspace_id,
+                AllocationCollectionReceipt.plan_id == assignment.plan_id,
+                AllocationCollectionReceipt.item_id == item.id,
+                or_(
+                    AllocationCollectionReceipt.assignment_id == assignment.id,
+                    AllocationCollectionReceipt.assignment_id.is_(None),
+                ),
+            )
+            .order_by(AllocationCollectionReceipt.created_at, AllocationCollectionReceipt.id)
+        ).all()
+    if audit_events is None:
+        audit_events = _audit_events(
+            session,
+            assignment.workspace_id,
+            "allocation_assignment",
+            assignment.id,
+        )
+    return {
+        "kind": "allocation_assignment_v1",
+        "assignment_id": str(assignment.id),
+        "planner_assignment_id": assignment.planner_assignment_id,
+        "plan_id": str(assignment.plan_id),
+        "item_id": str(item.id),
+        "record_id": item.record_id,
+        "external_id": item.external_id,
+        "batch_id": item.batch_id,
+        "content_hash": item.content_hash,
+        "dataset_group_id": str(dataset.id),
+        "planner_dataset_group_id": dataset.planner_dataset_group_id,
+        "workspace_group_id": str(workspace_group.id),
+        "planner_workspace_group_id": workspace_group.planner_workspace_group_id,
+        "phase": assignment.phase.value,
+        "role": assignment.role.value,
+        "assignee_mapping_id": (
+            str(assignment.assignee_mapping_id) if assignment.assignee_mapping_id is not None else None
+        ),
+        "pool_id": str(assignment.pool_id) if assignment.pool_id is not None else None,
+        "required_submissions": assignment.required_submissions,
+        "gate_id": assignment.gate_id,
+        "remote_binding": (
+            {
+                "argilla_dataset_id": str(record_binding.argilla_dataset_id),
+                "argilla_record_id": str(record_binding.argilla_record_id),
+                "bound_at": _datetime_value(record_binding.bound_at),
+            }
+            if record_binding is not None
+            and record_binding.argilla_dataset_id is not None
+            and record_binding.argilla_record_id is not None
+            else None
+        ),
+        "receipts": [_receipt_detail(receipt) for receipt in receipts],
+        "audit_events": audit_events,
+    }
+
+
+def _assignment_details(
+    session: Session,
+    rows: list[tuple[
+        AllocationAssignment,
+        AllocationAssignmentItem,
+        AllocationDatasetGroup,
+        AllocationWorkspaceGroup,
+        AllocationRecordBinding | None,
+    ]],
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    assignments = [row[0] for row in rows]
+    items = [row[1] for row in rows]
+    assignment_ids = [assignment.id for assignment in assignments]
+    item_ids = [item.id for item in items]
+    first_assignment = assignments[0]
+    receipts = session.scalars(
+        select(AllocationCollectionReceipt)
+        .where(
+            AllocationCollectionReceipt.workspace_id == first_assignment.workspace_id,
+            AllocationCollectionReceipt.plan_id == first_assignment.plan_id,
+            AllocationCollectionReceipt.item_id.in_(item_ids),
+            or_(
+                AllocationCollectionReceipt.assignment_id.in_(assignment_ids),
+                AllocationCollectionReceipt.assignment_id.is_(None),
+            ),
+        )
+        .order_by(AllocationCollectionReceipt.created_at, AllocationCollectionReceipt.id)
+    ).all()
+    receipts_by_assignment: dict[uuid.UUID, list[AllocationCollectionReceipt]] = {}
+    receipts_by_item: dict[uuid.UUID, list[AllocationCollectionReceipt]] = {}
+    for receipt in receipts:
+        if receipt.assignment_id is None:
+            receipts_by_item.setdefault(receipt.item_id, []).append(receipt)
+        else:
+            receipts_by_assignment.setdefault(receipt.assignment_id, []).append(receipt)
+    audit_by_assignment = _audit_events_by_resource(
+        session,
+        first_assignment.workspace_id,
+        "allocation_assignment",
+        assignment_ids,
+    )
+    result = []
+    for assignment, item, dataset, workspace_group, record_binding in rows:
+        result.append(
+            _assignment_detail(
+                session,
+                assignment,
+                item,
+                dataset,
+                workspace_group,
+                record_binding,
+                receipts=(
+                    receipts_by_assignment.get(assignment.id, [])
+                    + receipts_by_item.get(item.id, [])
+                ),
+                audit_events=audit_by_assignment.get(str(assignment.id), []),
+            )
+        )
+    return result
+
+
+def _receipt_detail(receipt: AllocationCollectionReceipt) -> dict[str, Any]:
+    return {
+        "receipt_id": str(receipt.id),
+        "assignment_id": str(receipt.assignment_id) if receipt.assignment_id is not None else None,
+        "argilla_response_id": str(receipt.argilla_response_id),
+        "argilla_respondent_id": str(receipt.argilla_respondent_id),
+        "response_status": receipt.response_status,
+        "disposition": receipt.disposition.value,
+        "rejection_reason": receipt.rejection_reason,
+        "pulled_at": _datetime_value(receipt.pulled_at),
+        "created_at": _datetime_value(receipt.created_at),
+    }
+
+
+def _progress_payload(progress: AllocationProgress) -> dict[str, Any]:
+    return {
+        "accepted_submissions": progress.accepted_submissions,
+        "required_submissions": progress.required_submissions,
+        "completed": progress.completed,
+        "ratio": progress.ratio,
+    }
+
+
+def _audit_events(
+    session: Session,
+    workspace_id: uuid.UUID,
+    resource_type: str,
+    resource_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    return _audit_events_by_resource(session, workspace_id, resource_type, [resource_id]).get(
+        str(resource_id),
+        [],
+    )
+
+
+def _audit_events_by_resource(
+    session: Session,
+    workspace_id: uuid.UUID,
+    resource_type: str,
+    resource_ids: list[uuid.UUID],
+) -> dict[str, list[dict[str, Any]]]:
+    if not resource_ids:
+        return {}
+    events = session.scalars(
+        select(AuditEvent)
+        .where(
+            AuditEvent.workspace_id == workspace_id,
+            AuditEvent.resource_type == resource_type,
+            AuditEvent.resource_id.in_([str(resource_id) for resource_id in resource_ids]),
+        )
+        .order_by(AuditEvent.occurred_at, AuditEvent.id)
+    ).all()
+    result: dict[str, list[dict[str, Any]]] = {}
+    for event in events:
+        result.setdefault(event.resource_id or "", []).append(
+            {
+                "event_id": str(event.id),
+                "event_type": event.event_type,
+                "actor_principal_id": str(event.actor_principal_id) if event.actor_principal_id else None,
+                "caller_principal_id": str(event.caller_principal_id) if event.caller_principal_id else None,
+                "channel": event.channel.value,
+                "request_id": event.request_id,
+                "details": dict(event.details),
+                "occurred_at": _datetime_value(event.occurred_at),
+            }
+        )
+    return result
+
+
+def _datetime_value(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
 
 
 def _plan_request_payload(request: AllocationRequest, context: _AllocationContext) -> dict[str, Any]:

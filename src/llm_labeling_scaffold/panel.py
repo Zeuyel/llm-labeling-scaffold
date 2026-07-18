@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,6 +28,12 @@ from .auth import (
 )
 from .config import load_task
 from .db import (
+    AllocationNaturalKeyConflict,
+    AllocationNotReady,
+    AllocationOperationInProgress,
+    AllocationRepositoryError,
+    AllocationRepositoryValidationError,
+    AllocationResourceNotFound,
     AuditChannel,
     AuthorizationDenied,
     AuthorizationReason,
@@ -49,6 +56,7 @@ from .db import (
     TaskPreconditionRequired,
     TaskPublishReasonRequired,
     TaskPublishInProgress,
+    TrustedAllocationRepository,
     task_definition_fingerprint,
 )
 from .db.database import create_database_engine, create_session_factory
@@ -58,12 +66,17 @@ from . import pipeline
 from . import panel_settings
 from .panel_allocation import (
     AllocationPreviewDTOError,
+    parse_allocation_plan_confirm_json,
+    parse_allocation_plan_create_json,
     parse_allocation_preview_json,
+    serialize_allocation_confirmation_result,
+    serialize_allocation_plan_result,
+    serialize_allocation_progress,
     preview_allocation_dto,
 )
 from .redaction import redact_text
 
-API_CONTRACT_VERSION = "2026-07-17"
+API_CONTRACT_VERSION = "2026-07-18"
 AUTHORIZATION_READY = "ready"
 AUTHORIZATION_UNAVAILABLE = "unavailable"
 
@@ -177,6 +190,26 @@ def _safe_segment(value: str) -> bool:
         and "\\" not in value
         and not any(ord(char) < 32 for char in value)
     )
+
+
+def _allocation_path_segment(value: str) -> str | None:
+    value = unquote(str(value or "")).strip()
+    if (
+        not value
+        or "/" in value
+        or "\\" in value
+        or ".." in value
+        or any(ord(char) < 32 for char in value)
+    ):
+        return None
+    return value
+
+
+def _allocation_uuid(value: str, field: str) -> uuid.UUID:
+    try:
+        return uuid.UUID(str(value).strip())
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise AllocationPreviewDTOError("invalid_uuid", f"{field} 必须是合法 UUID", field=field) from exc
 
 
 def _truthy_env(name: str) -> bool:
@@ -762,6 +795,128 @@ def _contract_capabilities(
             },
             {
                 "method": "POST",
+                "path": "/api/allocation/plans",
+                "action": "allocation_plan_create",
+                "side_effects": True,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "required_headers": {"Idempotency-Key": {"type": "string"}},
+                "request_schema": {
+                    "type": "object",
+                    "required": ["scope", "request"],
+                    "properties": {
+                        "scope": {
+                            "type": "object",
+                            "required": [
+                                "workspace",
+                                "task_id",
+                                "revision_id",
+                                "revision_hash",
+                                "cohort_revision_id",
+                            ],
+                        },
+                        "request": {"type": "object"},
+                        "idempotency_key": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["kind", "plan_id", "fingerprint", "lifecycle_state", "replayed"],
+                },
+            },
+            {
+                "method": "POST",
+                "path": "/api/allocation/plans/{plan_id}/confirm",
+                "action": "allocation_plan_confirm",
+                "side_effects": True,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "path_params": {"plan_id": {"type": "string", "format": "uuid"}},
+                "required_headers": {"Idempotency-Key": {"type": "string"}},
+                "request_schema": {
+                    "type": "object",
+                    "required": ["plan_fingerprint"],
+                    "properties": {
+                        "workspace": {"type": "string"},
+                        "plan_fingerprint": {"type": "string", "format": "sha256"},
+                        "idempotency_key": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["kind", "plan_id", "lifecycle_state", "replayed"],
+                },
+            },
+            {
+                "method": "GET",
+                "path": "/api/allocation/plans",
+                "action": "allocation_plan_list",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "query_params": {
+                    "workspace": {"type": "string", "required": True},
+                    "task_id": {"type": "string", "required": False},
+                    "limit": {"type": "integer", "required": False},
+                    "after": {"type": "string", "required": False},
+                },
+                "response_schema": {"type": "object", "required": ["workspace", "plans"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/allocation/plans/{plan_id}",
+                "action": "allocation_plan_detail",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "path_params": {"plan_id": {"type": "string", "format": "uuid"}},
+                "query_params": {"workspace": {"type": "string", "required": True}},
+                "response_schema": {"type": "object", "required": ["plan"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/allocation/plans/{plan_id}/progress",
+                "action": "allocation_plan_progress",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "path_params": {"plan_id": {"type": "string", "format": "uuid"}},
+                "query_params": {"workspace": {"type": "string", "required": True}},
+                "response_schema": {"type": "object", "required": ["kind", "plan_id", "progress"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/allocation/plans/{plan_id}/assignments",
+                "action": "allocation_assignment_list",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "path_params": {"plan_id": {"type": "string", "format": "uuid"}},
+                "query_params": {
+                    "workspace": {"type": "string", "required": True},
+                    "limit": {"type": "integer", "required": False},
+                    "after": {"type": "string", "required": False},
+                },
+                "response_schema": {"type": "object", "required": ["workspace", "plan_id", "assignments"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/allocation/assignments/{assignment_id}",
+                "action": "allocation_assignment_detail",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.ANNOTATION_REVIEW.value,
+                "path_params": {"assignment_id": {"type": "string", "format": "uuid"}},
+                "query_params": {
+                    "workspace": {"type": "string", "required": True},
+                    "plan_id": {"type": "string", "required": False},
+                },
+                "response_schema": {"type": "object", "required": ["assignment"]},
+            },
+            {
+                "method": "POST",
                 "path": "/api/suggestions/import",
                 "action": "suggestions_import",
                 "side_effects": True,
@@ -879,6 +1034,51 @@ def _contract_task_lifecycle_path(path: str) -> tuple[str, str] | None:
     return None
 
 
+def _allocation_plan_path(path: str, *, suffix: str | None = None) -> str | None:
+    prefix = "/api/allocation/plans/"
+    if not path.startswith(prefix):
+        return None
+    rest = path[len(prefix):]
+    if suffix is not None:
+        marker = f"/{suffix}"
+        if not rest.endswith(marker):
+            return None
+        rest = rest[: -len(marker)]
+    elif "/" in rest:
+        return None
+    return _allocation_path_segment(rest)
+
+
+def _allocation_assignment_path(path: str) -> str | None:
+    prefix = "/api/allocation/assignments/"
+    if not path.startswith(prefix) or "/" in path[len(prefix):]:
+        return None
+    return _allocation_path_segment(path[len(prefix):])
+
+
+def _allocation_route_allowed(method: str, path: str) -> bool:
+    if method == "GET":
+        return (
+            path
+            in {
+                "/api/allocation/plans",
+                "/api/allocation/plan/detail",
+                "/api/allocation/assignments",
+                "/api/allocation/assignment/detail",
+            }
+            or _allocation_plan_path(path) is not None
+            or _allocation_plan_path(path, suffix="progress") is not None
+            or _allocation_plan_path(path, suffix="assignments") is not None
+            or _allocation_assignment_path(path) is not None
+        )
+    if method == "POST":
+        return (
+            path in {"/api/allocation/plans", "/api/allocation/plan"}
+            or _allocation_plan_path(path, suffix="confirm") is not None
+        )
+    return False
+
+
 def _mcp_route_allowed(method: str, path: str) -> bool:
     if method == "GET":
         if path in {
@@ -894,10 +1094,14 @@ def _mcp_route_allowed(method: str, path: str) -> bool:
             "/api/data_lake/catalog",
         }:
             return True
+        if _allocation_route_allowed(method, path):
+            return True
         return _contract_task_path(path) is not None
     if method == "POST":
         if path == "/api/allocation/preview":
             return True
+        if _allocation_route_allowed(method, path):
+            return _mcp_writes_enabled()
         if path == "/api/import/data_lake" or _contract_task_path(path, suffix="check") is not None:
             return True
         if not _mcp_writes_enabled():
@@ -924,10 +1128,13 @@ def _database_authorized_route(method: str, path: str) -> bool:
             "/api/data_lake/catalog",
         }:
             return True
+        if _allocation_route_allowed(method, path):
+            return True
         return _contract_task_path(path) is not None
     if method == "POST":
         return (
             path in {"/api/tasks", "/api/import/data_lake", "/api/allocation/preview"}
+            or _allocation_route_allowed(method, path)
             or _contract_task_path(path, suffix="publish") is not None
             or _contract_task_path(path, suffix="check") is not None
             or _contract_task_lifecycle_path(path) is not None
@@ -1268,6 +1475,7 @@ class _Handler(BaseHTTPRequestHandler):
     static_dir: Path | None = None
     authenticator: PanelAuthenticator | None = None
     authorization_service: DatabaseService | None = None
+    allocation_repository: TrustedAllocationRepository | None = None
     authorization_ready: bool = False
     active_task_loader: ActiveTaskLoader | None = None
 
@@ -1520,6 +1728,42 @@ class _Handler(BaseHTTPRequestHandler):
                 payload["field"] = exc.field
             self._json(payload, status=HTTPStatus.UNPROCESSABLE_ENTITY, sort_keys=True)
             return
+        if isinstance(exc, AllocationResourceNotFound):
+            self._json(
+                {"error": "allocation 资源不存在", "code": "resource_not_found"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        if isinstance(exc, AllocationRepositoryValidationError):
+            self._json(
+                {"error": "allocation 请求无效", "code": "invalid_allocation_request"},
+                status=HTTPStatus.UNPROCESSABLE_ENTITY,
+            )
+            return
+        if isinstance(exc, AllocationNotReady):
+            self._json(
+                {"error": "allocation 计划尚未满足执行条件", "code": "allocation_not_ready"},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, AllocationOperationInProgress):
+            self._json(
+                {"error": "allocation 操作正在处理中，请稍后重试", "code": "operation_in_progress"},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, AllocationNaturalKeyConflict):
+            self._json(
+                {"error": "allocation 远端响应已记录且内容不一致", "code": "natural_key_conflict"},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, AllocationRepositoryError):
+            self._json(
+                {"error": "allocation 控制服务暂时不可用", "code": "allocation_api_unavailable"},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
         if isinstance(exc, AuthorizationDenied):
             reason = exc.decision.reason
             if reason in {
@@ -1710,6 +1954,223 @@ class _Handler(BaseHTTPRequestHandler):
                 status=HTTPStatus.OK if payload["ready"] else HTTPStatus.UNPROCESSABLE_ENTITY,
                 sort_keys=True,
             )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _read_allocation_control_body(self) -> bytes:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            raise AllocationPreviewDTOError("invalid_json", "请求体不能为空")
+        if length > 10 * 1024 * 1024:
+            raise AllocationPreviewDTOError("request_too_large", "allocation 请求体超过 10 MiB")
+        return self.rfile.read(length)
+
+    def _allocation_repository_ready(self) -> TrustedAllocationRepository:
+        if not _control_task_source_enabled():
+            raise _PanelRouteError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "allocation_api_unavailable",
+                "allocation 控制 API 需要 scaffold 控制面",
+            )
+        repository = self.allocation_repository
+        if not self.authorization_ready or repository is None:
+            raise _PanelRouteError(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                "allocation_api_unavailable",
+                "allocation 控制服务暂时不可用",
+            )
+        return repository
+
+    def _allocation_idempotency_key(self, body_value: str | None) -> str:
+        body_key = str(body_value or "").strip()
+        header_key = str(self.headers.get("Idempotency-Key") or "").strip()
+        if not header_key:
+            raise AllocationPreviewDTOError(
+                "missing_idempotency_key",
+                "create 和 confirm 必须提供 Idempotency-Key header",
+                field="Idempotency-Key",
+            )
+        if body_key and header_key and body_key != header_key:
+            raise AllocationPreviewDTOError(
+                "idempotency_key_conflict",
+                "JSON 幂等键与 Idempotency-Key header 不一致",
+                field="idempotency_key",
+            )
+        value = header_key
+        if not _valid_idempotency_key(value):
+            raise AllocationPreviewDTOError(
+                "invalid_idempotency_key",
+                "必须提供有效的 idempotency_key 或 Idempotency-Key header",
+                field="idempotency_key",
+            )
+        return value
+
+    def _allocation_request_id(self) -> str | None:
+        value = str(self.headers.get("X-Request-ID") or "").strip()
+        if not value:
+            return None
+        if len(value) > 255 or any(ord(char) < 32 for char in value):
+            raise AllocationPreviewDTOError("invalid_request_id", "X-Request-ID 不是有效请求标识", field="X-Request-ID")
+        return value
+
+    def _allocation_workspace(self, params, body_workspace: str | None = None) -> str:
+        service, actor_identity, _, _ = self._authorization_context()
+        body = {"workspace": body_workspace} if body_workspace else None
+        return self._resolve_workspace(
+            service,
+            actor_identity,
+            self._workspace_selector(params, body),
+        )
+
+    def _allocation_limit(self, params) -> int:
+        raw = str(params.get("limit", ["100"])[0] or "100")
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise AllocationPreviewDTOError("invalid_limit", "limit 必须是 1 到 100 的整数", field="limit") from exc
+        if value < 1 or value > 100:
+            raise AllocationPreviewDTOError("invalid_limit", "limit 必须是 1 到 100 的整数", field="limit")
+        return value
+
+    def _allocation_plan_create(self) -> None:
+        try:
+            repository = self._allocation_repository_ready()
+            _, actor_identity, caller_identity, channel = self._authorization_context()
+            request = parse_allocation_plan_create_json(self._read_allocation_control_body())
+            workspace_slug = self._workspace_selector(
+                {},
+                {"workspace": request.workspace},
+            )
+            if workspace_slug is None:
+                raise _PanelRouteError(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    "workspace_required",
+                    "allocation 请求必须显式选择 workspace",
+                )
+            idempotency_key = self._allocation_idempotency_key(request.idempotency_key)
+            result = repository.create(
+                request.allocation_request,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=request.task_id,
+                cohort_revision_id=request.cohort_revision_id,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=self._allocation_request_id(),
+            )
+            self._json(serialize_allocation_plan_result(result), status=result.response_status, sort_keys=True)
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _allocation_plan_confirm(self, plan_id: str, params) -> None:
+        try:
+            repository = self._allocation_repository_ready()
+            _, actor_identity, caller_identity, channel = self._authorization_context()
+            plan_uuid = _allocation_uuid(plan_id, "plan_id")
+            request = parse_allocation_plan_confirm_json(self._read_allocation_control_body())
+            workspace_slug = self._allocation_workspace(params, request.workspace)
+            idempotency_key = self._allocation_idempotency_key(request.idempotency_key)
+            result = repository.confirm(
+                plan_uuid,
+                plan_fingerprint=request.plan_fingerprint,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=self._allocation_request_id(),
+            )
+            self._json(serialize_allocation_confirmation_result(result), status=result.response_status, sort_keys=True)
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _allocation_plan_list(self, params) -> None:
+        try:
+            repository = self._allocation_repository_ready()
+            _, actor_identity, caller_identity, _ = self._authorization_context()
+            workspace_slug = self._allocation_workspace(params)
+            task_key = str(params.get("task_id", [""])[0] or "").strip() or None
+            if task_key is not None and not _safe_segment(task_key):
+                raise AllocationPreviewDTOError("invalid_identifier", "task_id 必须是单段安全标识符", field="task_id")
+            after_value = str(params.get("after", [""])[0] or "").strip() or None
+            result = repository.list_plans(
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=workspace_slug,
+                task_key=task_key,
+                limit=self._allocation_limit(params),
+                after_plan_id=_allocation_uuid(after_value, "after") if after_value else None,
+            )
+            self._json(result, sort_keys=True)
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _allocation_plan_detail(self, plan_id: str | None, params) -> None:
+        try:
+            repository = self._allocation_repository_ready()
+            _, actor_identity, caller_identity, _ = self._authorization_context()
+            resolved_plan_id = plan_id or str(params.get("plan_id", [""])[0] or "").strip()
+            plan_uuid = _allocation_uuid(resolved_plan_id, "plan_id")
+            result = repository.get_plan(
+                plan_uuid,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=self._allocation_workspace(params),
+            )
+            self._json({"plan": result}, sort_keys=True)
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _allocation_plan_progress(self, plan_id: str, params) -> None:
+        try:
+            repository = self._allocation_repository_ready()
+            _, actor_identity, _, _ = self._authorization_context()
+            plan_uuid = _allocation_uuid(plan_id, "plan_id")
+            progress = repository.progress(
+                plan_uuid,
+                actor_identity=actor_identity,
+                workspace_slug=self._allocation_workspace(params),
+            )
+            self._json(serialize_allocation_progress(progress), sort_keys=True)
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _allocation_assignment_list(self, plan_id: str | None, params) -> None:
+        try:
+            repository = self._allocation_repository_ready()
+            _, actor_identity, caller_identity, _ = self._authorization_context()
+            resolved_plan_id = plan_id or str(params.get("plan_id", [""])[0] or "").strip()
+            plan_uuid = _allocation_uuid(resolved_plan_id, "plan_id")
+            after_value = str(params.get("after", [""])[0] or "").strip() or None
+            result = repository.list_assignments(
+                plan_uuid,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=self._allocation_workspace(params),
+                limit=self._allocation_limit(params),
+                after_assignment_id=_allocation_uuid(after_value, "after") if after_value else None,
+            )
+            self._json(result, sort_keys=True)
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _allocation_assignment_detail(self, assignment_id: str | None, params) -> None:
+        try:
+            repository = self._allocation_repository_ready()
+            _, actor_identity, caller_identity, _ = self._authorization_context()
+            resolved_assignment_id = assignment_id or str(params.get("assignment_id", [""])[0] or "").strip()
+            assignment_uuid = _allocation_uuid(resolved_assignment_id, "assignment_id")
+            plan_id = str(params.get("plan_id", [""])[0] or "").strip() or None
+            plan_uuid = _allocation_uuid(plan_id, "plan_id") if plan_id is not None else None
+            result = repository.get_assignment(
+                assignment_uuid,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                workspace_slug=self._allocation_workspace(params),
+                plan_id=plan_uuid,
+            )
+            self._json({"assignment": result}, sort_keys=True)
         except Exception as exc:
             self._route_error(exc)
 
@@ -2514,6 +2975,22 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(_data_lake_catalog_payload(detail_dataset_id=dataset_id or None))
             except Exception as exc:
                 self._json({"error": str(exc)}, status=400)
+        elif path == "/api/allocation/plans":
+            self._allocation_plan_list(params)
+        elif path == "/api/allocation/plan/detail":
+            self._allocation_plan_detail(None, params)
+        elif path == "/api/allocation/assignments":
+            self._allocation_assignment_list(None, params)
+        elif path == "/api/allocation/assignment/detail":
+            self._allocation_assignment_detail(None, params)
+        elif _allocation_plan_path(path, suffix="progress") is not None:
+            self._allocation_plan_progress(_allocation_plan_path(path, suffix="progress"), params)
+        elif _allocation_plan_path(path, suffix="assignments") is not None:
+            self._allocation_assignment_list(_allocation_plan_path(path, suffix="assignments"), params)
+        elif _allocation_assignment_path(path) is not None:
+            self._allocation_assignment_detail(_allocation_assignment_path(path), params)
+        elif _allocation_plan_path(path) is not None:
+            self._allocation_plan_detail(_allocation_plan_path(path), params)
         elif contract_task_id is not None:
             if _control_task_source_enabled():
                 self._control_task_detail(contract_task_id, params)
@@ -2934,6 +3411,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "decisions": count})
         elif path == "/api/allocation/preview":
             self._allocation_preview()
+        elif path in {"/api/allocation/plans", "/api/allocation/plan"}:
+            self._allocation_plan_create()
+        elif _allocation_plan_path(path, suffix="confirm") is not None:
+            self._allocation_plan_confirm(_allocation_plan_path(path, suffix="confirm"), params)
         elif path == "/api/action":
             body = self._read_body()
             task_path = body.get("task")
@@ -3368,7 +3849,14 @@ def serve_panel(
         authorization_service = _build_authorization_service()
     except Exception:
         authorization_service = None
+    allocation_repository = None
+    if authorization_service is not None and _control_task_source_enabled():
+        try:
+            allocation_repository = TrustedAllocationRepository.from_url()
+        except Exception:
+            allocation_repository = None
     _Handler.authorization_service = authorization_service
+    _Handler.allocation_repository = allocation_repository
     _Handler.authorization_ready = _authorization_runtime_ready(authorization_service, active_task_loader)
     _Handler.active_task_loader = active_task_loader
     if static_dir is None:
@@ -3393,6 +3881,8 @@ def serve_panel(
         pass
     finally:
         httpd.server_close()
+        if allocation_repository is not None:
+            allocation_repository.close()
         if authorization_service is not None:
             authorization_service.close()
         if owned_active_task_loader and active_task_loader is not None:
