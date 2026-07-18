@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api.js";
 import WorkspaceScope from "../components/WorkspaceScope.jsx";
 import { Link, useRouter } from "../router.jsx";
@@ -248,12 +248,27 @@ export default function CohortsPage({
   const [operationError, setOperationError] = useState("");
   const [createDraft, setCreateDraft] = useState(EMPTY_DRAFT);
   const [detailDraft, setDetailDraft] = useState(EMPTY_DRAFT);
+  const pendingOperationRef = useRef(null);
 
   const showError = useCallback((error) => {
     const message = String(error);
     setOperationError(message);
     onError?.(message);
   }, [onError]);
+
+  function clearPendingOperation() {
+    pendingOperationRef.current = null;
+  }
+
+  function operationKey(operation, resource = "") {
+    const current = pendingOperationRef.current;
+    if (current?.operation === operation && current.workspace === workspace && current.resource === resource) {
+      return current.key;
+    }
+    const key = api.managementIdempotencyKey(operation, workspace, resource);
+    pendingOperationRef.current = { key, operation, resource, workspace };
+    return key;
+  }
 
   const loadList = useCallback(async () => {
     if (!workspace || !canManage) {
@@ -339,6 +354,7 @@ export default function CohortsPage({
   );
 
   function closeDrawer() {
+    clearPendingOperation();
     setDrawer("");
     setDetail(null);
     if (detailId) navigate("/cohorts");
@@ -349,6 +365,7 @@ export default function CohortsPage({
   }
 
   function openCreate() {
+    clearPendingOperation();
     setCreateDraft(EMPTY_DRAFT);
     setOperationError("");
     setNotice("");
@@ -381,13 +398,15 @@ export default function CohortsPage({
       default_capacity: Number(createDraft.default_capacity),
       member_annotator_ids: [...createDraft.member_annotator_ids],
     };
+    const idempotencyKey = operationKey("cohort.create", payload.name);
     setBusy(true);
     setOperationError("");
     setNotice("");
     try {
-      requireCohort(await api.createCohort(payload));
+      requireCohort(await api.createCohort(payload, { idempotencyKey }));
       setCreateDraft(EMPTY_DRAFT);
       setDrawer("");
+      clearPendingOperation();
       setNotice("人员组已创建。");
       await loadList();
     } catch (error) {
@@ -407,14 +426,16 @@ export default function CohortsPage({
     setOperationError("");
     setNotice("");
     try {
+      const idempotencyKey = operationKey("cohort.update", `${detail.cohort_id}:${detail.revision}`);
       const updated = requireCohort(await api.updateCohort(detail.cohort_id, {
         workspace,
         cohort_id: detail.cohort_id,
         name: detailDraft.name.trim(),
         default_capacity: Number(detailDraft.default_capacity),
         expected_revision: detail.revision,
-      }));
+      }, { idempotencyKey }));
       setDetail(updated);
+      clearPendingOperation();
       setNotice("人员组基本信息已保存，并生成新的 revision。");
       await loadList();
     } catch (error) {
@@ -434,13 +455,15 @@ export default function CohortsPage({
     setOperationError("");
     setNotice("");
     try {
+      const idempotencyKey = operationKey("cohort.members", `${detail.cohort_id}:${detail.revision}`);
       const updated = requireCohort(await api.replaceCohortMembers(detail.cohort_id, {
         workspace,
         cohort_id: detail.cohort_id,
         member_annotator_ids: [...detailDraft.member_annotator_ids],
         expected_revision: detail.revision,
-      }));
+      }, { idempotencyKey }));
       setDetail(updated);
+      clearPendingOperation();
       setNotice("人员组成员已保存，并生成新的 revision。");
       await loadList();
     } catch (error) {
@@ -452,6 +475,21 @@ export default function CohortsPage({
 
   const disabledReason = !workspace ? "请选择 Scaffold 工作区" : !canManage ? "缺少 workspace:manage 权限" : "";
 
+  function handleWorkspaceChange(value) {
+    clearPendingOperation();
+    onWorkspaceChange?.(value);
+  }
+
+  function updateCreateDraft(key, value) {
+    clearPendingOperation();
+    setCreateDraft((current) => ({ ...current, [key]: value }));
+  }
+
+  function updateDetailDraft(key, value) {
+    clearPendingOperation();
+    setDetailDraft((current) => ({ ...current, [key]: value }));
+  }
+
   return (
     <div>
       <div className="crumbs"><Link to="/">全部任务</Link> / 人员组</div>
@@ -460,7 +498,7 @@ export default function CohortsPage({
           <h2>人员组</h2>
           <p>维护可复用的标注人员集合、默认容量和不可变 revision。</p>
         </div>
-        <WorkspaceScope workspace={workspace} workspaces={workspaces} onChange={onWorkspaceChange} canManage={canManage} />
+        <WorkspaceScope workspace={workspace} workspaces={workspaces} onChange={handleWorkspaceChange} canManage={canManage} />
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
@@ -523,7 +561,7 @@ export default function CohortsPage({
           busy={busy}
           invalidMembers={invalidDetailMembers}
           draftInvalidMembers={draftInvalidMembers}
-          onChange={(key, value) => setDetailDraft((current) => ({ ...current, [key]: value }))}
+          onChange={updateDetailDraft}
           onClose={closeDrawer}
           onRetry={() => loadDetail(detailId)}
           onSaveBasics={saveBasics}
@@ -535,7 +573,7 @@ export default function CohortsPage({
           draft={createDraft}
           annotators={annotators}
           busy={busy}
-          onChange={(key, value) => setCreateDraft((current) => ({ ...current, [key]: value }))}
+          onChange={updateCreateDraft}
           onClose={closeDrawer}
           onSubmit={submitCreate}
         />

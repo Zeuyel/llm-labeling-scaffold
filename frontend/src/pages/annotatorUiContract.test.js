@@ -24,6 +24,7 @@ test("人员管理页面不调用 Argilla 或通用 action", () => {
 test("provision 密码只提交当前请求并在完成后清空", () => {
   const page = source("pages/AnnotatorsPage.jsx");
   assert.match(page, /name="?initial_password|initial_password/);
+  assert.match(page, /api\.provisionAnnotator/);
   assert.match(page, /autoComplete="off"/);
   assert.match(page, /payload\.initial_password = ""/);
   assert.doesNotMatch(page, /localStorage\.(setItem|getItem)/);
@@ -35,4 +36,15 @@ test("人员组编辑携带 expected_revision 且删除能力明确禁用", () =
   assert.match(page, /expected_revision/);
   assert.match(page, /删除人员组（未接入）/);
   assert.match(page, /disabled title="后端尚未接入人员组删除接口"/);
+});
+
+test("六类管理写操作在页面生命周期内复用幂等键", () => {
+  const annotators = source("pages/AnnotatorsPage.jsx");
+  const cohorts = source("pages/CohortsPage.jsx");
+  for (const page of [annotators, cohorts]) {
+    assert.match(page, /pendingOperationRef/);
+    assert.match(page, /operationKey\(/);
+    assert.match(page, /clearPendingOperation\(\)/);
+    assert.match(page, /idempotencyKey/);
+  }
 });

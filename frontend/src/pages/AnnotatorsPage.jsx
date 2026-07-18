@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "../api.js";
 import WorkspaceScope from "../components/WorkspaceScope.jsx";
 import { Link, useRouter } from "../router.jsx";
@@ -202,12 +202,27 @@ export default function AnnotatorsPage({
   const [operationError, setOperationError] = useState("");
   const [provisionForm, setProvisionForm] = useState(EMPTY_PROVISION_FORM);
   const [bindForm, setBindForm] = useState(EMPTY_BIND_FORM);
+  const pendingOperationRef = useRef(null);
 
   const showError = useCallback((error) => {
     const message = String(error);
     setOperationError(message);
     onError?.(message);
   }, [onError]);
+
+  function clearPendingOperation() {
+    pendingOperationRef.current = null;
+  }
+
+  function operationKey(operation, resource = "") {
+    const current = pendingOperationRef.current;
+    if (current?.operation === operation && current.workspace === workspace && current.resource === resource) {
+      return current.key;
+    }
+    const key = api.managementIdempotencyKey(operation, workspace, resource);
+    pendingOperationRef.current = { key, operation, resource, workspace };
+    return key;
+  }
 
   const loadList = useCallback(async () => {
     if (!workspace || !canManage) {
@@ -266,6 +281,7 @@ export default function AnnotatorsPage({
   }, [detailId, loadDetail]);
 
   function closeDrawer() {
+    clearPendingOperation();
     setDrawer("");
     setDetail(null);
     if (detailId) navigate("/annotators");
@@ -276,6 +292,7 @@ export default function AnnotatorsPage({
   }
 
   function openProvision() {
+    clearPendingOperation();
     setOperationError("");
     setNotice("");
     setProvisionForm(EMPTY_PROVISION_FORM);
@@ -283,6 +300,7 @@ export default function AnnotatorsPage({
   }
 
   function openBind() {
+    clearPendingOperation();
     setOperationError("");
     setNotice("");
     setBindForm(EMPTY_BIND_FORM);
@@ -308,13 +326,15 @@ export default function AnnotatorsPage({
       personal_workspace_name: provisionForm.personal_workspace_name.trim() || undefined,
       initial_password: provisionForm.initial_password,
     };
+    const idempotencyKey = operationKey("annotator.provision", payload.scaffold_user_id);
     setBusy(true);
     setOperationError("");
     setNotice("");
     try {
-      requireAnnotator(await api.createAnnotator(payload));
+      requireAnnotator(await api.provisionAnnotator(payload, { idempotencyKey }));
       setProvisionForm(EMPTY_PROVISION_FORM);
       setDrawer("");
+      clearPendingOperation();
       setNotice("标注人员已创建并绑定，初始密码已从表单清除。");
       await loadList();
     } catch (error) {
@@ -340,13 +360,15 @@ export default function AnnotatorsPage({
       argilla_username: bindForm.argilla_username.trim() || undefined,
       personal_workspace_id: bindForm.personal_workspace_id.trim() || undefined,
     };
+    const idempotencyKey = operationKey("annotator.bind", `${payload.scaffold_user_id}:${payload.argilla_user_id}`);
     setBusy(true);
     setOperationError("");
     setNotice("");
     try {
-      requireAnnotator(await api.bindAnnotator(payload));
+      requireAnnotator(await api.bindAnnotator(payload, { idempotencyKey }));
       setBindForm(EMPTY_BIND_FORM);
       setDrawer("");
+      clearPendingOperation();
       setNotice("已有 Argilla 身份已提交绑定，服务端校验通过后才会进入人员组候选。");
       await loadList();
     } catch (error) {
@@ -364,8 +386,10 @@ export default function AnnotatorsPage({
     setOperationError("");
     setNotice("");
     try {
-      const updated = requireAnnotator(await api.verifyAnnotator(detail.annotator_id, workspace));
+      const idempotencyKey = operationKey("annotator.verify", detail.annotator_id);
+      const updated = requireAnnotator(await api.verifyAnnotator(detail.annotator_id, workspace, { idempotencyKey }));
       setDetail(updated);
+      clearPendingOperation();
       setNotice("标注人员已重新验证，页面已更新最新验证结果。");
       await loadList();
     } catch (error) {
@@ -377,6 +401,21 @@ export default function AnnotatorsPage({
 
   const disabledReason = !workspace ? "请选择 Scaffold 工作区" : !canManage ? "缺少 workspace:manage 权限" : "";
 
+  function handleWorkspaceChange(value) {
+    clearPendingOperation();
+    onWorkspaceChange?.(value);
+  }
+
+  function updateProvisionField(key, value) {
+    clearPendingOperation();
+    setProvisionForm((current) => ({ ...current, [key]: value }));
+  }
+
+  function updateBindField(key, value) {
+    clearPendingOperation();
+    setBindForm((current) => ({ ...current, [key]: value }));
+  }
+
   return (
     <div>
       <div className="crumbs"><Link to="/">全部任务</Link> / 标注人员</div>
@@ -385,7 +424,7 @@ export default function AnnotatorsPage({
           <h2>标注人员</h2>
           <p>管理 Scaffold 用户与 Argilla annotator 身份绑定，验证状态由后端返回。</p>
         </div>
-        <WorkspaceScope workspace={workspace} workspaces={workspaces} onChange={onWorkspaceChange} canManage={canManage} />
+        <WorkspaceScope workspace={workspace} workspaces={workspaces} onChange={handleWorkspaceChange} canManage={canManage} />
       </div>
 
       {notice && <div className="status-banner">{notice}</div>}
@@ -468,7 +507,7 @@ export default function AnnotatorsPage({
         <ProvisionDrawer
           form={provisionForm}
           busy={busy}
-          onChange={(key, value) => setProvisionForm((current) => ({ ...current, [key]: value }))}
+          onChange={updateProvisionField}
           onClose={closeDrawer}
           onSubmit={submitProvision}
         />
@@ -477,7 +516,7 @@ export default function AnnotatorsPage({
         <BindDrawer
           form={bindForm}
           busy={busy}
-          onChange={(key, value) => setBindForm((current) => ({ ...current, [key]: value }))}
+          onChange={updateBindField}
           onClose={closeDrawer}
           onSubmit={submitBind}
         />
