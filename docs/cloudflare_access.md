@@ -2,6 +2,14 @@
 
 生产 Panel 使用 Cloudflare Access 完成用户登录，源站只验证 Cloudflare 注入的 `Cf-Access-Jwt-Assertion`。Scaffold 不签发 OAuth access token、refresh token，也不实现本地密码系统或 OAuth Authorization Server。
 
+成员生命周期的完整操作顺序见[成员管理与权限闭环运维](member_management.md)。Cloudflare Access 在该流程中仅负责认证和网络入口，不负责 Scaffold workspace membership、业务 role、Argilla annotator 或人员组授权。
+
+## 仅认证，不授予业务权限
+
+Access policy 允许某个身份完成登录，不会因为邮箱、邮箱后缀、Access group 或登录次数而创建或修改 `role_bindings`。源站验证 assertion 后只得到稳定的 `(issuer, subject)`；未知身份和没有 workspace membership 的身份仍是零业务权限。
+
+管理员必须在受控的 Panel 成员管理入口或等价服务 façade 中显式执行 grant/change/revoke。用户首次登录可以成功但 `/api/session` 没有 workspace；这不是认证失败，也不是应该通过扩大 Access policy 解决的问题。生产验收必须分别验证 Access policy、Scaffold role 和 Argilla mapping。
+
 ## 认证配置
 
 ```text

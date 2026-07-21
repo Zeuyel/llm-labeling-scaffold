@@ -62,13 +62,13 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 ```bash
 docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap \
-  --issuer https://example.cloudflareaccess.com \
+  --issuer '<access-team-domain>' \
   --subject '<stable-access-subject>' \
   --workspace-slug default \
   --workspace-name 'Default Workspace'
 ```
 
-数据库 schema、角色矩阵、迁移以及备份恢复说明见 [Scaffold 数据库与 RBAC](docs/database.md)。
+数据库 schema、角色矩阵、迁移以及备份恢复说明见 [Scaffold 数据库与 RBAC](docs/database.md)；成员邀请、首次登录、Argilla 映射、撤销和生产验收见 [成员管理与权限闭环运维](docs/member_management.md)。
 
 需要模型记录服务时再启用 Docker Compose 的 mlflow profile：
 
@@ -141,7 +141,7 @@ runs/_system/task_control/task_snapshots/<revision_uuid>/<content_sha256>/manife
 
 生产 Panel 使用 Cloudflare Access 注入的 `Cf-Access-Jwt-Assertion`，源站验证 RS256 签名、JWKS、issuer、显式 application AUD、时间声明和 `type=app`。稳定用户身份使用 `(issuer, subject)`，邮箱与显示名只作为显示快照；客户端自报 actor 或邮箱头不会建立身份。
 
-Scaffold 已有独立的用户、工作空间、任务 ACL 和 RBAC 持久化层，但尚未接入 Panel 业务授权路径。#46 完成接线和资源迁移前，Access 用户只能读取 `/api/session` 等系统认证态端点，所有业务 API 都会以 `503 authorization_unavailable` fail closed，不能因为“已登录”而获得原有管理员能力。现有 Basic Auth 只在显式 `LLS_PANEL_AUTH_MODE=basic_dev` 时用于本地开发；生产默认 `cloudflare_access`，配置或验证失败不会回退到 Basic。JWT 签名验证不证明请求经过 Cloudflare，只有 Tunnel-only 或宿主回环源站边界受控时 assertion 才作为可信身份输入。完整配置与部署要求见 [Cloudflare Access 身份验证](docs/cloudflare_access.md)。
+Scaffold 已有独立的用户、工作空间、任务 ACL 和 RBAC 持久化层；`/api/session`、控制面任务、标注人员和人员组路由按数据库授权运行，授权不可用时 fail closed。Cloudflare Access 只负责认证和网络入口，不根据邮箱后缀或 Access policy 自动授予业务 role；首次登录的未知身份仍可能没有 workspace。现有 Basic Auth 只在显式 `LLS_PANEL_AUTH_MODE=basic_dev` 时用于本地开发；生产默认 `cloudflare_access`，配置或验证失败不会回退到 Basic。JWT 签名验证不证明请求经过 Cloudflare，只有 Tunnel-only 或宿主回环源站边界受控时 assertion 才作为可信身份输入。完整配置与部署要求见 [Cloudflare Access 身份验证](docs/cloudflare_access.md) 和 [成员管理与权限闭环运维](docs/member_management.md)。
 
 ## 服务器测试
 
@@ -192,6 +192,8 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d 
 上述 base Compose 故意不发布 Panel 宿主端口，适合让同一 `lls` network 中的 `cloudflared` sidecar 访问 `http://panel:8765`。若 Tunnel 运行在宿主机，命令中再叠加 `-f docker-compose.loopback.yml`，只向 `127.0.0.1` 发布 Panel；不得用自定义 override 发布到非 loopback 接口。
 
 `r2` 模式启动后，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。只要任务需要 R2 数据湖，compose 启动都必须包含 rclone override 或等价 secret 挂载。
+
+浏览器只访问 Panel API，不直接获得 R2 access key、secret key、`rclone.conf` 或其他云端凭据；R2 数据湖成员权限和 Panel workspace role 也不能互相推断。
 
 如果要同时测试可选模型记录服务：
 

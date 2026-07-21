@@ -9,6 +9,8 @@
 - Argilla Server 2.8 的 provisioning policy 是 owner-only，`client.me.role` 必须是 `owner`；`admin` 和 `annotator` 均会被拒绝。目标用户必须是独立的 `annotator`，owner 账号不会作为 annotator 返回。
 - Argilla 2.8 public SDK 不暴露 user active/status，也不支持回读 API key、校验现有密码或安全地完成密码轮换。adapter 只把可读取且已通过 UUID/username/role、workspace 和 membership 校验的用户返回给调用方，不伪造 active/status。
 
+owner 只是一条受控的后端 provisioning/verification 操作身份，不能当作所有平台成员的共享登录账号，也不能映射为 Scaffold 用户的 `annotator`。每个实际标注者必须使用独立 Argilla 用户、独立 personal workspace 和独立的 Scaffold `(issuer, subject)` principal；Scaffold role、Argilla role 和 membership 必须分别审计。
+
 ## 稳定身份
 
 用户名和 personal workspace name 只由 Scaffold 的不可变 `(issuer, subject)` 身份键派生：

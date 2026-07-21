@@ -2,6 +2,8 @@
 
 `llm_labeling_scaffold.panel_annotators` 是供后续总 Panel 路由调用的纯 DTO/服务适配层。本模块不注册路由、不调用 Argilla，也不依赖具体数据库 repository；数据库和外部服务通过 `AnnotatorRepository`、`AnnotatorAdapter` 与 `WorkspaceAuthorizer` Protocol 注入。
 
+成员生命周期的邀请、首次登录绑定、Scaffold role 授权和撤销顺序见[成员管理与权限闭环运维](member_management.md)。本文只定义标注人员/人员组的 Panel 接口，不把 Argilla mapping 当作 Scaffold workspace membership。
+
 ## 专用 HTTP 路由
 
 人员控制 API 只在 Scaffold control-plane 且数据库授权运行时就绪时开放。所有请求必须显式绑定 `workspace`，查询使用 query 参数，写入使用 JSON body。不可见 workspace/resource 返回 `404`，权限不足返回 `403`，授权或运行时不可用返回 `503`。
@@ -27,6 +29,8 @@
 所有管理请求都必须带 `workspace`。服务默认使用 `Permission.WORKSPACE_MANAGE.value`，即 `workspace:manage`。授权器在服务端接收真实 actor；请求体中的 `actor`、`caller`、`channel`、`permission` 等字段会被拒绝。
 
 资源不可见统一映射为 `404 resource_not_found`，权限不足映射为 `403 permission_denied`，授权/资料库不可用映射为 `503`。请求 DTO 错误返回 `422`；repository 返回的损坏记录或响应序列化失败返回 `500 service_unavailable`，不把内部记录问题伪装成用户请求错误。布尔字段只接受 JSON `true/false` 或整数 `0/1`，其他值视为损坏数据。异常响应只使用模块定义的安全错误文本，不代理 repository 或外部 adapter 的原始异常内容。
+
+标注人员和人员组接口不是通用 workspace 成员邀请接口。它们只允许拥有 `workspace:manage` 的管理员操作当前 workspace；先完成 Scaffold workspace role grant，再执行 Argilla provision/bind/verify。目标基线没有独立的 `/api/members` 路由时，不能用这些接口或直接 SQL 伪装成通用成员管理。
 
 ## 请求白名单
 
