@@ -528,6 +528,30 @@ def test_http_write_idempotency_and_external_boundaries(control_plane):
         assert payload["code"] == "invalid_field"
 
 
+@pytest.mark.parametrize("field", ["actor", "caller", "channel", "permission"])
+def test_http_write_rejects_client_supplied_authorization_context(control_plane, field):
+    repository = _FakeRepository()
+    body = {
+        "workspace": WORKSPACE,
+        "scaffold_user_id": "annotator-subject",
+        "initial_password": "one-time-secret",
+        field: "forged-context",
+    }
+
+    with _server(control_plane, repository, _FakeAdapter()) as base_url:
+        status, payload = _request(
+            base_url,
+            "/api/annotators/provision",
+            method="POST",
+            body=body,
+            headers={"Idempotency-Key": f"forged-{field}"},
+        )
+
+    assert status == 422
+    assert payload["code"] == "unknown_field"
+    assert payload["field"] == field
+
+
 def test_annotator_routes_fail_closed_outside_control_plane(monkeypatch):
     repository = _FakeRepository()
     monkeypatch.setenv("LLS_TASK_SOURCE", "r2")

@@ -528,6 +528,39 @@ def test_permission_scopes_fail_closed_and_filter_capabilities(seeded_service, e
     assert task_access.workspace is None
     assert task_access.items == ()
 
+    with Session(engine) as session, session.begin():
+        session.add(
+            RoleBinding(
+                workspace_id=workspace_id,
+                principal_id=principal_id,
+                role=Role.VIEWER,
+            )
+        )
+
+    assert service.authorize_task(
+        seeded_service["mcp"],
+        "workspace-a",
+        "shared-key",
+        Permission.TASK_EDIT,
+    ).allowed
+    workspace_access = service.get_session(seeded_service["mcp"]).workspaces[0]
+    assert workspace_access.roles == (Role.VIEWER,)
+    assert workspace_access.workspace_capabilities == ()
+    assert workspace_access.task_capabilities == (Permission.TASK_READ,)
+    task_access = next(
+        item
+        for item in service.list_authorized_tasks(
+            seeded_service["mcp"],
+            "workspace-a",
+            limit=10,
+        ).items
+        if item.task.task_key == "shared-key"
+    )
+    assert Permission.TASK_CREATE not in task_access.capabilities
+    assert Permission.AUDIT_VIEW not in task_access.capabilities
+    assert Permission.WORKSPACE_MANAGE not in task_access.capabilities
+    assert Permission.TASK_EDIT in task_access.capabilities
+
 
 def test_task_acl_cannot_bypass_revoked_workspace_membership(seeded_service, engine):
     service = seeded_service["service"]
@@ -2322,3 +2355,92 @@ def test_authorization_database_errors_fail_closed(tmp_path: Path):
         )
 
     engine.dispose()
+
+
+def test_membership_revoke_is_immediate_while_task_acl_remains_explicit(seeded_service, engine):
+    service = seeded_service["service"]
+    target = ExternalIdentity("https://access.example.test", "revoke-immediate")
+    target_ref = service.resolve_or_provision(target)
+
+    with Session(engine) as session, session.begin():
+        workspace_id = session.scalar(select(Workspace.id).where(Workspace.slug == "workspace-a"))
+        task_id = session.scalar(
+            select(Task.id).where(Task.workspace_id == workspace_id, Task.task_key == "shared-key")
+        )
+        session.add(
+            RoleBinding(
+                workspace_id=workspace_id,
+                principal_id=target_ref.id,
+                task_id=task_id,
+                role=Role.ANNOTATOR,
+            )
+        )
+
+    service.grant_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        role=Role.VIEWER,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+    before_revoke = service.authorize_workspace(target, "workspace-a", Permission.TASK_CREATE)
+    assert before_revoke.reason == AuthorizationReason.ROLE_DENIED
+
+    revoked = service.revoke_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=target,
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+
+    assert revoked.action == MembershipMutationAction.REVOKED
+    after_revoke = service.authorize_workspace(target, "workspace-a", Permission.TASK_CREATE)
+    assert after_revoke.allowed is False
+    assert after_revoke.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+    session = service.get_session(target)
+    assert session.workspaces == ()
+    task_decision = service.authorize_task(
+        target,
+        "workspace-a",
+        "shared-key",
+        Permission.ANNOTATION_WORK,
+    )
+    assert task_decision.allowed is False
+    assert task_decision.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+    task_page = service.list_authorized_tasks(target, "workspace-a", limit=10)
+    assert task_page.items == ()
+
+
+def test_membership_mutation_rejects_forged_actor_and_caller_context(seeded_service):
+    service = seeded_service["service"]
+    target = ExternalIdentity("https://access.example.test", "forged-context-target")
+    service.resolve_or_provision(target)
+
+    with pytest.raises(AuthorizationDenied) as actor_spoof:
+        service.grant_workspace_membership(
+            workspace_slug="workspace-a",
+            target_identity=target,
+            role=Role.VIEWER,
+            actor_identity=seeded_service["viewer"],
+            caller_identity=seeded_service["admin"],
+            channel=AuditChannel.API,
+        )
+    with pytest.raises(AuthorizationDenied) as caller_spoof:
+        service.grant_workspace_membership(
+            workspace_slug="workspace-a",
+            target_identity=target,
+            role=Role.VIEWER,
+            actor_identity=seeded_service["admin"],
+            caller_identity=seeded_service["viewer"],
+            channel=AuditChannel.API,
+        )
+
+    assert actor_spoof.value.decision.reason == AuthorizationReason.ROLE_DENIED
+    assert caller_spoof.value.decision.reason == AuthorizationReason.INVALID_AUDIT_CONTEXT
+    assert service.authorize_workspace(
+        target,
+        "workspace-a",
+        Permission.AUDIT_VIEW,
+    ).reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
