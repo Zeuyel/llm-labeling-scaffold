@@ -259,6 +259,10 @@ tr:last-child td { border-bottom: 0; }
 .management-table table { min-width: 1060px; }
 .management-table td { white-space: normal; }
 .management-table .mono-cell { overflow-wrap: anywhere; word-break: break-word; }
+.members-table table { min-width: 860px; }
+.members-table td > strong, .members-table td > .muted { display: block; }
+.member-role-select { min-width: 126px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); font: inherit; }
+.member-role-select:disabled { opacity: .7; }
 .management-error, .drawer-error { display: flex; align-items: center; justify-content: center; gap: 10px; flex-wrap: wrap; }
 .disabled-action-note { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .drawer-section h4 { margin: 0 0 10px; font-size: 14px; }

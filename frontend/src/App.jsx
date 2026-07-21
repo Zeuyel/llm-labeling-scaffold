@@ -18,10 +18,12 @@ import DataAssetsPage from "./pages/DataAssetsPage.jsx";
 import AllocationPlansPage from "./pages/AllocationPlansPage.jsx";
 import AnnotatorsPage from "./pages/AnnotatorsPage.jsx";
 import CohortsPage from "./pages/CohortsPage.jsx";
+import MembersPage from "./pages/MembersPage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
   { pattern: "/settings", page: "settings" },
+  { pattern: "/members", page: "members" },
   { pattern: "/annotators/:id", page: "annotators" },
   { pattern: "/annotators", page: "annotators" },
   { pattern: "/cohorts/:id", page: "cohorts" },
@@ -147,6 +149,15 @@ function Shell({ session, onLogout }) {
       settings={settings}
       onSettingsSaved={handleSettingsSaved}
       onSettingsLoadError={handleSettingsLoadError}
+      {...common}
+    />
+  );
+  else if (matched.page === "members") page = (
+    <MembersPage
+      workspace={managementWorkspace}
+      workspaces={managementWorkspaces}
+      canManage={canManagePeople}
+      onWorkspaceChange={setManagementWorkspace}
       {...common}
     />
   );

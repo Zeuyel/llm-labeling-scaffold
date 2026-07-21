@@ -50,6 +50,8 @@ const API_ERROR_MESSAGES = {
   invalid_workspace: "Scaffold 工作区参数无效",
   workspace_selector_conflict: "工作区选择参数不一致",
   invalid_identifier: "资源标识无效",
+  invalid_principal_id: "成员标识无效",
+  invalid_role: "成员角色无效",
   invalid_request: "请求参数无效",
   invalid_field: "请求字段无效",
   unknown_field: "请求包含未允许的字段",
@@ -65,6 +67,8 @@ const API_ERROR_MESSAGES = {
   idempotency_conflict: "幂等键与既有请求冲突，请刷新后重试",
   idempotency_key_conflict: "幂等键与请求内容不一致，请重新提交",
   idempotency_replay_mismatch: "幂等重试内容不一致，请重新提交",
+  membership_conflict: "成员状态冲突，请刷新后重试",
+  last_workspace_admin: "不能移除或降级最后一个管理员",
 };
 
 const HTTP_ERROR_MESSAGES = {
@@ -201,6 +205,7 @@ export const getTaskArchivePlan = (taskId) => req(`/api/task/archive_plan?${q({ 
 
 const ANNOTATORS_PATH = "/api/annotators";
 const COHORTS_PATH = "/api/cohorts";
+const MEMBERS_PATH = "/api/members";
 
 function managementWorkspace(workspace) {
   const value = String(workspace || "").trim();
@@ -229,6 +234,9 @@ const annotatorPath = (annotatorId) =>
 
 const cohortPath = (cohortId) =>
   `${COHORTS_PATH}/${encodeURIComponent(cohortId)}`;
+
+const memberPath = (principalId) =>
+  `${MEMBERS_PATH}/${encodeURIComponent(principalId)}`;
 
 export const getAnnotators = (workspace) =>
   req(managementPath(ANNOTATORS_PATH, workspace));
@@ -282,6 +290,26 @@ export const replaceCohortMembers = (cohortId, payload = {}, options = {}) =>
     ...payload,
     workspace: managementWorkspace(payload.workspace),
     cohort_id: payload.cohort_id || cohortId,
+  }, options);
+
+export const getMembers = (workspace) =>
+  req(managementPath(MEMBERS_PATH, workspace));
+
+export const createMemberInvitation = (payload = {}, options = {}) =>
+  jsonRequest(`${MEMBERS_PATH}/invitations`, "POST", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  }, options);
+
+export const updateMemberRole = (principalId, payload = {}, options = {}) =>
+  jsonRequest(`${memberPath(principalId)}/role`, "PUT", {
+    ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  }, options);
+
+export const revokeMember = (principalId, payload = {}, options = {}) =>
+  jsonRequest(`${memberPath(principalId)}/revoke`, "POST", {
+    workspace: managementWorkspace(payload.workspace),
   }, options);
 
 export const createTask = (payload) =>
