@@ -490,6 +490,20 @@ class DatabaseService:
         with self.transaction() as transaction:
             return transaction.resolve_identity(identity)
 
+    def require_workspace_member_identity(
+        self,
+        *,
+        workspace_slug: str,
+        principal_id: uuid.UUID | str,
+        permission: Permission = Permission.ANNOTATION_WORK,
+    ) -> ExternalIdentity:
+        with self.transaction() as transaction:
+            return transaction.require_workspace_member_identity(
+                workspace_slug=workspace_slug,
+                principal_id=principal_id,
+                permission=permission,
+            )
+
     def resolve_or_provision(
         self,
         identity: ExternalIdentity,
@@ -949,6 +963,76 @@ class DatabaseTransaction:
     def resolve_identity(self, identity: ExternalIdentity) -> PrincipalRef | None:
         principal = self._find_principal(identity)
         return _principal_ref(principal) if principal is not None else None
+
+    def require_workspace_member_identity(
+        self,
+        *,
+        workspace_slug: str,
+        principal_id: uuid.UUID | str,
+        permission: Permission = Permission.ANNOTATION_WORK,
+    ) -> ExternalIdentity:
+        if permission not in TASK_PERMISSIONS:
+            raise AuthorizationDenied(
+                _decision(permission, AuthorizationReason.INVALID_PERMISSION_SCOPE)
+            )
+        normalized_principal_id = _principal_uuid(principal_id)
+        workspace = self._session.scalar(
+            select(Workspace)
+            .where(Workspace.slug == workspace_slug)
+            .execution_options(populate_existing=True),
+        )
+        if workspace is None:
+            raise AuthorizationDenied(
+                _decision(permission, AuthorizationReason.RESOURCE_NOT_VISIBLE)
+            )
+        workspace_ref = _workspace_ref(workspace)
+        if not workspace.is_active:
+            raise AuthorizationDenied(
+                _decision(
+                    permission,
+                    AuthorizationReason.INACTIVE_WORKSPACE,
+                    workspace=workspace_ref,
+                )
+            )
+
+        principal = self._session.scalar(
+            select(Principal)
+            .where(Principal.id == normalized_principal_id)
+            .execution_options(populate_existing=True),
+        )
+        if principal is None:
+            raise AuthorizationDenied(
+                _decision(permission, AuthorizationReason.RESOURCE_NOT_VISIBLE)
+            )
+        principal_ref = _principal_ref(principal)
+        if not principal.is_active:
+            raise AuthorizationDenied(
+                _decision(
+                    permission,
+                    AuthorizationReason.INACTIVE_PRINCIPAL,
+                    principal=principal_ref,
+                    workspace=workspace_ref,
+                )
+            )
+
+        roles = self._roles(principal.id, workspace.id)
+        if not roles:
+            raise AuthorizationDenied(
+                _decision(
+                    permission,
+                    AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                    principal=principal_ref,
+                    workspace=workspace_ref,
+                )
+            )
+        decision = _role_decision(permission, principal_ref, workspace_ref, None, roles)
+        self.require(decision)
+        return ExternalIdentity(
+            issuer=principal.issuer,
+            subject=principal.subject,
+            email_snapshot=principal.email_snapshot,
+            display_name_snapshot=principal.display_name,
+        )
 
     def resolve_or_provision(
         self,
@@ -3263,6 +3347,13 @@ def _require_task_key(task_key: str) -> str:
     ):
         raise ValueError("task_key must be a safe single-segment identifier")
     return normalized
+
+
+def _principal_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    try:
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value).strip())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("principal_id must be a valid UUID") from exc
 
 
 def _require_draft_match(draft: TaskDraft | None, if_match: str) -> None:

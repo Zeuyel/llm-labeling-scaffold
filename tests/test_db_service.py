@@ -265,6 +265,55 @@ def test_unknown_identity_and_missing_membership_have_zero_permissions(seeded_se
         service.require_task(unknown, "workspace-a", "shared-key", Permission.TASK_READ)
 
 
+def test_annotation_target_resolution_is_member_scoped_and_identity_bound(seeded_service, engine):
+    service = seeded_service["service"]
+    experimenter_id = service.resolve_identity(seeded_service["experimenter"]).id
+    resolved = service.require_workspace_member_identity(
+        workspace_slug="workspace-a",
+        principal_id=experimenter_id,
+    )
+    assert resolved.issuer == seeded_service["experimenter"].issuer
+    assert resolved.subject == seeded_service["experimenter"].subject
+
+    viewer_id = service.resolve_identity(seeded_service["viewer"]).id
+    with pytest.raises(AuthorizationDenied) as role_denied:
+        service.require_workspace_member_identity(
+            workspace_slug="workspace-a",
+            principal_id=viewer_id,
+        )
+    assert role_denied.value.decision.reason == AuthorizationReason.ROLE_DENIED
+
+    with pytest.raises(AuthorizationDenied) as hidden:
+        service.require_workspace_member_identity(
+            workspace_slug="workspace-b",
+            principal_id=experimenter_id,
+        )
+    assert hidden.value.decision.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+
+    service.revoke_workspace_membership(
+        workspace_slug="workspace-a",
+        target_identity=seeded_service["experimenter"],
+        actor_identity=seeded_service["admin"],
+        caller_identity=seeded_service["admin"],
+        channel=AuditChannel.API,
+    )
+    with pytest.raises(AuthorizationDenied) as revoked:
+        service.require_workspace_member_identity(
+            workspace_slug="workspace-a",
+            principal_id=experimenter_id,
+        )
+    assert revoked.value.decision.reason == AuthorizationReason.RESOURCE_NOT_VISIBLE
+
+    with Session(engine) as session, session.begin():
+        session.get(Principal, viewer_id).is_active = False
+    with pytest.raises(AuthorizationDenied) as inactive:
+        service.require_workspace_member_identity(
+            workspace_slug="workspace-a",
+            principal_id=viewer_id,
+        )
+    assert inactive.value.decision.reason == AuthorizationReason.INACTIVE_PRINCIPAL
+
+
 def test_nonmember_cannot_enumerate_workspace_or_task_existence(seeded_service):
     service = seeded_service["service"]
     identity = seeded_service["mcp"]

@@ -25,6 +25,7 @@ ARGILLA_USER_ID = UUID("22222222-2222-2222-2222-222222222222")
 ARGILLA_WORKSPACE_ID = UUID("33333333-3333-3333-3333-333333333333")
 BINDING_ID = UUID("44444444-4444-4444-4444-444444444444")
 COHORT_ID = UUID("55555555-5555-5555-5555-555555555555")
+PRINCIPAL_ID = UUID("66666666-6666-6666-6666-666666666666")
 
 
 class _FakeAuthorizationService:
@@ -38,6 +39,15 @@ class _FakeAuthorizationService:
         if workspace == "forbidden":
             raise AuthorizationDenied(SimpleNamespace(reason=AuthorizationReason.ROLE_DENIED))
         return SimpleNamespace(workspace=SimpleNamespace(slug=workspace))
+
+    def require_workspace_member_identity(self, *, workspace_slug, principal_id, permission):
+        if workspace_slug != WORKSPACE or principal_id != PRINCIPAL_ID:
+            raise AuthorizationDenied(SimpleNamespace(reason=AuthorizationReason.RESOURCE_NOT_VISIBLE))
+        return SimpleNamespace(
+            id=principal_id,
+            issuer="https://target.example",
+            subject="annotator-subject",
+        )
 
 
 class _FakeMember:
@@ -64,7 +74,7 @@ class _FakeRepository:
         self.mapping = SimpleNamespace(
             id=MAPPING_ID,
             principal_subject="annotator-subject",
-            principal_id=UUID("66666666-6666-6666-6666-666666666666"),
+            principal_id=PRINCIPAL_ID,
             argilla_user_id=ARGILLA_USER_ID,
             username="annotator-one",
             personal_argilla_workspace_id=ARGILLA_WORKSPACE_ID,
@@ -315,7 +325,7 @@ def test_http_write_dispatch_uses_idempotency_and_serializes_update(control_plan
             method="POST",
             body={
                 "workspace": WORKSPACE,
-                "scaffold_user_id": "annotator-subject",
+                "principal_id": str(PRINCIPAL_ID),
                 "initial_password": "one-time-secret",
             },
             headers={"Idempotency-Key": "provision-1"},
@@ -332,7 +342,7 @@ def test_http_write_dispatch_uses_idempotency_and_serializes_update(control_plan
             method="POST",
             body={
                 "workspace": WORKSPACE,
-                "scaffold_user_id": "annotator-subject",
+                "principal_id": str(PRINCIPAL_ID),
                 "argilla_user_id": str(ARGILLA_USER_ID),
                 "personal_workspace_id": str(ARGILLA_WORKSPACE_ID),
             },
@@ -445,7 +455,7 @@ def test_http_write_idempotency_and_external_boundaries(control_plane):
     with _server(control_plane, repository, adapter) as base_url:
         body = {
             "workspace": WORKSPACE,
-            "scaffold_user_id": "annotator-subject",
+            "principal_id": str(PRINCIPAL_ID),
             "initial_password": "secret-value",
         }
         status, payload = _request(base_url, "/api/annotators/provision", method="POST", body=body)
@@ -547,7 +557,7 @@ def test_external_annotator_runtime_unavailable_returns_503(control_plane):
             method="POST",
             body={
                 "workspace": WORKSPACE,
-                "scaffold_user_id": "annotator-subject",
+                "principal_id": str(PRINCIPAL_ID),
                 "initial_password": "one-time-secret",
             },
             headers={"Idempotency-Key": "adapter-missing"},

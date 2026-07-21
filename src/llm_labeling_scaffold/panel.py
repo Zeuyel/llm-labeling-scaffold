@@ -428,6 +428,23 @@ class _PanelAnnotatorAuthorizer:
         except Exception as exc:
             raise _map_annotator_dependency_error(exc) from None
 
+    def require_annotation_target(
+        self, *, workspace: str, principal_id: str, actor: Any
+    ) -> ExternalIdentity:
+        if not isinstance(actor, ExternalIdentity):
+            raise PanelAnnotatorError("permission_denied", "权限不足", HTTPStatus.FORBIDDEN)
+        resolver = getattr(self.service, "require_workspace_member_identity", None)
+        if not callable(resolver):
+            raise AuthorizationUnavailable("workspace member authorization is unavailable")
+        try:
+            return resolver(
+                workspace_slug=workspace,
+                principal_id=_annotator_uuid(principal_id, "principal_id"),
+                permission=Permission.ANNOTATION_WORK,
+            )
+        except Exception as exc:
+            raise _map_annotator_dependency_error(exc) from None
+
 
 class _PanelAnnotatorRepositoryFacade:
     def __init__(
@@ -573,7 +590,8 @@ class _PanelAnnotatorRepositoryFacade:
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_id: str,
+        principal_identity: ExternalIdentity,
         external: ExternalAnnotatorSnapshot,
     ) -> dict[str, Any]:
         user_id = _annotator_uuid(external.argilla_user_id, "argilla_user_id")
@@ -587,10 +605,8 @@ class _PanelAnnotatorRepositoryFacade:
             "create_annotator_mapping",
             workspace_slug=workspace,
             binding_id=self._binding(workspace).id,
-            principal_identity=ExternalIdentity(
-                self.actor_identity.issuer,
-                scaffold_user_id,
-            ),
+            principal_id=_annotator_uuid(principal_id, "principal_id"),
+            principal_identity=principal_identity,
             username=external.argilla_username,
             actor_identity=self.actor_identity,
             caller_identity=self.caller_identity,
@@ -851,7 +867,7 @@ class _PanelArgillaAdminFacade:
     def _ensure(
         self,
         *,
-        scaffold_user_id: str,
+        principal_identity: ExternalIdentity,
         password: str | None,
         personal_workspace_name: str | None,
         expected_user_uuid: str | None = None,
@@ -860,8 +876,8 @@ class _PanelArgillaAdminFacade:
     ) -> ExternalAnnotatorSnapshot:
         if personal_workspace_name is not None:
             expected_name = derive_personal_workspace_name(
-                self.principal_issuer,
-                scaffold_user_id,
+                principal_identity.issuer,
+                principal_identity.subject,
             )
             if personal_workspace_name != expected_name:
                 raise PanelAnnotatorError(
@@ -872,8 +888,8 @@ class _PanelArgillaAdminFacade:
                 )
         try:
             result = self.adapter.ensure_annotator(
-                principal_issuer=self.principal_issuer,
-                principal_subject=scaffold_user_id,
+                principal_issuer=principal_identity.issuer,
+                principal_subject=principal_identity.subject,
                 password=password,
                 expected_user_uuid=(
                     _annotator_uuid(expected_user_uuid, "argilla_user_id")
@@ -920,8 +936,8 @@ class _PanelArgillaAdminFacade:
             if callable(workspace_lookup):
                 try:
                     resolved_workspace_id = workspace_lookup(
-                        principal_issuer=self.principal_issuer,
-                        principal_subject=scaffold_user_id,
+                        principal_issuer=principal_identity.issuer,
+                        principal_subject=principal_identity.subject,
                     )
                 except Exception:
                     raise PanelAnnotatorError(
@@ -940,13 +956,13 @@ class _PanelArgillaAdminFacade:
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_identity: ExternalIdentity,
         personal_workspace_name: str | None,
         initial_password: str,
     ) -> ExternalAnnotatorSnapshot:
         del workspace
         return self._ensure(
-            scaffold_user_id=scaffold_user_id,
+            principal_identity=principal_identity,
             password=initial_password,
             personal_workspace_name=personal_workspace_name,
         )
@@ -955,14 +971,14 @@ class _PanelArgillaAdminFacade:
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_identity: ExternalIdentity,
         argilla_user_id: str,
         argilla_username: str | None,
         personal_workspace_id: str | None,
     ) -> ExternalAnnotatorSnapshot:
         del workspace, argilla_username
         return self._ensure(
-            scaffold_user_id=scaffold_user_id,
+            principal_identity=principal_identity,
             password=None,
             personal_workspace_name=None,
             expected_user_uuid=argilla_user_id,
@@ -975,9 +991,12 @@ class _PanelArgillaAdminFacade:
                 "identity_incomplete",
                 "标注人员缺少可验证的 Argilla UUID",
                 HTTPStatus.CONFLICT,
-            )
+        )
         snapshot = self._ensure(
-            scaffold_user_id=annotator.scaffold_user_id,
+            principal_identity=ExternalIdentity(
+                self.principal_issuer,
+                annotator.scaffold_user_id,
+            ),
             password=None,
             personal_workspace_name=None,
             expected_user_uuid=annotator.argilla_user_id,
@@ -1183,7 +1202,7 @@ def _annotator_contract_endpoints() -> list[dict[str, Any]]:
             "side_effects": True,
             "required_permission": WORKSPACE_MANAGE_PERMISSION,
             "required_headers": write_headers,
-            "request_schema": {"type": "object", "required": ["workspace", "scaffold_user_id", "initial_password"]},
+            "request_schema": {"type": "object", "required": ["workspace", "principal_id", "initial_password"]},
             "response_schema": {"type": "object", "required": ["annotator", "replayed"]},
         },
         {
@@ -1193,7 +1212,7 @@ def _annotator_contract_endpoints() -> list[dict[str, Any]]:
             "side_effects": True,
             "required_permission": WORKSPACE_MANAGE_PERMISSION,
             "required_headers": write_headers,
-            "request_schema": {"type": "object", "required": ["workspace", "scaffold_user_id", "argilla_user_id"]},
+            "request_schema": {"type": "object", "required": ["workspace", "principal_id", "argilla_user_id"]},
             "response_schema": {"type": "object", "required": ["annotator", "replayed"]},
         },
         {

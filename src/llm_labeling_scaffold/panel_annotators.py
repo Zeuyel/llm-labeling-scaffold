@@ -60,7 +60,7 @@ SENSITIVE_FIELDS = frozenset(
 ANNOTATOR_CREATE_REQUEST_FIELDS = frozenset(
     {
         "workspace",
-        "scaffold_user_id",
+        "principal_id",
         "personal_workspace_name",
         "initial_password",
     }
@@ -68,7 +68,7 @@ ANNOTATOR_CREATE_REQUEST_FIELDS = frozenset(
 ANNOTATOR_BIND_REQUEST_FIELDS = frozenset(
     {
         "workspace",
-        "scaffold_user_id",
+        "principal_id",
         "argilla_user_id",
         "argilla_username",
         "personal_workspace_id",
@@ -284,14 +284,14 @@ class WorkspaceScope:
 @dataclass(frozen=True, slots=True)
 class CreateAnnotatorRequest:
     workspace: str
-    scaffold_user_id: str
+    principal_id: str
     initial_password: str = field(repr=False)
     personal_workspace_name: str | None = None
 
     def safe_dict(self) -> dict[str, Any]:
         return {
             "workspace": self.workspace,
-            "scaffold_user_id": self.scaffold_user_id,
+            "principal_id": self.principal_id,
             "personal_workspace_name": self.personal_workspace_name,
         }
 
@@ -299,7 +299,7 @@ class CreateAnnotatorRequest:
 @dataclass(frozen=True, slots=True)
 class BindAnnotatorRequest:
     workspace: str
-    scaffold_user_id: str
+    principal_id: str
     argilla_user_id: str
     argilla_username: str | None = None
     personal_workspace_id: str | None = None
@@ -376,9 +376,7 @@ def parse_create_annotator_request(payload: Any) -> CreateAnnotatorRequest:
     _ensure_fields(root, ANNOTATOR_CREATE_REQUEST_FIELDS, "annotator_create")
     return CreateAnnotatorRequest(
         workspace=_required_text(root.get("workspace"), "workspace"),
-        scaffold_user_id=_required_text(
-            root.get("scaffold_user_id"), "scaffold_user_id"
-        ),
+        principal_id=_required_principal_id(root.get("principal_id")),
         initial_password=_initial_password(root.get("initial_password")),
         personal_workspace_name=_optional_text(
             root.get("personal_workspace_name"), "personal_workspace_name"
@@ -392,9 +390,7 @@ def parse_bind_annotator_request(payload: Any) -> BindAnnotatorRequest:
     _ensure_fields(root, ANNOTATOR_BIND_REQUEST_FIELDS, "annotator_bind")
     return BindAnnotatorRequest(
         workspace=_required_text(root.get("workspace"), "workspace"),
-        scaffold_user_id=_required_text(
-            root.get("scaffold_user_id"), "scaffold_user_id"
-        ),
+        principal_id=_required_principal_id(root.get("principal_id")),
         argilla_user_id=_required_text(root.get("argilla_user_id"), "argilla_user_id"),
         argilla_username=_optional_text(
             root.get("argilla_username"), "argilla_username"
@@ -710,6 +706,12 @@ class WorkspaceAuthorizer(Protocol):
     ) -> Any: ...
 
 
+class AnnotationTargetAuthorizer(Protocol):
+    def require_annotation_target(
+        self, *, workspace: str, principal_id: str, actor: Any
+    ) -> Any: ...
+
+
 class AnnotatorRepository(Protocol):
     def list_annotators(self, *, workspace: str) -> Iterable[Any]: ...
 
@@ -719,7 +721,8 @@ class AnnotatorRepository(Protocol):
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_id: str,
+        principal_identity: Any,
         external: ExternalAnnotatorSnapshot,
     ) -> Any: ...
 
@@ -776,7 +779,7 @@ class AnnotatorAdapter(Protocol):
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_identity: Any,
         personal_workspace_name: str | None,
         initial_password: str,
     ) -> Any: ...
@@ -785,7 +788,7 @@ class AnnotatorAdapter(Protocol):
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_identity: Any,
         argilla_user_id: str,
         argilla_username: str | None,
         personal_workspace_id: str | None,
@@ -845,10 +848,11 @@ class PanelAnnotatorService:
         )
         resolved = self._scope(request.workspace, actor=actor)
         self._authorize(resolved)
+        principal_identity = self._annotation_target(resolved, request.principal_id)
         if self.adapter is None:
             raise _external_unavailable()
         workspace = request.workspace
-        scaffold_user_id = request.scaffold_user_id
+        principal_id = request.principal_id
         workspace_name = request.personal_workspace_name
         initial_password = request.initial_password
         del request
@@ -856,7 +860,7 @@ class PanelAnnotatorService:
             external = self._adapter_call(
                 "provision_annotator",
                 workspace=workspace,
-                scaffold_user_id=scaffold_user_id,
+                principal_identity=principal_identity,
                 personal_workspace_name=workspace_name,
                 initial_password=initial_password,
             )
@@ -866,7 +870,8 @@ class PanelAnnotatorService:
         record = self._repository_call(
             "create_annotator",
             workspace=workspace,
-            scaffold_user_id=scaffold_user_id,
+            principal_id=principal_id,
+            principal_identity=principal_identity,
             external=snapshot,
         )
         return AnnotatorResponse.from_record(record, workspace=workspace)
@@ -879,13 +884,14 @@ class PanelAnnotatorService:
         )
         resolved = self._scope(request.workspace, actor=actor)
         self._authorize(resolved)
+        principal_identity = self._annotation_target(resolved, request.principal_id)
         if self.adapter is None:
             raise _external_unavailable()
         external = self._validated_snapshot(
             self._adapter_call(
                 "bind_annotator",
                 workspace=request.workspace,
-                scaffold_user_id=request.scaffold_user_id,
+                principal_identity=principal_identity,
                 argilla_user_id=request.argilla_user_id,
                 argilla_username=request.argilla_username,
                 personal_workspace_id=request.personal_workspace_id,
@@ -895,7 +901,8 @@ class PanelAnnotatorService:
         record = self._repository_call(
             "create_annotator",
             workspace=request.workspace,
-            scaffold_user_id=request.scaffold_user_id,
+            principal_id=request.principal_id,
+            principal_identity=principal_identity,
             external=external,
         )
         return AnnotatorResponse.from_record(record, workspace=request.workspace)
@@ -1084,6 +1091,35 @@ class PanelAnnotatorService:
             raise
         except Exception as exc:
             raise map_workspace_error(exc) from None
+
+    def _annotation_target(self, scope: WorkspaceScope, principal_id: str) -> Any:
+        if self.authorizer is None:
+            raise map_workspace_error(WorkspaceUnavailable())
+        method = getattr(self.authorizer, "require_annotation_target", None)
+        if not callable(method):
+            raise map_workspace_error(WorkspaceUnavailable())
+        try:
+            target = method(
+                workspace=scope.workspace,
+                principal_id=principal_id,
+                actor=scope.actor,
+            )
+        except PanelAnnotatorError:
+            raise
+        except Exception as exc:
+            raise map_workspace_error(exc) from None
+        if target is None:
+            raise map_workspace_error(WorkspacePermissionDenied())
+        issuer = getattr(target, "issuer", None)
+        subject = getattr(target, "subject", None)
+        if (
+            not isinstance(issuer, str)
+            or not issuer.strip()
+            or not isinstance(subject, str)
+            or not subject.strip()
+        ):
+            raise map_workspace_error(WorkspaceUnavailable())
+        return target
 
     def _repository_call(self, method_name: str, **kwargs: Any) -> Any:
         method = getattr(self.repository, method_name, None)
@@ -1317,6 +1353,16 @@ def _required_text(value: Any, field_name: str, *, max_length: int = 255) -> str
     ):
         raise AnnotatorDTOError("invalid_field", "请求字段无效", field=field_name)
     return value.strip()
+
+
+def _required_principal_id(value: Any) -> str:
+    text = _required_text(value, "principal_id")
+    try:
+        return str(UUID(text))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AnnotatorDTOError(
+            "invalid_uuid", "principal_id 必须是合法 UUID", field="principal_id"
+        ) from exc
 
 
 def _optional_text(value: Any, field_name: str, *, max_length: int = 255) -> str | None:
@@ -1570,6 +1616,7 @@ __all__ = [
     "AnnotatorRepository",
     "AnnotatorResponse",
     "AnnotatorService",
+    "AnnotationTargetAuthorizer",
     "BatchAnnotatorRepository",
     "BindAnnotatorRequest",
     "COHORT_CREATE_REQUEST_FIELDS",

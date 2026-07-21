@@ -20,6 +20,8 @@ from llm_labeling_scaffold.db import (
     CohortMemberInput,
     ExternalIdentity,
     Permission,
+    PrincipalType,
+    Role,
 )
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
 from llm_labeling_scaffold.db.database import create_database_engine
@@ -29,6 +31,9 @@ from llm_labeling_scaffold.db.models import (
     AnnotatorCohort,
     AnnotatorCohortMember,
     IdempotencyRecord,
+    Principal,
+    RoleBinding,
+    Workspace,
 )
 from llm_labeling_scaffold.db.service import DatabaseTransaction
 
@@ -57,6 +62,31 @@ def annotator_repository(tmp_path: Path):
             workspace_slug="workspace-b",
             workspace_name="Workspace B",
         )
+    with Session(engine) as session, session.begin():
+        workspace = session.scalar(select(Workspace).where(Workspace.slug == "workspace-a"))
+        admin = session.scalar(
+            select(Principal).where(
+                Principal.issuer == admin_a.issuer,
+                Principal.subject == admin_a.subject,
+            )
+        )
+        assert workspace is not None and admin is not None
+        for subject in ("annotator-owner", "annotator-a", "verified", "unverified", "scoped", "race"):
+            principal = Principal(
+                issuer=admin_a.issuer,
+                subject=subject,
+                principal_type=PrincipalType.USER,
+            )
+            session.add(principal)
+            session.flush()
+            session.add(
+                RoleBinding(
+                    workspace_id=workspace.id,
+                    principal_id=principal.id,
+                    role=Role.ANNOTATOR,
+                    created_by_principal_id=admin.id,
+                )
+            )
     repository = AnnotatorControlRepository(factory, engine)
     try:
         yield {

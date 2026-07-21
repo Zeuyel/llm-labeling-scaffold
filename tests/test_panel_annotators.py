@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,9 @@ try:
     from llm_labeling_scaffold.db.rbac import Permission
 except ImportError:
     Permission = None
+
+
+PRINCIPAL_ID = "11111111-1111-1111-1111-111111111111"
 
 
 def _annotator_record(
@@ -98,7 +102,7 @@ class _Repository:
         record = _annotator_record(
             workspace=kwargs["workspace"],
             annotator_id="annotator-created",
-            scaffold_user_id=kwargs["scaffold_user_id"],
+            scaffold_user_id=kwargs["principal_identity"].subject,
             argilla_user_id=external.argilla_user_id,
             argilla_username=external.argilla_username,
         )
@@ -192,6 +196,7 @@ class _Authorizer:
     def __init__(self, error: Exception | None = None):
         self.error = error
         self.calls: list[dict] = []
+        self.target_calls: list[dict] = []
 
     def require_workspace(self, *, workspace: str, actor, permission: str):
         self.calls.append(
@@ -199,6 +204,17 @@ class _Authorizer:
         )
         if self.error is not None:
             raise self.error
+
+    def require_annotation_target(self, *, workspace: str, principal_id: str, actor):
+        self.target_calls.append(
+            {"workspace": workspace, "principal_id": principal_id, "actor": actor}
+        )
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(
+            issuer="https://target.example",
+            subject=f"target-{principal_id}",
+        )
 
 
 def test_default_permission_uses_rbac_value_and_workspace_scope():
@@ -227,11 +243,11 @@ def test_create_request_does_not_accept_external_username_and_bind_does():
     request = api.parse_create_annotator_request(
         {
             "workspace": "workspace-a",
-            "scaffold_user_id": "principal-1",
+            "principal_id": PRINCIPAL_ID,
             "initial_password": "one-time-secret",
         }
     )
-    assert request.scaffold_user_id == "principal-1"
+    assert request.principal_id == PRINCIPAL_ID
     assert "initial_password" not in request.safe_dict()
 
     with pytest.raises(api.AnnotatorDTOError) as exc_info:
@@ -239,6 +255,16 @@ def test_create_request_does_not_accept_external_username_and_bind_does():
             {
                 "workspace": "workspace-a",
                 "scaffold_user_id": "principal-1",
+                "initial_password": "one-time-secret",
+            }
+        )
+    assert exc_info.value.code == "unknown_field"
+
+    with pytest.raises(api.AnnotatorDTOError) as exc_info:
+        api.parse_create_annotator_request(
+            {
+                "workspace": "workspace-a",
+                "principal_id": PRINCIPAL_ID,
                 "argilla_username": "forged-name",
                 "initial_password": "one-time-secret",
             }
@@ -248,7 +274,7 @@ def test_create_request_does_not_accept_external_username_and_bind_does():
     bound = api.parse_bind_annotator_request(
         {
             "workspace": "workspace-a",
-            "scaffold_user_id": "principal-1",
+            "principal_id": PRINCIPAL_ID,
             "argilla_user_id": "argilla-user-1",
             "argilla_username": "existing-name",
         }
@@ -260,10 +286,10 @@ def test_sensitive_fields_are_rejected_without_secret_values_in_errors():
     secret = "initial-password-value"
     with pytest.raises(api.SensitiveInputError) as exc_info:
         api.parse_bind_annotator_request(
-            {
-                "workspace": "workspace-a",
-                "scaffold_user_id": "principal-1",
-                "argilla_user_id": "argilla-user-1",
+                {
+                    "workspace": "workspace-a",
+                    "principal_id": PRINCIPAL_ID,
+                    "argilla_user_id": "argilla-user-1",
                 "credentials": {"password": secret},
             }
         )
@@ -273,7 +299,7 @@ def test_sensitive_fields_are_rejected_without_secret_values_in_errors():
     request = api.parse_create_annotator_request(
         {
             "workspace": "workspace-a",
-            "scaffold_user_id": "principal-1",
+            "principal_id": PRINCIPAL_ID,
             "initial_password": secret,
         }
     )
@@ -286,26 +312,26 @@ def test_create_annotator_derives_external_username_and_never_returns_password()
     secret = "one-time-password"
     repository = _Repository()
     adapter = _Adapter(_external_snapshot(username="derived-from-principal"))
-    service = api.PanelAnnotatorService(repository, adapter)
+    authorizer = _Authorizer()
+    service = api.PanelAnnotatorService(repository, adapter, authorizer=authorizer)
 
     response = service.create_annotator(
         {
             "workspace": "workspace-a",
-            "scaffold_user_id": "principal-1",
+            "principal_id": PRINCIPAL_ID,
             "initial_password": secret,
         }
     )
     payload = response.to_dict()
 
-    assert adapter.provision_calls == [
-        {
-            "workspace": "workspace-a",
-            "scaffold_user_id": "principal-1",
-            "personal_workspace_name": None,
-            "initial_password": secret,
-        }
-    ]
+    assert adapter.provision_calls[0]["workspace"] == "workspace-a"
+    assert adapter.provision_calls[0]["principal_identity"].issuer == "https://target.example"
+    assert adapter.provision_calls[0]["principal_identity"].subject.endswith(PRINCIPAL_ID)
+    assert adapter.provision_calls[0]["personal_workspace_name"] is None
+    assert adapter.provision_calls[0]["initial_password"] == secret
     assert "argilla_username" not in adapter.provision_calls[0]
+    assert repository.create_annotator_calls[0]["principal_id"] == PRINCIPAL_ID
+    assert repository.create_annotator_calls[0]["principal_identity"].subject.endswith(PRINCIPAL_ID)
     assert "initial_password" not in repository.create_annotator_calls[0]
     assert secret not in json.dumps(payload, ensure_ascii=False)
     assert "active" not in payload
@@ -322,13 +348,13 @@ def test_adapter_exception_does_not_expose_initial_password():
                 503,
             )
 
-    service = api.PanelAnnotatorService(_Repository(), _FailingAdapter())
+    service = api.PanelAnnotatorService(_Repository(), _FailingAdapter(), authorizer=_Authorizer())
     with pytest.raises(api.PanelAnnotatorError) as exc_info:
         service.create_annotator(
-            {
-                "workspace": "workspace-a",
-                "scaffold_user_id": "principal-1",
-                "initial_password": secret,
+                {
+                    "workspace": "workspace-a",
+                    "principal_id": PRINCIPAL_ID,
+                    "initial_password": secret,
             }
         )
     assert exc_info.value.code == "external_service_unavailable"

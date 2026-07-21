@@ -30,9 +30,10 @@ from .models import (
     ArgillaAnnotatorMapping,
     ArgillaConnectionBinding,
     Principal,
+    RoleBinding,
     Workspace,
 )
-from .rbac import Permission
+from .rbac import Permission, role_allows
 from .service import (
     AuthorizationUnavailable,
     DatabaseTransaction,
@@ -431,6 +432,7 @@ class AnnotatorControlRepository:
         workspace_slug: str,
         binding_id: uuid.UUID | str,
         principal_identity: ExternalIdentity,
+        principal_id: uuid.UUID | str | None = None,
         username: str,
         actor_identity: ExternalIdentity,
         idempotency_key: str,
@@ -445,6 +447,11 @@ class AnnotatorControlRepository:
     ) -> AnnotatorMappingResult:
         del initial_password
         normalized_binding_id = _uuid(binding_id, "binding_id")
+        normalized_principal_id = (
+            _optional_uuid(principal_id, "principal_id")
+            if principal_id is not None
+            else None
+        )
         remote_user_id = _optional_uuid(argilla_user_id, "argilla_user_id")
         personal_workspace_id = _optional_uuid(
             personal_argilla_workspace_id,
@@ -463,6 +470,9 @@ class AnnotatorControlRepository:
         caller = caller_identity or actor_identity
         payload = {
             "binding_id": str(normalized_binding_id),
+            "principal_id": (
+                str(normalized_principal_id) if normalized_principal_id is not None else None
+            ),
             "principal_issuer": principal_identity.issuer,
             "principal_subject": principal_identity.subject,
             "username": normalized_username,
@@ -504,10 +514,35 @@ class AnnotatorControlRepository:
                 raise AnnotatorResourceNotFound("workspace binding was not found")
             if binding.state != ArgillaBindingState.ACTIVE:
                 raise AnnotatorNotReady("workspace binding is disabled")
-            principal_ref = transaction.resolve_or_provision(principal_identity)
-            principal = session.scalar(select(Principal).where(Principal.id == principal_ref.id))
+            principal_statement = select(Principal).with_for_update()
+            if normalized_principal_id is not None:
+                principal_statement = principal_statement.where(
+                    Principal.id == normalized_principal_id,
+                )
+            else:
+                principal_statement = principal_statement.where(
+                    Principal.issuer == principal_identity.issuer,
+                    Principal.subject == principal_identity.subject,
+                )
+            principal = session.scalar(principal_statement)
             if principal is None or not principal.is_active:
                 raise AnnotatorResourceNotFound("annotator principal is not active")
+            if (
+                principal.issuer != principal_identity.issuer
+                or principal.subject != principal_identity.subject
+            ):
+                raise AnnotatorRepositoryValidationError(
+                    "principal identity does not match principal_id",
+                )
+            roles = session.scalars(
+                select(RoleBinding.role).where(
+                    RoleBinding.workspace_id == workspace.id,
+                    RoleBinding.principal_id == principal.id,
+                    RoleBinding.task_id.is_(None),
+                ),
+            ).all()
+            if not any(role_allows(role, Permission.ANNOTATION_WORK) for role in roles):
+                raise AnnotatorResourceNotFound("annotator principal is not an annotation member")
             existing = session.scalar(
                 select(ArgillaAnnotatorMapping)
                 .where(
