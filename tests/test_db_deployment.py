@@ -440,6 +440,7 @@ def test_runtime_role_final_schema_acl_matches_service_dependencies(
         "tasks": (True, True, True, False),
         "role_bindings": (True, True, True, True),
         "idempotency_records": (True, True, False, False),
+        "workspace_invitations": (True, True, True, True),
         "workspace_settings": (True, True, True, False),
         "task_drafts": (True, True, True, False),
         "task_revisions": (True, True, False, False),

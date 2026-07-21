@@ -713,7 +713,11 @@ def test_panel_session_uses_verified_display_snapshot_not_spoofed_headers(tmp_pa
             "email": "alice@example.com",
         },
         "authentication": {"method": "cloudflare_access"},
-        "authorization": {"state": "ready", "workspaces": []},
+            "authorization": {
+                "state": "ready",
+                "workspaces": [],
+                "invitation_claims": {"status": "none", "items": []},
+            },
     }
     assert "issuer" not in session["user"]
     assert "subject" not in session["user"]
@@ -942,7 +946,11 @@ def test_basic_auth_remains_available_only_in_explicit_development_mode(tmp_path
         "authenticated": True,
         "user": {"display_name": "admin"},
         "authentication": {"method": "basic_dev"},
-        "authorization": {"state": "ready", "workspaces": []},
+            "authorization": {
+                "state": "ready",
+                "workspaces": [],
+                "invitation_claims": {"status": "not_claimable_no_email", "items": []},
+            },
     }
 
 

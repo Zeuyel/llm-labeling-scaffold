@@ -7,6 +7,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
 
@@ -25,6 +26,7 @@ from .enums import (
     Role,
     TaskLifecycleState,
     TaskMaterializationState,
+    WorkspaceInvitationStatus,
 )
 from .models import (
     AuditEvent,
@@ -36,6 +38,7 @@ from .models import (
     TaskRevision,
     TaskRevisionMaterialization,
     Workspace,
+    WorkspaceInvitation,
 )
 from .idempotency_boundary import sqlite_idempotency_completion_gate
 from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS, Permission, role_allows
@@ -43,7 +46,9 @@ from .sensitive_json import canonical_sensitive_json_bytes, normalize_sensitive_
 
 
 MAX_AUTHORIZED_TASKS_PAGE_SIZE = 100
+DEFAULT_INVITATION_TTL = timedelta(days=7)
 _IDEMPOTENCY_OPERATION = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,254}\Z", re.ASCII)
+_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\Z", re.ASCII)
 _TASK_LIFECYCLE_TRANSITIONS = {
     TaskLifecycleState.ACTIVE: frozenset({TaskLifecycleState.DISABLED, TaskLifecycleState.ARCHIVED}),
     TaskLifecycleState.DISABLED: frozenset({TaskLifecycleState.ACTIVE, TaskLifecycleState.ARCHIVED}),
@@ -129,6 +134,7 @@ class TaskAccessPage:
 class AuthorizationSession:
     principal: PrincipalRef | None
     workspaces: tuple[WorkspaceAccess, ...]
+    invitation_claims: tuple["InvitationClaimRef", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -273,6 +279,59 @@ class MembershipMutationResult:
     audit_event_id: uuid.UUID | None
 
 
+@dataclass(frozen=True)
+class WorkspaceMemberRef:
+    principal_id: uuid.UUID
+    email: str | None
+    display_name: str | None
+    role: Role
+    is_active: bool
+
+
+@dataclass(frozen=True)
+class WorkspaceInvitationRef:
+    id: uuid.UUID
+    workspace: WorkspaceRef
+    email: str
+    role: Role
+    status: WorkspaceInvitationStatus
+    expires_at: datetime
+    claimed_principal_id: uuid.UUID | None
+
+
+@dataclass(frozen=True)
+class WorkspaceMemberList:
+    workspace: WorkspaceRef
+    members: tuple[WorkspaceMemberRef, ...]
+    invitations: tuple[WorkspaceInvitationRef, ...]
+
+
+@dataclass(frozen=True)
+class InvitationClaimRef:
+    invitation_id: uuid.UUID
+    workspace: WorkspaceRef
+    role: Role
+    principal_id: uuid.UUID
+    membership_created: bool
+    claim_status: str
+
+
+@dataclass(frozen=True)
+class WorkspaceInvitationResult:
+    action: str
+    invitation: WorkspaceInvitationRef
+    claim_status: str
+    response_status: int
+    replayed: bool
+
+
+@dataclass(frozen=True)
+class IdempotentMembershipMutationResult:
+    result: MembershipMutationResult
+    response_status: int
+    replayed: bool
+
+
 class AuthorizationUnavailable(RuntimeError):
     pass
 
@@ -391,6 +450,14 @@ class MembershipNotFound(RuntimeError):
     pass
 
 
+class InvitationConflict(RuntimeError):
+    pass
+
+
+class MembershipOperationInProgress(RuntimeError):
+    code = "membership_operation_in_progress"
+
+
 class LastWorkspaceAdmin(RuntimeError):
     pass
 
@@ -434,6 +501,88 @@ class DatabaseService:
     def get_session(self, identity: ExternalIdentity) -> AuthorizationSession:
         with self.transaction() as transaction:
             return transaction.get_session(identity)
+
+    def list_workspace_members(
+        self,
+        *,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+    ) -> WorkspaceMemberList:
+        with self.transaction() as transaction:
+            return transaction.list_workspace_members(
+                identity=identity,
+                workspace_slug=workspace_slug,
+            )
+
+    def create_workspace_invitation(
+        self,
+        *,
+        workspace_slug: str,
+        email: str,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> WorkspaceInvitationResult:
+        with self.transaction() as transaction:
+            return transaction.create_workspace_invitation(
+                workspace_slug=workspace_slug,
+                email=email,
+                role=role,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=request_id,
+            )
+
+    def change_workspace_membership_by_principal_id(
+        self,
+        *,
+        workspace_slug: str,
+        principal_id: uuid.UUID,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> IdempotentMembershipMutationResult:
+        with self.transaction() as transaction:
+            return transaction.change_workspace_membership_by_principal_id(
+                workspace_slug=workspace_slug,
+                principal_id=principal_id,
+                role=role,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=request_id,
+            )
+
+    def revoke_workspace_membership_by_principal_id(
+        self,
+        *,
+        workspace_slug: str,
+        principal_id: uuid.UUID,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> IdempotentMembershipMutationResult:
+        with self.transaction() as transaction:
+            return transaction.revoke_workspace_membership_by_principal_id(
+                workspace_slug=workspace_slug,
+                principal_id=principal_id,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=request_id,
+            )
 
     def list_authorized_workspaces(self, identity: ExternalIdentity) -> tuple[WorkspaceAccess, ...]:
         return self.get_session(identity).workspaces
@@ -836,15 +985,234 @@ class DatabaseTransaction:
         return _principal_ref(principal)
 
     def get_session(self, identity: ExternalIdentity) -> AuthorizationSession:
+        invitation_claims = self._claim_pending_invitations(identity)
         principal = self._find_principal(identity)
         if principal is None:
-            return AuthorizationSession(principal=None, workspaces=())
+            return AuthorizationSession(
+                principal=None,
+                workspaces=(),
+                invitation_claims=invitation_claims,
+            )
         principal_ref = _principal_ref(principal)
         if not principal.is_active:
-            return AuthorizationSession(principal=principal_ref, workspaces=())
+            return AuthorizationSession(
+                principal=principal_ref,
+                workspaces=(),
+                invitation_claims=invitation_claims,
+            )
         return AuthorizationSession(
             principal=principal_ref,
             workspaces=self._list_authorized_workspaces(principal.id),
+            invitation_claims=invitation_claims,
+        )
+
+    def list_workspace_members(
+        self,
+        *,
+        identity: ExternalIdentity,
+        workspace_slug: str,
+    ) -> WorkspaceMemberList:
+        decision = self.authorize_workspace(identity, workspace_slug, Permission.WORKSPACE_MANAGE)
+        self.require(decision)
+        assert decision.workspace is not None
+        workspace = self._session.scalar(
+            select(Workspace)
+            .where(Workspace.id == decision.workspace.id)
+            .execution_options(populate_existing=True),
+        )
+        if workspace is None:
+            raise AuthorizationDenied(
+                _decision(
+                    Permission.WORKSPACE_MANAGE,
+                    AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                )
+            )
+        self._expire_workspace_invitations(workspace.id)
+        members = self._session.execute(
+            select(RoleBinding, Principal)
+            .join(Principal, Principal.id == RoleBinding.principal_id)
+            .where(
+                RoleBinding.workspace_id == workspace.id,
+                RoleBinding.task_id.is_(None),
+            )
+            .order_by(Principal.email_snapshot, Principal.display_name, Principal.id)
+        ).all()
+        invitations = self._session.scalars(
+            select(WorkspaceInvitation)
+            .where(WorkspaceInvitation.workspace_id == workspace.id)
+            .order_by(WorkspaceInvitation.email, WorkspaceInvitation.id),
+        ).all()
+        return WorkspaceMemberList(
+            workspace=_workspace_ref(workspace),
+            members=tuple(
+                WorkspaceMemberRef(
+                    principal_id=principal.id,
+                    email=principal.email_snapshot,
+                    display_name=principal.display_name,
+                    role=binding.role,
+                    is_active=principal.is_active,
+                )
+                for binding, principal in members
+            ),
+            invitations=tuple(
+                _workspace_invitation_ref(invitation, workspace)
+                for invitation in invitations
+            ),
+        )
+
+    def _claim_pending_invitations(
+        self,
+        identity: ExternalIdentity,
+    ) -> tuple[InvitationClaimRef, ...]:
+        normalized_email = normalize_optional_invitation_email(identity.email_snapshot)
+        if normalized_email is None:
+            return ()
+        now = datetime.now(timezone.utc)
+        candidates = self._session.scalars(
+            select(WorkspaceInvitation)
+            .where(
+                WorkspaceInvitation.email == normalized_email,
+                WorkspaceInvitation.status == WorkspaceInvitationStatus.PENDING,
+            )
+            .order_by(WorkspaceInvitation.workspace_id, WorkspaceInvitation.id)
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        ).all()
+        if not candidates:
+            return ()
+        expired = [
+            invitation
+            for invitation in candidates
+            if _utc_datetime(invitation.expires_at) <= now
+        ]
+        for invitation in expired:
+            self._expire_invitation(invitation)
+        pending = [invitation for invitation in candidates if invitation not in expired]
+        if not pending:
+            self._session.flush()
+            return ()
+
+        principal_ref = self.resolve_or_provision(identity, PrincipalType.USER)
+        principal = self._session.scalar(
+            select(Principal)
+            .where(Principal.id == principal_ref.id)
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        if principal is None or not principal.is_active:
+            return ()
+        workspace_ids = sorted({invitation.workspace_id for invitation in pending}, key=str)
+        workspaces = {
+            workspace.id: workspace
+            for workspace in self._session.scalars(
+                select(Workspace)
+                .where(Workspace.id.in_(workspace_ids))
+                .order_by(Workspace.id)
+                .with_for_update()
+                .execution_options(populate_existing=True),
+            ).all()
+        }
+        claims: list[InvitationClaimRef] = []
+        for invitation in pending:
+            workspace = workspaces.get(invitation.workspace_id)
+            if workspace is None or not workspace.is_active:
+                continue
+            binding = self._workspace_binding(
+                workspace.id,
+                principal.id,
+                for_update=True,
+            )
+            if binding is not None and binding.role != invitation.role:
+                claims.append(
+                    InvitationClaimRef(
+                        invitation_id=invitation.id,
+                        workspace=_workspace_ref(workspace),
+                        role=invitation.role,
+                        principal_id=principal.id,
+                        membership_created=False,
+                        claim_status="role_conflict",
+                    )
+                )
+                continue
+            membership_created = binding is None
+            if binding is None:
+                binding = RoleBinding(
+                    workspace_id=workspace.id,
+                    principal_id=principal.id,
+                    role=invitation.role,
+                    created_by_principal_id=principal.id,
+                )
+                self._session.add(binding)
+                self._session.flush()
+            invitation.status = WorkspaceInvitationStatus.CLAIMED
+            invitation.claimed_principal_id = principal.id
+            invitation.claimed_at = now
+            append_audit_event(
+                self._session,
+                workspace_id=workspace.id,
+                event_type="workspace.invitation_claimed",
+                actor=principal,
+                caller=principal,
+                channel=AuditChannel.PANEL,
+                resource_type="workspace_invitation",
+                resource_id=invitation.id,
+                details={
+                    "invitation_id": str(invitation.id),
+                    "target_principal_id": str(principal.id),
+                    "role": invitation.role.value,
+                    "membership_created": membership_created,
+                },
+            )
+            claims.append(
+                InvitationClaimRef(
+                    invitation_id=invitation.id,
+                    workspace=_workspace_ref(workspace),
+                    role=invitation.role,
+                    principal_id=principal.id,
+                    membership_created=membership_created,
+                    claim_status="claimed",
+                )
+            )
+        self._session.flush()
+        return tuple(claims)
+
+    def _expire_workspace_invitations(
+        self,
+        workspace_id: uuid.UUID,
+        *,
+        email: str | None = None,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        statement = select(WorkspaceInvitation).where(
+            WorkspaceInvitation.workspace_id == workspace_id,
+            WorkspaceInvitation.status == WorkspaceInvitationStatus.PENDING,
+            WorkspaceInvitation.expires_at <= now,
+        )
+        if email is not None:
+            statement = statement.where(WorkspaceInvitation.email == normalize_invitation_email(email))
+        invitations = self._session.scalars(
+            statement.with_for_update().execution_options(populate_existing=True),
+        ).all()
+        for invitation in invitations:
+            self._expire_invitation(invitation)
+        if invitations:
+            self._session.flush()
+
+    def _expire_invitation(self, invitation: WorkspaceInvitation) -> None:
+        invitation.status = WorkspaceInvitationStatus.EXPIRED
+        append_audit_event(
+            self._session,
+            workspace_id=invitation.workspace_id,
+            event_type="workspace.invitation_expired",
+            actor=None,
+            caller=None,
+            channel=AuditChannel.SYSTEM,
+            resource_type="workspace_invitation",
+            resource_id=invitation.id,
+            details={
+                "invitation_id": str(invitation.id),
+                "role": invitation.role.value,
+            },
         )
 
     def list_authorized_tasks(
@@ -869,6 +1237,7 @@ class DatabaseTransaction:
                 and_(
                     RoleBinding.workspace_id == Workspace.id,
                     RoleBinding.principal_id == principal.id,
+                    RoleBinding.task_id.is_(None),
                 ),
             )
             .where(Workspace.slug == workspace_slug, Workspace.is_active.is_(True))
@@ -1017,7 +1386,7 @@ class DatabaseTransaction:
                 and_(
                     RoleBinding.workspace_id == Workspace.id,
                     RoleBinding.principal_id == principal.id,
-                    or_(RoleBinding.task_id.is_(None), RoleBinding.task_id == Task.id),
+                    RoleBinding.task_id.is_(None),
                 ),
             )
             .where(Workspace.slug == workspace_slug, Task.task_key == task_key)
@@ -1630,6 +1999,7 @@ class DatabaseTransaction:
         response_body: dict[str, Any] | None,
         succeeded: bool = True,
         request_id: str | None = None,
+        _allow_membership_self_transition: bool = False,
     ) -> IdempotencyClaim:
         if type(response_status) is not int:
             raise ValueError("response_status must be an integer")
@@ -1672,6 +2042,8 @@ class DatabaseTransaction:
             record,
             actor_identity=actor_identity,
             caller_identity=caller_identity,
+            response_body=normalized_body,
+            allow_membership_self_transition=_allow_membership_self_transition,
         )
         target_state = IdempotencyState.SUCCEEDED if succeeded else IdempotencyState.FAILED
         if record.state == IdempotencyState.PENDING:
@@ -1855,6 +2227,8 @@ class DatabaseTransaction:
         *,
         actor_identity: ExternalIdentity,
         caller_identity: ExternalIdentity,
+        response_body: dict[str, Any] | None = None,
+        allow_membership_self_transition: bool = False,
     ) -> tuple[Principal, Principal, Permission, AuditChannel]:
         try:
             permission = Permission(record.required_permission)
@@ -1915,11 +2289,315 @@ class DatabaseTransaction:
             )
         else:
             raise IdempotencyConflict()
-        self.require(decision)
+        if not decision.allowed and not (
+            allow_membership_self_transition
+            and self._valid_membership_self_transition(record, actor, response_body)
+        ):
+            self.require(decision)
         authorized_caller = self._require_caller(caller_identity, actor.id, permission)
         if authorized_caller.id != record.caller_principal_id:
             raise IdempotencyConflict()
         return actor, authorized_caller, permission, channel
+
+    def _valid_membership_self_transition(
+        self,
+        record: IdempotencyRecord,
+        actor: Principal,
+        response_body: dict[str, Any] | None,
+    ) -> bool:
+        if (
+            record.resource_type != "workspace"
+            or record.resource_id != record.workspace_id
+            or record.required_permission != Permission.WORKSPACE_MANAGE.value
+            or record.operation not in {
+                "workspace.membership.role",
+                "workspace.membership.revoke",
+            }
+            or response_body is None
+        ):
+            return False
+        membership = response_body.get("membership")
+        if not isinstance(membership, dict):
+            return False
+        principal = membership.get("principal")
+        if not isinstance(principal, dict) or principal.get("principal_id") != str(actor.id):
+            return False
+        if membership.get("previous_role") != Role.ADMIN.value:
+            return False
+        workspace = self._session.get(Workspace, record.workspace_id, populate_existing=True)
+        if workspace is None or not workspace.is_active:
+            return False
+        binding = self._workspace_binding(record.workspace_id, actor.id, for_update=False)
+        if record.operation == "workspace.membership.role":
+            return (
+                membership.get("action") == MembershipMutationAction.CHANGED.value
+                and membership.get("role") in {
+                    Role.VIEWER.value,
+                    Role.ANNOTATOR.value,
+                    Role.EXPERIMENTER.value,
+                }
+                and binding is not None
+                and binding.role.value == membership.get("role")
+            )
+        return (
+            membership.get("action") == MembershipMutationAction.REVOKED.value
+            and membership.get("role") is None
+            and binding is None
+        )
+
+    def create_workspace_invitation(
+        self,
+        *,
+        workspace_slug: str,
+        email: str,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> WorkspaceInvitationResult:
+        normalized_email = normalize_invitation_email(email)
+        normalized_role = normalize_role(role)
+        claim = self.claim_idempotency(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            required_permission=Permission.WORKSPACE_MANAGE,
+            operation="workspace.invitation.create",
+            idempotency_key=idempotency_key,
+            request_payload={
+                "invitee_email_hash": _invitation_email_fingerprint(normalized_email),
+                "role": normalized_role.value,
+            },
+            channel=channel,
+        )
+        if claim.status == IdempotencyClaimStatus.REPLAY:
+            return _workspace_invitation_result_from_claim(self._session, claim, replayed=True)
+        if claim.status == IdempotencyClaimStatus.PENDING:
+            raise MembershipOperationInProgress("workspace invitation is already in progress")
+
+        workspace = self._session.scalar(
+            select(Workspace)
+            .where(Workspace.id == claim.workspace_id, Workspace.slug == workspace_slug)
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        if workspace is None:
+            raise AuthorizationDenied(
+                _decision(
+                    Permission.WORKSPACE_MANAGE,
+                    AuthorizationReason.RESOURCE_NOT_VISIBLE,
+                )
+            )
+        self._expire_workspace_invitations(workspace.id, email=normalized_email)
+        invitation = self._session.scalar(
+            select(WorkspaceInvitation)
+            .where(
+                WorkspaceInvitation.workspace_id == workspace.id,
+                WorkspaceInvitation.email == normalized_email,
+                WorkspaceInvitation.status == WorkspaceInvitationStatus.PENDING,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        if invitation is not None and invitation.role != normalized_role:
+            raise InvitationConflict("a pending invitation already exists with another role")
+        action = "unchanged"
+        if invitation is None:
+            invitation = WorkspaceInvitation(
+                workspace_id=workspace.id,
+                email=normalized_email,
+                role=normalized_role,
+                status=WorkspaceInvitationStatus.PENDING,
+                expires_at=datetime.now(timezone.utc) + DEFAULT_INVITATION_TTL,
+                created_by_principal_id=claim.actor_principal_id,
+            )
+            self._session.add(invitation)
+            self._session.flush()
+            action = "created"
+            append_audit_event(
+                self._session,
+                workspace_id=workspace.id,
+                event_type="workspace.invitation_created",
+                actor=self._session.get(Principal, claim.actor_principal_id),
+                caller=self._session.get(Principal, claim.caller_principal_id),
+                channel=channel,
+                resource_type="workspace_invitation",
+                resource_id=invitation.id,
+                request_id=request_id,
+                details={
+                    "invitation_id": str(invitation.id),
+                    "role": normalized_role.value,
+                },
+            )
+            self._session.flush()
+
+        response = _workspace_invitation_response(
+            invitation,
+            workspace,
+            action=action,
+            claim_status="pending",
+        )
+        completed = self.complete_idempotency(
+            claim,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            response_status=201 if action == "created" else 200,
+            response_body=response,
+            request_id=request_id,
+        )
+        return WorkspaceInvitationResult(
+            action=action,
+            invitation=_workspace_invitation_ref(invitation, workspace),
+            claim_status="pending",
+            response_status=completed.response_status or (201 if action == "created" else 200),
+            replayed=False,
+        )
+
+    def change_workspace_membership_by_principal_id(
+        self,
+        *,
+        workspace_slug: str,
+        principal_id: uuid.UUID,
+        role: Role,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> IdempotentMembershipMutationResult:
+        normalized_principal_id = _principal_uuid(principal_id)
+        normalized_role = normalize_role(role)
+        claim = self.claim_idempotency(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            required_permission=Permission.WORKSPACE_MANAGE,
+            operation="workspace.membership.role",
+            idempotency_key=idempotency_key,
+            request_payload={
+                "principal_id": str(normalized_principal_id),
+                "role": normalized_role.value,
+            },
+            channel=channel,
+        )
+        if claim.status == IdempotencyClaimStatus.REPLAY:
+            return _membership_mutation_result_from_claim(self._session, claim, replayed=True)
+        if claim.status == IdempotencyClaimStatus.PENDING:
+            raise MembershipOperationInProgress("workspace membership role change is already in progress")
+        target = self._target_member_for_workspace(
+            workspace_slug=workspace_slug,
+            principal_id=normalized_principal_id,
+            actor_identity=actor_identity,
+        )
+        result = self.change_workspace_membership(
+            workspace_slug=workspace_slug,
+            target_identity=ExternalIdentity(target.issuer, target.subject),
+            role=normalized_role,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            channel=channel,
+            request_id=request_id,
+        )
+        response = {"membership": _membership_result_payload(result)}
+        completed = self.complete_idempotency(
+            claim,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            response_status=200,
+            response_body=response,
+            request_id=request_id,
+            _allow_membership_self_transition=normalized_principal_id == claim.actor_principal_id,
+        )
+        return IdempotentMembershipMutationResult(
+            result=result,
+            response_status=completed.response_status or 200,
+            replayed=False,
+        )
+
+    def revoke_workspace_membership_by_principal_id(
+        self,
+        *,
+        workspace_slug: str,
+        principal_id: uuid.UUID,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> IdempotentMembershipMutationResult:
+        normalized_principal_id = _principal_uuid(principal_id)
+        claim = self.claim_idempotency(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            required_permission=Permission.WORKSPACE_MANAGE,
+            operation="workspace.membership.revoke",
+            idempotency_key=idempotency_key,
+            request_payload={"principal_id": str(normalized_principal_id)},
+            channel=channel,
+        )
+        if claim.status == IdempotencyClaimStatus.REPLAY:
+            return _membership_mutation_result_from_claim(self._session, claim, replayed=True)
+        if claim.status == IdempotencyClaimStatus.PENDING:
+            raise MembershipOperationInProgress("workspace membership revoke is already in progress")
+        target = self._target_member_for_workspace(
+            workspace_slug=workspace_slug,
+            principal_id=normalized_principal_id,
+            actor_identity=actor_identity,
+        )
+        result = self.revoke_workspace_membership(
+            workspace_slug=workspace_slug,
+            target_identity=ExternalIdentity(target.issuer, target.subject),
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            channel=channel,
+            request_id=request_id,
+        )
+        response = {"membership": _membership_result_payload(result)}
+        completed = self.complete_idempotency(
+            claim,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            response_status=200,
+            response_body=response,
+            request_id=request_id,
+            _allow_membership_self_transition=normalized_principal_id == claim.actor_principal_id,
+        )
+        return IdempotentMembershipMutationResult(
+            result=result,
+            response_status=completed.response_status or 200,
+            replayed=False,
+        )
+
+    def _target_member_for_workspace(
+        self,
+        *,
+        workspace_slug: str,
+        principal_id: uuid.UUID,
+        actor_identity: ExternalIdentity,
+    ) -> Principal:
+        decision = self.authorize_workspace(actor_identity, workspace_slug, Permission.WORKSPACE_MANAGE)
+        self.require(decision)
+        if decision.workspace is None:
+            raise MembershipNotFound("workspace membership does not exist")
+        target = self._session.scalar(
+            select(Principal)
+            .join(
+                RoleBinding,
+                and_(
+                    RoleBinding.principal_id == Principal.id,
+                    RoleBinding.workspace_id == decision.workspace.id,
+                    RoleBinding.task_id.is_(None),
+                ),
+            )
+            .where(Principal.id == principal_id)
+            .execution_options(populate_existing=True),
+        )
+        if target is None:
+            raise MembershipNotFound("workspace membership does not exist")
+        return target
 
     def grant_workspace_membership(
         self,
@@ -2423,8 +3101,15 @@ class DatabaseTransaction:
     def _list_authorized_workspaces(self, principal_id: uuid.UUID) -> tuple[WorkspaceAccess, ...]:
         workspaces = self._session.scalars(
             select(Workspace)
-            .join(RoleBinding, RoleBinding.workspace_id == Workspace.id)
-            .where(RoleBinding.principal_id == principal_id, Workspace.is_active.is_(True))
+            .join(
+                RoleBinding,
+                and_(
+                    RoleBinding.workspace_id == Workspace.id,
+                    RoleBinding.principal_id == principal_id,
+                    RoleBinding.task_id.is_(None),
+                ),
+            )
+            .where(Workspace.is_active.is_(True))
             .distinct()
             .order_by(Workspace.slug),
         ).all()
@@ -2810,6 +3495,202 @@ def _membership_result(
         previous_role=previous_role,
         role=role,
         audit_event_id=audit_event.id if audit_event is not None else None,
+    )
+
+
+def normalize_invitation_email(value: str) -> str:
+    normalized = str(value or "").strip().casefold()
+    if len(normalized) > 320 or _EMAIL.fullmatch(normalized) is None:
+        raise ValueError("invitation email must be a valid email address")
+    return normalized
+
+
+def normalize_optional_invitation_email(value: str | None) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return normalize_invitation_email(value)
+    except ValueError:
+        return None
+
+
+def normalize_role(value: Role | str) -> Role:
+    try:
+        return value if isinstance(value, Role) else Role(str(value).strip().lower())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid workspace role") from exc
+
+
+def _invitation_email_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _principal_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    try:
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value).strip())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("principal_id must be a valid UUID") from exc
+
+
+def _utc_datetime(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _workspace_invitation_ref(
+    invitation: WorkspaceInvitation,
+    workspace: Workspace,
+) -> WorkspaceInvitationRef:
+    return WorkspaceInvitationRef(
+        id=invitation.id,
+        workspace=_workspace_ref(workspace),
+        email=invitation.email,
+        role=invitation.role,
+        status=invitation.status,
+        expires_at=_utc_datetime(invitation.expires_at),
+        claimed_principal_id=invitation.claimed_principal_id,
+    )
+
+
+def _workspace_invitation_payload(
+    invitation: WorkspaceInvitation,
+    workspace: Workspace,
+    *,
+    action: str,
+    claim_status: str,
+) -> dict[str, Any]:
+    reference = _workspace_invitation_ref(invitation, workspace)
+    return {
+        "action": action,
+        "invitation": {
+            "invitation_id": str(reference.id),
+            "workspace": reference.workspace.slug,
+            "role": reference.role.value,
+            "status": reference.status.value,
+            "expires_at": reference.expires_at.isoformat(),
+        },
+        "claim": {"status": claim_status},
+    }
+
+
+def _workspace_invitation_response(
+    invitation: WorkspaceInvitation,
+    workspace: Workspace,
+    *,
+    action: str,
+    claim_status: str,
+) -> dict[str, Any]:
+    return _workspace_invitation_payload(
+        invitation,
+        workspace,
+        action=action,
+        claim_status=claim_status,
+    )
+
+
+def _workspace_invitation_result_from_claim(
+    session: Session,
+    claim: IdempotencyClaim,
+    *,
+    replayed: bool,
+) -> WorkspaceInvitationResult:
+    body = claim.response_body
+    if not isinstance(body, dict):
+        raise AuthorizationUnavailable("workspace invitation idempotency response is invalid")
+    invitation_payload = body.get("invitation")
+    if not isinstance(invitation_payload, dict):
+        raise AuthorizationUnavailable("workspace invitation idempotency response is invalid")
+    try:
+        invitation_id = uuid.UUID(str(invitation_payload["invitation_id"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuthorizationUnavailable("workspace invitation idempotency response is invalid") from exc
+    invitation = session.get(WorkspaceInvitation, invitation_id)
+    workspace = session.get(Workspace, claim.workspace_id)
+    if invitation is None or workspace is None:
+        raise AuthorizationUnavailable("workspace invitation disappeared during replay")
+    return WorkspaceInvitationResult(
+        action=str(body.get("action") or "unchanged"),
+        invitation=_workspace_invitation_ref(invitation, workspace),
+        claim_status=(
+            "claimed"
+            if invitation.status == WorkspaceInvitationStatus.CLAIMED
+            else str((body.get("claim") or {}).get("status") or invitation.status.value)
+        ),
+        response_status=claim.response_status or 200,
+        replayed=replayed,
+    )
+
+
+def _membership_result_payload(result: MembershipMutationResult) -> dict[str, Any]:
+    return {
+        "action": result.action.value,
+        "workspace": {
+            "slug": result.workspace.slug,
+            "name": result.workspace.name,
+        },
+        "principal": {
+            "principal_id": str(result.principal.id),
+            "display_name": result.principal.display_name,
+        },
+        "binding_id": str(result.binding_id) if result.binding_id is not None else None,
+        "previous_role": result.previous_role.value if result.previous_role is not None else None,
+        "role": result.role.value if result.role is not None else None,
+        "audit_event_id": str(result.audit_event_id) if result.audit_event_id is not None else None,
+    }
+
+
+def _membership_mutation_result_from_claim(
+    session: Session,
+    claim: IdempotencyClaim,
+    *,
+    replayed: bool,
+) -> IdempotentMembershipMutationResult:
+    body = claim.response_body
+    payload = body.get("membership") if isinstance(body, dict) else None
+    if not isinstance(payload, dict):
+        raise AuthorizationUnavailable("membership idempotency response is invalid")
+    principal_payload = payload.get("principal")
+    if not isinstance(principal_payload, dict):
+        raise AuthorizationUnavailable("membership idempotency response is invalid")
+    try:
+        principal_id = uuid.UUID(str(principal_payload["principal_id"]))
+        binding_id = (
+            uuid.UUID(str(payload["binding_id"]))
+            if payload.get("binding_id") is not None
+            else None
+        )
+        audit_event_id = (
+            uuid.UUID(str(payload["audit_event_id"]))
+            if payload.get("audit_event_id") is not None
+            else None
+        )
+        action = MembershipMutationAction(str(payload["action"]))
+        previous_role = (
+            Role(str(payload["previous_role"]))
+            if payload.get("previous_role") is not None
+            else None
+        )
+        role = Role(str(payload["role"])) if payload.get("role") is not None else None
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AuthorizationUnavailable("membership idempotency response is invalid") from exc
+    workspace = session.get(Workspace, claim.workspace_id)
+    principal = session.get(Principal, principal_id)
+    if workspace is None or principal is None:
+        raise AuthorizationUnavailable("membership target disappeared during replay")
+    result = MembershipMutationResult(
+        action=action,
+        workspace=_workspace_ref(workspace),
+        principal=_principal_ref(principal),
+        binding_id=binding_id,
+        previous_role=previous_role,
+        role=role,
+        audit_event_id=audit_event_id,
+    )
+    return IdempotentMembershipMutationResult(
+        result=result,
+        response_status=claim.response_status or 200,
+        replayed=replayed,
     )
 
 
