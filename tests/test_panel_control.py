@@ -215,6 +215,12 @@ def control_database():
                 ),
                 RoleBinding(
                     workspace_id=workspace_a.id,
+                    principal_id=principals["annotator"].id,
+                    role=Role.ANNOTATOR,
+                    created_by_principal_id=principals["admin"].id,
+                ),
+                RoleBinding(
+                    workspace_id=workspace_a.id,
                     task_id=task.id,
                     principal_id=principals["annotator"].id,
                     role=Role.ANNOTATOR,
@@ -391,8 +397,11 @@ def test_session_and_workspace_selection_fail_closed(control_database, tmp_path:
     assert session["authorization"]["state"] == "ready"
     assert [item["slug"] for item in session["authorization"]["workspaces"]] == ["workspace-a"]
     assert "token" not in json.dumps(session).lower()
-    assert "claims" not in json.dumps(session).lower()
     assert "jwks" not in json.dumps(session).lower()
+    assert session["authorization"]["invitation_claims"] == {
+        "status": "none",
+        "items": [],
+    }
     assert list_status == 200
     assert listed["workspace"] == "workspace-a"
 
