@@ -548,7 +548,7 @@ def test_http_write_rejects_client_supplied_authorization_context(control_plane,
         )
 
     assert status == 422
-    assert payload["code"] == "unknown_field"
+    assert payload["code"] == "server_context_forbidden"
     assert payload["field"] == field
 
 
