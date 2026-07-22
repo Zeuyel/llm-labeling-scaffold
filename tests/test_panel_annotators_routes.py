@@ -533,7 +533,7 @@ def test_http_write_rejects_client_supplied_authorization_context(control_plane,
     repository = _FakeRepository()
     body = {
         "workspace": WORKSPACE,
-        "scaffold_user_id": "annotator-subject",
+        "principal_id": str(PRINCIPAL_ID),
         "initial_password": "one-time-secret",
         field: "forged-context",
     }
