@@ -149,7 +149,6 @@ export function modelSummary(model) {
     trainRows: firstDefined(model?.metrics?.train_rows, "-"),
     testRows: firstDefined(model?.metrics?.test_rows, "-"),
     metricSummary: modelMetricSummary(model),
-    externalRecord: firstDefined(model?.manifest?.mlflow?.run_id, model?.mlflow?.run_id, "仅本地"),
     labels: modelLabelsText(model),
     goldPath: firstDefined(model?.metrics?.gold_path, model?.manifest?.gold_path, "-"),
     path: modelPath(model),

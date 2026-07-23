@@ -84,7 +84,6 @@ test("model summary combines manifest and metrics without requiring external rec
   assert.equal(summary.status, "可用");
   assert.equal(summary.trainer, "tfidf_sgd");
   assert.equal(summary.metricSummary, "macro F1 0.625 · 测试 3 行 · 训练 9 行");
-  assert.equal(summary.externalRecord, "仅本地");
   assert.equal(summary.labels, "a, b");
   assert.equal(summary.goldPath, "runs/task/gold/gold_v001.jsonl");
   assert.equal(summary.path, "runs/task/models/baseline_v001/model.joblib");

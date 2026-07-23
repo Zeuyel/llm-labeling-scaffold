@@ -1,1 +1,1 @@
-"""Optional integrations for external annotation and experiment systems."""
+"""Optional integration for the external annotation system."""

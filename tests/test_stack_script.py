@@ -302,39 +302,6 @@ def test_stack_accepts_managed_mcp_without_static_bearer(tmp_path: Path):
     assert deploy_call.endswith("redis cloudflared mcp")
 
 
-def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp_path: Path):
-    result, calls = _run_stack(
-        tmp_path,
-        {
-            "LLS_DEPLOYMENT_MODE": "tunnel",
-            "LLS_PANEL_AUTH_MODE": "cloudflare_access",
-            "LLS_CF_ACCESS_ISSUER": "https://team.cloudflareaccess.com",
-            "LLS_CF_ACCESS_AUD": "configured-audience",
-            "CLOUDFLARE_TUNNEL_TOKEN": "tunnel-token-0123456789-abcdef-0123456789",
-            "ARGILLA_USERNAME": "argilla-owner",
-            "ARGILLA_PASSWORD": "argilla-password-0123456789",
-            "ARGILLA_API_KEY": "argilla-api-key-0123456789",
-            "ARGILLA_POSTGRES_PASSWORD": "argilla-db-password-0123456789",
-            "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
-            "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
-            "LLS_TASK_SOURCE": "local",
-        },
-        "restart",
-        "--mlflow",
-    )
-
-    assert result.returncode == 0
-    deploy_call = calls[-1]
-    assert deploy_call.startswith("MCP_BIND_HOST=;MLFLOW_TRACKING_URI=http://mlflow:5000|")
-    assert "compose -f docker-compose.yml -f docker-compose.production.yml -f docker-compose.tunnel.yml --profile mlflow up -d --force-recreate" in deploy_call
-    assert "docker-compose.loopback.yml" not in deploy_call
-    assert deploy_call.endswith(
-        "scaffold-postgres db-role-init migrate panel argilla argilla-worker "
-        "argilla-postgres elasticsearch redis cloudflared mlflow"
-    )
-    assert " restart " not in deploy_call
-
-
 def test_stack_cloudflare_loopback_mode_uses_fixed_override(tmp_path: Path):
     result, calls = _run_stack(
         tmp_path,

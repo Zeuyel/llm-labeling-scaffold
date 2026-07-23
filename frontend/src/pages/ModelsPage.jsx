@@ -33,8 +33,6 @@ export default function ModelsPage({ task, taskId, onError }) {
   const [modelId, setModelId] = useState("");
   const [trainer, setTrainer] = useState("tfidf_sgd");
   const [trainerParams, setTrainerParams] = useState("{}");
-  const [useMlflow, setUseMlflow] = useState(false);
-  const [mlflowExperiment, setMlflowExperiment] = useState("");
   const [model, setModel] = useState("");
   const [corpus, setCorpus] = useState("");
   const [output, setOutput] = useState("");
@@ -125,7 +123,6 @@ export default function ModelsPage({ task, taskId, onError }) {
         model_id: modelId,
         trainer,
         trainer_params: parsedParams,
-        mlflow: useMlflow ? { experiment: mlflowExperiment || taskId } : null,
       });
       const finished = job?.id ? await api.waitForJob(taskId, job.id) : null;
       if (finished?.status === "failed") {
@@ -170,7 +167,7 @@ export default function ModelsPage({ task, taskId, onError }) {
       </div>
       <div className="page-header">
         <h2>模型管理</h2>
-        <p>默认登记到本地文件目录，按需同步到外部模型记录服务</p>
+        <p>登记模型产物、训练指标和推理结果</p>
       </div>
 
       <div className="card">
@@ -203,7 +200,6 @@ export default function ModelsPage({ task, taskId, onError }) {
                   <th>训练器标识</th>
                   <th>训练/测试行数</th>
                   <th>指标摘要</th>
-                  <th>外部记录</th>
                   <th>标签</th>
                   <th>创建时间</th>
                   <th>路径</th>
@@ -219,7 +215,6 @@ export default function ModelsPage({ task, taskId, onError }) {
                       <td>{summary.trainer}</td>
                       <td>{summary.trainRows} / {summary.testRows}</td>
                       <td className="muted text-cell">{summary.metricSummary}</td>
-                      <td>{summary.externalRecord}</td>
                       <td className="muted text-cell">{summary.labels}</td>
                       <td className="muted">{summary.createdAt}</td>
                       <td className="muted path-cell">
@@ -282,22 +277,6 @@ export default function ModelsPage({ task, taskId, onError }) {
                   value={trainer}
                   onChange={(event) => setTrainer(event.target.value)}
                   placeholder="tfidf_sgd 或 package.module:function"
-                />
-              </div>
-              <div className="field field-half">
-                <label>外部模型记录服务（可选）</label>
-                <select value={useMlflow ? "yes" : "no"} onChange={(event) => setUseMlflow(event.target.value === "yes")}>
-                  <option value="no">仅本地文件登记</option>
-                  <option value="yes">同步到外部记录服务</option>
-                </select>
-              </div>
-              <div className="field field-half">
-                <label>外部实验名称</label>
-                <input
-                  value={mlflowExperiment}
-                  onChange={(event) => setMlflowExperiment(event.target.value)}
-                  placeholder={taskId}
-                  disabled={!useMlflow}
                 />
               </div>
               <div className="field field-wide">
@@ -386,7 +365,6 @@ export default function ModelsPage({ task, taskId, onError }) {
               <DetailField label="测试行数" value={selectedSummary.testRows} />
               <DetailField label="指标摘要" value={selectedSummary.metricSummary} />
               <DetailField label="标签" value={selectedSummary.labels} />
-              <DetailField label="外部记录" value={selectedSummary.externalRecord} />
               <DetailField label="创建时间" value={selectedSummary.createdAt} />
               <DetailField label="模型路径" value={selectedSummary.path} />
               <DetailField label="metrics" value={selectedSummary.metricsPath} />

@@ -37,11 +37,10 @@ env_value() {
 
 usage() {
   cat >&2 <<'EOF'
-用法：scripts/stack [up|down|logs|ps|restart] [--mlflow] [--mcp]
+用法：scripts/stack [up|down|logs|ps|restart] [--mcp]
 
 默认启动 light panel 和 Argilla 标注服务。
 必须在 .env 设置 LLS_DEPLOYMENT_MODE=loopback 或 tunnel。
-如需可选模型记录服务，使用：scripts/stack up --mlflow
 生产 tunnel 模式会自动加入 Cloudflare Tunnel sidecar；如需 MCP companion service，使用：scripts/stack up --mcp
 EOF
 }
@@ -51,19 +50,11 @@ if [ "$#" -gt 0 ]; then
   shift
 fi
 
-enable_mlflow=0
 enable_mcp=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --mlflow|--profile=mlflow)
-      enable_mlflow=1
-      shift
-      ;;
     --profile)
-      if [ "${2:-}" = "mlflow" ]; then
-        enable_mlflow=1
-        shift 2
-      elif [ "${2:-}" = "mcp" ]; then
+      if [ "${2:-}" = "mcp" ]; then
         enable_mcp=1
         shift 2
       else
@@ -233,10 +224,6 @@ services=(scaffold-postgres db-role-init migrate panel argilla argilla-worker ar
 if [ "$deployment_mode" = "tunnel" ]; then
   services+=(cloudflared)
 fi
-if [ "$enable_mlflow" -eq 1 ]; then
-  compose+=(--profile mlflow)
-  services+=(mlflow)
-fi
 if [ "$enable_mcp" -eq 1 ]; then
   compose+=(--profile mcp)
   services+=(mcp)
@@ -253,9 +240,6 @@ print_urls() {
     echo "light panel： Cloudflare Access hostname（Panel 未发布宿主端口）"
   fi
   echo "Argilla：     http://localhost:$(env_value ARGILLA_PORT 6900)"
-  if [ "$enable_mlflow" -eq 1 ]; then
-    echo "模型记录服务： http://localhost:$(env_value MLFLOW_PORT 5000)"
-  fi
   if [ "$enable_mcp" -eq 1 ]; then
     echo "MCP：         http://localhost:$(env_value MCP_PORT 8766)/mcp"
   fi
@@ -266,10 +250,6 @@ print_urls() {
     echo "panel 登录：Cloudflare Access"
   fi
   echo "Argilla 登录：$(env_value ARGILLA_USERNAME argilla) / $(env_value ARGILLA_PASSWORD 12345678)"
-  if [ "$enable_mlflow" -eq 0 ]; then
-    echo
-    echo "默认未启动模型记录服务；需要时运行：scripts/stack up --mlflow"
-  fi
   if [ "$enable_mcp" -eq 0 ]; then
     echo
     echo "默认未启动 MCP；需要时先配置独立 MCP Access application 和 LLS_MCP_INTERNAL_TOKEN，再运行：scripts/stack up --mcp"
@@ -296,20 +276,11 @@ print_urls() {
 case "$cmd" in
   up)
     panel_image="$(env_value PANEL_IMAGE "llm-labeling-scaffold-panel:local")"
-    if [ "$enable_mlflow" -eq 1 ]; then
-      if [[ "$panel_image" == ghcr.io/* ]]; then
-        "${compose[@]}" pull panel
-        MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --no-build
-      else
-        MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --build
-      fi
+    if [[ "$panel_image" == ghcr.io/* ]]; then
+      "${compose[@]}" pull panel
+      "${compose[@]}" up -d --no-build
     else
-      if [[ "$panel_image" == ghcr.io/* ]]; then
-        "${compose[@]}" pull panel
-        "${compose[@]}" up -d --no-build
-      else
-        "${compose[@]}" up -d --build
-      fi
+      "${compose[@]}" up -d --build
     fi
     print_urls
     ;;
@@ -323,11 +294,7 @@ case "$cmd" in
     "${compose[@]}" ps
     ;;
   restart)
-    if [ "$enable_mlflow" -eq 1 ]; then
-      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --force-recreate "${services[@]}"
-    else
-      "${compose[@]}" up -d --force-recreate "${services[@]}"
-    fi
+    "${compose[@]}" up -d --force-recreate "${services[@]}"
     ;;
   *)
     usage
