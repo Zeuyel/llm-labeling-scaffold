@@ -55,6 +55,7 @@ from .enums import (
     Role,
     TaskLifecycleState,
     TaskMaterializationState,
+    WorkspaceInvitationStatus,
 )
 from .rbac import TASK_PERMISSIONS, WORKSPACE_PERMISSIONS
 from .sensitive_json import SENSITIVE_JSON_DOCUMENT, install_sensitive_json_schema_events
@@ -237,6 +238,72 @@ class RoleBinding(Base):
         DateTime(timezone=True),
         nullable=False,
         server_default=func.now(),
+    )
+
+
+class WorkspaceInvitation(Base):
+    __tablename__ = "workspace_invitations"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "email",
+            "status",
+            name="uq_workspace_invitations_workspace_email_status",
+        ),
+        CheckConstraint("length(trim(email)) > 0", name="invitation_email_not_blank"),
+        CheckConstraint("length(trim(email)) <= 320", name="invitation_email_length"),
+        Index(
+            "uq_workspace_invitations_pending_email",
+            "workspace_id",
+            "email",
+            unique=True,
+            postgresql_where=text("status = 'pending'"),
+            sqlite_where=text("status = 'pending'"),
+        ),
+        Index(
+            "ix_workspace_invitations_workspace_status_expiry",
+            "workspace_id",
+            "status",
+            "expires_at",
+        ),
+        Index("ix_workspace_invitations_claimed_principal", "claimed_principal_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    role: Mapped[Role] = mapped_column(_enum_type(Role, "role_name"), nullable=False)
+    status: Mapped[WorkspaceInvitationStatus] = mapped_column(
+        _enum_type(WorkspaceInvitationStatus, "workspace_invitation_status"),
+        nullable=False,
+        default=WorkspaceInvitationStatus.PENDING,
+        server_default=WorkspaceInvitationStatus.PENDING.value,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_by_principal_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("principals.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    claimed_principal_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("principals.id", ondelete="RESTRICT"),
+    )
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
     )
 
 

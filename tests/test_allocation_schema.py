@@ -1524,7 +1524,7 @@ def test_allocation_migration_upgrade_downgrade_round_trip(tmp_path: Path):
         assert ALLOCATION_TABLES <= set(inspect(engine).get_table_names())
         with Session(engine) as session:
             assert session.scalar(select(text("version_num")).select_from(text("alembic_version"))) == (
-                "20260717_0007"
+                "20260721_0008"
             )
     finally:
         engine.dispose()

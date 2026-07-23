@@ -5,7 +5,7 @@
 1. **轻量控制台**：给实验人员管理任务、导入数据、生成样本、发起标注任务、拉回标注结果、构建训练集版本、创建训练任务、查看模型产物和执行状态。
 2. **Argilla**：作为正式标注工作台，用来分发标注任务、收集标注结果和支持复核。
 
-MLflow 不再是默认依赖。它只作为可选外部模型记录服务，适合团队已经需要集中记录训练参数、指标和模型产物时再启用。默认部署只依赖本地 `runs/` 目录保存实验产物。
+训练记录、模型指标和模型清单由训练服务器写入任务产物目录并按 manifest 回传；平台不集成外部实验记录服务。
 
 ## 快速启动
 
@@ -62,26 +62,15 @@ echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-elasticsearch.conf
 
 ```bash
 docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap \
-  --issuer https://example.cloudflareaccess.com \
+  --issuer '<access-team-domain>' \
   --subject '<stable-access-subject>' \
   --workspace-slug default \
   --workspace-name 'Default Workspace'
 ```
 
-数据库 schema、角色矩阵、迁移以及备份恢复说明见 [Scaffold 数据库与 RBAC](docs/database.md)。
+数据库 schema、角色矩阵、迁移以及备份恢复说明见 [Scaffold 数据库与 RBAC](docs/database.md)；成员邀请、首次登录、Argilla 映射、撤销和生产验收见 [成员管理与权限闭环运维](docs/member_management.md)。
 
-需要模型记录服务时再启用 Docker Compose 的 mlflow profile：
-
-```bash
-./scripts/stack up --mlflow
-./scripts/stack logs --mlflow
-```
-
-启用后会额外启动：
-
-- 模型记录服务：`http://localhost:5000`
-
-脚本会在 `--mlflow` 模式下临时把 `MLFLOW_TRACKING_URI=http://mlflow:5000` 传给控制台；默认模式不会注入这个地址。
+完整的 GHCR、Cloudflare Tunnel、R2 rclone secret、数据库备份和更新命令见 [生产部署结构](docs/deployment.md)。
 
 需要让 Codex 或其他 MCP client 调用平台时，为 MCP hostname 配置独立的 Cloudflare Access application 与 Managed OAuth，在 `.env` 设置独立 MCP AUD 和内部 Panel service token，再启用 MCP profile：
 
@@ -104,7 +93,6 @@ MCP endpoint 为 `http://localhost:8766/mcp`，生产只通过 Cloudflare Tunnel
 7. 实验人员在轻量控制台创建训练任务。
 8. 高性能训练服务器读取训练任务并产出模型版本。
 9. 模型产物、指标和 manifest 默认写入 `runs/`。
-10. 如果启用了 MLflow，训练记录可同步到外部模型记录服务。
 
 在 panel 工作流中，`profile` 是执行模板，不是备注。任务的 `task.yaml` 可以通过 `profile: {preset: manual_labeling_cv_v1}` 绑定预设流程，面板据此展开导入、抽样、Argilla 分发、结果回收、质量门槛、训练集构建、训练和推理的默认动作与参数；每个阶段都必须写 manifest，下一阶段只消费上游 manifest 中登记的产物。术语和 `manual_labeling_cv_v1` 示例见 [Profile 预设](docs/profile_presets.md)。
 
@@ -141,7 +129,7 @@ runs/_system/task_control/task_snapshots/<revision_uuid>/<content_sha256>/manife
 
 生产 Panel 使用 Cloudflare Access 注入的 `Cf-Access-Jwt-Assertion`，源站验证 RS256 签名、JWKS、issuer、显式 application AUD、时间声明和 `type=app`。稳定用户身份使用 `(issuer, subject)`，邮箱与显示名只作为显示快照；客户端自报 actor 或邮箱头不会建立身份。
 
-Scaffold 已有独立的用户、工作空间、任务 ACL 和 RBAC 持久化层，但尚未接入 Panel 业务授权路径。#46 完成接线和资源迁移前，Access 用户只能读取 `/api/session` 等系统认证态端点，所有业务 API 都会以 `503 authorization_unavailable` fail closed，不能因为“已登录”而获得原有管理员能力。现有 Basic Auth 只在显式 `LLS_PANEL_AUTH_MODE=basic_dev` 时用于本地开发；生产默认 `cloudflare_access`，配置或验证失败不会回退到 Basic。JWT 签名验证不证明请求经过 Cloudflare，只有 Tunnel-only 或宿主回环源站边界受控时 assertion 才作为可信身份输入。完整配置与部署要求见 [Cloudflare Access 身份验证](docs/cloudflare_access.md)。
+Scaffold 已有独立的用户、工作空间、任务 ACL 和 RBAC 持久化层；`/api/session`、控制面任务、标注人员和人员组路由按数据库授权运行，授权不可用时 fail closed。Cloudflare Access 只负责认证和网络入口，不根据邮箱后缀或 Access policy 自动授予业务 role；首次登录的未知身份仍可能没有 workspace。现有 Basic Auth 只在显式 `LLS_PANEL_AUTH_MODE=basic_dev` 时用于本地开发；生产默认 `cloudflare_access`，配置或验证失败不会回退到 Basic。JWT 签名验证不证明请求经过 Cloudflare，只有 Tunnel-only 或宿主回环源站边界受控时 assertion 才作为可信身份输入。完整配置与部署要求见 [Cloudflare Access 身份验证](docs/cloudflare_access.md) 和 [成员管理与权限闭环运维](docs/member_management.md)。
 
 ## 服务器测试
 
@@ -193,14 +181,7 @@ docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml up -d 
 
 `r2` 模式启动后，进入“系统设置”填写本部署的 `task_registry_uri` 和 `data_lake_r2_prefix`，再返回任务列表同步任务配置。R2 访问只通过 rclone 完成，`docker-compose.rclone.example.yml` 只读挂载宿主机的 `rclone.conf`，不要把密钥写进镜像或 compose 文件。只要任务需要 R2 数据湖，compose 启动都必须包含 rclone override 或等价 secret 挂载。
 
-如果要同时测试可选模型记录服务：
-
-```bash
-export MLFLOW_TRACKING_URI=http://mlflow:5000
-docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow pull panel
-docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow build mlflow
-docker compose -f docker-compose.yml -f docker-compose.rclone.example.yml --profile mlflow up -d --no-build
-```
+浏览器只访问 Panel API，不直接获得 R2 access key、secret key、`rclone.conf` 或其他云端凭据；R2 数据湖成员权限和 Panel workspace role 也不能互相推断。
 
 ### 方式二：在服务器本地构建
 
@@ -214,12 +195,6 @@ sed -i "s|^SCAFFOLD_POSTGRES_OWNER_PASSWORD=.*|SCAFFOLD_POSTGRES_OWNER_PASSWORD=
 sed -i "s|^SCAFFOLD_POSTGRES_APP_PASSWORD=.*|SCAFFOLD_POSTGRES_APP_PASSWORD=${app_password}|" .env
 unset owner_password app_password
 ./scripts/stack up
-```
-
-可选模型记录服务：
-
-```bash
-./scripts/stack up --mlflow
 ```
 
 ### 启用控制面任务来源
@@ -298,7 +273,6 @@ ARGILLA_PASSWORD=12345678
 ARGILLA_API_KEY=argilla.apikey
 ARGILLA_WORKSPACE=argilla
 
-MLFLOW_PORT=5000
 MCP_PORT=8766
 MCP_BIND_HOST=127.0.0.1
 LLS_MCP_AUTH_MODE=cloudflare_access
@@ -317,12 +291,6 @@ LLS_RCLONE_TIMEOUT_SECONDS=120
 
 `LLS_TASK_SOURCE` 可设为 `r2`、`control` 或 `local`。`YOUR_BUCKET` 是占位格式，必须替换成自己的 R2 bucket 和 registry 路径；也可以在面板“系统设置”中保存当前部署的 `task_registry_uri` 和 `data_lake_r2_prefix`。在 `r2` 模式中，`LLS_TASK_REGISTRY_URI` 对应 `task_registry_uri`，应指向数据湖治理登记表，通常是 `data_lake.yaml`；具体任务文件由登记表的 `tasks.<task_id>.task_uri` 指向。在 `control` 模式中，它只作为数据湖 registry 的默认配置，不参与任务单同步。
 
-`MLFLOW_TRACKING_URI` 默认不设置。只有需要把训练记录同步到可选模型记录服务时，才设置：
-
-```bash
-export MLFLOW_TRACKING_URI=http://mlflow:5000
-```
-
 ## Docker 镜像说明
 
 控制台镜像会把前端构建产物打进后端镜像，并安装：
@@ -331,11 +299,10 @@ export MLFLOW_TRACKING_URI=http://mlflow:5000
 - SQLAlchemy 2、Alembic 和 PostgreSQL 驱动
 - Argilla 集成依赖
 - 基线训练依赖：`scikit-learn`、`joblib`
-- MLflow 客户端依赖
 - MCP Streamable HTTP 服务依赖
 - rclone，用于按任务配置读取 R2 数据湖
 
-因此默认部署可以直接运行内置 `tfidf_sgd` 基线训练器。MLflow 客户端只提供可选记录能力；不启用 Docker Compose 的 mlflow profile 时不会启动 MLflow 服务。
+训练服务器不通过 Panel 集成外部实验记录服务；模型、指标和 manifest 由训练服务器按数据湖产物规范回写 R2。
 
 容器挂载：
 
@@ -375,13 +342,6 @@ python -m llm_labeling_scaffold.cli infer --task examples/toy_text_classificatio
 
 ```bash
 pip install -e ".[baseline,argilla]"
-```
-
-如果本地也要调试可选模型记录服务：
-
-```bash
-pip install -e ".[baseline,argilla,mlflow]"
-export MLFLOW_TRACKING_URI=http://localhost:5000
 ```
 
 本地调试 MCP：

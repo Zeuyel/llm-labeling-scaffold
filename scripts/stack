@@ -37,12 +37,11 @@ env_value() {
 
 usage() {
   cat >&2 <<'EOF'
-用法：scripts/stack [up|down|logs|ps|restart] [--mlflow] [--mcp]
+用法：scripts/stack [up|down|logs|ps|restart] [--mcp]
 
 默认启动 light panel 和 Argilla 标注服务。
 必须在 .env 设置 LLS_DEPLOYMENT_MODE=loopback 或 tunnel。
-如需可选模型记录服务，使用：scripts/stack up --mlflow
-如需 MCP companion service，使用：scripts/stack up --mcp
+生产 tunnel 模式会自动加入 Cloudflare Tunnel sidecar；如需 MCP companion service，使用：scripts/stack up --mcp
 EOF
 }
 
@@ -51,19 +50,11 @@ if [ "$#" -gt 0 ]; then
   shift
 fi
 
-enable_mlflow=0
 enable_mcp=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --mlflow|--profile=mlflow)
-      enable_mlflow=1
-      shift
-      ;;
     --profile)
-      if [ "${2:-}" = "mlflow" ]; then
-        enable_mlflow=1
-        shift 2
-      elif [ "${2:-}" = "mcp" ]; then
+      if [ "${2:-}" = "mcp" ]; then
         enable_mcp=1
         shift 2
       else
@@ -174,6 +165,27 @@ if [ "$apply_config" -eq 1 ]; then
   esac
 fi
 
+if [ "$apply_config" -eq 1 ] && [ "$deployment_mode" = "tunnel" ]; then
+  tunnel_token="$(env_value CLOUDFLARE_TUNNEL_TOKEN "")"
+  if [ "${#tunnel_token}" -lt 32 ] || [[ "$tunnel_token" =~ [[:space:]] ]]; then
+    echo "tunnel 模式必须设置至少 32 个非空白字符的 CLOUDFLARE_TUNNEL_TOKEN。" >&2
+    exit 2
+  fi
+  for required_name in ARGILLA_PASSWORD ARGILLA_API_KEY ARGILLA_POSTGRES_PASSWORD; do
+    required_value="$(env_value "$required_name" "")"
+    if [ -z "$required_value" ]; then
+      echo "tunnel 模式必须设置 $required_name。" >&2
+      exit 2
+    fi
+  done
+  if [ "$(env_value ARGILLA_PASSWORD "")" = "12345678" ] || \
+     [ "$(env_value ARGILLA_API_KEY "")" = "argilla.apikey" ] || \
+     [ "$(env_value ARGILLA_POSTGRES_PASSWORD "")" = "postgres" ]; then
+    echo "tunnel 模式不能使用 Argilla 默认密码、API key 或数据库密码。" >&2
+    exit 2
+  fi
+fi
+
 if [ "$apply_config" -eq 1 ]; then
   database_owner_password="$(env_value SCAFFOLD_POSTGRES_OWNER_PASSWORD "")"
   database_app_password="$(env_value SCAFFOLD_POSTGRES_APP_PASSWORD "")"
@@ -188,9 +200,18 @@ if [ "$apply_config" -eq 1 ]; then
 fi
 
 task_source="$(env_value LLS_TASK_SOURCE control)"
+if [ "$apply_config" -eq 1 ] && [ "$deployment_mode" = "tunnel" ] && [ "${task_source,,}" != "local" ]; then
+  rclone_config_host="$(env_value RCLONE_CONFIG_HOST "$HOME/.config/rclone/rclone.conf")"
+  if [ ! -r "$rclone_config_host" ]; then
+    echo "生产 tunnel 模式需要可读的 RCLONE_CONFIG_HOST：$rclone_config_host" >&2
+    exit 2
+  fi
+fi
 compose=(docker compose -f docker-compose.yml)
 if [ "$deployment_mode" = "loopback" ]; then
   compose+=(-f docker-compose.loopback.yml)
+else
+  compose+=(-f docker-compose.production.yml -f docker-compose.tunnel.yml)
 fi
 case "${task_source,,}" in
   local)
@@ -200,9 +221,8 @@ case "${task_source,,}" in
     ;;
 esac
 services=(scaffold-postgres db-role-init migrate panel argilla argilla-worker argilla-postgres elasticsearch redis)
-if [ "$enable_mlflow" -eq 1 ]; then
-  compose+=(--profile mlflow)
-  services+=(mlflow)
+if [ "$deployment_mode" = "tunnel" ]; then
+  services+=(cloudflared)
 fi
 if [ "$enable_mcp" -eq 1 ]; then
   compose+=(--profile mcp)
@@ -220,9 +240,6 @@ print_urls() {
     echo "light panel： Cloudflare Access hostname（Panel 未发布宿主端口）"
   fi
   echo "Argilla：     http://localhost:$(env_value ARGILLA_PORT 6900)"
-  if [ "$enable_mlflow" -eq 1 ]; then
-    echo "模型记录服务： http://localhost:$(env_value MLFLOW_PORT 5000)"
-  fi
   if [ "$enable_mcp" -eq 1 ]; then
     echo "MCP：         http://localhost:$(env_value MCP_PORT 8766)/mcp"
   fi
@@ -233,10 +250,6 @@ print_urls() {
     echo "panel 登录：Cloudflare Access"
   fi
   echo "Argilla 登录：$(env_value ARGILLA_USERNAME argilla) / $(env_value ARGILLA_PASSWORD 12345678)"
-  if [ "$enable_mlflow" -eq 0 ]; then
-    echo
-    echo "默认未启动模型记录服务；需要时运行：scripts/stack up --mlflow"
-  fi
   if [ "$enable_mcp" -eq 0 ]; then
     echo
     echo "默认未启动 MCP；需要时先配置独立 MCP Access application 和 LLS_MCP_INTERNAL_TOKEN，再运行：scripts/stack up --mcp"
@@ -262,8 +275,10 @@ print_urls() {
 
 case "$cmd" in
   up)
-    if [ "$enable_mlflow" -eq 1 ]; then
-      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --build
+    panel_image="$(env_value PANEL_IMAGE "llm-labeling-scaffold-panel:local")"
+    if [[ "$panel_image" == ghcr.io/* ]]; then
+      "${compose[@]}" pull panel
+      "${compose[@]}" up -d --no-build
     else
       "${compose[@]}" up -d --build
     fi
@@ -279,11 +294,7 @@ case "$cmd" in
     "${compose[@]}" ps
     ;;
   restart)
-    if [ "$enable_mlflow" -eq 1 ]; then
-      MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-http://mlflow:5000}" "${compose[@]}" up -d --force-recreate "${services[@]}"
-    else
-      "${compose[@]}" up -d --force-recreate "${services[@]}"
-    fi
+    "${compose[@]}" up -d --force-recreate "${services[@]}"
     ;;
   *)
     usage

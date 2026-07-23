@@ -277,6 +277,7 @@ class CloudflareAccessVerifier:
         max_negative_kids: int = _DEFAULT_MAX_NEGATIVE_KIDS,
         unknown_kid_cooldown_seconds: float = _DEFAULT_UNKNOWN_KID_COOLDOWN_SECONDS,
         refresh_failure_cooldown_seconds: float = _DEFAULT_REFRESH_FAILURE_COOLDOWN_SECONDS,
+        trust_email_claim: bool = False,
         jwks_fetcher: JwksFetcher = _fetch_jwks,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
@@ -287,6 +288,7 @@ class CloudflareAccessVerifier:
         if not math.isfinite(clock_skew_seconds) or clock_skew_seconds < 0 or clock_skew_seconds > 60:
             raise ValueError("JWT clock skew 必须在 0 到 60 秒之间")
         self._clock_skew_seconds = clock_skew_seconds
+        self._trust_email_claim = bool(trust_email_claim)
         self.jwks_url = f"{self.issuer}/cdn-cgi/access/certs"
         self._jwks = _BoundedJwksCache(
             self.jwks_url,
@@ -349,13 +351,16 @@ class CloudflareAccessVerifier:
             raise TokenVerificationError("invalid_access_subject")
         email = claims.get("email")
         display_name = claims.get("name")
+        email_value = email.strip() if isinstance(email, str) and 0 < len(email.strip()) <= 1024 else None
         return Identity(
             issuer=self.issuer,
             subject=subject.strip(),
-            email=email.strip() if isinstance(email, str) and 0 < len(email.strip()) <= 1024 else None,
+            email=email_value,
             display_name=(
                 display_name.strip()
                 if isinstance(display_name, str) and 0 < len(display_name.strip()) <= 1024
                 else None
             ),
+            email_verified=(claims.get("email_verified") is True)
+            or (self._trust_email_claim and email_value is not None),
         )

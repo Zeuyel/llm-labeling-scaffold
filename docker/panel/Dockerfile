@@ -2,7 +2,7 @@ FROM node:22-slim AS frontend
 
 WORKDIR /app/frontend
 COPY frontend/package*.json ./
-RUN npm install --no-audit --no-fund
+RUN npm ci --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
@@ -23,7 +23,7 @@ RUN apt-get update \
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN pip install -e ".[baseline,argilla,mlflow,mcp]"
+RUN pip install -e ".[baseline,argilla,mcp]"
 ARG PANEL_UID=1000
 ARG PANEL_GID=1000
 RUN groupadd --gid "${PANEL_GID}" panel \

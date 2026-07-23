@@ -51,6 +51,11 @@ from .db import (
     DatabaseService,
     ExternalIdentity,
     IdempotencyConflict,
+    InvitationConflict,
+    LastWorkspaceAdmin,
+    MembershipConflict,
+    MembershipNotFound,
+    MembershipOperationInProgress,
     Permission,
     TaskCreateConflict,
     TaskCreateInProgress,
@@ -100,7 +105,7 @@ from .panel_annotators import (
 )
 from .redaction import redact_text
 
-API_CONTRACT_VERSION = "2026-07-18"
+API_CONTRACT_VERSION = "2026-07-21"
 AUTHORIZATION_READY = "ready"
 AUTHORIZATION_UNAVAILABLE = "unavailable"
 
@@ -300,6 +305,7 @@ def _external_identity(principal) -> ExternalIdentity:
         subject=principal.identity.subject,
         email_snapshot=principal.identity.email,
         display_name_snapshot=principal.identity.display_name,
+        email_verified=principal.identity.email_verified,
     )
 
 
@@ -419,6 +425,23 @@ class _PanelAnnotatorAuthorizer:
                 actor,
                 workspace,
                 Permission.WORKSPACE_MANAGE,
+            )
+        except Exception as exc:
+            raise _map_annotator_dependency_error(exc) from None
+
+    def require_annotation_target(
+        self, *, workspace: str, principal_id: str, actor: Any
+    ) -> ExternalIdentity:
+        if not isinstance(actor, ExternalIdentity):
+            raise PanelAnnotatorError("permission_denied", "权限不足", HTTPStatus.FORBIDDEN)
+        resolver = getattr(self.service, "require_workspace_member_identity", None)
+        if not callable(resolver):
+            raise AuthorizationUnavailable("workspace member authorization is unavailable")
+        try:
+            return resolver(
+                workspace_slug=workspace,
+                principal_id=_annotator_uuid(principal_id, "principal_id"),
+                permission=Permission.ANNOTATION_WORK,
             )
         except Exception as exc:
             raise _map_annotator_dependency_error(exc) from None
@@ -568,7 +591,8 @@ class _PanelAnnotatorRepositoryFacade:
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_id: str,
+        principal_identity: ExternalIdentity,
         external: ExternalAnnotatorSnapshot,
     ) -> dict[str, Any]:
         user_id = _annotator_uuid(external.argilla_user_id, "argilla_user_id")
@@ -582,10 +606,8 @@ class _PanelAnnotatorRepositoryFacade:
             "create_annotator_mapping",
             workspace_slug=workspace,
             binding_id=self._binding(workspace).id,
-            principal_identity=ExternalIdentity(
-                self.actor_identity.issuer,
-                scaffold_user_id,
-            ),
+            principal_id=_annotator_uuid(principal_id, "principal_id"),
+            principal_identity=principal_identity,
             username=external.argilla_username,
             actor_identity=self.actor_identity,
             caller_identity=self.caller_identity,
@@ -843,20 +865,37 @@ class _PanelArgillaAdminFacade:
             _annotator_uuid(snapshot.personal_workspace_id, "personal_workspace_id")
         return snapshot
 
+    def _shared_workspace_uuid(self, workspace: str) -> str:
+        if self.repository is None:
+            raise PanelAnnotatorError(
+                "repository_unavailable",
+                "Argilla workspace binding 尚未就绪",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        binding = self.repository._binding(workspace)
+        if binding.argilla_workspace_id is None:
+            raise PanelAnnotatorError(
+                "workspace_binding_unavailable",
+                "Argilla 共享 workspace 尚未配置",
+                HTTPStatus.CONFLICT,
+            )
+        return _annotator_uuid(binding.argilla_workspace_id, "argilla_workspace_id").__str__()
+
     def _ensure(
         self,
         *,
-        scaffold_user_id: str,
+        principal_identity: ExternalIdentity,
         password: str | None,
         personal_workspace_name: str | None,
         expected_user_uuid: str | None = None,
         expected_workspace_uuid: str | None = None,
+        shared_workspace_uuid: str | None = None,
         membership_present: bool = True,
     ) -> ExternalAnnotatorSnapshot:
         if personal_workspace_name is not None:
             expected_name = derive_personal_workspace_name(
-                self.principal_issuer,
-                scaffold_user_id,
+                principal_identity.issuer,
+                principal_identity.subject,
             )
             if personal_workspace_name != expected_name:
                 raise PanelAnnotatorError(
@@ -867,8 +906,8 @@ class _PanelArgillaAdminFacade:
                 )
         try:
             result = self.adapter.ensure_annotator(
-                principal_issuer=self.principal_issuer,
-                principal_subject=scaffold_user_id,
+                principal_issuer=principal_identity.issuer,
+                principal_subject=principal_identity.subject,
                 password=password,
                 expected_user_uuid=(
                     _annotator_uuid(expected_user_uuid, "argilla_user_id")
@@ -878,6 +917,11 @@ class _PanelArgillaAdminFacade:
                 expected_workspace_uuid=(
                     _annotator_uuid(expected_workspace_uuid, "personal_workspace_id")
                     if expected_workspace_uuid is not None
+                    else None
+                ),
+                shared_workspace_uuid=(
+                    _annotator_uuid(shared_workspace_uuid, "argilla_workspace_id")
+                    if shared_workspace_uuid is not None
                     else None
                 ),
             )
@@ -915,8 +959,8 @@ class _PanelArgillaAdminFacade:
             if callable(workspace_lookup):
                 try:
                     resolved_workspace_id = workspace_lookup(
-                        principal_issuer=self.principal_issuer,
-                        principal_subject=scaffold_user_id,
+                        principal_issuer=principal_identity.issuer,
+                        principal_subject=principal_identity.subject,
                     )
                 except Exception:
                     raise PanelAnnotatorError(
@@ -935,33 +979,34 @@ class _PanelArgillaAdminFacade:
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_identity: ExternalIdentity,
         personal_workspace_name: str | None,
         initial_password: str,
     ) -> ExternalAnnotatorSnapshot:
-        del workspace
         return self._ensure(
-            scaffold_user_id=scaffold_user_id,
+            principal_identity=principal_identity,
             password=initial_password,
             personal_workspace_name=personal_workspace_name,
+            shared_workspace_uuid=self._shared_workspace_uuid(workspace),
         )
 
     def bind_annotator(
         self,
         *,
         workspace: str,
-        scaffold_user_id: str,
+        principal_identity: ExternalIdentity,
         argilla_user_id: str,
         argilla_username: str | None,
         personal_workspace_id: str | None,
     ) -> ExternalAnnotatorSnapshot:
-        del workspace, argilla_username
+        del argilla_username
         return self._ensure(
-            scaffold_user_id=scaffold_user_id,
+            principal_identity=principal_identity,
             password=None,
             personal_workspace_name=None,
             expected_user_uuid=argilla_user_id,
             expected_workspace_uuid=personal_workspace_id,
+            shared_workspace_uuid=self._shared_workspace_uuid(workspace),
         )
 
     def verify_annotator(self, *, annotator: AnnotatorLookup) -> ExternalAnnotatorSnapshot:
@@ -970,13 +1015,17 @@ class _PanelArgillaAdminFacade:
                 "identity_incomplete",
                 "标注人员缺少可验证的 Argilla UUID",
                 HTTPStatus.CONFLICT,
-            )
+        )
         snapshot = self._ensure(
-            scaffold_user_id=annotator.scaffold_user_id,
+            principal_identity=ExternalIdentity(
+                self.principal_issuer,
+                annotator.scaffold_user_id,
+            ),
             password=None,
             personal_workspace_name=None,
             expected_user_uuid=annotator.argilla_user_id,
             expected_workspace_uuid=annotator.personal_workspace_id,
+            shared_workspace_uuid=self._shared_workspace_uuid(annotator.workspace),
         )
         if self.repository is not None:
             self.repository.pending_verification_snapshot = snapshot
@@ -990,6 +1039,51 @@ def _workspace_access_payload(access) -> dict[str, Any]:
         "roles": [role.value for role in access.roles],
         "workspace_capabilities": [permission.value for permission in access.workspace_capabilities],
         "task_capabilities": [permission.value for permission in access.task_capabilities],
+    }
+
+
+def _workspace_member_payload(member) -> dict[str, Any]:
+    return {
+        "principal_id": str(member.principal_id),
+        "email": member.email,
+        "display_name": member.display_name,
+        "role": member.role.value,
+        "status": "active" if member.is_active else "inactive",
+    }
+
+
+def _workspace_invitation_payload(invitation) -> dict[str, Any]:
+    return {
+        "invitation_id": str(invitation.id),
+        "email": invitation.email,
+        "role": invitation.role.value,
+        "status": invitation.status.value,
+        "expires_at": invitation.expires_at.isoformat(),
+        "claimed_principal_id": (
+            str(invitation.claimed_principal_id)
+            if invitation.claimed_principal_id is not None
+            else None
+        ),
+    }
+
+
+def _member_mutation_payload(result) -> dict[str, Any]:
+    return {
+        "action": result.action.value,
+        "workspace": {
+            "slug": result.workspace.slug,
+            "name": result.workspace.name,
+        },
+        "principal": {
+            "principal_id": str(result.principal.id),
+            "email": result.principal.email_snapshot,
+            "display_name": result.principal.display_name,
+            "status": "active" if result.principal.is_active else "inactive",
+        },
+        "binding_id": str(result.binding_id) if result.binding_id is not None else None,
+        "previous_role": result.previous_role.value if result.previous_role is not None else None,
+        "role": result.role.value if result.role is not None else None,
+        "audit_event_id": str(result.audit_event_id) if result.audit_event_id is not None else None,
     }
 
 
@@ -1133,7 +1227,7 @@ def _annotator_contract_endpoints() -> list[dict[str, Any]]:
             "side_effects": True,
             "required_permission": WORKSPACE_MANAGE_PERMISSION,
             "required_headers": write_headers,
-            "request_schema": {"type": "object", "required": ["workspace", "scaffold_user_id", "initial_password"]},
+            "request_schema": {"type": "object", "required": ["workspace", "principal_id", "initial_password"]},
             "response_schema": {"type": "object", "required": ["annotator", "replayed"]},
         },
         {
@@ -1143,7 +1237,7 @@ def _annotator_contract_endpoints() -> list[dict[str, Any]]:
             "side_effects": True,
             "required_permission": WORKSPACE_MANAGE_PERMISSION,
             "required_headers": write_headers,
-            "request_schema": {"type": "object", "required": ["workspace", "scaffold_user_id", "argilla_user_id"]},
+            "request_schema": {"type": "object", "required": ["workspace", "principal_id", "argilla_user_id"]},
             "response_schema": {"type": "object", "required": ["annotator", "replayed"]},
         },
         {
@@ -1222,6 +1316,65 @@ def _annotator_contract_endpoints() -> list[dict[str, Any]]:
     ]
 
 
+def _member_contract_endpoints() -> list[dict[str, Any]]:
+    workspace_query = {"workspace": {"type": "string", "required": True}}
+    write_headers = {"Idempotency-Key": {"type": "string", "required": True}}
+    return [
+        {
+            "method": "GET",
+            "path": "/api/members",
+            "action": "members_list",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "query_params": workspace_query,
+            "response_schema": {"type": "object", "required": ["members", "invitations", "workspace"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/members/invitations",
+            "action": "member_invitation_create",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "request_schema": {"type": "object", "required": ["workspace", "email", "role"]},
+            "response_schema": {"type": "object", "required": ["invitation", "claim", "replayed"]},
+        },
+        {
+            "method": "PUT",
+            "path": "/api/members/{principal_id}/role",
+            "action": "member_role_change",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"principal_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace", "role"]},
+            "response_schema": {"type": "object", "required": ["membership", "replayed"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/members/{principal_id}/revoke",
+            "action": "member_revoke",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"principal_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace"]},
+            "response_schema": {"type": "object", "required": ["membership", "replayed"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/members/invitations/{invitation_id}/revoke",
+            "action": "member_invitation_revoke",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"invitation_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace"]},
+            "response_schema": {"type": "object", "required": ["invitation", "claim", "replayed"]},
+        },
+    ]
+
+
 def _contract_capabilities(
     auth_mode: str = "unconfigured",
     authorization_state: str = AUTHORIZATION_UNAVAILABLE,
@@ -1236,6 +1389,7 @@ def _contract_capabilities(
         },
         "authorization": {"state": authorization_state},
         "endpoints": [
+            *_member_contract_endpoints(),
             *_annotator_contract_endpoints(),
             {
                 "method": "GET",
@@ -1910,6 +2064,38 @@ def _panel_path_segment(value: str) -> str | None:
     return value
 
 
+def _member_route_kind(method: str, path: str) -> tuple[str, str | None] | None:
+    if method == "GET" and path == "/api/members":
+        return "members_list", None
+    if method == "POST":
+        if path == "/api/members/invitations":
+            return "member_invitation_create", None
+        invitation_prefix = "/api/members/invitations/"
+        invitation_suffix = "/revoke"
+        if path.startswith(invitation_prefix) and path.endswith(invitation_suffix):
+            value = _panel_path_segment(path[len(invitation_prefix):-len(invitation_suffix)])
+            if value is not None and "/" not in value:
+                return "member_invitation_revoke", value
+        prefix = "/api/members/"
+        suffix = "/revoke"
+        if path.startswith(prefix) and path.endswith(suffix):
+            value = _panel_path_segment(path[len(prefix):-len(suffix)])
+            if value is not None and "/" not in value:
+                return "member_revoke", value
+    if method == "PUT":
+        prefix = "/api/members/"
+        suffix = "/role"
+        if path.startswith(prefix) and path.endswith(suffix):
+            value = _panel_path_segment(path[len(prefix):-len(suffix)])
+            if value is not None and "/" not in value:
+                return "member_role_change", value
+    return None
+
+
+def _member_route_allowed(method: str, path: str) -> bool:
+    return _member_route_kind(method, path) is not None
+
+
 def _annotator_route_kind(method: str, path: str) -> tuple[str, str | None] | None:
     if method == "GET":
         if path == "/api/annotators":
@@ -2002,6 +2188,8 @@ def _database_authorized_route(method: str, path: str) -> bool:
         return True
     if not _control_task_source_enabled():
         return False
+    if _member_route_allowed(method, path):
+        return True
     if _annotator_route_allowed(method, path):
         return True
     if method == "GET":
@@ -2577,6 +2765,241 @@ class _Handler(BaseHTTPRequestHandler):
             HTTPStatus.SERVICE_UNAVAILABLE,
         )
 
+    def _member_body(
+        self,
+        body: Any,
+        *,
+        allowed: set[str],
+        required: set[str],
+    ) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_member_request",
+                "成员管理请求必须是 JSON 对象",
+            )
+        unknown = sorted(set(body) - allowed)
+        if unknown:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_member_request",
+                f"成员管理请求包含未知字段: {', '.join(unknown)}",
+            )
+        missing = sorted(field for field in required if field not in body)
+        if missing:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_member_request",
+                f"成员管理请求缺少字段: {', '.join(missing)}",
+            )
+        return body
+
+    def _member_workspace(self, params, body: dict[str, Any] | None = None) -> str:
+        workspace = self._workspace_selector(params, body)
+        if workspace is None:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "workspace_required",
+                "成员管理必须显式提供 workspace",
+            )
+        return workspace
+
+    @staticmethod
+    def _member_role(value: Any) -> Role:
+        try:
+            return Role(str(value or "").strip().lower())
+        except ValueError as exc:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_role",
+                "workspace role 无效",
+            ) from exc
+
+    @staticmethod
+    def _member_principal_id(value: str) -> uuid.UUID:
+        try:
+            return uuid.UUID(str(value).strip())
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_principal_id",
+                "principal_id 必须是合法 UUID",
+            ) from exc
+
+    @staticmethod
+    def _member_invitation_id(value: str) -> uuid.UUID:
+        try:
+            return uuid.UUID(str(value).strip())
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_invitation_id",
+                "invitation_id 必须是合法 UUID",
+            ) from exc
+
+    def _member_idempotency_key(self) -> str:
+        value = str(self.headers.get("Idempotency-Key") or "").strip()
+        if not _valid_idempotency_key(value):
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "missing_idempotency_key",
+                "成员管理写操作必须提供有效的 Idempotency-Key header",
+            )
+        return value
+
+    def _member_request_id(self) -> str | None:
+        value = str(self.headers.get("X-Request-ID") or "").strip()
+        if not value:
+            return None
+        if len(value) > 255 or any(ord(char) < 32 for char in value):
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_request_id",
+                "X-Request-ID 不是有效请求标识",
+            )
+        return value
+
+    def _members_list(self, params) -> None:
+        try:
+            service, actor_identity, _, _ = self._authorization_context()
+            workspace_slug = self._member_workspace(params)
+            result = service.list_workspace_members(
+                identity=actor_identity,
+                workspace_slug=workspace_slug,
+            )
+            self._json(
+                {
+                    "workspace": result.workspace.slug,
+                    "members": [_workspace_member_payload(item) for item in result.members],
+                    "invitations": [
+                        _workspace_invitation_payload(item) for item in result.invitations
+                    ],
+                },
+                headers={"Cache-Control": "no-store, private", "Pragma": "no-cache"},
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _member_invitation_create(self, params) -> None:
+        try:
+            body = self._member_body(
+                self._read_body(),
+                allowed={"workspace", "email", "role"},
+                required={"workspace", "email", "role"},
+            )
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            workspace_slug = self._member_workspace(params, body)
+            result = service.create_workspace_invitation(
+                workspace_slug=workspace_slug,
+                email=body["email"],
+                role=self._member_role(body["role"]),
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=self._member_idempotency_key(),
+                channel=channel,
+                request_id=self._member_request_id(),
+            )
+            self._json(
+                {
+                    "workspace": result.invitation.workspace.slug,
+                    "invitation": _workspace_invitation_payload(result.invitation),
+                    "claim": {"status": result.claim_status},
+                    "action": result.action,
+                    "replayed": result.replayed,
+                },
+                status=result.response_status,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _member_invitation_revoke(self, invitation_id_value: str, params) -> None:
+        try:
+            invitation_id = self._member_invitation_id(invitation_id_value)
+            body = self._member_body(
+                self._read_body(),
+                allowed={"workspace"},
+                required={"workspace"},
+            )
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            result = service.revoke_workspace_invitation(
+                workspace_slug=self._member_workspace(params, body),
+                invitation_id=invitation_id,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=self._member_idempotency_key(),
+                channel=channel,
+                request_id=self._member_request_id(),
+            )
+            self._json(
+                {
+                    "workspace": result.invitation.workspace.slug,
+                    "invitation": _workspace_invitation_payload(result.invitation),
+                    "claim": {"status": result.claim_status},
+                    "action": result.action,
+                    "replayed": result.replayed,
+                },
+                status=result.response_status,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _member_role_change(self, principal_id_value: str, params) -> None:
+        try:
+            principal_id = self._member_principal_id(principal_id_value)
+            body = self._member_body(
+                self._read_body(),
+                allowed={"workspace", "role"},
+                required={"workspace", "role"},
+            )
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            result = service.change_workspace_membership_by_principal_id(
+                workspace_slug=self._member_workspace(params, body),
+                principal_id=principal_id,
+                role=self._member_role(body["role"]),
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=self._member_idempotency_key(),
+                channel=channel,
+                request_id=self._member_request_id(),
+            )
+            self._json(
+                {
+                    "membership": _member_mutation_payload(result.result),
+                    "replayed": result.replayed,
+                },
+                status=result.response_status,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _member_revoke(self, principal_id_value: str, params) -> None:
+        try:
+            principal_id = self._member_principal_id(principal_id_value)
+            body = self._member_body(
+                self._read_body(),
+                allowed={"workspace"},
+                required={"workspace"},
+            )
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            result = service.revoke_workspace_membership_by_principal_id(
+                workspace_slug=self._member_workspace(params, body),
+                principal_id=principal_id,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=self._member_idempotency_key(),
+                channel=channel,
+                request_id=self._member_request_id(),
+            )
+            self._json(
+                {
+                    "membership": _member_mutation_payload(result.result),
+                    "replayed": result.replayed,
+                },
+                status=result.response_status,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
     def _annotator_list(self, params) -> None:
         try:
             workspace = self._annotator_workspace(params)
@@ -3010,6 +3433,30 @@ class _Handler(BaseHTTPRequestHandler):
                 status=HTTPStatus.SERVICE_UNAVAILABLE,
             )
             return
+        if isinstance(exc, MembershipNotFound):
+            self._json(
+                {"error": "成员资源不存在", "code": "resource_not_found"},
+                status=HTTPStatus.NOT_FOUND,
+            )
+            return
+        if isinstance(exc, (InvitationConflict, MembershipConflict)):
+            self._json(
+                {"error": "成员管理请求与现有状态冲突", "code": "membership_conflict"},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, LastWorkspaceAdmin):
+            self._json(
+                {"error": "不能移除或降级最后一个 active admin", "code": "last_workspace_admin"},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
+        if isinstance(exc, MembershipOperationInProgress):
+            self._json(
+                {"error": "成员管理操作正在处理中，请稍后重试", "code": exc.code},
+                status=HTTPStatus.CONFLICT,
+            )
+            return
         if isinstance(exc, ActiveTaskLoaderUnavailable):
             self._json(
                 {"error": "active task loader 返回无效数据", "code": "active_task_loader_unavailable"},
@@ -3429,6 +3876,27 @@ class _Handler(BaseHTTPRequestHandler):
         service, actor_identity, _, _ = self._authorization_context()
         context = self._request_context
         session = service.get_session(actor_identity)
+        if session.invitation_claims:
+            claim_statuses = {claim.claim_status for claim in session.invitation_claims}
+            overall_claim_status = "claimed" if "claimed" in claim_statuses else "role_conflict"
+            invitation_claims = {
+                "status": overall_claim_status,
+                "items": [
+                    {
+                        "invitation_id": str(claim.invitation_id),
+                        "workspace": claim.workspace.slug,
+                        "role": claim.role.value,
+                        "principal_id": str(claim.principal_id),
+                        "membership_created": claim.membership_created,
+                        "claim_status": claim.claim_status,
+                    }
+                    for claim in session.invitation_claims
+                ],
+            }
+        elif context.actor.identity.email:
+            invitation_claims = {"status": "none", "items": []}
+        else:
+            invitation_claims = {"status": "not_claimable_no_email", "items": []}
         return (
             {
                 "authenticated": True,
@@ -3437,6 +3905,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "authorization": {
                     "state": AUTHORIZATION_READY,
                     "workspaces": [_workspace_access_payload(access) for access in session.workspaces],
+                    "invitation_claims": invitation_claims,
                 },
             },
             {
@@ -4157,6 +4626,12 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         params = parse_qs(parsed.query)
+        member_route = _member_route_kind(self.command, path)
+        if member_route is not None:
+            kind, _ = member_route
+            if kind == "members_list":
+                self._members_list(params)
+            return
         annotator_route = _annotator_route_kind(self.command, path)
         if annotator_route is not None:
             kind, resource_id = annotator_route
@@ -4596,6 +5071,16 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
+        member_route = _member_route_kind(self.command, path)
+        if member_route is not None:
+            kind, resource_id = member_route
+            if kind == "member_invitation_create":
+                self._member_invitation_create(params)
+            elif kind == "member_invitation_revoke":
+                self._member_invitation_revoke(resource_id, params)
+            elif kind == "member_revoke":
+                self._member_revoke(resource_id, params)
+            return
         annotator_route = _annotator_route_kind(self.command, path)
         if annotator_route is not None:
             kind, resource_id = annotator_route
@@ -4758,6 +5243,12 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
+        member_route = _member_route_kind(self.command, path)
+        if member_route is not None:
+            kind, resource_id = member_route
+            if kind == "member_role_change":
+                self._member_role_change(resource_id, params)
+            return
         annotator_route = _annotator_route_kind(self.command, path)
         if annotator_route is not None:
             kind, resource_id = annotator_route

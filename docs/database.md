@@ -2,6 +2,8 @@
 
 Scaffold 使用独立 PostgreSQL 保存身份、工作空间、授权和审计数据。Docker Compose 中的服务名为 `scaffold-postgres`，数据库与持久卷都不复用 `argilla-postgres`。
 
+成员邀请、首次登录、Argilla 映射、撤销和生产验收的运维主流程见[成员管理与权限闭环运维](member_management.md)。本文件说明其数据库授权和不变量；Cloudflare Access 只负责认证，不替代本文件中的 membership/role binding。
+
 ## Schema
 
 初始迁移包含以下表：
@@ -29,7 +31,7 @@ revision `20260716_0004` 将 allocation planner 的确定性输出和 Argilla �
 
 PostgreSQL 使用原生 enum、`JSONB`、行级触发器和 `BEFORE TRUNCATE` 触发器执行这些约束；SQLite migration 与 `Base.metadata.create_all` 测试路径使用等价的 enum check 和行级触发器。downgrade 到 `20260714_0002` 会删除全部 allocation 表、触发器、函数和原生 enum，因此执行前必须先保留需要的 allocation 数据。
 
-任务生命周期变更通过 `DatabaseService.disable_task`、`archive_task` 和 `restore_task` 完成。每次请求必须通过 task ACL，提交 reason 和幂等键，并追加 `task.lifecycle_changed` 审计事件；相同幂等键会回放原响应，非法转移返回冲突。Panel 控制面对应端点为 `POST /api/tasks/{task_id}/disable`、`/archive` 和 `/restore`。
+任务生命周期变更通过 `DatabaseService.disable_task`、`archive_task` 和 `restore_task` 完成。每次请求必须先通过 active workspace membership，再通过 task ACL，提交 reason 和幂等键，并追加 `task.lifecycle_changed` 审计事件；相同幂等键会回放原响应，非法转移返回冲突。Panel 控制面对应端点为 `POST /api/tasks/{task_id}/disable`、`/archive` 和 `/restore`。
 
 不会创建密码、session、OAuth client、authorization code、access token 或 refresh token 表。
 
@@ -51,13 +53,13 @@ Panel、MCP 和后续认证层不直接接收 SQLAlchemy ORM 或 `Session`。公
 - `resolve_identity`：只按 `(issuer, subject)` 查找 principal。
 - `resolve_or_provision`：未知身份只创建零权限 principal；相同邮箱不会合并身份或授予 membership。
 - `get_session`、`list_authorized_workspaces`：只返回不可变的 principal、workspace 级角色、`workspace_capabilities`，以及该 workspace role 可继承到任务的 `task_capabilities`；不枚举任务，也不创建数据库 session/token 表。
-- `list_authorized_tasks`：按 workspace 和 task ACL 延迟加载任务，必须显式传入 `limit`，单页上限 100，并使用 `after_task_key` cursor 翻页。
-- `authorize_workspace`、`authorize_task`：每次从数据库读取角色，不缓存放行结果。
+- `list_authorized_tasks`：先确认 principal、workspace 和 workspace-scoped membership 都 active，再合并 task ACL 延迟加载任务；必须显式传入 `limit`，单页上限 100，并使用 `after_task_key` cursor 翻页。
+- `authorize_workspace`、`authorize_task`：每次从数据库读取角色，不缓存放行结果。task decision 必须先通过 active workspace membership，再合并 task-scoped ACL；task ACL 不能独立授予任务访问。
 - `claim_idempotency`、`complete_idempotency`：原子 claim/pending/replay，唯一范围固定为 workspace + operation + key hash；actor、caller 或 request fingerprint 任一不一致即返回稳定 conflict，绝不返回其他主体的 response。PostgreSQL app role 没有 `idempotency_records` 的 UPDATE/DELETE 权限，completion 只能调用 owner-side security-definer gate；SQLite Core SQL 由同等连接 gate trigger 保护。gate 会重新锁定并读取 workspace、principal、role binding、task/resource 的 active、permission 和 visibility，再写 terminal response 与一条 completion audit。
 - `grant_workspace_membership`、`change_workspace_membership`、`revoke_workspace_membership`：先通过标准 workspace 授权入口保持 `resource_not_visible` 语义，再按 workspace → principal → role binding → task/resource 锁序重新校验 `WORKSPACE_MANAGE`；原子修改 binding 并追加审计，重复操作返回稳定的 unchanged 结果。
 - `transaction`、`append_audit`：在 façade 事务内组合授权和追加审计，不向调用方暴露 ORM session。
 
-`TASK_CREATE` 是 workspace-scoped 权限，只授予 `experimenter` 和 `admin`。其他 task 权限只能传给 task 授权入口；`AUDIT_VIEW`、`WORKSPACE_MANAGE` 和 `TASK_CREATE` 不能通过 task role 获得。actor 与 caller 不同时，caller 必须是 active service principal；普通用户不能伪装成另一用户的调用方。
+`TASK_CREATE` 是 workspace-scoped 权限，只授予 `experimenter` 和 `admin`。其他 task 权限只能传给 task 授权入口，并且 task ACL 只有在同一 workspace 存在 active workspace membership 时才生效；`AUDIT_VIEW`、`WORKSPACE_MANAGE` 和 `TASK_CREATE` 不能通过 task role 获得。actor 与 caller 不同时，caller 必须是 active service principal；普通用户不能伪装成另一用户的调用方。
 
 没有可见 membership/ACL 时，workspace 和 task 判权统一返回 `resource_not_visible`，且不返回 `WorkspaceRef` 或 `TaskRef`，避免枚举资源。未知身份和无 membership 始终是零权限。数据库连接、schema 或事务异常会抛出 `AuthorizationUnavailable`；上层必须 fail closed，不能沿用旧的允许结果。
 
@@ -102,7 +104,15 @@ python -m llm_labeling_scaffold.cli db materialize \
 
 ## Membership lifecycle
 
-membership grant/change/revoke 在取得 workspace 锁后重新读取 actor 权限；已有 binding 的变更统一使用 role binding → workspace 锁序，首次 grant 初读不存在 binding 时以 workspace 锁串行化并锁后重读。grant/change 要求 target principal 仍为 active；revoke 允许清理 inactive target。最后管理员只统计 active principal 的 workspace-scoped `admin`，服务层和 SQLite/PostgreSQL 触发器都会拒绝删除或降级最后一个 active admin，直接 SQL 也不能绕过。存在 role binding 的 principal 不能直接删除，必须先通过 revoke 解除成员关系。mutation 与对应审计事件在同一事务内提交；unchanged 不追加事件。task-scoped ACL 独立存在，撤销 workspace membership 不会隐式删除显式 task ACL。
+membership grant/change/revoke 在取得 workspace 锁后重新读取 actor 权限；已有 binding 的变更统一使用 role binding → workspace 锁序，首次 grant 初读不存在 binding 时以 workspace 锁串行化并锁后重读。grant/change 要求 target principal 仍为 active；revoke 允许清理 inactive target。最后管理员只统计 active principal 的 workspace-scoped `admin`，服务层和 SQLite/PostgreSQL 触发器都会拒绝删除或降级最后一个 active admin，直接 SQL 也不能绕过。存在 role binding 的 principal 不能直接删除，必须先通过 revoke 解除成员关系。mutation 与对应审计事件在同一事务内提交；unchanged 不追加事件。
+
+### Task ACL 与 workspace membership 约束
+
+task-scoped ACL 记录可以为了审计或后续清理暂时保留，但它不是独立授权。任何 task list/read/write 判权都必须先确认 principal active、workspace active 且存在 active workspace-scoped membership，再合并 task-scoped ACL；workspace membership revoke 必须立即阻止任务访问，即使旧 task ACL 行尚未清理。撤销后的 task ACL 清理是数据卫生步骤，不能被当作阻断访问的前置条件。
+
+**必须修正后才能发布：** 当前 `origin/integration/multiuser-control-plane` 的 `DatabaseTransaction.list_authorized_tasks` 和 `authorize_task` 查询仍把 workspace binding 与 task binding 放在可由 task binding 单独命中的 OR 条件中，尚未证明满足上述不变量。生产验收前必须修正两条判权路径，并加入至少以下回归测试：active workspace membership + task ACL 可访问；撤销 workspace membership 后保留 task ACL 也立即拒绝 list/read/write；重新 grant 后按现有 task ACL 恢复；inactive principal 或 workspace 始终拒绝。
+
+工作区成员的邀请和撤销不能通过邮箱后缀、Access policy 或直接修改 `role_bindings` 完成。生产操作必须使用受控的 Panel 成员管理入口或等价服务 façade，并同时检查 task 判权是否先验证 active workspace membership、Argilla membership 和 cohort revision；完整顺序见[成员管理与权限闭环运维](member_management.md)。
 
 ## 迁移
 
@@ -159,7 +169,7 @@ ownership 也属于启动前白名单：目标数据库和迁移产生的 public
 
 ## 首位管理员
 
-首位管理员必须由一次性命令或等价显式配置创建，不会根据邮箱域名或邮箱地址自动提权：
+首位管理员必须由一次性命令或等价显式配置创建，不会根据邮箱域名或邮箱地址自动提权。Cloudflare Access 只验证 `(issuer, subject)`，不自动创建 workspace membership：
 
 ```bash
 docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap \

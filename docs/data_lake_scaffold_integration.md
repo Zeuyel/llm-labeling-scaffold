@@ -164,6 +164,8 @@ R2 导入不是把 data lake 复制成本地第二份权威数据。它只是下
 
 R2 操作层只使用 `rclone`。应用、镜像和 compose 文件都不直接保存 R2 access key / secret key。
 
+浏览器只调用 Panel API，不直接连接 R2，也不接收 access key、secret key、`rclone.conf` 或其他 R2 临时凭据。Panel 返回的 registry URI、允许前缀和 job 状态不是浏览器凭据；不要为了下载或排查问题把 rclone 配置、签名材料或云端 secret 注入前端。
+
 面板运行环境必须能执行 `rclone`，并且 rclone 配置中要有可访问目标 bucket 的 remote，例如 `r2`。Docker 部署时使用 `docker-compose.rclone.example.yml` 把宿主机 `rclone.conf` 只读映射到容器：
 
 ```bash

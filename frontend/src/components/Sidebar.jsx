@@ -30,6 +30,10 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
         <span className="nav-short">设</span>
         <span className="nav-label">系统设置</span>
       </Link>
+      <Link to="/members" className={activePage === "members" ? "nav-item active" : "nav-item"} title="成员管理">
+        <span className="nav-short">成</span>
+        <span className="nav-label">成员管理</span>
+      </Link>
       <Link to="/annotators" className={activePage === "annotators" ? "nav-item active" : "nav-item"} title="标注人员">
         <span className="nav-short">人</span>
         <span className="nav-label">标注人员</span>

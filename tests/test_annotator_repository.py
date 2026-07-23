@@ -20,6 +20,8 @@ from llm_labeling_scaffold.db import (
     CohortMemberInput,
     ExternalIdentity,
     Permission,
+    PrincipalType,
+    Role,
 )
 from llm_labeling_scaffold.db.bootstrap import bootstrap_admin
 from llm_labeling_scaffold.db.database import create_database_engine
@@ -29,6 +31,9 @@ from llm_labeling_scaffold.db.models import (
     AnnotatorCohort,
     AnnotatorCohortMember,
     IdempotencyRecord,
+    Principal,
+    RoleBinding,
+    Workspace,
 )
 from llm_labeling_scaffold.db.service import DatabaseTransaction
 
@@ -57,6 +62,31 @@ def annotator_repository(tmp_path: Path):
             workspace_slug="workspace-b",
             workspace_name="Workspace B",
         )
+    with Session(engine) as session, session.begin():
+        workspace = session.scalar(select(Workspace).where(Workspace.slug == "workspace-a"))
+        admin = session.scalar(
+            select(Principal).where(
+                Principal.issuer == admin_a.issuer,
+                Principal.subject == admin_a.subject,
+            )
+        )
+        assert workspace is not None and admin is not None
+        for subject in ("annotator-owner", "annotator-a", "verified", "unverified", "scoped", "race"):
+            principal = Principal(
+                issuer=admin_a.issuer,
+                subject=subject,
+                principal_type=PrincipalType.USER,
+            )
+            session.add(principal)
+            session.flush()
+            session.add(
+                RoleBinding(
+                    workspace_id=workspace.id,
+                    principal_id=principal.id,
+                    role=Role.ANNOTATOR,
+                    created_by_principal_id=admin.id,
+                )
+            )
     repository = AnnotatorControlRepository(factory, engine)
     try:
         yield {
@@ -248,6 +278,35 @@ def test_cohort_requires_verified_mapping_and_replacement_creates_revision(annot
     assert second.revision.revision_number == 2
     assert second.revision.id != first.revision.id
     assert second.revision.members[0].default_capacity == 25
+
+    with Session(annotator_repository["engine"]) as session, session.begin():
+        principal = session.scalar(
+            select(Principal).where(
+                Principal.issuer == "https://annotator.test",
+                Principal.subject == "verified",
+            )
+        )
+        workspace = session.scalar(select(Workspace).where(Workspace.slug == "workspace-a"))
+        assert principal is not None and workspace is not None
+        binding_row = session.scalar(
+            select(RoleBinding).where(
+                RoleBinding.workspace_id == workspace.id,
+                RoleBinding.principal_id == principal.id,
+                RoleBinding.task_id.is_(None),
+            )
+        )
+        assert binding_row is not None
+        session.delete(binding_row)
+
+    with pytest.raises(AnnotatorNotReady):
+        repository.create_cohort_revision(
+            workspace_slug="workspace-a",
+            cohort_id=first.cohort.id,
+            binding_id=binding.binding.id,
+            members=(CohortMemberInput(verified_mapping.mapping.id, 30),),
+            actor_identity=admin,
+            idempotency_key="cohort-revoke-blocked",
+        )
 
     with pytest.raises(DBAPIError):
         with Session(annotator_repository["engine"]) as session, session.begin():

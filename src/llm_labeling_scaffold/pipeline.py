@@ -2282,14 +2282,10 @@ def start_action(runs_root: Path, task_path: str | Path | TaskConfig, action: st
                 params.get("trainer", "tfidf_sgd"),
                 params.get("trainer_params", {}),
             )
-            if params.get("mlflow"):
-                from .integrations.mlflow import log_training_result
-                result = log_training_result(task.task_id, params["model_id"], result, params.get("mlflow", {}))
             return {
                 "artifact": result.get("model_path"),
                 "model_id": params["model_id"],
                 "trainer": result.get("trainer"),
-                "mlflow": result.get("mlflow"),
                 "kind": "model_version",
                 "result": result,
             }

@@ -15,6 +15,13 @@ class Role(str, Enum):
     ADMIN = "admin"
 
 
+class WorkspaceInvitationStatus(str, Enum):
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
 class IdempotencyState(str, Enum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"

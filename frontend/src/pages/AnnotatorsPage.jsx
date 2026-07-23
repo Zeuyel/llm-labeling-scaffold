@@ -10,21 +10,63 @@ import {
   valueOrDash,
   verificationBadgeClass,
   verificationLabel,
-  workspaceMembershipLabel,
 } from "./annotatorManagementState.js";
+import { memberDisplayName, roleLabel, unwrapMembers } from "./memberManagementState.js";
 
 const EMPTY_PROVISION_FORM = {
-  scaffold_user_id: "",
+  principal_id: "",
   personal_workspace_name: "",
   initial_password: "",
 };
 
 const EMPTY_BIND_FORM = {
-  scaffold_user_id: "",
+  principal_id: "",
   argilla_user_id: "",
   argilla_username: "",
   personal_workspace_id: "",
 };
+
+const ANNOTATION_MEMBER_ROLES = new Set(["annotator", "experimenter", "admin"]);
+const ARGILLA_ROLE_LABELS = Object.freeze({
+  owner: "所有者",
+  admin: "管理员",
+  annotator: "标注人员",
+  experimenter: "实验者",
+  reviewer: "审核员",
+});
+
+function errorMessage(error) {
+  return error && typeof error.message === "string" ? error.message : String(error);
+}
+
+function annotationMemberCandidates(data) {
+  return unwrapMembers(data).members.filter((member) => {
+    const principalId = String(member?.principal_id || "").trim();
+    const role = String(member?.role || "").trim().toLowerCase();
+    const status = String(member?.status || "").trim().toLowerCase();
+    return Boolean(principalId) && status === "active" && ANNOTATION_MEMBER_ROLES.has(role);
+  });
+}
+
+function memberSelectionError(principalId, members) {
+  if (!principalId) return "请选择具有标注权限的成员";
+  if (!members.some((member) => String(member?.principal_id || "").trim() === principalId)) {
+    return "所选成员当前不在可用标注成员列表中，请刷新后重试";
+  }
+  return "";
+}
+
+function argillaRoleLabel(role) {
+  const normalized = String(role || "").trim().toLowerCase();
+  return normalized ? ARGILLA_ROLE_LABELS[normalized] || "未知角色" : "-";
+}
+
+function annotatorMembershipLabel(annotator) {
+  if (annotator?.membership?.present !== true) return "缺失";
+  return annotator?.membership?.role
+    ? `已加入（${argillaRoleLabel(annotator.membership.role)}）`
+    : "已加入";
+}
 
 function requireAnnotator(data) {
   const record = unwrapAnnotator(data);
@@ -38,6 +80,47 @@ function DetailField({ label, children }) {
       <span>{label}</span>
       <strong>{children}</strong>
     </div>
+  );
+}
+
+function AnnotationMemberSelect({
+  value,
+  members,
+  loading,
+  error,
+  busy,
+  onChange,
+  onRetry,
+}) {
+  const hasCandidates = members.length > 0;
+  return (
+    <>
+      <label className="field field-wide">
+        <span>标注成员</span>
+        <select
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          disabled={busy || loading || Boolean(error) || !hasCandidates}
+        >
+          <option value="">请选择有标注权限的成员</option>
+          {members.map((member) => (
+            <option key={member.principal_id} value={member.principal_id}>
+              {memberDisplayName(member)}（{roleLabel(member.role)}）
+            </option>
+          ))}
+        </select>
+      </label>
+      {loading && <div className="status-line">正在读取当前工作区成员...</div>}
+      {!loading && error && (
+        <div className="empty management-error">
+          <span>{error}</span>
+          <button className="btn btn-sm" type="button" onClick={onRetry} disabled={busy}>重试</button>
+        </div>
+      )}
+      {!loading && !error && !hasCandidates && (
+        <div className="hint">当前工作区暂无可选标注成员，请先到成员管理授予标注权限。</div>
+      )}
+    </>
   );
 }
 
@@ -74,13 +157,13 @@ function AnnotatorDetailDrawer({
               <DetailField label="标注人员 ID"><span className="mono-cell">{valueOrDash(annotator.annotator_id)}</span></DetailField>
               <DetailField label="Argilla 用户名">{valueOrDash(annotator.argilla_username)}</DetailField>
               <DetailField label="Argilla 用户 UUID"><span className="mono-cell">{valueOrDash(annotator.argilla_user_id)}</span></DetailField>
-              <DetailField label="Argilla 角色">{valueOrDash(annotator.argilla_role)}</DetailField>
+              <DetailField label="Argilla 角色">{argillaRoleLabel(annotator.argilla_role)}</DetailField>
               <DetailField label="个人工作区 UUID"><span className="mono-cell">{valueOrDash(annotator.personal_workspace_id)}</span></DetailField>
               <DetailField label="验证状态（verification_state）">
                 <span className={`badge ${verificationBadgeClass(annotator)}`}>{verificationLabel(annotator)}</span>
               </DetailField>
               <DetailField label="最近验证时间">{formatTimestamp(annotator.verification?.last_verified_at)}</DetailField>
-              <DetailField label="工作区成员关系">{workspaceMembershipLabel(annotator)}</DetailField>
+              <DetailField label="工作区成员关系">{annotatorMembershipLabel(annotator)}</DetailField>
               <DetailField label="Argilla 工作区 UUID"><span className="mono-cell">{valueOrDash(annotator.membership?.workspace_id)}</span></DetailField>
               <DetailField label="成员关系角色">{valueOrDash(annotator.membership?.role)}</DetailField>
               <DetailField label="记录更新时间">{formatTimestamp(annotator.updated_at)}</DetailField>
@@ -97,23 +180,38 @@ function AnnotatorDetailDrawer({
   );
 }
 
-function ProvisionDrawer({ form, busy, onChange, onClose, onSubmit }) {
+function ProvisionDrawer({
+  form,
+  members,
+  memberLoading,
+  memberError,
+  busy,
+  onChange,
+  onRetryMembers,
+  onClose,
+  onSubmit,
+}) {
   return (
     <div className="drawer-backdrop" onClick={onClose}>
       <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
         <div className="drawer-head">
           <div>
             <h3>新增标注人员</h3>
-            <p>创建请求只提交 Scaffold 用户和一次性初始密码，外部用户名由服务端派生。</p>
+            <p>创建请求只提交所选 Scaffold 成员和一次性初始密码，外部用户名由服务端派生。</p>
           </div>
           <button className="btn btn-sm" type="button" onClick={onClose}>关闭</button>
         </div>
         <form onSubmit={onSubmit}>
           <div className="form-grid drawer-form-grid">
-            <label className="field field-wide">
-              <span>Scaffold 用户 ID</span>
-              <input value={form.scaffold_user_id} onChange={(event) => onChange("scaffold_user_id", event.target.value)} autoComplete="off" />
-            </label>
+            <AnnotationMemberSelect
+              value={form.principal_id}
+              members={members}
+              loading={memberLoading}
+              error={memberError}
+              busy={busy}
+              onChange={(value) => onChange("principal_id", value)}
+              onRetry={onRetryMembers}
+            />
             <label className="field field-wide">
               <span>个人工作区名称（可选）</span>
               <input value={form.personal_workspace_name} onChange={(event) => onChange("personal_workspace_name", event.target.value)} autoComplete="off" />
@@ -132,7 +230,7 @@ function ProvisionDrawer({ form, busy, onChange, onClose, onSubmit }) {
             </label>
           </div>
           <div className="drawer-actions">
-            <button className="btn btn-primary" type="submit" disabled={busy}>{busy ? "提交中..." : "创建并绑定"}</button>
+            <button className="btn btn-primary" type="submit" disabled={busy || memberLoading || Boolean(memberError) || !members.length}>{busy ? "提交中..." : "创建并绑定"}</button>
             <button className="btn" type="button" disabled={busy} onClick={onClose}>取消</button>
           </div>
         </form>
@@ -141,7 +239,17 @@ function ProvisionDrawer({ form, busy, onChange, onClose, onSubmit }) {
   );
 }
 
-function BindDrawer({ form, busy, onChange, onClose, onSubmit }) {
+function BindDrawer({
+  form,
+  members,
+  memberLoading,
+  memberError,
+  busy,
+  onChange,
+  onRetryMembers,
+  onClose,
+  onSubmit,
+}) {
   return (
     <div className="drawer-backdrop" onClick={onClose}>
       <aside className="drawer-panel" onClick={(event) => event.stopPropagation()}>
@@ -154,10 +262,15 @@ function BindDrawer({ form, busy, onChange, onClose, onSubmit }) {
         </div>
         <form onSubmit={onSubmit}>
           <div className="form-grid drawer-form-grid">
-            <label className="field field-wide">
-              <span>Scaffold 用户 ID</span>
-              <input value={form.scaffold_user_id} onChange={(event) => onChange("scaffold_user_id", event.target.value)} autoComplete="off" />
-            </label>
+            <AnnotationMemberSelect
+              value={form.principal_id}
+              members={members}
+              loading={memberLoading}
+              error={memberError}
+              busy={busy}
+              onChange={(value) => onChange("principal_id", value)}
+              onRetry={onRetryMembers}
+            />
             <label className="field field-wide">
               <span>Argilla 用户 UUID</span>
               <input value={form.argilla_user_id} onChange={(event) => onChange("argilla_user_id", event.target.value)} autoComplete="off" />
@@ -172,7 +285,7 @@ function BindDrawer({ form, busy, onChange, onClose, onSubmit }) {
             </label>
           </div>
           <div className="drawer-actions">
-            <button className="btn btn-primary" type="submit" disabled={busy}>{busy ? "提交中..." : "绑定身份"}</button>
+            <button className="btn btn-primary" type="submit" disabled={busy || memberLoading || Boolean(memberError) || !members.length}>{busy ? "提交中..." : "绑定身份"}</button>
             <button className="btn" type="button" disabled={busy} onClick={onClose}>取消</button>
           </div>
         </form>
@@ -193,6 +306,9 @@ export default function AnnotatorsPage({
   const [annotators, setAnnotators] = useState([]);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [memberCandidates, setMemberCandidates] = useState([]);
+  const [memberLoading, setMemberLoading] = useState(false);
+  const [memberLoadError, setMemberLoadError] = useState("");
   const [detail, setDetail] = useState(null);
   const [detailLoading, setDetailLoading] = useState(false);
   const [detailError, setDetailError] = useState("");
@@ -205,7 +321,7 @@ export default function AnnotatorsPage({
   const pendingOperationRef = useRef(null);
 
   const showError = useCallback((error) => {
-    const message = String(error);
+    const message = errorMessage(error);
     setOperationError(message);
     onError?.(message);
   }, [onError]);
@@ -236,11 +352,33 @@ export default function AnnotatorsPage({
       const data = await api.getAnnotators(workspace);
       setAnnotators(unwrapAnnotators(data));
     } catch (error) {
-      const message = String(error);
+      const message = errorMessage(error);
       setLoadError(message);
       showError(message);
     } finally {
       setLoading(false);
+    }
+  }, [canManage, showError, workspace]);
+
+  const loadMembers = useCallback(async () => {
+    if (!workspace || !canManage) {
+      setMemberCandidates([]);
+      setMemberLoadError("");
+      return;
+    }
+    setMemberLoading(true);
+    setMemberLoadError("");
+    setMemberCandidates([]);
+    try {
+      const data = await api.getMembers(workspace);
+      setMemberCandidates(annotationMemberCandidates(data));
+    } catch (error) {
+      const message = errorMessage(error);
+      setMemberLoadError(message);
+      setMemberCandidates([]);
+      showError(message);
+    } finally {
+      setMemberLoading(false);
     }
   }, [canManage, showError, workspace]);
 
@@ -251,7 +389,7 @@ export default function AnnotatorsPage({
     try {
       setDetail(requireAnnotator(await api.getAnnotator(annotatorId, workspace)));
     } catch (error) {
-      const message = String(error);
+      const message = errorMessage(error);
       setDetailError(message);
       showError(message);
     } finally {
@@ -264,8 +402,11 @@ export default function AnnotatorsPage({
     setOperationError("");
     setDetail(null);
     setDetailError("");
+    setProvisionForm(EMPTY_PROVISION_FORM);
+    setBindForm(EMPTY_BIND_FORM);
     loadList();
-  }, [loadList]);
+    loadMembers();
+  }, [loadList, loadMembers]);
 
   useEffect(() => {
     if (!detailId) {
@@ -318,15 +459,17 @@ export default function AnnotatorsPage({
     if (busy) return;
     const scopeError = validateWorkspace();
     if (scopeError) { showError(scopeError); return; }
-    if (!provisionForm.scaffold_user_id.trim()) { showError("请填写 Scaffold 用户 ID"); return; }
+    const principalId = provisionForm.principal_id.trim();
+    const memberError = memberSelectionError(principalId, memberCandidates);
+    if (memberError) { showError(memberError); return; }
     if (!provisionForm.initial_password) { showError("请填写一次性初始密码"); return; }
     const payload = {
       workspace,
-      scaffold_user_id: provisionForm.scaffold_user_id.trim(),
+      principal_id: principalId,
       personal_workspace_name: provisionForm.personal_workspace_name.trim() || undefined,
       initial_password: provisionForm.initial_password,
     };
-    const idempotencyKey = operationKey("annotator.provision", payload.scaffold_user_id);
+    const idempotencyKey = operationKey("annotator.provision", payload.principal_id);
     setBusy(true);
     setOperationError("");
     setNotice("");
@@ -351,16 +494,18 @@ export default function AnnotatorsPage({
     if (busy) return;
     const scopeError = validateWorkspace();
     if (scopeError) { showError(scopeError); return; }
-    if (!bindForm.scaffold_user_id.trim()) { showError("请填写 Scaffold 用户 ID"); return; }
+    const principalId = bindForm.principal_id.trim();
+    const memberError = memberSelectionError(principalId, memberCandidates);
+    if (memberError) { showError(memberError); return; }
     if (!bindForm.argilla_user_id.trim()) { showError("请填写 Argilla 用户 UUID"); return; }
     const payload = {
       workspace,
-      scaffold_user_id: bindForm.scaffold_user_id.trim(),
+      principal_id: principalId,
       argilla_user_id: bindForm.argilla_user_id.trim(),
       argilla_username: bindForm.argilla_username.trim() || undefined,
       personal_workspace_id: bindForm.personal_workspace_id.trim() || undefined,
     };
-    const idempotencyKey = operationKey("annotator.bind", `${payload.scaffold_user_id}:${payload.argilla_user_id}`);
+    const idempotencyKey = operationKey("annotator.bind", `${payload.principal_id}:${payload.argilla_user_id}`);
     setBusy(true);
     setOperationError("");
     setNotice("");
@@ -446,6 +591,16 @@ export default function AnnotatorsPage({
         {!workspace && <div className="empty">当前会话没有可用的 Scaffold 工作区，无法读取标注人员。</div>}
         {workspace && !canManage && <div className="empty">当前工作区缺少 workspace:manage 权限，标注人员管理已禁用。</div>}
         {workspace && canManage && loading && <div className="status-line">正在读取标注人员...</div>}
+        {workspace && canManage && memberLoading && <div className="status-line">正在读取当前工作区成员...</div>}
+        {workspace && canManage && !memberLoading && memberLoadError && (
+          <div className="empty management-error">
+            <div>当前工作区成员读取失败，请重试。</div>
+            <button className="btn btn-sm" type="button" onClick={loadMembers} disabled={memberLoading}>重试</button>
+          </div>
+        )}
+        {workspace && canManage && !memberLoading && !memberLoadError && !memberCandidates.length && (
+          <div className="empty">当前工作区暂无可选标注成员，请先到成员管理授予标注权限。</div>
+        )}
         {workspace && canManage && !loading && loadError && (
           <div className="empty management-error">
             <div>标注人员读取失败，请重试。</div>
@@ -478,7 +633,7 @@ export default function AnnotatorsPage({
                     <td className="mono-cell">{valueOrDash(annotator.argilla_user_id)}</td>
                     <td>{valueOrDash(annotator.argilla_role)}</td>
                     <td className="mono-cell">{valueOrDash(annotator.personal_workspace_id)}</td>
-                    <td>{workspaceMembershipLabel(annotator)}</td>
+                    <td>{annotatorMembershipLabel(annotator)}</td>
                     <td><span className={`badge ${verificationBadgeClass(annotator)}`}>{verificationLabel(annotator)}</span></td>
                     <td>{formatTimestamp(annotator.verification?.last_verified_at)}</td>
                     <td>
@@ -506,8 +661,12 @@ export default function AnnotatorsPage({
       {drawer === "provision" && (
         <ProvisionDrawer
           form={provisionForm}
+          members={memberCandidates}
+          memberLoading={memberLoading}
+          memberError={memberLoadError}
           busy={busy}
           onChange={updateProvisionField}
+          onRetryMembers={loadMembers}
           onClose={closeDrawer}
           onSubmit={submitProvision}
         />
@@ -515,8 +674,12 @@ export default function AnnotatorsPage({
       {drawer === "bind" && (
         <BindDrawer
           form={bindForm}
+          members={memberCandidates}
+          memberLoading={memberLoading}
+          memberError={memberLoadError}
           busy={busy}
           onChange={updateBindField}
+          onRetryMembers={loadMembers}
           onClose={closeDrawer}
           onSubmit={submitBind}
         />

@@ -70,7 +70,7 @@ ALLOCATION_TABLES = {
     "annotation_jobs",
 }
 
-EXPECTED_ALEMBIC_HEAD = "20260717_0007"
+EXPECTED_ALEMBIC_HEAD = "20260721_0008"
 
 EXPECTED_ALLOCATION_ENUMS = {
     "argilla_binding_state": ("active", "disabled"),
@@ -207,6 +207,7 @@ EXPECTED_TABLES = {
     "role_bindings",
     "tasks",
     "idempotency_records",
+    "workspace_invitations",
     "workspace_settings",
     "audit_events",
     "migration_runs",

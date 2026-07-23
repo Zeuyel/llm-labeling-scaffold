@@ -207,7 +207,11 @@ def test_cloudflare_access_real_ipv4_http_path_handles_auth_and_duplicate_header
         "authenticated": True,
         "user": {"display_name": "Alice", "email": "alice@example.com"},
         "authentication": {"method": "cloudflare_access"},
-        "authorization": {"state": "ready", "workspaces": []},
+        "authorization": {
+            "state": "ready",
+            "workspaces": [],
+            "invitation_claims": {"status": "none", "items": []},
+        },
     }
     assert response_headers["Cache-Control"] == "no-store, private"
     assert authenticator.observed_headers[-1] == {
@@ -239,5 +243,9 @@ def test_panel_ipv6_loopback_bind_and_request():
         "authenticated": True,
         "user": {"display_name": "admin"},
         "authentication": {"method": "basic_dev"},
-        "authorization": {"state": "ready", "workspaces": []},
+        "authorization": {
+            "state": "ready",
+            "workspaces": [],
+            "invitation_claims": {"status": "not_claimable_no_email", "items": []},
+        },
     }
