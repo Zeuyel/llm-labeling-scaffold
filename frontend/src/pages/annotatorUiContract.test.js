@@ -31,6 +31,19 @@ test("provision 密码只提交当前请求并在完成后清空", () => {
   assert.doesNotMatch(page, /sessionStorage\.(setItem|getItem)/);
 });
 
+test("标注人员只能选择当前工作区的可用成员", () => {
+  const page = source("pages/AnnotatorsPage.jsx");
+  assert.match(page, /api\.getMembers\(workspace\)/);
+  assert.match(page, /unwrapMembers\(data\)\.members/);
+  assert.match(page, /status === "active"/);
+  for (const role of ["annotator", "experimenter", "admin"]) assert.match(page, new RegExp(`"${role}"`));
+  assert.match(page, /value=\{form\.principal_id\}/);
+  assert.match(page, /onChange=\{\(value\) => onChange\("principal_id", value\)\}/);
+  assert.doesNotMatch(page, /form\.scaffold_user_id/);
+  assert.match(page, /成员管理授予标注权限/);
+  assert.match(page, /roleLabel\(member\.role\)/);
+});
+
 test("人员组编辑携带 expected_revision 且删除能力明确禁用", () => {
   const page = source("pages/CohortsPage.jsx");
   assert.match(page, /expected_revision/);

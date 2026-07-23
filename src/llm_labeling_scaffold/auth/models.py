@@ -10,6 +10,7 @@ class Identity:
     subject: str
     email: str | None = None
     display_name: str | None = None
+    email_verified: bool = False
 
     @property
     def identity_key(self) -> tuple[str, str]:

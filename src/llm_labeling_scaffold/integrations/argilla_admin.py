@@ -167,6 +167,7 @@ class ArgillaAdminAdapter:
         last_name: str | None = None,
         expected_user_uuid: UUID | str | None = None,
         expected_workspace_uuid: UUID | str | None = None,
+        shared_workspace_uuid: UUID | str | None = None,
     ) -> ArgillaUserDTO:
         create_input = _EphemeralUserCreateInput(password, first_name, last_name)
         password = None
@@ -193,6 +194,20 @@ class ArgillaAdminAdapter:
                 user=user,
                 user_dto=user_dto,
             )
+            if shared_workspace_uuid is not None:
+                shared_workspace = self._workspace_by_uuid(
+                    _expected_uuid(shared_workspace_uuid, "shared_workspace_uuid")
+                )
+                if shared_workspace is None:
+                    raise ArgillaProvisioningError(
+                        "shared_workspace_missing",
+                        "当前 Argilla 共享 workspace 不存在；拒绝继续绑定",
+                    )
+                self._ensure_membership(
+                    workspace=shared_workspace,
+                    user=user,
+                    user_dto=user_dto,
+                )
             return user_dto
         finally:
             create_input.clear()

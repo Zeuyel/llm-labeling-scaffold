@@ -25,19 +25,22 @@ Cloudflare Access 认证
 
 `email`、display name 和邮箱域名只用于显示或审计外的快照，身份权威始终是认证提供方的 `issuer` 与稳定 `subject`。同一个邮箱在不同 issuer 或 subject 下是不同 principal；邮箱相同也不会自动合并或获得 membership。
 
-本目标基线已提供：
+当前控制面已提供：
 
 - `/api/session`：返回当前认证状态、可见 workspace、role 和 capability；
+- `/api/members`：列出当前 workspace 成员和邀请记录，并创建邀请；
+- `/api/members/invitations/{invitation_id}/revoke`：幂等撤销尚未认领的邀请；已认领邀请拒绝撤销，已撤销或已过期邀请保持原状态；
+- `/api/members/{principal_id}/role`、`/api/members/{principal_id}/revoke`：幂等变更或撤销成员资格；
 - `/api/annotators`、`/api/annotators/{id}`、`/api/cohorts` 等 Panel 控制路由；
-- `DatabaseService.grant_workspace_membership`、`change_workspace_membership`、`revoke_workspace_membership` 成员变更 façade。
+- `DatabaseService` 的成员变更 façade，供控制面和受控后台调用。
 
-本目标基线没有独立的通用 `/api/members` 路由。部署验收必须确认实际发布的 Panel 成员管理入口已经调用上述 façade；没有该入口时，不得把 Cloudflare Access policy、直接 SQL 或 Argilla owner API 当作成员管理替代品。
+成员管理页使用 `/api/members` 作为稳定的工作区成员生命周期入口。Cloudflare Access policy、直接 SQL 或 Argilla owner API 都不能替代该入口。
 
 ### 任务授权的强制不变量
 
 task-scoped ACL 只能在 active principal、active workspace 和 active workspace-scoped membership 已确认后增加任务权限。它可以细化某个任务的能力，但不能脱离 workspace membership 单独授权；workspace membership revoke 必须立即阻止任务列表、读取、写入和管理操作。旧 task ACL 行可以随后清理，但不能作为继续放行的依据。
 
-**发布阻断：** 目标基线当前的 task list/decision 查询仍存在 task binding 单独命中的风险，必须先修正并通过回归测试，才能把本节的撤销验收标记为通过。本文不把“task ACL 记录独立存在”解释为“task ACL 可以绕过 workspace membership”。
+任务列表和判权查询都把 active workspace membership 作为前置条件；残留 task ACL 不能绕过该条件。发布验收仍需运行撤销回归测试。
 
 ## 2. 首次管理员 bootstrap
 
@@ -87,10 +90,10 @@ Access policy 允许用户登录，不等于以下任何一项：
 “邀请用户”是三个可审计动作，不是一次 Access 配置：
 
 1. **Access 放行**：管理员在 Cloudflare Access policy 中允许目标身份访问 Panel hostname。这一步只解决认证。
-2. **Scaffold principal 与 workspace role**：由已发布的 Panel 成员管理入口或受控后台作业按稳定 `(issuer, subject)` 创建/解析 principal，再调用 `grant_workspace_membership`。未知身份最多创建零权限 principal；不能在解析身份时顺便授予 role。
-3. **首次登录确认**：用户访问 Panel 并完成 Access 登录。管理员确认 `/api/session` 的 workspace、role 和 capability 与授权单一致；用户不需要、也不应提交 JWT、Access assertion 或自报 `X-Actor`。
+2. **创建邀请**：管理员在 Panel 成员管理页按邮箱和目标 role 创建邀请记录。该记录不会因邮箱后缀自动授予权限，也不会把邮箱当成 principal 主键。
+3. **首次登录认领**：用户访问 Panel 并完成 Access 登录，系统仅在认证邮箱与未过期邀请精确匹配且邮箱已被可信验证时认领邀请，并以 `(issuer, subject)` 创建或解析 principal。默认要求 Access JWT 提供签名的 `email_verified=true`；使用已由 Access 验证邮箱的 One-time PIN 应用时，管理员必须显式开启 `LLS_CF_ACCESS_TRUST_EMAIL_CLAIM=1`。管理员再确认 `/api/session` 的 workspace、role 和 capability 与授权单一致；用户不需要、也不应提交 JWT、Access assertion 或自报 `X-Actor`。
 
-管理员只能在自己拥有 `workspace:manage` 的 workspace 内执行成员变更。每次变更应记录目标 identity、workspace、旧 role、新 role、操作人、caller、channel 和 request ID。不要通过浏览器直接提交数据库主键、actor 或 caller 来扩大权限。
+管理员只能在自己拥有 `workspace:manage` 的 workspace 内执行成员变更。每次变更应记录目标 identity、workspace、旧 role、新 role、操作人、caller、channel 和 request ID。不要通过浏览器直接提交数据库主键、actor 或 caller 来扩大权限。成员管理写请求必须带 `Idempotency-Key`。
 
 成员变更的语义如下：
 

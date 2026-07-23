@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -22,6 +22,7 @@ from .enums import (
     ArgillaBindingState,
     AuditChannel,
     IdempotencyState,
+    Role,
 )
 from .models import (
     AnnotatorCohort,
@@ -738,6 +739,17 @@ class AnnotatorControlRepository:
             if row is None:
                 raise AnnotatorResourceNotFound("annotator mapping was not found")
             mapping, principal = row
+            platform_membership = session.scalar(
+                select(RoleBinding.id)
+                .join(Principal, Principal.id == RoleBinding.principal_id)
+                .where(
+                    RoleBinding.workspace_id == workspace.id,
+                    RoleBinding.task_id.is_(None),
+                    RoleBinding.principal_id == mapping.principal_id,
+                    Principal.is_active.is_(True),
+                    RoleBinding.role.in_((Role.ANNOTATOR, Role.EXPERIMENTER, Role.ADMIN)),
+                )
+            ) if mapping.principal_id is not None else None
             binding = session.scalar(
                 select(ArgillaConnectionBinding)
                 .where(
@@ -748,6 +760,8 @@ class AnnotatorControlRepository:
             )
             if mapping.state != AnnotatorMappingState.ACTIVE:
                 rejected_reason = "mapping_disabled"
+            elif platform_membership is None:
+                rejected_reason = "scaffold_membership_missing"
             elif binding is None or binding.state != ArgillaBindingState.ACTIVE:
                 rejected_reason = "workspace_binding_unavailable"
             elif normalized_role != "annotator":
@@ -1378,6 +1392,19 @@ class AnnotatorControlRepository:
         mapping_ids = [member.annotator_mapping_id for member in members]
         mappings = session.scalars(
             select(ArgillaAnnotatorMapping)
+            .join(
+                Principal,
+                Principal.id == ArgillaAnnotatorMapping.principal_id,
+            )
+            .join(
+                RoleBinding,
+                and_(
+                    RoleBinding.workspace_id == ArgillaAnnotatorMapping.workspace_id,
+                    RoleBinding.principal_id == ArgillaAnnotatorMapping.principal_id,
+                    RoleBinding.task_id.is_(None),
+                    RoleBinding.role.in_((Role.ANNOTATOR, Role.EXPERIMENTER, Role.ADMIN)),
+                ),
+            )
             .where(
                 ArgillaAnnotatorMapping.workspace_id == cohort.workspace_id,
                 ArgillaAnnotatorMapping.connection_binding_id == binding_id,
@@ -1385,6 +1412,7 @@ class AnnotatorControlRepository:
                 ArgillaAnnotatorMapping.state == AnnotatorMappingState.ACTIVE,
                 ArgillaAnnotatorMapping.verification_state == AnnotatorVerificationState.VERIFIED,
                 ArgillaAnnotatorMapping.argilla_user_id.is_not(None),
+                Principal.is_active.is_(True),
             )
             .with_for_update(),
         ).all()

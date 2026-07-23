@@ -46,6 +46,7 @@ from .enums import (
     ArgillaBindingState,
     AuditChannel,
     CollectionDisposition,
+    Role,
 )
 from .models import (
     AllocationAssignment,
@@ -64,6 +65,7 @@ from .models import (
     ArgillaConnectionBinding,
     AuditEvent,
     Principal,
+    RoleBinding,
     Task,
     TaskRevision,
 )
@@ -1090,6 +1092,19 @@ class TrustedAllocationRepository:
                 and_(
                     ArgillaAnnotatorMapping.workspace_id == AnnotatorCohortMember.workspace_id,
                     ArgillaAnnotatorMapping.id == AnnotatorCohortMember.annotator_mapping_id,
+                ),
+            )
+            .join(
+                Principal,
+                Principal.id == ArgillaAnnotatorMapping.principal_id,
+            )
+            .join(
+                RoleBinding,
+                and_(
+                    RoleBinding.workspace_id == ArgillaAnnotatorMapping.workspace_id,
+                    RoleBinding.principal_id == ArgillaAnnotatorMapping.principal_id,
+                    RoleBinding.task_id.is_(None),
+                    RoleBinding.role.in_((Role.ANNOTATOR, Role.EXPERIMENTER, Role.ADMIN)),
                 ),
             )
             .where(

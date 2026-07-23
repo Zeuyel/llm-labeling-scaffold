@@ -83,7 +83,7 @@ class _FakeRepository:
             argilla_role="annotator",
             membership_verified=True,
         )
-        self.binding = SimpleNamespace(id=BINDING_ID)
+        self.binding = SimpleNamespace(id=BINDING_ID, argilla_workspace_id=ARGILLA_WORKSPACE_ID)
         self.cohort = _FakeCohort()
         self.calls: list[tuple[str, dict]] = []
         self.audit_details: list[dict] = []
@@ -313,6 +313,25 @@ def test_http_get_dispatch_and_workspace_scope(control_plane):
             item["method"] == "POST" and item["path"] == "/api/annotators"
             for item in capabilities["endpoints"]
         )
+
+
+def test_member_invitation_revoke_route_is_advertised():
+    invitation_id = "00000000-0000-4000-8000-000000000002"
+    assert panel._member_route_kind(
+        "POST",
+        f"/api/members/invitations/{invitation_id}/revoke",
+    ) == ("member_invitation_revoke", invitation_id)
+    assert panel._member_route_kind(
+        "POST",
+        "/api/members/invitations/not-a-uuid/revoke",
+    ) == ("member_invitation_revoke", "not-a-uuid")
+    contract = next(
+        item
+        for item in panel._member_contract_endpoints()
+        if item["action"] == "member_invitation_revoke"
+    )
+    assert contract["path"] == "/api/members/invitations/{invitation_id}/revoke"
+    assert contract["path_params"]["invitation_id"]["format"] == "uuid"
 
 
 def test_http_write_dispatch_uses_idempotency_and_serializes_update(control_plane):

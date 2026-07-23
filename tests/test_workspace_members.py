@@ -13,6 +13,7 @@ from llm_labeling_scaffold.db import (
     AuthorizationReason,
     DatabaseService,
     ExternalIdentity,
+    InvitationConflict,
     LastWorkspaceAdmin,
     MembershipMutationAction,
     Permission,
@@ -108,6 +109,16 @@ def test_pending_invitation_claim_requires_verified_email_and_is_identity_bound(
     assert replay.invitation.id == invite.invitation.id
     assert replay.claim_status == "pending"
 
+    unverified = service.get_session(
+        ExternalIdentity(
+            member_database["issuer"],
+            "unverified-subject",
+            email_snapshot="invitee@example.test",
+        )
+    )
+    assert unverified.principal is None
+    assert unverified.workspaces == ()
+
     no_email = ExternalIdentity(member_database["issuer"], "no-email")
     no_email_invite = service.create_workspace_invitation(
         workspace_slug="members-a",
@@ -130,6 +141,7 @@ def test_pending_invitation_claim_requires_verified_email_and_is_identity_bound(
         member_database["issuer"],
         "invitee-subject",
         email_snapshot="invitee@example.test",
+        email_verified=True,
     )
     claimed = service.get_session(invitee)
     assert claimed.principal is not None
@@ -147,6 +159,7 @@ def test_pending_invitation_claim_requires_verified_email_and_is_identity_bound(
             member_database["issuer"],
             "different-subject",
             email_snapshot="invitee@example.test",
+            email_verified=True,
         )
     )
     assert same_email_other_subject.principal is None
@@ -253,6 +266,7 @@ def test_invitation_claim_keeps_pending_on_role_conflict(member_database):
         member_database["issuer"],
         "conflicting-subject",
         email_snapshot="conflict@example.test",
+        email_verified=True,
     )
     target_ref = service.resolve_or_provision(target)
     service.grant_workspace_membership(
@@ -289,6 +303,102 @@ def test_invitation_claim_keeps_pending_on_role_conflict(member_database):
                 RoleBinding.role == Role.VIEWER,
             )
         ) == 1
+
+
+def test_invitation_revoke_is_idempotent_and_rejects_claimed(member_database):
+    service = member_database["service"]
+    admin = member_database["admin"]
+    pending = service.create_workspace_invitation(
+        workspace_slug="members-a",
+        email="revoke-pending@example.test",
+        role=Role.ANNOTATOR,
+        actor_identity=admin,
+        caller_identity=admin,
+        idempotency_key="revoke-invitation-create",
+        channel=AuditChannel.PANEL,
+    )
+
+    revoked = service.revoke_workspace_invitation(
+        workspace_slug="members-a",
+        invitation_id=pending.invitation.id,
+        actor_identity=admin,
+        caller_identity=admin,
+        idempotency_key="revoke-invitation-1",
+        channel=AuditChannel.PANEL,
+    )
+    assert revoked.action == "revoked"
+    assert revoked.invitation.status == WorkspaceInvitationStatus.REVOKED
+
+    replay = service.revoke_workspace_invitation(
+        workspace_slug="members-a",
+        invitation_id=pending.invitation.id,
+        actor_identity=admin,
+        caller_identity=admin,
+        idempotency_key="revoke-invitation-1",
+        channel=AuditChannel.PANEL,
+    )
+    assert replay.replayed is True
+    assert replay.action == "revoked"
+
+    unchanged = service.revoke_workspace_invitation(
+        workspace_slug="members-a",
+        invitation_id=pending.invitation.id,
+        actor_identity=admin,
+        caller_identity=admin,
+        idempotency_key="revoke-invitation-2",
+        channel=AuditChannel.PANEL,
+    )
+    assert unchanged.action == "unchanged"
+    assert unchanged.invitation.status == WorkspaceInvitationStatus.REVOKED
+
+    expired = service.create_workspace_invitation(
+        workspace_slug="members-a",
+        email="revoke-expired@example.test",
+        role=Role.ANNOTATOR,
+        actor_identity=admin,
+        caller_identity=admin,
+        idempotency_key="revoke-expired-create",
+        channel=AuditChannel.PANEL,
+    )
+    with Session(member_database["engine"]) as db_session, db_session.begin():
+        db_session.get(WorkspaceInvitation, expired.invitation.id).status = WorkspaceInvitationStatus.EXPIRED
+    expired_result = service.revoke_workspace_invitation(
+        workspace_slug="members-a",
+        invitation_id=expired.invitation.id,
+        actor_identity=admin,
+        caller_identity=admin,
+        idempotency_key="revoke-expired-1",
+        channel=AuditChannel.PANEL,
+    )
+    assert expired_result.action == "unchanged"
+    assert expired_result.invitation.status == WorkspaceInvitationStatus.EXPIRED
+
+    claimed = service.create_workspace_invitation(
+        workspace_slug="members-a",
+        email="revoke-claimed@example.test",
+        role=Role.ANNOTATOR,
+        actor_identity=admin,
+        caller_identity=admin,
+        idempotency_key="revoke-claimed-create",
+        channel=AuditChannel.PANEL,
+    )
+    service.get_session(
+        ExternalIdentity(
+            member_database["issuer"],
+            "revoke-claimed-subject",
+            email_snapshot="revoke-claimed@example.test",
+            email_verified=True,
+        )
+    )
+    with pytest.raises(InvitationConflict):
+        service.revoke_workspace_invitation(
+            workspace_slug="members-a",
+            invitation_id=claimed.invitation.id,
+            actor_identity=admin,
+            caller_identity=admin,
+            idempotency_key="revoke-claimed-1",
+            channel=AuditChannel.PANEL,
+        )
 
 
 def test_idempotent_self_role_downgrade_completes_after_authority_changes(member_database):

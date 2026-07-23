@@ -73,6 +73,7 @@ class ExternalIdentity:
     subject: str
     email_snapshot: str | None = None
     display_name_snapshot: str | None = None
+    email_verified: bool = False
 
     def __post_init__(self) -> None:
         if not self.issuer.strip() or not self.subject.strip():
@@ -545,6 +546,28 @@ class DatabaseService:
                 workspace_slug=workspace_slug,
                 email=email,
                 role=role,
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=idempotency_key,
+                channel=channel,
+                request_id=request_id,
+            )
+
+    def revoke_workspace_invitation(
+        self,
+        *,
+        workspace_slug: str,
+        invitation_id: uuid.UUID | str,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> WorkspaceInvitationResult:
+        with self.transaction() as transaction:
+            return transaction.revoke_workspace_invitation(
+                workspace_slug=workspace_slug,
+                invitation_id=invitation_id,
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
                 idempotency_key=idempotency_key,
@@ -1148,6 +1171,8 @@ class DatabaseTransaction:
         self,
         identity: ExternalIdentity,
     ) -> tuple[InvitationClaimRef, ...]:
+        if identity.email_verified is not True:
+            return ()
         normalized_email = normalize_optional_invitation_email(identity.email_snapshot)
         if normalized_email is None:
             return ()
@@ -2539,6 +2564,100 @@ class DatabaseTransaction:
             replayed=False,
         )
 
+    def revoke_workspace_invitation(
+        self,
+        *,
+        workspace_slug: str,
+        invitation_id: uuid.UUID | str,
+        actor_identity: ExternalIdentity,
+        caller_identity: ExternalIdentity,
+        idempotency_key: str,
+        channel: AuditChannel,
+        request_id: str | None = None,
+    ) -> WorkspaceInvitationResult:
+        normalized_invitation_id = _invitation_uuid(invitation_id)
+        claim = self.claim_idempotency(
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            workspace_slug=workspace_slug,
+            required_permission=Permission.WORKSPACE_MANAGE,
+            operation="workspace.invitation.revoke",
+            idempotency_key=idempotency_key,
+            request_payload={"invitation_id": str(normalized_invitation_id)},
+            channel=channel,
+        )
+        if claim.status == IdempotencyClaimStatus.REPLAY:
+            return _workspace_invitation_result_from_claim(self._session, claim, replayed=True)
+        if claim.status == IdempotencyClaimStatus.PENDING:
+            raise MembershipOperationInProgress("workspace invitation revoke is already in progress")
+
+        workspace = self._session.scalar(
+            select(Workspace)
+            .where(Workspace.id == claim.workspace_id, Workspace.slug == workspace_slug)
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        if workspace is None:
+            raise AuthorizationDenied(
+                _decision(Permission.WORKSPACE_MANAGE, AuthorizationReason.RESOURCE_NOT_VISIBLE)
+            )
+        invitation = self._session.scalar(
+            select(WorkspaceInvitation)
+            .where(
+                WorkspaceInvitation.id == normalized_invitation_id,
+                WorkspaceInvitation.workspace_id == workspace.id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True),
+        )
+        if invitation is None:
+            raise MembershipNotFound("workspace invitation does not exist")
+        if invitation.status == WorkspaceInvitationStatus.CLAIMED:
+            raise InvitationConflict("claimed workspace invitation cannot be revoked")
+
+        action = "unchanged"
+        if invitation.status == WorkspaceInvitationStatus.PENDING:
+            invitation.status = WorkspaceInvitationStatus.REVOKED
+            append_audit_event(
+                self._session,
+                workspace_id=workspace.id,
+                event_type="workspace.invitation_revoked",
+                actor=self._session.get(Principal, claim.actor_principal_id),
+                caller=self._session.get(Principal, claim.caller_principal_id),
+                channel=channel,
+                resource_type="workspace_invitation",
+                resource_id=invitation.id,
+                request_id=request_id,
+                details={
+                    "invitation_id": str(invitation.id),
+                    "role": invitation.role.value,
+                },
+            )
+            self._session.flush()
+            action = "revoked"
+
+        response = _workspace_invitation_response(
+            invitation,
+            workspace,
+            action=action,
+            claim_status=invitation.status.value,
+        )
+        completed = self.complete_idempotency(
+            claim,
+            actor_identity=actor_identity,
+            caller_identity=caller_identity,
+            response_status=200,
+            response_body=response,
+            request_id=request_id,
+        )
+        return WorkspaceInvitationResult(
+            action=action,
+            invitation=_workspace_invitation_ref(invitation, workspace),
+            claim_status=invitation.status.value,
+            response_status=completed.response_status or 200,
+            replayed=False,
+        )
+
     def change_workspace_membership_by_principal_id(
         self,
         *,
@@ -3621,6 +3740,13 @@ def _principal_uuid(value: uuid.UUID | str) -> uuid.UUID:
         return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value).strip())
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError("principal_id must be a valid UUID") from exc
+
+
+def _invitation_uuid(value: uuid.UUID | str) -> uuid.UUID:
+    try:
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value).strip())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("invitation_id must be a valid UUID") from exc
 
 
 def _utc_datetime(value: datetime) -> datetime:

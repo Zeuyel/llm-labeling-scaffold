@@ -305,6 +305,7 @@ def _external_identity(principal) -> ExternalIdentity:
         subject=principal.identity.subject,
         email_snapshot=principal.identity.email,
         display_name_snapshot=principal.identity.display_name,
+        email_verified=principal.identity.email_verified,
     )
 
 
@@ -864,6 +865,22 @@ class _PanelArgillaAdminFacade:
             _annotator_uuid(snapshot.personal_workspace_id, "personal_workspace_id")
         return snapshot
 
+    def _shared_workspace_uuid(self, workspace: str) -> str:
+        if self.repository is None:
+            raise PanelAnnotatorError(
+                "repository_unavailable",
+                "Argilla workspace binding 尚未就绪",
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+        binding = self.repository._binding(workspace)
+        if binding.argilla_workspace_id is None:
+            raise PanelAnnotatorError(
+                "workspace_binding_unavailable",
+                "Argilla 共享 workspace 尚未配置",
+                HTTPStatus.CONFLICT,
+            )
+        return _annotator_uuid(binding.argilla_workspace_id, "argilla_workspace_id").__str__()
+
     def _ensure(
         self,
         *,
@@ -872,6 +889,7 @@ class _PanelArgillaAdminFacade:
         personal_workspace_name: str | None,
         expected_user_uuid: str | None = None,
         expected_workspace_uuid: str | None = None,
+        shared_workspace_uuid: str | None = None,
         membership_present: bool = True,
     ) -> ExternalAnnotatorSnapshot:
         if personal_workspace_name is not None:
@@ -899,6 +917,11 @@ class _PanelArgillaAdminFacade:
                 expected_workspace_uuid=(
                     _annotator_uuid(expected_workspace_uuid, "personal_workspace_id")
                     if expected_workspace_uuid is not None
+                    else None
+                ),
+                shared_workspace_uuid=(
+                    _annotator_uuid(shared_workspace_uuid, "argilla_workspace_id")
+                    if shared_workspace_uuid is not None
                     else None
                 ),
             )
@@ -960,11 +983,11 @@ class _PanelArgillaAdminFacade:
         personal_workspace_name: str | None,
         initial_password: str,
     ) -> ExternalAnnotatorSnapshot:
-        del workspace
         return self._ensure(
             principal_identity=principal_identity,
             password=initial_password,
             personal_workspace_name=personal_workspace_name,
+            shared_workspace_uuid=self._shared_workspace_uuid(workspace),
         )
 
     def bind_annotator(
@@ -976,13 +999,14 @@ class _PanelArgillaAdminFacade:
         argilla_username: str | None,
         personal_workspace_id: str | None,
     ) -> ExternalAnnotatorSnapshot:
-        del workspace, argilla_username
+        del argilla_username
         return self._ensure(
             principal_identity=principal_identity,
             password=None,
             personal_workspace_name=None,
             expected_user_uuid=argilla_user_id,
             expected_workspace_uuid=personal_workspace_id,
+            shared_workspace_uuid=self._shared_workspace_uuid(workspace),
         )
 
     def verify_annotator(self, *, annotator: AnnotatorLookup) -> ExternalAnnotatorSnapshot:
@@ -1001,6 +1025,7 @@ class _PanelArgillaAdminFacade:
             personal_workspace_name=None,
             expected_user_uuid=annotator.argilla_user_id,
             expected_workspace_uuid=annotator.personal_workspace_id,
+            shared_workspace_uuid=self._shared_workspace_uuid(annotator.workspace),
         )
         if self.repository is not None:
             self.repository.pending_verification_snapshot = snapshot
@@ -1335,6 +1360,17 @@ def _member_contract_endpoints() -> list[dict[str, Any]]:
             "path_params": {"principal_id": {"type": "string", "format": "uuid"}},
             "request_schema": {"type": "object", "required": ["workspace"]},
             "response_schema": {"type": "object", "required": ["membership", "replayed"]},
+        },
+        {
+            "method": "POST",
+            "path": "/api/members/invitations/{invitation_id}/revoke",
+            "action": "member_invitation_revoke",
+            "side_effects": True,
+            "required_permission": WORKSPACE_MANAGE_PERMISSION,
+            "required_headers": write_headers,
+            "path_params": {"invitation_id": {"type": "string", "format": "uuid"}},
+            "request_schema": {"type": "object", "required": ["workspace"]},
+            "response_schema": {"type": "object", "required": ["invitation", "claim", "replayed"]},
         },
     ]
 
@@ -2034,6 +2070,12 @@ def _member_route_kind(method: str, path: str) -> tuple[str, str | None] | None:
     if method == "POST":
         if path == "/api/members/invitations":
             return "member_invitation_create", None
+        invitation_prefix = "/api/members/invitations/"
+        invitation_suffix = "/revoke"
+        if path.startswith(invitation_prefix) and path.endswith(invitation_suffix):
+            value = _panel_path_segment(path[len(invitation_prefix):-len(invitation_suffix)])
+            if value is not None and "/" not in value:
+                return "member_invitation_revoke", value
         prefix = "/api/members/"
         suffix = "/revoke"
         if path.startswith(prefix) and path.endswith(suffix):
@@ -2784,6 +2826,17 @@ class _Handler(BaseHTTPRequestHandler):
                 "principal_id 必须是合法 UUID",
             ) from exc
 
+    @staticmethod
+    def _member_invitation_id(value: str) -> uuid.UUID:
+        try:
+            return uuid.UUID(str(value).strip())
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise _PanelRouteError(
+                HTTPStatus.UNPROCESSABLE_ENTITY,
+                "invalid_invitation_id",
+                "invitation_id 必须是合法 UUID",
+            ) from exc
+
     def _member_idempotency_key(self) -> str:
         value = str(self.headers.get("Idempotency-Key") or "").strip()
         if not _valid_idempotency_key(value):
@@ -2840,6 +2893,37 @@ class _Handler(BaseHTTPRequestHandler):
                 workspace_slug=workspace_slug,
                 email=body["email"],
                 role=self._member_role(body["role"]),
+                actor_identity=actor_identity,
+                caller_identity=caller_identity,
+                idempotency_key=self._member_idempotency_key(),
+                channel=channel,
+                request_id=self._member_request_id(),
+            )
+            self._json(
+                {
+                    "workspace": result.invitation.workspace.slug,
+                    "invitation": _workspace_invitation_payload(result.invitation),
+                    "claim": {"status": result.claim_status},
+                    "action": result.action,
+                    "replayed": result.replayed,
+                },
+                status=result.response_status,
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
+    def _member_invitation_revoke(self, invitation_id_value: str, params) -> None:
+        try:
+            invitation_id = self._member_invitation_id(invitation_id_value)
+            body = self._member_body(
+                self._read_body(),
+                allowed={"workspace"},
+                required={"workspace"},
+            )
+            service, actor_identity, caller_identity, channel = self._authorization_context()
+            result = service.revoke_workspace_invitation(
+                workspace_slug=self._member_workspace(params, body),
+                invitation_id=invitation_id,
                 actor_identity=actor_identity,
                 caller_identity=caller_identity,
                 idempotency_key=self._member_idempotency_key(),
@@ -4992,6 +5076,8 @@ class _Handler(BaseHTTPRequestHandler):
             kind, resource_id = member_route
             if kind == "member_invitation_create":
                 self._member_invitation_create(params)
+            elif kind == "member_invitation_revoke":
+                self._member_invitation_revoke(resource_id, params)
             elif kind == "member_revoke":
                 self._member_revoke(resource_id, params)
             return

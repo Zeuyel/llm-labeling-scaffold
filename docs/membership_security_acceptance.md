@@ -8,7 +8,7 @@
 - Cloudflare Access 只负责证明请求携带了配置 application 的有效身份断言，不授予 workspace 或 task 权限。
 - Scaffold RBAC 以不可变的 `(issuer, subject)` principal 为授权主体。workspace role 与 task ACL 是两个独立 scope，但 task ACL 只有在 active workspace membership 内才生效；未知主体、无 membership 和不可见资源必须默认拒绝并避免枚举。
 - 当前标注人员 API 管理的是 Argilla 外部身份映射，不等于 Scaffold 平台成员。Argilla annotator、Argilla workspace membership 和平台 workspace membership 不能互相替代。
-- 平台成员的 grant/change/revoke 当前只有 `DatabaseService` Python façade 可作为稳定公共契约。目标基线没有平台成员管理 HTTP 路由或成员管理页；因此不能把 `/api/annotators` 契约当作平台成员生命周期契约。
+- 平台成员的列表、邀请、角色变更和撤销由 `/api/members` 及 `DatabaseService` façade 共同提供稳定契约；`/api/annotators` 仍只管理 Argilla 外部身份映射。
 - R2 是任务与数据湖的对象权威，不是成员身份源。R2 URI、Argilla user UUID、邮箱和客户端 headers 都不能直接授予数据访问；应用必须先完成 Scaffold task authorization，再执行受控的 R2 读写。
 
 ## 四层边界
@@ -60,20 +60,20 @@ task-scoped R2 operation with manifest/hash checks
 | RBAC-10 | 幂等上下文 | key 只保存 hash；workspace + operation + hash 唯一；actor、caller、fingerprint、permission、resource、channel 不一致时 conflict；撤销后 completion 重新判权 | `test_idempotency_key_is_bound_to_actor_caller_and_fingerprint`、`test_idempotency_claim_conflicts_and_successful_replay`、`test_idempotency_completion_rejects_revoked_membership`、forged claim tests | 已覆盖 |
 | EXT-01 | Argilla annotator mapping | 仅验证/创建外部 annotator 与 Argilla membership；不得由 Argilla role 或 verified mapping 推导 Scaffold platform role | `tests/test_argilla_admin.py`、`tests/test_annotator_repository.py::test_binding_mapping_verification_and_sensitive_boundary`、`tests/test_panel_annotators.py` | 已覆盖外部映射边界 |
 | DATA-01 | R2 任务/数据访问 | 先通过 Scaffold task authorization，再依据 registry/manifest/hash 读写；R2 凭据属于运行时信任根，不是逐用户 principal | `docs/data_governance.md`、`tests/test_data_lake_publish.py`、`tests/test_smoke.py` | 本地契约覆盖；无真实 R2 成员联测 |
-| HTTP-01 | 平台成员管理页和 HTTP 生命周期 | 提供显式成员列表、grant/change/revoke、最后 admin、审计和幂等响应契约；请求 actor/caller 由服务端注入 | 目标基线没有 `/api/members` 或等价平台成员路由，只有 `DatabaseService` façade | 阻塞，需后端/控制面实现后补测 |
+| HTTP-01 | 平台成员管理页和 HTTP 生命周期 | 提供显式成员列表、邀请、change/revoke、最后 admin、审计和幂等响应契约；请求 actor/caller 由服务端注入 | `tests/test_workspace_members.py`、`tests/test_panel_control.py`、`tests/test_panel_login.py` | 已覆盖 |
 
 ## 成员与标注人员的边界
 
 “当前标注人员”在本代码库中指 Argilla 外部身份映射记录。它可以包含 Scaffold principal 引用、Argilla user UUID、Argilla username、个人 workspace UUID、外部 membership 和 verification 状态，但这些字段描述的是外部标注运行时资源，不是平台 workspace membership。
 
-平台成员必须由新的成员管理页和其后端成员管理 API 负责。成员管理页至少要操作 Scaffold 的 `(issuer, subject)` principal、workspace role 和显式 task ACL，并在变更后使后续请求立即重新判权。`/api/annotators`、`/api/cohorts` 只能管理 Argilla 映射、外部验证和人员组，不能被复用为平台成员管理页。
+平台成员由成员管理页和 `/api/members` 负责。邀请按邮箱匹配，但最终 principal 仍由认证后的 `(issuer, subject)` 确定；成员管理页操作 workspace role，并在变更后使后续请求立即重新判权。`/api/annotators`、`/api/cohorts` 只能管理 Argilla 映射、外部验证和人员组，不能被复用为平台成员管理页。
 
 ## 当前阻塞点与后端验收建议
 
-1. 后端必须提供可稳定调用的成员管理 HTTP API，或明确将某个现有 API 作为版本化公共契约。契约至少包括列表、grant、change、revoke、workspace scope、资源不可见语义、`Idempotency-Key`、actor/caller 服务端注入和审计结果。
-2. 后端必须把 active workspace membership 作为 `authorize_task` 的硬前置条件。撤销 workspace membership 后，即使 task ACL 行仍残留，也必须立即拒绝 task 访问；不能让前端自行删除 task ACL 来弥补授权缺口。该项是高风险验收门槛。
+1. 成员管理 HTTP API 已提供列表、邀请、change、revoke、workspace scope、资源不可见语义、`Idempotency-Key`、actor/caller 服务端注入和审计结果；发布时必须继续以这些契约验收。
+2. 后端必须把 active workspace membership 作为 `authorize_task` 的硬前置条件。撤销 workspace membership 后，即使 task ACL 行仍残留，也必须立即拒绝 task 访问；不能让前端自行删除 task ACL 来弥补授权缺口。
 3. 每个 R2 读写路径必须展示对应的 `require_task` 或等价授权检查，以及 registry/manifest/hash 校验；不能把 Argilla user UUID、email、workspace query 参数或 R2 URI 作为授权凭据。
-4. 只有在成员 HTTP API 和 R2 授权入口稳定后，才能新增真正的浏览器到 R2 的端到端测试。当前在不改生产代码的约束下，只能验收 `DatabaseService`、Cloudflare auth、Argilla adapter/repository 和既有数据湖契约。
+4. 浏览器到 R2 的端到端测试仍需在部署环境运行；本地契约测试覆盖 `DatabaseService`、Cloudflare auth、成员/Argilla 控制路由和既有数据湖边界。
 
 ## 验收命令
 

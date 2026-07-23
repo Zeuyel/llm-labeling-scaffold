@@ -4,6 +4,7 @@ import {
   createMemberInvitation,
   getMembers,
   revokeMember,
+  revokeMemberInvitation,
   updateMemberRole,
 } from "../api.js";
 
@@ -49,6 +50,11 @@ test("成员邀请、角色变更和撤销发送正确的幂等键", async () =>
       { workspace: "workspace-a" },
       { idempotencyKey: "revoke-key" },
     );
+    await revokeMemberInvitation(
+      "00000000-0000-4000-8000-000000000002",
+      { workspace: "workspace-a" },
+      { idempotencyKey: "revoke-invitation-key" },
+    );
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -57,11 +63,13 @@ test("成员邀请、角色变更和撤销发送正确的幂等键", async () =>
     "/api/members/invitations",
     "/api/members/00000000-0000-4000-8000-000000000001/role",
     "/api/members/00000000-0000-4000-8000-000000000001/revoke",
+    "/api/members/invitations/00000000-0000-4000-8000-000000000002/revoke",
   ]);
   assert.deepEqual(calls.map(({ opts }) => opts.headers["Idempotency-Key"]), [
     "invite-key",
     "role-key",
     "revoke-key",
+    "revoke-invitation-key",
   ]);
   assert.deepEqual(JSON.parse(calls[0].opts.body), {
     workspace: "workspace-a",
@@ -73,6 +81,7 @@ test("成员邀请、角色变更和撤销发送正确的幂等键", async () =>
     role: "admin",
   });
   assert.deepEqual(JSON.parse(calls[2].opts.body), { workspace: "workspace-a" });
+  assert.deepEqual(JSON.parse(calls[3].opts.body), { workspace: "workspace-a" });
 });
 
 test("成员写 API 没有幂等键时拒绝发送请求", () => {
@@ -86,6 +95,10 @@ test("成员写 API 没有幂等键时拒绝发送请求", () => {
   );
   assert.throws(
     () => revokeMember("principal-1", { workspace: "workspace-a" }),
+    (error) => error.code === "missing_idempotency_key" && error.status === 422,
+  );
+  assert.throws(
+    () => revokeMemberInvitation("invitation-1", { workspace: "workspace-a" }),
     (error) => error.code === "missing_idempotency_key" && error.status === 422,
   );
 });

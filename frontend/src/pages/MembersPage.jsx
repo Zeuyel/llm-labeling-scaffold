@@ -196,6 +196,37 @@ export default function MembersPage({
     }
   }
 
+  async function revokeInvitation(invitation) {
+    if (busyOperation || invitation.status !== "pending") return;
+    const scopeError = validateWorkspace();
+    if (scopeError) {
+      showError(scopeError);
+      return;
+    }
+    if (typeof window !== "undefined" && typeof window.confirm === "function") {
+      const confirmed = window.confirm(`确认撤销发往 ${invitation.email || "该邮箱"} 的邀请吗？`);
+      if (!confirmed) return;
+    }
+    const { key, signature } = getOperationKey("member.invitation.revoke", invitation.invitation_id);
+    setBusyOperation(signature);
+    setOperationError("");
+    setNotice("");
+    try {
+      const result = await api.revokeMemberInvitation(
+        invitation.invitation_id,
+        { workspace },
+        { idempotencyKey: key },
+      );
+      clearOperationKey(signature);
+      setNotice(result?.action === "unchanged" ? "该邀请已经不是待认领状态。" : "邀请已撤销。");
+      await loadMembers();
+    } catch (error) {
+      showError(error);
+    } finally {
+      setBusyOperation("");
+    }
+  }
+
   const disabled = Boolean(busyOperation) || loading;
 
   return (
@@ -349,6 +380,7 @@ export default function MembersPage({
                       <th>状态</th>
                       <th>有效期至</th>
                       <th>认领成员</th>
+                      <th>操作</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -363,6 +395,18 @@ export default function MembersPage({
                         </td>
                         <td>{formatMemberTimestamp(invitation.expires_at)}</td>
                         <td>{invitation.claimed_principal_id ? "已认领" : "-"}</td>
+                        <td>
+                          {invitation.status === "pending" ? (
+                            <button
+                              className="btn btn-danger btn-sm"
+                              type="button"
+                              onClick={() => revokeInvitation(invitation)}
+                              disabled={disabled}
+                            >
+                              {busyOperation === operationName("member.invitation.revoke", `${workspace}:${invitation.invitation_id}`) ? "撤销中..." : "撤销邀请"}
+                            </button>
+                          ) : "-"}
+                        </td>
                       </tr>
                     ))}
                   </tbody>

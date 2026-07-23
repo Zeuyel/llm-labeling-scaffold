@@ -19,9 +19,12 @@ LLS_CF_ACCESS_AUD=<Access application Audience Tag>
 LLS_CF_ACCESS_JWKS_TTL_SECONDS=300
 LLS_CF_ACCESS_HTTP_TIMEOUT_SECONDS=5
 LLS_CF_ACCESS_CLOCK_SKEW_SECONDS=0
+# LLS_CF_ACCESS_TRUST_EMAIL_CLAIM=1  # 仅当当前 Access 应用已完成邮箱验证但 JWT 不含 email_verified 时开启
 ```
 
 `LLS_CF_ACCESS_ISSUER` 必须是 Cloudflare One team domain。Panel 从 `${LLS_CF_ACCESS_ISSUER}/cdn-cgi/access/certs` 获取 JWKS，按 `kid` 选择 RS256 公钥，并验证签名、issuer、显式配置的 application audience、`exp`、`iat`、`nbf`、`sub` 和 `type=app`。JWKS 缓存同时受 TTL 和 key 数量上限约束；刷新采用 single-flight，网络 I/O 不持有 key 状态锁。未知 `kid` 和失败刷新使用全局 cooldown 与有界负缓存限制重试频率，cooldown 后仍可发现轮换 key。刷新失败、响应无效或 token 校验失败时请求不会继续进入业务处理。
+
+邀请按邮箱认领默认还要求签名 JWT 提供 `email_verified=true`。使用 One-time PIN 等由 Cloudflare Access 完成邮箱验证、但 JWT 不携带该 claim 的应用时，必须人工确认该 Access application 的邮箱验证策略后显式设置 `LLS_CF_ACCESS_TRUST_EMAIL_CLAIM=1`；该配置不能由浏览器请求覆盖。
 
 稳定身份键是 `(issuer, subject)`。邮箱和显示名只保存为可更新的显示快照，不参与唯一身份判断。`X-Actor`、`X-User-Email`、`Cf-Access-Authenticated-User-Email` 等客户端可提交头不会建立 actor。
 

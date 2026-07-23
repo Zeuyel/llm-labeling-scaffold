@@ -64,6 +64,7 @@ def _assertion(
     payload = {
         "aud": [EXPECTED_AUDIENCE],
         "email": "alice@example.com",
+        "email_verified": True,
         "name": "Alice",
         "exp": now + 300,
         "iat": now - 1,
@@ -161,8 +162,27 @@ def test_verifies_access_identity_and_uses_issuer_subject_as_key():
     assert verifier.expected_audience == EXPECTED_AUDIENCE
     assert identity.identity_key == (ISSUER, SUBJECT)
     assert identity.email == "alice@example.com"
+    assert identity.email_verified is True
     assert identity.display_name == "Alice"
     assert fetcher.calls == [(f"{ISSUER}/cdn-cgi/access/certs", 5)]
+
+
+def test_email_claim_is_not_trusted_without_verification_marker():
+    private_key, jwk = _signing_key("key-1")
+    identity = _verifier(jwk).verify(
+        _assertion(private_key, "key-1", claims={"email_verified": False})
+    )
+    assert identity.email == "alice@example.com"
+    assert identity.email_verified is False
+
+
+def test_explicit_access_email_trust_allows_verified_provider_without_claim():
+    private_key, jwk = _signing_key("key-1")
+    verifier = _verifier(jwk, trust_email_claim=True)
+    identity = verifier.verify(
+        _assertion(private_key, "key-1", omit=("email_verified",))
+    )
+    assert identity.email_verified is True
 
 
 def test_rejects_tampered_signature():

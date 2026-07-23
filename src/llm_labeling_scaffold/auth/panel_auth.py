@@ -31,6 +31,10 @@ def _valid_service_token(value: str) -> bool:
     return len(value) >= 32 and not any(char.isspace() for char in value)
 
 
+def _truthy_env(name: str) -> bool:
+    return str(os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _bounded_float_env(name: str, default: float, minimum: float, maximum: float) -> float:
     raw = str(os.environ.get(name, "")).strip()
     if not raw:
@@ -232,6 +236,7 @@ def build_panel_authenticator(
             jwks_ttl_seconds=_bounded_float_env("LLS_MCP_CF_ACCESS_JWKS_TTL_SECONDS", 300, 30, 3600),
             http_timeout_seconds=_bounded_float_env("LLS_MCP_CF_ACCESS_HTTP_TIMEOUT_SECONDS", 5, 0.5, 15),
             clock_skew_seconds=_bounded_float_env("LLS_MCP_CF_ACCESS_CLOCK_SKEW_SECONDS", 0, 0, 60),
+            trust_email_claim=_truthy_env("LLS_MCP_CF_ACCESS_TRUST_EMAIL_CLAIM"),
         )
     if resolved_mode == "basic_dev":
         password = str(basic_password or os.environ.get("LLS_PANEL_PASSWORD") or "")
@@ -255,6 +260,7 @@ def build_panel_authenticator(
         jwks_ttl_seconds=_bounded_float_env("LLS_CF_ACCESS_JWKS_TTL_SECONDS", 300, 30, 3600),
         http_timeout_seconds=_bounded_float_env("LLS_CF_ACCESS_HTTP_TIMEOUT_SECONDS", 5, 0.5, 15),
         clock_skew_seconds=_bounded_float_env("LLS_CF_ACCESS_CLOCK_SKEW_SECONDS", 0, 0, 60),
+        trust_email_claim=_truthy_env("LLS_CF_ACCESS_TRUST_EMAIL_CLAIM"),
     )
     return PanelAuthenticator(
         mode=resolved_mode,

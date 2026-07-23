@@ -363,6 +363,59 @@ def test_create_routes_and_whitelist_dto(monkeypatch):
         assert sensitive not in serialized
 
 
+def test_shared_workspace_membership_is_verified_when_requested(monkeypatch):
+    issuer, subject, username, workspace_name = _identity()
+    client = _FakeClient()
+    personal = _workspace(client, _WORKSPACE_ID, workspace_name)
+    shared = _workspace(client, _OTHER_WORKSPACE_ID, "labeling-shared")
+    client.workspace_items.extend([personal, shared])
+    user = _user(client, _USER_ID, username)
+    client.user_items.append(user)
+    client.memberships[_WORKSPACE_ID] = [user]
+    client.memberships[_OTHER_WORKSPACE_ID] = []
+    _install_sdk(monkeypatch, client)
+    adapter = ArgillaAdminAdapter(api_url=client.api_url)
+
+    adapter.ensure_annotator(
+        principal_issuer=issuer,
+        principal_subject=subject,
+        expected_user_uuid=_USER_ID,
+        expected_workspace_uuid=_WORKSPACE_ID,
+        shared_workspace_uuid=_OTHER_WORKSPACE_ID,
+    )
+
+    assert client.memberships[_OTHER_WORKSPACE_ID] == [user]
+    assert client.routes[-4:] == [
+        f"GET /api/v1/workspaces/{_OTHER_WORKSPACE_ID}",
+        f"GET /api/v1/workspaces/{_OTHER_WORKSPACE_ID}/users",
+        f"POST /api/v1/workspaces/{_OTHER_WORKSPACE_ID}/users",
+        f"GET /api/v1/workspaces/{_OTHER_WORKSPACE_ID}/users",
+    ]
+
+
+def test_missing_shared_workspace_fails_closed(monkeypatch):
+    issuer, subject, username, workspace_name = _identity()
+    client = _FakeClient()
+    personal = _workspace(client, _WORKSPACE_ID, workspace_name)
+    user = _user(client, _USER_ID, username)
+    client.workspace_items.append(personal)
+    client.user_items.append(user)
+    client.memberships[_WORKSPACE_ID] = [user]
+    _install_sdk(monkeypatch, client)
+    adapter = ArgillaAdminAdapter(api_url=client.api_url)
+
+    with pytest.raises(ArgillaProvisioningError) as exc_info:
+        adapter.ensure_annotator(
+            principal_issuer=issuer,
+            principal_subject=subject,
+            expected_user_uuid=_USER_ID,
+            expected_workspace_uuid=_WORKSPACE_ID,
+            shared_workspace_uuid=_OTHER_WORKSPACE_ID,
+        )
+
+    assert exc_info.value.code == "shared_workspace_missing"
+
+
 def test_expected_ids_are_authoritative_and_existing_membership_performs_zero_posts(monkeypatch):
     issuer, subject, username, workspace_name = _identity()
     client = _FakeClient()

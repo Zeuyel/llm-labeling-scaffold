@@ -279,6 +279,35 @@ def test_cohort_requires_verified_mapping_and_replacement_creates_revision(annot
     assert second.revision.id != first.revision.id
     assert second.revision.members[0].default_capacity == 25
 
+    with Session(annotator_repository["engine"]) as session, session.begin():
+        principal = session.scalar(
+            select(Principal).where(
+                Principal.issuer == "https://annotator.test",
+                Principal.subject == "verified",
+            )
+        )
+        workspace = session.scalar(select(Workspace).where(Workspace.slug == "workspace-a"))
+        assert principal is not None and workspace is not None
+        binding_row = session.scalar(
+            select(RoleBinding).where(
+                RoleBinding.workspace_id == workspace.id,
+                RoleBinding.principal_id == principal.id,
+                RoleBinding.task_id.is_(None),
+            )
+        )
+        assert binding_row is not None
+        session.delete(binding_row)
+
+    with pytest.raises(AnnotatorNotReady):
+        repository.create_cohort_revision(
+            workspace_slug="workspace-a",
+            cohort_id=first.cohort.id,
+            binding_id=binding.binding.id,
+            members=(CohortMemberInput(verified_mapping.mapping.id, 30),),
+            actor_identity=admin,
+            idempotency_key="cohort-revoke-blocked",
+        )
+
     with pytest.raises(DBAPIError):
         with Session(annotator_repository["engine"]) as session, session.begin():
             member = session.scalar(

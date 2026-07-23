@@ -7,6 +7,7 @@ import {
   getAnnotators,
   getCohort,
   getCohorts,
+  getMembers,
   managementIdempotencyKey,
   provisionAnnotator,
   replaceCohortMembers,
@@ -25,14 +26,15 @@ test("标注人员和人员组 API 使用专用 workspace 路径", async () => {
   try {
     await getAnnotators("workspace-a");
     await getAnnotator("annotator-1", "workspace-a");
-    await provisionAnnotator({ workspace: "workspace-a", scaffold_user_id: "principal-1", initial_password: "one-time" }, { idempotencyKey: "key-provision" });
-    await bindAnnotator({ workspace: "workspace-a", scaffold_user_id: "principal-1", argilla_user_id: "argilla-1" }, { idempotencyKey: "key-bind" });
+    await provisionAnnotator({ workspace: "workspace-a", principal_id: "principal-1", scaffold_user_id: "legacy-user", initial_password: "one-time" }, { idempotencyKey: "key-provision" });
+    await bindAnnotator({ workspace: "workspace-a", principal_id: "principal-1", scaffold_user_id: "legacy-user", argilla_user_id: "argilla-1" }, { idempotencyKey: "key-bind" });
     await verifyAnnotator("annotator-1", "workspace-a", { idempotencyKey: "key-verify" });
     await getCohorts("workspace-a");
     await getCohort("cohort-1", "workspace-a");
     await createCohort({ workspace: "workspace-a", name: "reviewers", default_capacity: 4, member_annotator_ids: ["annotator-1"] }, { idempotencyKey: "key-cohort-create" });
     await updateCohort("cohort-1", { workspace: "workspace-a", name: "reviewers", default_capacity: 4, expected_revision: 2 }, { idempotencyKey: "key-cohort-update" });
     await replaceCohortMembers("cohort-1", { workspace: "workspace-a", member_annotator_ids: ["annotator-1"], expected_revision: 2 }, { idempotencyKey: "key-cohort-members" });
+    await getMembers("workspace-a");
   } finally {
     globalThis.fetch = previousFetch;
   }
@@ -48,10 +50,15 @@ test("标注人员和人员组 API 使用专用 workspace 路径", async () => {
     "/api/cohorts",
     "/api/cohorts/cohort-1",
     "/api/cohorts/cohort-1/members",
+    "/api/members?workspace=workspace-a",
   ]);
   assert.equal(JSON.parse(calls[2].opts.body).initial_password, "one-time");
   assert.equal(JSON.parse(calls[2].opts.body).workspace, "workspace-a");
+  assert.equal(JSON.parse(calls[2].opts.body).principal_id, "principal-1");
+  assert.equal(JSON.parse(calls[2].opts.body).scaffold_user_id, undefined);
   assert.equal(JSON.parse(calls[3].opts.body).workspace, "workspace-a");
+  assert.equal(JSON.parse(calls[3].opts.body).principal_id, "principal-1");
+  assert.equal(JSON.parse(calls[3].opts.body).scaffold_user_id, undefined);
   assert.equal(JSON.parse(calls[4].opts.body).annotator_id, "annotator-1");
   assert.equal(JSON.parse(calls[4].opts.body).workspace, "workspace-a");
   assert.equal(JSON.parse(calls[7].opts.body).workspace, "workspace-a");
@@ -69,7 +76,8 @@ test("标注人员和人员组 API 使用专用 workspace 路径", async () => {
 test("管理 API 没有 workspace 时拒绝发送请求", () => {
   const cases = [
     () => getAnnotators(""),
-    () => provisionAnnotator({ scaffold_user_id: "principal-1", initial_password: "one-time" }, { idempotencyKey: "key" }),
+    () => getMembers(""),
+    () => provisionAnnotator({ principal_id: "principal-1", initial_password: "one-time" }, { idempotencyKey: "key" }),
     () => updateCohort("cohort-1", { name: "reviewers" }, { idempotencyKey: "key" }),
   ];
   for (const operation of cases) {
@@ -90,8 +98,8 @@ test("前端生成的管理幂等键是非空且满足后端长度边界", () =>
 
 test("所有管理写操作都拒绝缺失或空的 Idempotency-Key", () => {
   const cases = [
-    () => provisionAnnotator({ workspace: "workspace-a", scaffold_user_id: "principal-1", initial_password: "one-time" }),
-    () => bindAnnotator({ workspace: "workspace-a", scaffold_user_id: "principal-1", argilla_user_id: "argilla-1" }),
+    () => provisionAnnotator({ workspace: "workspace-a", principal_id: "principal-1", initial_password: "one-time" }),
+    () => bindAnnotator({ workspace: "workspace-a", principal_id: "principal-1", argilla_user_id: "argilla-1" }),
     () => verifyAnnotator("annotator-1", "workspace-a"),
     () => createCohort({ workspace: "workspace-a", name: "reviewers", default_capacity: 4, member_annotator_ids: [] }),
     () => updateCohort("cohort-1", { workspace: "workspace-a", name: "reviewers", default_capacity: 4, expected_revision: 2 }, { idempotencyKey: " " }),

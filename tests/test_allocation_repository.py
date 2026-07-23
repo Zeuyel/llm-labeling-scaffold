@@ -44,6 +44,7 @@ from llm_labeling_scaffold.db.enums import (
     AnnotatorVerificationState,
     ArgillaBindingState,
     PrincipalType,
+    Role,
 )
 from llm_labeling_scaffold.db.models import (
     AllocationAssignment,
@@ -139,9 +140,26 @@ def repository(tmp_path: Path, request):
         session.add(binding)
         session.flush()
         for index, remote_user in enumerate(remote_users):
+            annotator_principal = Principal(
+                issuer=identity.issuer,
+                subject=f"annotator-{suffix}-{index}",
+                principal_type=PrincipalType.USER,
+            )
+            session.add(annotator_principal)
+            session.flush()
+            session.add(
+                RoleBinding(
+                    workspace_id=bootstrap.workspace_id,
+                    principal_id=annotator_principal.id,
+                    role=Role.ANNOTATOR,
+                    created_by_principal_id=bootstrap.principal_id,
+                )
+            )
+            session.flush()
             mapping = ArgillaAnnotatorMapping(
                 workspace_id=bootstrap.workspace_id,
                 connection_binding_id=binding.id,
+                principal_id=annotator_principal.id,
                 argilla_user_id=remote_user,
                 username_snapshot=f"annotator-{index}",
                 personal_argilla_workspace_id=uuid.uuid4(),

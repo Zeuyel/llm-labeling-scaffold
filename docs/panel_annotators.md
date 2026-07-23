@@ -30,7 +30,7 @@
 
 资源不可见统一映射为 `404 resource_not_found`，权限不足映射为 `403 permission_denied`，授权/资料库不可用映射为 `503`。请求 DTO 错误返回 `422`；repository 返回的损坏记录或响应序列化失败返回 `500 service_unavailable`，不把内部记录问题伪装成用户请求错误。布尔字段只接受 JSON `true/false` 或整数 `0/1`，其他值视为损坏数据。异常响应只使用模块定义的安全错误文本，不代理 repository 或外部 adapter 的原始异常内容。
 
-标注人员和人员组接口不是通用 workspace 成员邀请接口。它们只允许拥有 `workspace:manage` 的管理员操作当前 workspace；先完成 Scaffold workspace role grant，再执行 Argilla provision/bind/verify。目标基线没有独立的 `/api/members` 路由时，不能用这些接口或直接 SQL 伪装成通用成员管理。
+标注人员和人员组接口不是通用 workspace 成员邀请接口。它们只允许拥有 `workspace:manage` 的管理员操作当前 workspace；先在成员管理页完成 Scaffold workspace role grant，再执行 Argilla provision/bind/verify。不能用这些接口或直接 SQL 伪装成通用成员管理。
 
 ## 请求白名单
 
@@ -39,7 +39,7 @@
 ```json
 {
   "workspace": "workspace-a",
-  "scaffold_user_id": "principal-1",
+  "principal_id": "principal-uuid",
   "personal_workspace_name": "optional-name",
   "initial_password": "one-time-input"
 }

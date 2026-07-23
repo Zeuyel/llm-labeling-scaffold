@@ -246,16 +246,21 @@ export const getAnnotator = (annotatorId, workspace) =>
 
 export const provisionAnnotator = (payload = {}, options = {}) =>
   jsonRequest(`${ANNOTATORS_PATH}/provision`, "POST", {
-    ...payload,
     workspace: managementWorkspace(payload.workspace),
+    principal_id: payload.principal_id,
+    personal_workspace_name: payload.personal_workspace_name,
+    initial_password: payload.initial_password,
   }, options);
 
 export const createAnnotator = provisionAnnotator;
 
 export const bindAnnotator = (payload = {}, options = {}) =>
   jsonRequest(`${ANNOTATORS_PATH}/bind`, "POST", {
-    ...payload,
     workspace: managementWorkspace(payload.workspace),
+    principal_id: payload.principal_id,
+    argilla_user_id: payload.argilla_user_id,
+    argilla_username: payload.argilla_username,
+    personal_workspace_id: payload.personal_workspace_id,
   }, options);
 
 export const verifyAnnotator = (annotatorId, workspace, options = {}) => {
@@ -298,6 +303,11 @@ export const getMembers = (workspace) =>
 export const createMemberInvitation = (payload = {}, options = {}) =>
   jsonRequest(`${MEMBERS_PATH}/invitations`, "POST", {
     ...payload,
+    workspace: managementWorkspace(payload.workspace),
+  }, options);
+
+export const revokeMemberInvitation = (invitationId, payload = {}, options = {}) =>
+  jsonRequest(`${MEMBERS_PATH}/invitations/${encodeURIComponent(invitationId)}/revoke`, "POST", {
     workspace: managementWorkspace(payload.workspace),
   }, options);
 
