@@ -4,7 +4,7 @@
 
 Pushes to `main` and `integration/multiuser-control-plane` run the Python test suite, frontend build, and Compose configuration checks. Pull requests and manual runs use the same checks.
 
-The Compose job validates the base stack and the loopback and rclone overrides with CI-only database passwords. It does not start services or publish ports.
+The Compose job validates the base stack and the loopback and rclone overrides with CI-only database passwords. It does not start services or publish ports. Production and Tunnel overlays require deployment secrets and are validated on the server during the deployment preflight.
 
 ## Docker image
 

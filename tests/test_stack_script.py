@@ -282,6 +282,11 @@ def test_stack_accepts_managed_mcp_without_static_bearer(tmp_path: Path):
             "LLS_MCP_CF_ACCESS_AUD": "mcp-audience",
             "LLS_MCP_INTERNAL_TOKEN": "internal-token-0123456789-abcdef-012",
             "MCP_BIND_HOST": "localhost",
+            "CLOUDFLARE_TUNNEL_TOKEN": "tunnel-token-0123456789-abcdef-0123456789",
+            "ARGILLA_USERNAME": "argilla-owner",
+            "ARGILLA_PASSWORD": "argilla-password-0123456789",
+            "ARGILLA_API_KEY": "argilla-api-key-0123456789",
+            "ARGILLA_POSTGRES_PASSWORD": "argilla-db-password-0123456789",
             "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
             "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
             "LLS_TASK_SOURCE": "local",
@@ -293,8 +298,8 @@ def test_stack_accepts_managed_mcp_without_static_bearer(tmp_path: Path):
     assert result.returncode == 0
     deploy_call = calls[-1]
     assert deploy_call.startswith("MCP_BIND_HOST=127.0.0.1;MLFLOW_TRACKING_URI=|")
-    assert "compose -f docker-compose.yml --profile mcp up -d --force-recreate" in deploy_call
-    assert deploy_call.endswith("redis mcp")
+    assert "compose -f docker-compose.yml -f docker-compose.production.yml -f docker-compose.tunnel.yml --profile mcp up -d --force-recreate" in deploy_call
+    assert deploy_call.endswith("redis cloudflared mcp")
 
 
 def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp_path: Path):
@@ -305,6 +310,11 @@ def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp
             "LLS_PANEL_AUTH_MODE": "cloudflare_access",
             "LLS_CF_ACCESS_ISSUER": "https://team.cloudflareaccess.com",
             "LLS_CF_ACCESS_AUD": "configured-audience",
+            "CLOUDFLARE_TUNNEL_TOKEN": "tunnel-token-0123456789-abcdef-0123456789",
+            "ARGILLA_USERNAME": "argilla-owner",
+            "ARGILLA_PASSWORD": "argilla-password-0123456789",
+            "ARGILLA_API_KEY": "argilla-api-key-0123456789",
+            "ARGILLA_POSTGRES_PASSWORD": "argilla-db-password-0123456789",
             "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
             "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
             "LLS_TASK_SOURCE": "local",
@@ -316,11 +326,11 @@ def test_stack_restart_force_recreates_services_and_preserves_mlflow_profile(tmp
     assert result.returncode == 0
     deploy_call = calls[-1]
     assert deploy_call.startswith("MCP_BIND_HOST=;MLFLOW_TRACKING_URI=http://mlflow:5000|")
-    assert "compose -f docker-compose.yml --profile mlflow up -d --force-recreate" in deploy_call
+    assert "compose -f docker-compose.yml -f docker-compose.production.yml -f docker-compose.tunnel.yml --profile mlflow up -d --force-recreate" in deploy_call
     assert "docker-compose.loopback.yml" not in deploy_call
     assert deploy_call.endswith(
         "scaffold-postgres db-role-init migrate panel argilla argilla-worker "
-        "argilla-postgres elasticsearch redis mlflow"
+        "argilla-postgres elasticsearch redis cloudflared mlflow"
     )
     assert " restart " not in deploy_call
 
@@ -344,6 +354,27 @@ def test_stack_cloudflare_loopback_mode_uses_fixed_override(tmp_path: Path):
     assert "compose -f docker-compose.yml -f docker-compose.loopback.yml" in calls[-1]
 
 
+def test_stack_uses_published_ghcr_image_without_local_build(tmp_path: Path):
+    result, calls = _run_stack(
+        tmp_path,
+        {
+            "LLS_DEPLOYMENT_MODE": "loopback",
+            "LLS_PANEL_AUTH_MODE": "basic_dev",
+            "LLS_PANEL_PASSWORD": "secret",
+            "PANEL_IMAGE": "ghcr.io/zeuyel/llm-labeling-scaffold/panel:sha-test",
+            "SCAFFOLD_POSTGRES_OWNER_PASSWORD": "owner-password",
+            "SCAFFOLD_POSTGRES_APP_PASSWORD": "app-password",
+            "LLS_TASK_SOURCE": "local",
+        },
+        "up",
+    )
+
+    assert result.returncode == 0
+    assert "pull panel" in calls[-2]
+    assert "up -d --no-build" in calls[-1]
+    assert "--build" not in calls[-1]
+
+
 def test_compose_mcp_managed_oauth_contract():
     compose = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
     mcp = compose["services"]["mcp"]
@@ -358,3 +389,19 @@ def test_compose_mcp_managed_oauth_contract():
     assert "--published-host" in mcp["command"]
     published_index = mcp["command"].index("--published-host")
     assert mcp["command"][published_index + 1] == "${MCP_BIND_HOST:-127.0.0.1}"
+
+
+def test_production_tunnel_compose_keeps_services_internal():
+    base = yaml.safe_load((REPO_ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    production = yaml.safe_load((REPO_ROOT / "docker-compose.production.yml").read_text(encoding="utf-8"))
+    tunnel = yaml.safe_load((REPO_ROOT / "docker-compose.tunnel.yml").read_text(encoding="utf-8"))
+
+    assert base["services"]["argilla"]["ports"] == [
+        "${ARGILLA_BIND_HOST:-127.0.0.1}:${ARGILLA_PORT:-6900}:6900"
+    ]
+    assert production["services"]["panel"]["environment"]["LLS_DEPLOYMENT_MODE"] == "tunnel"
+    assert production["services"]["panel"]["environment"]["LLS_PANEL_AUTH_MODE"] == "cloudflare_access"
+    assert "ports" not in tunnel["services"]["cloudflared"]
+    assert tunnel["services"]["cloudflared"]["environment"]["TUNNEL_TOKEN"].startswith(
+        "${CLOUDFLARE_TUNNEL_TOKEN:?"
+    )

@@ -58,7 +58,7 @@ LLS_PANEL_PASSWORD=<local-only-password>
 docker compose -f docker-compose.yml -f docker-compose.loopback.yml up -d
 ```
 
-Tunnel sidecar 部署使用 base Compose，不叠加 loopback override。把 `cloudflared` 加入 `lls` network，并将 Tunnel service URL 配置为 `http://panel:8765`。如果 `cloudflared` 运行在宿主机而不是 Compose network 中，则使用 loopback 模式，将 service URL 指向 `http://127.0.0.1:${PANEL_PORT}`。
+Tunnel sidecar 部署使用 `docker-compose.production.yml` 和 `docker-compose.tunnel.yml`，将 `cloudflared` 加入 `lls` network，并将 Tunnel service URL 配置为 `http://panel:8765`。`scripts/stack` 在 `LLS_DEPLOYMENT_MODE=tunnel` 时会自动叠加这两个文件。如果 `cloudflared` 运行在宿主机而不是 Compose network 中，则使用 loopback 模式，将 service URL 指向 `http://127.0.0.1:${PANEL_PORT}`。
 
 `scripts/stack up` 和 `scripts/stack restart` 要求显式设置 `LLS_DEPLOYMENT_MODE`，并校验部署模式、认证配置、开发密码和数据库凭据组合。restart 使用强制重建容器，以应用认证和 MCP 环境变量变更。生产模式不会在 Access 配置缺失或验证失败时回退到 Basic Auth。
 

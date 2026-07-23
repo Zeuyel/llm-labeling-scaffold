@@ -70,6 +70,8 @@ docker compose run --rm migrate python -m llm_labeling_scaffold.cli db bootstrap
 
 数据库 schema、角色矩阵、迁移以及备份恢复说明见 [Scaffold 数据库与 RBAC](docs/database.md)；成员邀请、首次登录、Argilla 映射、撤销和生产验收见 [成员管理与权限闭环运维](docs/member_management.md)。
 
+完整的 GHCR、Cloudflare Tunnel、R2 rclone secret、数据库备份和更新命令见 [生产部署结构](docs/deployment.md)。
+
 需要模型记录服务时再启用 Docker Compose 的 mlflow profile：
 
 ```bash

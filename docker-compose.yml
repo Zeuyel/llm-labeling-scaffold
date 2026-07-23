@@ -3,7 +3,7 @@ name: lls-stack
 x-argilla-env: &argilla-env
   ARGILLA_HOME_PATH: /var/lib/argilla
   ARGILLA_ELASTICSEARCH: http://elasticsearch:9200
-  ARGILLA_DATABASE_URL: postgresql+asyncpg://postgres:postgres@argilla-postgres:5432/argilla
+  ARGILLA_DATABASE_URL: postgresql+asyncpg://${ARGILLA_POSTGRES_USER:-postgres}:${ARGILLA_POSTGRES_PASSWORD:-postgres}@argilla-postgres:5432/${ARGILLA_POSTGRES_DB:-argilla}
   ARGILLA_REDIS_URL: redis://redis:6379/0
 
 services:
@@ -67,6 +67,11 @@ services:
     networks:
       - lls
       - scaffold-db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
 
   migrate:
     image: ${PANEL_IMAGE:-llm-labeling-scaffold-panel:local}
@@ -194,7 +199,7 @@ services:
     image: argilla/argilla-server:v2.8.0
     restart: unless-stopped
     ports:
-      - "${ARGILLA_PORT:-6900}:6900"
+      - "${ARGILLA_BIND_HOST:-127.0.0.1}:${ARGILLA_PORT:-6900}:6900"
     environment:
       <<: *argilla-env
       USERNAME: ${ARGILLA_USERNAME:-argilla}
@@ -260,9 +265,9 @@ services:
     image: postgres:14
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: argilla
+      POSTGRES_USER: ${ARGILLA_POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${ARGILLA_POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${ARGILLA_POSTGRES_DB:-argilla}
     volumes:
       - argilla-postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -321,7 +326,7 @@ services:
         PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-repo.huaweicloud.com}
     restart: unless-stopped
     ports:
-      - "${MLFLOW_PORT:-5000}:5000"
+      - "${MLFLOW_BIND_HOST:-127.0.0.1}:${MLFLOW_PORT:-5000}:5000"
     command:
       - mlflow
       - server
