@@ -16,9 +16,9 @@ export default function Sidebar({ tasks, activeTaskId, activePage, collapsed, on
   return (
     <aside className={collapsed ? "sidebar is-collapsed" : "sidebar"}>
       <div className="sidebar-head">
-        <div className="brand-mark" title="标注控制台">标</div>
+        <div className="brand-mark" title="实证标注平台">标</div>
         <div className="brand-copy">
-          <h1>标注控制台</h1>
+          <h1>实证标注平台</h1>
           <div className="sub">任务与数据流管理</div>
         </div>
         <button className="sidebar-toggle" type="button" onClick={onToggle} title={collapsed ? "展开侧栏" : "收起侧栏"}>
