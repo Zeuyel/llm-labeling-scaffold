@@ -8,3 +8,5 @@ tasks/*
 !tasks/.gitkeep
 *.egg-info/
 .pytest_cache/
+# 本地 rclone 覆盖配置（挂载本机 rclone.conf）；示例见 docker-compose.rclone.example.yml
+docker-compose.override.yml
