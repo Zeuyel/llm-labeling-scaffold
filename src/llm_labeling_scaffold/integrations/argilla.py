@@ -176,8 +176,18 @@ def _suggestion_values(task: TaskConfig, entry: dict[str, Any]) -> dict[str, Any
         value = source.get(name)
         if value in (None, ""):
             continue
-        out[name] = _cast_value(label, _response_value(value))
+        out[name] = _argilla_suggestion_value(label, _response_value(value))
     return out
+
+
+def _argilla_suggestion_value(label: dict[str, Any], value: Any) -> Any:
+    casted = _cast_value(label, value)
+    label_type = label.get("type", "string")
+    if label_type == "integer" and "values" in label:
+        return str(casted)
+    if label_type == "boolean":
+        return "true" if casted else "false"
+    return casted
 
 
 def _make_suggestion(rg, *, question_name: str, value: Any, score: Any = None, agent: str | None = None):
@@ -270,6 +280,40 @@ def _human_label_from_values(task: TaskConfig, values: dict) -> dict:
         if value is not None:
             human_label[name] = value
     return human_label
+
+
+def _record_response_groups(record) -> list[dict[str, Any]]:
+    responses = getattr(record, "responses", None)
+    if not responses:
+        return []
+    if hasattr(responses, "to_dict"):
+        grouped: dict[str, dict[str, Any]] = {}
+        for question_name, entries in responses.to_dict().items():
+            for entry in entries or []:
+                if not isinstance(entry, dict):
+                    continue
+                user_id = str(entry.get("user_id") or "")
+                group = grouped.setdefault(
+                    user_id,
+                    {
+                        "values": {},
+                        "user_id": user_id,
+                        "status": str(getattr(record, "status", "")),
+                    },
+                )
+                group["values"][question_name] = {"value": entry.get("value")}
+        return list(grouped.values())
+
+    groups: list[dict[str, Any]] = []
+    for response in responses:
+        groups.append(
+            {
+                "values": getattr(response, "values", {}) or {},
+                "user_id": str(getattr(response, "user_id", "")),
+                "status": str(getattr(response, "status", "")),
+            }
+        )
+    return groups
 
 
 def _guidelines_for_task(task: TaskConfig, params: dict[str, Any]) -> str:
@@ -721,17 +765,16 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
     rows = []
     for record in dataset.records:
         record_id = _record_source_id(record, task)
-        for response in getattr(record, "responses", []) or []:
-            values = getattr(response, "values", {}) or {}
-            human_label = _human_label_from_values(task, values)
+        for response in _record_response_groups(record):
+            human_label = _human_label_from_values(task, response["values"])
             if not human_label:
                 continue
             rows.append({
                 task.id_field: record_id,
                 "human_label": human_label,
                 "source": "argilla",
-                "user_id": str(getattr(response, "user_id", "")),
-                "status": str(getattr(response, "status", "")),
+                "user_id": response["user_id"],
+                "status": response["status"],
             })
     write_jsonl(rows, output_path)
     return {

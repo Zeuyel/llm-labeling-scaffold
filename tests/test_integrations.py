@@ -14,6 +14,7 @@ from llm_labeling_scaffold.integrations.argilla import (
     _prepare_dataset,
     _prepare_records_for_push,
     _questions_for_task,
+    _record_response_groups,
 )
 from llm_labeling_scaffold.integrations.mlflow import log_training_result
 from llm_labeling_scaffold.io import read_json, write_json, write_jsonl
@@ -207,6 +208,44 @@ def test_argilla_pull_expands_all_response_fields():
     assert human_label["reason"] == "claims describe a new product application"
     assert human_label["confidence"] == 88
     assert human_label["evidence_product_application"] == "new remote monitoring product"
+
+
+def test_argilla_record_responses_are_grouped_by_reviewer():
+    class _Responses:
+        def to_dict(self):
+            return {
+                "label": [
+                    {"value": "yes", "user_id": "u1"},
+                    {"value": "no", "user_id": "u2"},
+                ],
+                "reason": [
+                    {"value": "direct evidence", "user_id": "u1"},
+                    {"value": "insufficient evidence", "user_id": "u2"},
+                ],
+            }
+
+    record = types.SimpleNamespace(responses=_Responses(), status="completed")
+
+    groups = _record_response_groups(record)
+
+    assert groups == [
+        {
+            "values": {
+                "label": {"value": "yes"},
+                "reason": {"value": "direct evidence"},
+            },
+            "user_id": "u1",
+            "status": "completed",
+        },
+        {
+            "values": {
+                "label": {"value": "no"},
+                "reason": {"value": "insufficient evidence"},
+            },
+            "user_id": "u2",
+            "status": "completed",
+        },
+    ]
 
 
 def test_argilla_guidelines_use_task_annotation_by_default():
@@ -427,6 +466,48 @@ def test_argilla_push_attaches_suggestions_without_responses(tmp_path: Path):
         "agent": "codex_exec:v001",
     }
     assert not hasattr(records[1], "responses")
+
+
+def test_argilla_suggestions_encode_integer_label_values_as_strings(tmp_path: Path):
+    task = TaskConfig(
+        path=Path("task.yaml"),
+        raw={
+            "task_id": "argilla_suggestion_value_task",
+            "id_field": "record_id",
+            "input": {"path": "input.jsonl", "text_fields": ["title"]},
+            "labels": {
+                "primary": {"name": "label", "type": "categorical", "values": ["yes", "no"]},
+                "auxiliary": [
+                    {"name": "flag", "type": "integer", "values": [0, 1]},
+                    {"name": "bool_flag", "type": "boolean"},
+                ],
+            },
+        },
+    )
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "suggestions": {"label": "yes", "flag": 0, "bool_flag": False},
+            }
+        ],
+        suggestions,
+    )
+    fake_rg = types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion)
+
+    records, _, _ = _prepare_records_for_push(
+        fake_rg,
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+
+    values = {item.kwargs["question_name"]: item.kwargs["value"] for item in records[0].suggestions}
+    assert values == {"label": "yes", "flag": "0", "bool_flag": "false"}
 
 
 def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp_path: Path):
