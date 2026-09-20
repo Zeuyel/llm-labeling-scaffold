@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 from pathlib import Path
 from time import monotonic, sleep
@@ -44,10 +45,9 @@ def _load_task_reference(task_path: str | None, task_id: str | None, tasks_root:
 
 def _workflow_module():
     try:
-        from . import workflow
+        return importlib.import_module("llm_labeling_scaffold.workflow")
     except ImportError as exc:
         raise SystemExit("workflow 核心模块不可用，请先完成后端部署") from exc
-    return workflow
 
 
 def _workflow_task(args):

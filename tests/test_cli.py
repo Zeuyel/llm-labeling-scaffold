@@ -37,6 +37,17 @@ def test_workflow_parser_has_expected_commands():
     assert args.workflow_cmd == "status"
 
 
+def test_workflow_module_resolution_uses_current_imported_module(monkeypatch):
+    import llm_labeling_scaffold as package
+
+    stale = ModuleType("llm_labeling_scaffold.workflow")
+    current = ModuleType("llm_labeling_scaffold.workflow")
+    monkeypatch.setattr(package, "workflow", stale, raising=False)
+    monkeypatch.setitem(sys.modules, "llm_labeling_scaffold.workflow", current)
+
+    assert cli._workflow_module() is current
+
+
 def test_workflow_start_prints_core_result(monkeypatch, capsys, tmp_path: Path):
     calls: dict[str, object] = {}
     workflow = ModuleType("llm_labeling_scaffold.workflow")
