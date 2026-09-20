@@ -177,6 +177,196 @@ def test_task_graph_api_returns_nodes_and_edges(panel_workspace):
     assert any(edge["source"] == "sample:sample_a" and edge["target"] == "decision:argilla_round_1" for edge in body["edges"])
 
 
+def test_workflow_start_api_passes_validated_inputs(panel_workspace, monkeypatch):
+    calls = {}
+
+    class FakeWorkflow:
+        @staticmethod
+        def start_workflow(runs_root, task, *, profile_id, workflow_id, params):
+            calls.update({
+                "runs_root": runs_root,
+                "task_id": task.task_id,
+                "profile_id": profile_id,
+                "workflow_id": workflow_id,
+                "params": params,
+            })
+            return {"workflow_id": workflow_id, "status": "running"}
+
+    monkeypatch.setattr(panel, "_workflow_api", lambda: FakeWorkflow)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={
+                "task_id": "toy_multiclass_v1",
+                "profile": "manual_labeling_cv_v1",
+                "workflow_id": "workflow_001",
+                "params": {"batch_size": 10},
+            },
+        )
+
+    assert status == 200
+    assert body == {"ok": True, "workflow": {"workflow_id": "workflow_001", "status": "running"}}
+    assert calls == {
+        "runs_root": panel_workspace["runs_root"],
+        "task_id": "toy_multiclass_v1",
+        "profile_id": "manual_labeling_cv_v1",
+        "workflow_id": "workflow_001",
+        "params": {"batch_size": 10},
+    }
+
+
+def test_workflow_list_and_status_api(panel_workspace, monkeypatch):
+    calls = []
+
+    class FakeWorkflow:
+        @staticmethod
+        def list_workflows(runs_root, task_id):
+            calls.append(("list", runs_root, task_id))
+            return [{"workflow_id": "workflow_001", "status": "running"}]
+
+        @staticmethod
+        def get_workflow_status(runs_root, task_id, workflow_id):
+            calls.append(("status", runs_root, task_id, workflow_id))
+            return {"workflow_id": workflow_id, "status": "running"}
+
+    monkeypatch.setattr(panel, "_workflow_api", lambda: FakeWorkflow)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        list_status, list_body = _request(base_url, "/api/workflow?task_id=toy_multiclass_v1")
+        status_status, status_body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=workflow_001",
+        )
+
+    assert list_status == 200
+    assert list_body == {"workflows": [{"workflow_id": "workflow_001", "status": "running"}]}
+    assert status_status == 200
+    assert status_body == {"workflow": {"workflow_id": "workflow_001", "status": "running"}}
+    assert calls == [
+        ("list", panel_workspace["runs_root"], "toy_multiclass_v1"),
+        ("status", panel_workspace["runs_root"], "toy_multiclass_v1", "workflow_001"),
+    ]
+
+
+def test_workflow_status_api_returns_404_for_unknown_workflow(panel_workspace):
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=missing_workflow",
+        )
+
+    assert status == 404
+    assert body == {"error": "workflow not found: missing_workflow"}
+
+
+def test_workflow_api_preserves_r2_task_registry_constraint(panel_workspace, monkeypatch):
+    class SyncedTasks:
+        tasks = {}
+
+    called = False
+
+    def unavailable():
+        nonlocal called
+        called = True
+        raise AssertionError("workflow engine must not run for an unregistered R2 task")
+
+    monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    monkeypatch.setattr(panel._Handler, "_sync_tasks_if_needed", lambda _self: SyncedTasks())
+    monkeypatch.setattr(panel, "_workflow_api", unavailable)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=workflow_001",
+        )
+
+    assert status == 400
+    assert "未在 R2 数据湖登记表中登记为启用状态" in body["error"]
+    assert called is False
+
+
+def test_workflow_api_does_not_sync_r2_registry_in_local_mode(panel_workspace, monkeypatch):
+    apply_calls = []
+
+    class FakeWorkflow:
+        @staticmethod
+        def get_workflow_status(_runs_root, _task_id, workflow_id):
+            return {"workflow_id": workflow_id, "status": "running"}
+
+    monkeypatch.setenv("LLS_TASK_SOURCE", "local")
+    monkeypatch.setattr(
+        panel,
+        "_apply_runtime_settings",
+        lambda *args, **kwargs: apply_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(panel, "_workflow_api", lambda: FakeWorkflow)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=workflow_001",
+        )
+
+    assert status == 200
+    assert body == {"workflow": {"workflow_id": "workflow_001", "status": "running"}}
+    assert apply_calls == []
+
+
+def test_workflow_api_rejects_invalid_inputs(panel_workspace, monkeypatch):
+    called = False
+
+    def unavailable():
+        nonlocal called
+        called = True
+        raise AssertionError("workflow engine should not be called for invalid input")
+
+    monkeypatch.setattr(panel, "_workflow_api", unavailable)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        missing_task_status, _ = _request(base_url, "/api/workflow/start", method="POST", body={})
+        bad_task_status, _ = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={"task_id": "../outside"},
+        )
+        dot_task_status, _ = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={"task_id": "."},
+        )
+        missing_workflow_status, _ = _request(
+            base_url,
+            "/api/workflow/resume",
+            method="POST",
+            body={"task_id": "toy_multiclass_v1"},
+        )
+        bad_params_status, _ = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={"task_id": "toy_multiclass_v1", "params": []},
+        )
+        bad_workflow_status, _ = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=../outside",
+        )
+        dot_workflow_status, _ = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=.",
+        )
+
+    assert [
+        missing_task_status,
+        bad_task_status,
+        dot_task_status,
+        missing_workflow_status,
+        bad_params_status,
+        bad_workflow_status,
+        dot_workflow_status,
+    ] == [400, 400, 400, 400, 400, 400, 400]
+    assert called is False
+
+
 def test_task_archive_plan_api_returns_active_assets(panel_workspace):
     with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
         status, body = _request(base_url, "/api/task/archive_plan?task_id=toy_multiclass_v1")

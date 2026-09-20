@@ -37,6 +37,33 @@ def _safe_segment(value: str) -> bool:
     return bool(value) and ".." not in value and "/" not in value and "\\" not in value
 
 
+def _workflow_api():
+    try:
+        from . import workflow
+    except ImportError as exc:
+        raise RuntimeError("workflow API is not available") from exc
+    return workflow
+
+
+def _workflow_identifier(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a single path segment")
+    value = value.strip()
+    if value == "." or not _safe_segment(value):
+        raise ValueError(f"{field} must be a single path segment")
+    return value
+
+
+def _workflow_profile_id(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    profile_id = _workflow_identifier(value, "profile")
+    from .profiles import profile_definition
+
+    profile_definition(profile_id)
+    return profile_id
+
+
 def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -193,6 +220,59 @@ def _contract_capabilities() -> dict[str, Any]:
                     "type": "object",
                     "required": ["ok", "task_id", "checks", "warnings", "errors"],
                 },
+            },
+            {
+                "method": "POST",
+                "path": "/api/workflow/start",
+                "action": "workflow_start",
+                "side_effects": True,
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id"],
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "profile": {"type": "string"},
+                        "workflow_id": {"type": "string"},
+                        "params": {"type": "object"},
+                    },
+                },
+                "response_schema": {"type": "object", "required": ["ok", "workflow"]},
+            },
+            {
+                "method": "POST",
+                "path": "/api/workflow/resume",
+                "action": "workflow_resume",
+                "side_effects": True,
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id", "workflow_id"],
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "profile": {"type": "string"},
+                        "workflow_id": {"type": "string"},
+                        "params": {"type": "object"},
+                    },
+                },
+                "response_schema": {"type": "object", "required": ["ok", "workflow"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/workflow",
+                "action": "workflow_list",
+                "side_effects": False,
+                "query_params": {"task_id": {"type": "string", "required": True}},
+                "response_schema": {"type": "object", "required": ["workflows"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/workflow/status",
+                "action": "workflow_status",
+                "side_effects": False,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workflow_id": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["workflow"]},
             },
         ],
     }
@@ -478,6 +558,80 @@ class _Handler(BaseHTTPRequestHandler):
             raise ValueError(f"任务未在 R2 数据湖登记表中登记为启用状态: {task.task_id}")
         return str(meta["path"])
 
+    def _workflow_task(self, task_id: str):
+        task = self._load_task_by_id(task_id)
+        self._resolve_action_task_path(str(task.path))
+        return task
+
+    def _workflow_payload(self, body: Any, *, require_workflow_id: bool) -> tuple[str, str | None, str | None, dict]:
+        if not isinstance(body, dict):
+            raise ValueError("workflow payload must be a JSON object")
+        task_id = _workflow_identifier(body.get("task_id"), "task_id")
+        profile_id = _workflow_profile_id(body.get("profile"))
+        workflow_value = body.get("workflow_id")
+        if workflow_value in (None, "") and not require_workflow_id:
+            workflow_id = None
+        else:
+            workflow_id = _workflow_identifier(workflow_value, "workflow_id")
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            raise ValueError("params must be a JSON object")
+        return task_id, profile_id, workflow_id, params
+
+    def _workflow_start(self) -> None:
+        body = self._read_body()
+        try:
+            task_id, profile_id, workflow_id, params = self._workflow_payload(body, require_workflow_id=False)
+            task = self._workflow_task(task_id)
+            result = _workflow_api().start_workflow(
+                self.runs_root,
+                task,
+                profile_id=profile_id,
+                workflow_id=workflow_id,
+                params=params,
+            )
+            self._json({"ok": True, "workflow": result})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
+    def _workflow_resume(self) -> None:
+        body = self._read_body()
+        try:
+            task_id, profile_id, workflow_id, params = self._workflow_payload(body, require_workflow_id=True)
+            task = self._workflow_task(task_id)
+            result = _workflow_api().resume_workflow(
+                self.runs_root,
+                task,
+                workflow_id=workflow_id,
+                profile_id=profile_id,
+                params=params,
+            )
+            self._json({"ok": True, "workflow": result})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
+    def _workflow_list(self, params) -> None:
+        try:
+            task_id = _workflow_identifier(params.get("task_id", [""])[0], "task_id")
+            self._workflow_task(task_id)
+            result = _workflow_api().list_workflows(self.runs_root, task_id)
+            self._json({"workflows": result})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
+    def _workflow_status(self, params) -> None:
+        try:
+            task_id = _workflow_identifier(params.get("task_id", [""])[0], "task_id")
+            workflow_id = _workflow_identifier(params.get("workflow_id", [""])[0], "workflow_id")
+            self._workflow_task(task_id)
+            result = _workflow_api().get_workflow_status(self.runs_root, task_id, workflow_id)
+            if result is None:
+                self._json({"error": f"workflow not found: {workflow_id}"}, status=404)
+                return
+            self._json({"workflow": result})
+        except Exception as exc:
+            self._json({"error": str(exc)}, status=400)
+
     def _task_detail(self, task_id: str) -> None:
         if not _safe_segment(task_id):
             self._json({"error": "bad task"}, status=400)
@@ -614,6 +768,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._task_detail(contract_task_id)
         elif path.startswith("/api/tasks/"):
             self._json({"error": "not found"}, status=404)
+        elif path == "/api/workflow":
+            self._workflow_list(params)
+        elif path == "/api/workflow/status":
+            self._workflow_status(params)
         elif path == "/api/runs":
             self._json({"runs": discover_runs(self.runs_root)})
         elif path == "/api/run":
@@ -855,6 +1013,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._task_check(contract_check_task_id)
         elif path.startswith("/api/tasks/"):
             self._json({"error": "not found"}, status=404)
+        elif path == "/api/workflow/start":
+            self._workflow_start()
+        elif path == "/api/workflow/resume":
+            self._workflow_resume()
         elif path == "/api/adjudicate":
             run_dir = self._resolve_run(params)
             if not run_dir:
