@@ -80,6 +80,27 @@ export const startAction = (taskPath, action, params) =>
     body: JSON.stringify({ task: taskPath, action, params }),
   }).then((data) => data.job || data);
 
+export const startWorkflow = (taskId, payload = {}) =>
+  req("/api/workflow/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_id: taskId, ...payload }),
+  }).then((data) => data.workflow || data);
+
+export const resumeWorkflow = (taskId, workflowId, payload = {}) =>
+  req("/api/workflow/resume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_id: taskId, workflow_id: workflowId, ...payload }),
+  }).then((data) => data.workflow || data);
+
+export const listWorkflows = (taskId) => req(`/api/workflow?${q({ task_id: taskId })}`);
+
+export const getWorkflowStatus = (taskId, workflowId) =>
+  req(`/api/workflow/status?${q({ task_id: taskId, workflow_id: workflowId })}`).then(
+    (data) => data.workflow || data,
+  );
+
 export async function waitForJob(taskId, jobId, attempts = 30) {
   for (let i = 0; i < attempts; i += 1) {
     const data = await getJobs(taskId);
