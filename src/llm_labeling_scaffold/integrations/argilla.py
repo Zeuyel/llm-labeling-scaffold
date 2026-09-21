@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -451,6 +453,153 @@ def _record_id_for_row(row: dict, task: TaskConfig, strategy: str) -> str:
     return original_id
 
 
+def _canonical_record_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _suggestion_attribute(suggestion: Any, name: str) -> Any:
+    if isinstance(suggestion, dict):
+        return suggestion.get(name)
+    kwargs = getattr(suggestion, "kwargs", None)
+    if isinstance(kwargs, dict) and name in kwargs:
+        return kwargs[name]
+    return getattr(suggestion, name, None)
+
+
+def _suggestion_signature(suggestion: Any) -> dict[str, Any]:
+    return {
+        name: _suggestion_attribute(suggestion, name)
+        for name in ("question_name", "value", "score", "agent")
+    }
+
+
+def _record_suggestion_signature(record: Any) -> list[dict[str, Any]]:
+    suggestions = getattr(record, "suggestions", None) or []
+    signatures = [_suggestion_signature(item) for item in suggestions]
+    return sorted(signatures, key=_canonical_record_value)
+
+
+def _dataset_records(dataset) -> list:
+    records = getattr(dataset, "records", None)
+    if records is None:
+        return []
+    try:
+        return list(records)
+    except TypeError:
+        lister = getattr(records, "list", None)
+        if callable(lister):
+            return list(lister())
+        raise RuntimeError("Argilla 数据集不支持读取既有记录，无法安全执行 append")
+
+
+def _require_argilla_log_update_contract(rg: Any, records_store: Any) -> None:
+    expected_type = getattr(rg, "DatasetRecords", None)
+    version = str(getattr(rg, "__version__", ""))
+    if (
+        expected_type is None
+        or not isinstance(records_store, expected_type)
+        or not callable(getattr(records_store, "log", None))
+        or not re.fullmatch(r"2\.8(?:\.\d+)?", version)
+    ):
+        raise RuntimeError(
+            "Argilla 既有记录补写 suggestions 需要已验证的 Argilla 2.8 public "
+            "DatasetRecords.log 更新契约；当前 SDK 无法证明安全原地更新，请新建 dataset "
+            "或使用官方更新接口。"
+        )
+
+
+def _append_records(dataset, incoming: list) -> tuple[list, int]:
+    existing_by_id: dict[str, Any] = {}
+    for record in _dataset_records(dataset):
+        record_id = str(getattr(record, "id", ""))
+        if not record_id:
+            raise ValueError("Argilla 既有数据集包含缺失 Record.id 的记录，无法安全执行 append")
+        if record_id in existing_by_id:
+            raise ValueError(f"Argilla 既有数据集包含重复 Record.id: {record_id}")
+        existing_by_id[record_id] = record
+
+    to_log: list = []
+    reused = 0
+    for record in incoming:
+        record_id = str(getattr(record, "id", ""))
+        existing = existing_by_id.get(record_id)
+        if existing is None:
+            to_log.append(record)
+            continue
+
+        incoming_fields = getattr(record, "fields", None) or {}
+        existing_fields = getattr(existing, "fields", None) or {}
+        incoming_metadata = getattr(record, "metadata", None) or {}
+        existing_metadata = getattr(existing, "metadata", None) or {}
+        mismatches: list[str] = []
+        if _canonical_record_value(existing_fields) != _canonical_record_value(incoming_fields):
+            mismatches.append("fields")
+        if _canonical_record_value(existing_metadata) != _canonical_record_value(incoming_metadata):
+            mismatches.append("metadata")
+        lineage_mismatches = [
+            field
+            for field in _CONTEXT_METADATA_FIELDS
+            if existing_metadata.get(field) != incoming_metadata.get(field)
+        ]
+        if lineage_mismatches:
+            mismatches.append(f"batch lineage: {', '.join(lineage_mismatches)}")
+        if mismatches:
+            raise ValueError(
+                f"Argilla append 记录 {record_id} 已存在但记录内容、metadata 或批次血缘不一致: "
+                f"{'; '.join(mismatches)}"
+            )
+        reused += 1
+    return to_log, reused
+
+
+def _append_suggestion_records(dataset, incoming: list) -> tuple[list, int, bool]:
+    existing_by_id: dict[str, Any] = {}
+    for record in _dataset_records(dataset):
+        record_id = str(getattr(record, "id", ""))
+        if not record_id:
+            raise ValueError("Argilla 既有数据集包含缺失 Record.id 的记录，无法安全写入 suggestions")
+        if record_id in existing_by_id:
+            raise ValueError(f"Argilla 既有数据集包含重复 Record.id: {record_id}")
+        existing_by_id[record_id] = record
+
+    to_log: list = []
+    reused = 0
+    requires_update = False
+    for record in incoming:
+        if not getattr(record, "suggestions", None):
+            continue
+        record_id = str(getattr(record, "id", ""))
+        existing = existing_by_id.get(record_id)
+        if existing is None:
+            to_log.append(record)
+            continue
+
+        mismatches: list[str] = []
+        if _canonical_record_value(getattr(existing, "fields", None) or {}) != _canonical_record_value(
+            getattr(record, "fields", None) or {}
+        ):
+            mismatches.append("fields")
+        if _canonical_record_value(getattr(existing, "metadata", None) or {}) != _canonical_record_value(
+            getattr(record, "metadata", None) or {}
+        ):
+            mismatches.append("metadata")
+        existing_suggestions = _record_suggestion_signature(existing)
+        incoming_suggestions = _record_suggestion_signature(record)
+        if existing_suggestions and existing_suggestions != incoming_suggestions:
+            mismatches.append("suggestions")
+        if mismatches:
+            raise ValueError(
+                f"Argilla suggestions 记录 {record_id} 已存在但记录内容、metadata 或 suggestions 不一致: "
+                f"{'; '.join(mismatches)}"
+            )
+        if existing_suggestions == incoming_suggestions:
+            reused += 1
+        else:
+            to_log.append(record)
+            requires_update = True
+    return to_log, reused, requires_update
+
+
 def _record_context_metadata(row: dict, params: dict[str, Any]) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
     for field in _CONTEXT_METADATA_FIELDS:
@@ -704,7 +853,12 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
     dataset = rg.Dataset(name=dataset_name, workspace=workspace, settings=settings)
     dataset, dataset_action = _prepare_dataset(client, dataset, dataset_name, workspace, if_exists)
 
-    dataset.records.log(records)
+    records_to_log = records
+    reused_records = 0
+    if dataset_action == "appended":
+        records_to_log, reused_records = _append_records(dataset, records)
+    if records_to_log:
+        dataset.records.log(records_to_log)
     return {
         "backend": "argilla",
         "workspace": workspace,
@@ -712,6 +866,8 @@ def push_sample(task: TaskConfig, sample_path: str | Path, dataset_name: str, pa
         "dataset_action": dataset_action,
         "if_exists": if_exists,
         "records": len(records),
+        "logged_records": len(records_to_log),
+        "reused_records": reused_records,
         "suggestions": _record_suggestion_count(records),
         "record_id_policy": record_id_policy,
         "duplicate_record_ids": duplicate_record_ids,
@@ -745,12 +901,18 @@ def push_suggestions(
 
     client = _client(params.get("api_url"), params.get("api_key"))
     dataset = client.datasets(dataset_name, workspace=workspace)
-    dataset.records.log(records)
+    records_to_log, reused_records, requires_update = _append_suggestion_records(dataset, records)
+    if records_to_log:
+        if requires_update:
+            _require_argilla_log_update_contract(rg, dataset.records)
+        dataset.records.log(records_to_log)
     return {
         "backend": "argilla",
         "workspace": workspace,
         "dataset": dataset_name,
         "records": len(records),
+        "logged_records": len(records_to_log),
+        "reused_records": reused_records,
         "suggestions": suggestion_count,
         "record_id_policy": record_id_policy,
         "duplicate_record_ids": duplicate_record_ids,
@@ -759,6 +921,9 @@ def push_suggestions(
 
 def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path, params: dict[str, Any] | None = None) -> dict:
     params = params or {}
+    output = Path(output_path)
+    if output.exists():
+        raise FileExistsError(f"标注结果产物已存在，拒绝覆盖: {output}")
     client = _client(params.get("api_url"), params.get("api_key"))
     workspace = params.get("workspace") or os.environ.get("ARGILLA_WORKSPACE") or "argilla"
     dataset = client.datasets(dataset_name, workspace=workspace)
@@ -776,7 +941,7 @@ def pull_responses(task: TaskConfig, dataset_name: str, output_path: str | Path,
                 "user_id": response["user_id"],
                 "status": response["status"],
             })
-    write_jsonl(rows, output_path)
+    write_jsonl(rows, output)
     return {
         "backend": "argilla",
         "workspace": workspace,

@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import tempfile
 import types
+import inspect
 
 import pytest
 
@@ -9,6 +10,7 @@ from llm_labeling_scaffold.config import TaskConfig, load_task
 from llm_labeling_scaffold.integrations import argilla
 from llm_labeling_scaffold.integrations.argilla import (
     _argilla_text_fields,
+    _append_suggestion_records,
     _guidelines_for_task,
     _human_label_from_values,
     _prepare_dataset,
@@ -508,6 +510,244 @@ def test_argilla_suggestions_encode_integer_label_values_as_strings(tmp_path: Pa
 
     values = {item.kwargs["question_name"]: item.kwargs["value"] for item in records[0].suggestions}
     assert values == {"label": "yes", "flag": "0", "bool_flag": "false"}
+
+
+def test_argilla_suggestions_reuse_identical_existing_record():
+    existing = _Record(
+        id="r1",
+        fields={"text": "one"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+        suggestions=[_Suggestion(question_name="label", value="yes", score=0.8, agent="model:v1")],
+    )
+    incoming = _Record(
+        id="r1",
+        fields={"text": "one"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+        suggestions=[_Suggestion(question_name="label", value="yes", score=0.8, agent="model:v1")],
+    )
+    dataset = types.SimpleNamespace(records=[existing])
+
+    to_log, reused, requires_update = _append_suggestion_records(dataset, [incoming])
+
+    assert to_log == []
+    assert reused == 1
+    assert not requires_update
+
+
+def test_argilla_suggestions_reject_conflicting_existing_suggestion():
+    existing = _Record(
+        id="r1",
+        fields={"text": "one"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+        suggestions=[_Suggestion(question_name="label", value="yes", agent="model:v1")],
+    )
+    incoming = _Record(
+        id="r1",
+        fields={"text": "one"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+        suggestions=[_Suggestion(question_name="label", value="no", agent="model:v1")],
+    )
+    dataset = types.SimpleNamespace(records=[existing])
+
+    with pytest.raises(ValueError, match="suggestions 不一致"):
+        _append_suggestion_records(dataset, [incoming])
+
+
+def test_argilla_suggestions_add_to_existing_record_without_suggestions():
+    existing = _Record(
+        id="r1",
+        fields={"text": "one"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+    )
+    incoming = _Record(
+        id="r1",
+        fields={"text": "one"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+        suggestions=[_Suggestion(question_name="label", value="yes", agent="model:v1")],
+    )
+    dataset = types.SimpleNamespace(records=[existing])
+
+    to_log, reused, requires_update = _append_suggestion_records(dataset, [incoming])
+
+    assert to_log == [incoming]
+    assert reused == 0
+    assert requires_update
+
+
+def test_push_suggestions_is_idempotent_for_existing_records(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl([{"record_id": "r1", "suggestions": {"label": "yes"}}], suggestions)
+
+    class _RecordAPI:
+        def bulk_upsert(self, *args, **kwargs):
+            return [], 0
+
+    class _RecordStore:
+        def __init__(self, records):
+            self.records = list(records)
+            self.logged = []
+            self._api = _RecordAPI()
+
+        def __iter__(self):
+            return iter(self.records)
+
+        def log(self, records):
+            """Add or update records. If the record includes a known `id` field, the record will be updated."""
+            for record in records:
+                for index, existing in enumerate(self.records):
+                    if existing.id == record.id:
+                        self.records[index] = record
+                        break
+                else:
+                    self.records.append(record)
+                self.logged.append(record)
+
+    records, _, _ = _prepare_records_for_push(
+        types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion),
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+    existing = _Record(id="r1", fields=records[0].fields, metadata=records[0].metadata)
+    store = _RecordStore([existing])
+    dataset = types.SimpleNamespace(records=store)
+    client = types.SimpleNamespace(datasets=lambda _name, workspace=None: dataset)
+    fake_rg = types.SimpleNamespace(
+        Record=_Record,
+        Suggestion=_Suggestion,
+        DatasetRecords=_RecordStore,
+        __version__="2.8.0",
+    )
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+
+    first = argilla.push_suggestions(task, sample, "dataset_a", suggestions)
+    assert first["logged_records"] == 1
+    assert first["reused_records"] == 0
+
+    assert len(store.records) == 1
+    store.records = list(store.records)
+    store.logged.clear()
+    second = argilla.push_suggestions(task, sample, "dataset_a", suggestions)
+    assert second["logged_records"] == 0
+    assert second["reused_records"] == 1
+    assert store.logged == []
+
+
+def test_push_suggestions_fails_fast_without_proven_upsert_contract(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl([{"record_id": "r1", "suggestions": {"label": "yes"}}], suggestions)
+
+    class _AppendOnlyStore:
+        def __init__(self, records):
+            self.records = list(records)
+            self.logged = False
+
+        def __iter__(self):
+            return iter(self.records)
+
+        def log(self, records):
+            self.logged = True
+
+    records, _, _ = _prepare_records_for_push(
+        types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion),
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+    store = _AppendOnlyStore([_Record(id="r1", fields=records[0].fields, metadata=records[0].metadata)])
+    dataset = types.SimpleNamespace(records=store)
+    client = types.SimpleNamespace(datasets=lambda _name, workspace=None: dataset)
+    fake_rg = types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion, DatasetRecords=_AppendOnlyStore)
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+
+    with pytest.raises(RuntimeError, match="新建 dataset 或使用官方更新接口"):
+        argilla.push_suggestions(task, sample, "dataset_a", suggestions)
+    assert not store.logged
+
+
+def test_push_suggestions_does_not_trust_bulk_upsert_attribute_alone(tmp_path: Path, monkeypatch):
+    task = _argilla_push_task()
+    sample = tmp_path / "sample.jsonl"
+    write_jsonl([{"record_id": "r1", "title": "one"}], sample)
+    suggestions = tmp_path / "suggestions.jsonl"
+    write_jsonl([{"record_id": "r1", "suggestions": {"label": "yes"}}], suggestions)
+
+    class _UnverifiedStore:
+        def __init__(self, records):
+            self.records = list(records)
+            self._api = types.SimpleNamespace(bulk_upsert=lambda *args, **kwargs: None)
+            self.logged = False
+
+        def __iter__(self):
+            return iter(self.records)
+
+        def log(self, records):
+            self.logged = True
+
+    records, _, _ = _prepare_records_for_push(
+        types.SimpleNamespace(Record=_Record, Suggestion=_Suggestion),
+        task,
+        sample,
+        "text",
+        {"suggestions_path": str(suggestions)},
+    )
+    store = _UnverifiedStore([_Record(id="r1", fields=records[0].fields, metadata=records[0].metadata)])
+    dataset = types.SimpleNamespace(records=store)
+    client = types.SimpleNamespace(datasets=lambda _name, workspace=None: dataset)
+    fake_rg = types.SimpleNamespace(
+        Record=_Record,
+        Suggestion=_Suggestion,
+        DatasetRecords=_UnverifiedStore,
+        __version__="2.9.0",
+    )
+    monkeypatch.setattr(argilla, "_load_argilla", lambda: fake_rg)
+    monkeypatch.setattr(argilla, "_client", lambda api_url=None, api_key=None: client)
+
+    with pytest.raises(RuntimeError, match="无法证明安全原地更新"):
+        argilla.push_suggestions(task, sample, "dataset_a", suggestions)
+    assert not store.logged
+
+
+def test_argilla_28_public_log_contract_is_update_capable():
+    rg = pytest.importorskip("argilla")
+    if not str(getattr(rg, "__version__", "")).startswith("2.8."):
+        pytest.skip("requires Argilla 2.8")
+
+    log = rg.DatasetRecords.log
+    doc = inspect.getdoc(log) or ""
+    source = inspect.getsource(log)
+
+    assert "known `id` field" in doc
+    assert "will be updated" in doc
+    assert "bulk_upsert" in source
+
+
+def test_argilla_suggestions_reject_existing_record_content_mismatch():
+    existing = _Record(
+        id="r1",
+        fields={"text": "different"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+    )
+    incoming = _Record(
+        id="r1",
+        fields={"text": "one"},
+        metadata={"record_id": "r1", "batch_id": "batch_1"},
+        suggestions=[_Suggestion(question_name="label", value="yes", agent="model:v1")],
+    )
+    dataset = types.SimpleNamespace(records=[existing])
+
+    with pytest.raises(ValueError, match="fields"):
+        _append_suggestion_records(dataset, [incoming])
 
 
 def test_argilla_push_batch_scoped_fails_on_same_batch_duplicate_original_id(tmp_path: Path):

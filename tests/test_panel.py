@@ -10,10 +10,13 @@ import threading
 import urllib.error
 import urllib.request
 
+import pytest
+
 from llm_labeling_scaffold import panel
 from llm_labeling_scaffold import pipeline
+from llm_labeling_scaffold import gold as gold_module
 from llm_labeling_scaffold.gold import build_gold_from_decisions
-from llm_labeling_scaffold.io import read_json, read_jsonl
+from llm_labeling_scaffold.io import read_json, read_jsonl, write_jsonl
 
 
 def _decode_basic(header: str) -> tuple[str, str]:
@@ -400,3 +403,207 @@ def test_build_gold_from_sample_and_decisions(panel_workspace):
     assert manifest["source"] == "decision_artifact"
     assert manifest["rows"] == 2
     assert manifest["sample_path"] == str(panel_workspace["sample_path"])
+
+
+def test_build_gold_from_decisions_rejects_unknown_id_without_outputs(panel_workspace):
+    task = panel_workspace["task"]
+    decisions_path = panel_workspace["decisions_path"]
+    write_jsonl(
+        [{"record_id": "unknown", "human_label": {"class_label": "non_target"}}],
+        decisions_path,
+    )
+
+    with pytest.raises(ValueError, match="未知 ID"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            decisions_path,
+            "strict_unknown_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not any(
+        path.exists()
+        for path in (
+            gold_dir / "gold_strict_unknown_v001.jsonl",
+            gold_dir / "gold_strict_unknown_v001.manifest.json",
+            gold_dir / "gold_strict_unknown_v001.data_card.md",
+        )
+    )
+
+
+def test_build_gold_from_decisions_rejects_duplicate_id_without_outputs(panel_workspace):
+    task = panel_workspace["task"]
+    decisions_path = panel_workspace["decisions_path"]
+    write_jsonl(
+        [
+            {"record_id": "r001", "human_label": {"class_label": "non_target"}},
+            {"record_id": "r001", "human_label": {"class_label": "non_target"}},
+        ],
+        decisions_path,
+    )
+
+    with pytest.raises(ValueError, match="重复 ID"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            decisions_path,
+            "strict_duplicate_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not (gold_dir / "gold_strict_duplicate_v001.jsonl").exists()
+    assert not (gold_dir / "gold_strict_duplicate_v001.manifest.json").exists()
+    assert not (gold_dir / "gold_strict_duplicate_v001.data_card.md").exists()
+
+
+def test_build_gold_from_decisions_rejects_missing_primary_label_without_outputs(panel_workspace):
+    task = panel_workspace["task"]
+    decisions_path = panel_workspace["decisions_path"]
+    write_jsonl(
+        [{"record_id": "r001", "human_label": {"is_target": 0}}],
+        decisions_path,
+    )
+
+    with pytest.raises(ValueError, match="缺少主标签"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            decisions_path,
+            "strict_missing_primary_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not (gold_dir / "gold_strict_missing_primary_v001.jsonl").exists()
+    assert not (gold_dir / "gold_strict_missing_primary_v001.manifest.json").exists()
+    assert not (gold_dir / "gold_strict_missing_primary_v001.data_card.md").exists()
+
+
+def test_build_gold_allows_identical_cross_batch_overlap(panel_workspace):
+    task = panel_workspace["task"]
+    run_dir = panel_workspace["run_dir"]
+    write_jsonl(
+        [
+            {"record_id": "r001", "title": "General notice"},
+            {"record_id": "r002", "title": "Service upgrade"},
+        ],
+        run_dir / "input" / "batches" / "batch_00001.jsonl",
+    )
+    write_jsonl(
+        [{"record_id": "r001", "title": "General notice"}],
+        run_dir / "input" / "batches" / "batch_00002.jsonl",
+    )
+
+    gold_path = gold_module.build_gold(task, run_dir, "strict_overlap_v001")
+
+    assert len(read_jsonl(gold_path)) == 2
+
+
+def test_build_gold_rejects_conflicting_cross_batch_duplicate(panel_workspace):
+    task = panel_workspace["task"]
+    run_dir = panel_workspace["run_dir"]
+    write_jsonl(
+        [{"record_id": "r001", "title": "General notice"}],
+        run_dir / "input" / "batches" / "batch_00001.jsonl",
+    )
+    write_jsonl(
+        [{"record_id": "r001", "title": "Conflicting source"}],
+        run_dir / "input" / "batches" / "batch_00002.jsonl",
+    )
+
+    with pytest.raises(ValueError, match="跨批重复 ID 内容不一致"):
+        gold_module.build_gold(task, run_dir, "strict_overlap_conflict_v001")
+
+
+def test_build_gold_rejects_duplicate_merged_id(panel_workspace):
+    task = panel_workspace["task"]
+    run_dir = panel_workspace["run_dir"]
+    write_jsonl(
+        [
+            {"record_id": "r001", "class_label": "non_target"},
+            {"record_id": "r001", "class_label": "service_upgrade"},
+        ],
+        run_dir / "merged" / "merged_clean.jsonl",
+    )
+
+    with pytest.raises(ValueError, match="merged_clean 存在重复 ID"):
+        gold_module.build_gold(task, run_dir, "strict_merged_duplicate_v001")
+
+
+@pytest.mark.parametrize(
+    "existing_name",
+    [
+        "gold_strict_existing_v001.jsonl",
+        "gold_strict_existing_v001.manifest.json",
+        "gold_strict_existing_v001.data_card.md",
+    ],
+)
+def test_build_gold_from_decisions_rejects_any_existing_output(panel_workspace, existing_name):
+    task = panel_workspace["task"]
+    gold_dir = task.runs_dir / "gold"
+    existing_path = gold_dir / existing_name
+    existing_path.write_text("existing\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="拒绝覆盖"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            panel_workspace["decisions_path"],
+            "strict_existing_v001",
+        )
+
+    assert existing_path.read_text(encoding="utf-8") == "existing\n"
+    output_paths = {
+        gold_dir / "gold_strict_existing_v001.jsonl",
+        gold_dir / "gold_strict_existing_v001.manifest.json",
+        gold_dir / "gold_strict_existing_v001.data_card.md",
+    }
+    assert {path for path in output_paths if path.exists()} == {existing_path}
+
+
+def test_build_gold_from_decisions_does_not_publish_partial_outputs(panel_workspace, monkeypatch):
+    task = panel_workspace["task"]
+
+    def fail_manifest_write(*args, **kwargs):
+        raise OSError("manifest storage unavailable")
+
+    monkeypatch.setattr(gold_module, "write_json", fail_manifest_write)
+
+    with pytest.raises(OSError, match="manifest storage unavailable"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            panel_workspace["decisions_path"],
+            "strict_atomic_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not any(gold_dir.glob("gold_strict_atomic_v001.*"))
+    assert not any(gold_dir.glob(".gold_strict_atomic_v001_*"))
+
+
+def test_build_gold_cleans_published_files_when_publish_fails(panel_workspace, monkeypatch):
+    task = panel_workspace["task"]
+    real_link = gold_module.os.link
+    calls = 0
+
+    def fail_on_second_link(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("gold publication unavailable")
+        return real_link(source, target)
+
+    monkeypatch.setattr(gold_module.os, "link", fail_on_second_link)
+
+    with pytest.raises(OSError, match="gold publication unavailable"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            panel_workspace["decisions_path"],
+            "strict_publish_failure_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not any(gold_dir.glob("gold_strict_publish_failure_v001.*"))
+    assert not any(gold_dir.glob(".gold_strict_publish_failure_v001_*"))
