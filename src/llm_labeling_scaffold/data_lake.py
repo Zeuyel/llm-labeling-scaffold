@@ -9,7 +9,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 import yaml
@@ -242,7 +242,7 @@ def copy_uri_to_path(uri: str, target: str | Path) -> Path:
     return target_path
 
 
-def copy_path_to_uri(source: str | Path, uri: str) -> str:
+def copy_path_to_uri(source: str | Path, uri: str, *, immutable: bool = False) -> str:
     source_path = Path(source)
     if not source_path.is_file():
         raise DataLakeError(f"本地文件不存在: {source_path}")
@@ -251,14 +251,22 @@ def copy_path_to_uri(source: str | Path, uri: str) -> str:
             raise DataLakeError("生产模式不允许本地数据湖 URI；如需单测请设置 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1")
         target = _local_path(uri)
         target.parent.mkdir(parents=True, exist_ok=True)
+        if immutable and target.exists():
+            if target.stat().st_size != source_path.stat().st_size or _file_sha256(target) != _file_sha256(source_path):
+                raise DataLakeError(f"不可变写入冲突，目标已有不同内容: {uri}")
+            return str(target)
         shutil.copyfile(source_path, target)
         return str(target)
     if not _is_rclone_uri(uri):
         raise DataLakeError(f"不支持的数据湖 URI: {uri}")
     _validate_rclone_uri(uri)
+    command = [_rclone_bin(), "copyto"]
+    if immutable:
+        command.append("--immutable")
+    command.extend([str(source_path), uri])
     try:
         subprocess.run(
-            [_rclone_bin(), "copyto", str(source_path), uri],
+            command,
             check=True,
             text=True,
             capture_output=True,
@@ -270,7 +278,8 @@ def copy_path_to_uri(source: str | Path, uri: str) -> str:
         raise DataLakeError(f"rclone 写入超时: {uri}") from exc
     except subprocess.CalledProcessError as exc:
         detail = (exc.stderr or exc.stdout or "").strip()
-        raise DataLakeError(f"rclone 写入失败: {uri} {detail}") from exc
+        prefix = "rclone 不可变写入冲突" if immutable else "rclone 写入失败"
+        raise DataLakeError(f"{prefix}: {uri} {detail}") from exc
     return uri
 
 
@@ -402,23 +411,13 @@ def _validate_label_import_object(item: dict[str, Any], task: TaskConfig) -> dic
     }
 
 
-def _canonical_relative_storage_uri(dataset: dict[str, Any], source_object_path: str) -> str | None:
-    canonical_uri = str(dataset.get("canonical_uri") or "").strip()
-    if not canonical_uri:
-        return None
-    return canonical_uri.rstrip("/") + "/" + source_object_path
-
-
-def _select_object(manifest: dict[str, Any], cfg: dict[str, Any], dataset: dict[str, Any] | None = None) -> dict[str, Any]:
+def _select_object(manifest: dict[str, Any], cfg: dict[str, Any]) -> dict[str, Any]:
     objects = _manifest_objects(manifest)
     source_object_path = str(cfg.get("source_object_path") or "").strip()
 
     if source_object_path:
         safe_path = _validate_manifest_path(source_object_path)
         matches = [item for item in objects if item.get("path") == safe_path]
-        if not matches and dataset:
-            expected_uri = _canonical_relative_storage_uri(dataset, safe_path)
-            matches = [item for item in objects if item.get("storage_uri") == expected_uri] if expected_uri else []
     else:
         matches = candidate_objects(manifest)
 
@@ -463,7 +462,7 @@ def resolve_source(task: TaskConfig, overrides: dict[str, Any] | None = None) ->
                 raise DataLakeError(f"manifest 缺少 {key}")
             if registry_value != manifest_value:
                 raise DataLakeError(f"manifest.{key} 与 registry 不一致: registry={registry_value}, manifest={manifest_value}")
-    selected = _validate_label_import_object(_select_object(manifest, cfg, dataset), task)
+    selected = _validate_label_import_object(_select_object(manifest, cfg), task)
     object_uri = str(selected.get("storage_uri") or "").strip()
     if not object_uri:
         raise DataLakeError("匹配对象缺少 storage_uri")
@@ -602,8 +601,187 @@ def _artifact_manifest_uri(target_uri: str) -> str:
     return target_uri.rstrip("/") + ".manifest.json"
 
 
+def _canonical_json_sha256(value: Mapping[str, Any]) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _read_json_uri_with_hash(uri: str) -> tuple[dict[str, Any], str]:
+    with tempfile.TemporaryDirectory(prefix="lls-lake-json-") as td:
+        path = Path(td) / "object.json"
+        copy_uri_to_path(uri, path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DataLakeError(f"数据湖对象不是有效 JSON: {uri}") from exc
+        if not isinstance(data, dict):
+            raise DataLakeError(f"数据湖 manifest 必须是对象: {uri}")
+        return data, _file_sha256(path)
+
+
+def _uri_exists(uri: str) -> bool:
+    if _is_local_path(uri):
+        if not _allow_local_data_lake_uris():
+            raise DataLakeError("生产模式不允许本地数据湖 URI；如需单测请设置 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1")
+        return _local_path(uri).is_file()
+    if not _is_rclone_uri(uri):
+        raise DataLakeError(f"不支持的数据湖对象 URI: {uri}")
+    _validate_rclone_uri(uri)
+    try:
+        result = subprocess.run(
+            [_rclone_bin(), "lsjson", "--files-only", uri],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=_rclone_timeout(),
+        )
+    except FileNotFoundError as exc:
+        raise DataLakeError("未找到 rclone。请在宿主机或面板容器中安装 rclone，并配置 R2 remote。") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise DataLakeError(f"rclone 检查对象是否存在超时: {uri}") from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        lowered = detail.lower()
+        if any(token in lowered for token in ("not found", "notfound", "no such", "doesn't exist", "404")):
+            return False
+        raise DataLakeError(f"rclone 检查对象失败: {uri} {detail}")
+    try:
+        entries = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise DataLakeError(f"rclone lsjson 返回无效 JSON: {uri}") from exc
+    return isinstance(entries, list) and any(isinstance(entry, dict) for entry in entries)
+
+
+def _read_optional_manifest(uri: str) -> tuple[dict[str, Any], str] | None:
+    if not _uri_exists(uri):
+        return None
+    return _read_json_uri_with_hash(uri)
+
+
+def _validate_publication_value(name: str, value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise DataLakeError(f"{name} 不能为空")
+    if len(text) > 256 or "/" in text or "\\" in text:
+        raise DataLakeError(f"{name} 不是有效的发布标识: {value}")
+    return text
+
+
+def _source_manifest_details(
+    task: TaskConfig,
+    source_manifest_uri: str | None,
+    source_manifest: Mapping[str, Any] | None,
+) -> tuple[str | None, str | None, dict[str, Any] | None]:
+    task_uri = str(task.data_lake.get("source_manifest_uri") or "").strip()
+    explicit_uri = str(source_manifest_uri or "").strip()
+    if task_uri and explicit_uri and task_uri != explicit_uri:
+        raise DataLakeError("source_manifest_uri 与任务配置不一致")
+    configured_uri = explicit_uri or task_uri
+    uri = configured_uri or None
+    if source_manifest is not None and not isinstance(source_manifest, Mapping):
+        raise DataLakeError("source_manifest 必须是 JSON 对象")
+    inline = dict(source_manifest) if source_manifest is not None else None
+    if uri:
+        remote, digest = _read_json_uri_with_hash(uri)
+        if inline is not None and _canonical_json_sha256(inline) != _canonical_json_sha256(remote):
+            raise DataLakeError("source_manifest 与 source_manifest_uri 内容不一致")
+        return uri, digest, remote
+    if inline is not None:
+        return None, _canonical_json_sha256(inline), inline
+    return None, None, None
+
+
+def _manifest_value(manifest: Mapping[str, Any], key: str) -> Any:
+    output = manifest.get("output")
+    if isinstance(output, Mapping) and key in output:
+        return output[key]
+    return manifest.get(key)
+
+
+def _assert_existing_publication(
+    existing: Mapping[str, Any],
+    desired: Mapping[str, Any],
+    expected_version: str | None,
+) -> None:
+    required = (
+        "task_id",
+        "asset_type",
+        "version",
+        "idempotency_key",
+        "storage_uri",
+        "sha256",
+        "bytes",
+        "rows",
+        "source_manifest_uri",
+        "source_manifest_sha256",
+    )
+    missing = [key for key in required if key not in existing and not (isinstance(existing.get("output"), Mapping) and key in existing["output"])]
+    if missing:
+        raise DataLakeError(f"现有发布 manifest 缺少不可变契约字段: {', '.join(missing)}")
+    existing_version = str(existing.get("version") or "")
+    if expected_version is not None and existing_version != expected_version:
+        raise DataLakeError(f"expected_version 冲突: expected={expected_version}, actual={existing_version}")
+    if existing_version != desired["version"]:
+        raise DataLakeError(f"目标已有其他发布版本: existing={existing_version}, requested={desired['version']}")
+    if existing.get("task_id") != desired["task_id"]:
+        raise DataLakeError("目标已有其他任务的发布，拒绝复用或覆盖")
+    if existing.get("asset_type") != desired["asset_type"]:
+        raise DataLakeError("目标已有其他资产类型的发布，拒绝复用或覆盖")
+    if existing.get("idempotency_key") != desired["idempotency_key"]:
+        raise DataLakeError("目标已有不同 idempotency_key，拒绝复用或覆盖")
+    for key in (
+        "storage_uri",
+        "path",
+        "bytes",
+        "rows",
+        "source_manifest_uri",
+        "source_manifest_sha256",
+    ):
+        if _manifest_value(existing, key) != _manifest_value(desired, key):
+            raise DataLakeError(f"发布契约字段不一致: {key}")
+    if _manifest_value(existing, "sha256") != _manifest_value(desired, "sha256"):
+        raise DataLakeError("同版本不同 hash，拒绝覆盖")
+
+
+def _verify_artifact_uri(uri: str, expected: Mapping[str, Any]) -> None:
+    with tempfile.TemporaryDirectory(prefix="lls-lake-verify-") as td:
+        path = Path(td) / (Path(uri).name or "artifact")
+        copy_uri_to_path(uri, path)
+        actual_bytes = path.stat().st_size
+        actual_sha256 = _file_sha256(path)
+        if actual_bytes != expected["bytes"] or actual_sha256 != expected["sha256"]:
+            raise DataLakeError(f"已发布对象校验失败: {uri}")
+        expected_rows = expected.get("rows")
+        if expected_rows is not None and _jsonl_rows_if_supported(path) != expected_rows:
+            raise DataLakeError(f"已发布对象行数校验失败: {uri}")
+
+
+def _publication_result(
+    task: TaskConfig,
+    local: Path,
+    target_uri: str,
+    manifest_uri: str,
+    manifest: Mapping[str, Any],
+    action: str,
+) -> dict[str, Any]:
+    return {
+        "task_id": task.task_id,
+        "local_path": str(local),
+        "target_uri": target_uri,
+        "manifest_uri": manifest_uri,
+        "action": action,
+        "idempotent": action == "reused",
+        "manifest": dict(manifest),
+    }
+
+
 def export_artifact(task: TaskConfig, local_path: str | Path,
-                    target_uri: str | None = None, target_path: str | None = None) -> dict[str, Any]:
+                    target_uri: str | None = None, target_path: str | None = None, *,
+                    source_manifest_uri: str | None = None,
+                    source_manifest: Mapping[str, Any] | None = None,
+                    idempotency_key: str | None = None,
+                    version: str | None = None,
+                    expected_version: str | None = None) -> dict[str, Any]:
     cfg = task.data_lake
     local = Path(local_path)
     if not local.is_file():
@@ -616,29 +794,116 @@ def export_artifact(task: TaskConfig, local_path: str | Path,
         target_uri = base.rstrip("/") + "/" + rel
     else:
         rel = _validate_output_path(target_path or local.name)
+    target_uri = str(target_uri).strip()
+    _validate_storage_uri(target_uri)
     manifest_uri = _artifact_manifest_uri(target_uri)
+    configured_source_uri = str(source_manifest_uri or cfg.get("source_manifest_uri") or "").strip()
+    if configured_source_uri and configured_source_uri in {target_uri, manifest_uri}:
+        raise DataLakeError("输出对象或发布 manifest 不能覆盖 source_manifest_uri")
     rows = _jsonl_rows_if_supported(local)
+    output_bytes = local.stat().st_size
+    output_sha256 = _file_sha256(local)
+    publication_version = _validate_publication_value(
+        "version", version or cfg.get("output_version") or cfg.get("artifact_version") or "v001"
+    )
+    expected = str(expected_version).strip() if expected_version is not None and str(expected_version).strip() else None
+    if expected is not None:
+        expected = _validate_publication_value("expected_version", expected)
+    configured_task_source_uri = str(cfg.get("source_manifest_uri") or "").strip()
+    if _is_rclone_uri(target_uri) and not configured_task_source_uri:
+        if source_manifest_uri:
+            raise DataLakeError("R2 发布的 source_manifest_uri 必须来自任务配置")
+        raise DataLakeError("R2 发布必须提供 source_manifest_uri")
+    source_uri, source_sha256, source_data = _source_manifest_details(task, source_manifest_uri, source_manifest)
+    if source_uri and source_uri in {target_uri, manifest_uri}:
+        raise DataLakeError("输出对象或发布 manifest 不能覆盖 source_manifest_uri")
+    if _is_rclone_uri(target_uri):
+        if source_uri is None:
+            raise DataLakeError("R2 发布必须提供 source_manifest_uri")
+        if not _is_rclone_uri(source_uri):
+            raise DataLakeError("R2 发布的 source_manifest_uri 必须是 R2 URI")
+    requested_key = str(idempotency_key or "").strip()
+    if requested_key:
+        requested_key = _validate_publication_value("idempotency_key", requested_key)
+    else:
+        seed = "\n".join(
+            [task.task_id, target_uri, publication_version, output_sha256, source_uri or "", source_sha256 or ""]
+        ).encode("utf-8")
+        requested_key = f"auto-{hashlib.sha256(seed).hexdigest()}"
     manifest = {
-        "manifest_version": "1.0",
+        "manifest_version": "2.0",
         "task_id": task.task_id,
         "asset_type": "scaffold_output",
+        "version": publication_version,
+        "idempotency_key": requested_key,
+        "expected_version": expected,
+        "source_manifest_uri": source_uri,
+        "source_manifest_sha256": source_sha256,
+        "source_manifest": {
+            "uri": source_uri,
+            "sha256": source_sha256,
+            "dataset_id": source_data.get("dataset_id") if source_data else None,
+            "manifest_version": source_data.get("manifest_version") if source_data else None,
+        } if source_data is not None else None,
+        "output": {
+            "path": rel,
+            "storage_uri": target_uri,
+            "manifest_uri": manifest_uri,
+            "bytes": output_bytes,
+            "sha256": output_sha256,
+            "rows": rows,
+        },
         "path": rel,
         "storage_uri": target_uri,
-        "bytes": local.stat().st_size,
-        "sha256": _file_sha256(local),
+        "bytes": output_bytes,
+        "sha256": output_sha256,
         "rows": rows,
         "created_at": _now(),
         "created_by": "llm_labeling_scaffold",
     }
+    existing_manifest = _read_optional_manifest(manifest_uri)
+    artifact_exists = _uri_exists(target_uri)
+    if existing_manifest is not None:
+        existing, _ = existing_manifest
+        if not artifact_exists:
+            raise DataLakeError("发布 manifest 已存在但产物对象缺失，拒绝自动修复")
+        _assert_existing_publication(existing, manifest, expected)
+        _verify_artifact_uri(target_uri, existing.get("output") if isinstance(existing.get("output"), Mapping) else existing)
+        return _publication_result(task, local, target_uri, manifest_uri, existing, "reused")
+    if artifact_exists:
+        raise DataLakeError("产物对象已存在但 manifest 缺失，拒绝覆盖")
+    if expected is not None and expected != publication_version:
+        raise DataLakeError(
+            f"expected_version 与待发布版本不一致: expected={expected} actual={publication_version}"
+        )
     with tempfile.TemporaryDirectory(prefix="lls-lake-export-") as td:
         manifest_path = Path(td) / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-        written = copy_path_to_uri(local, target_uri)
-        written_manifest = copy_path_to_uri(manifest_path, manifest_uri)
-    return {
-        "task_id": task.task_id,
-        "local_path": str(local),
-        "target_uri": written,
-        "manifest_uri": written_manifest,
-        "manifest": manifest,
-    }
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        copy_path_to_uri(local, target_uri, immutable=True)
+        _verify_artifact_uri(target_uri, manifest["output"])
+        raced_manifest = _read_optional_manifest(manifest_uri)
+        if raced_manifest is not None:
+            raced, _ = raced_manifest
+            _assert_existing_publication(raced, manifest, expected)
+            _verify_artifact_uri(target_uri, raced.get("output") if isinstance(raced.get("output"), Mapping) else raced)
+            return _publication_result(task, local, target_uri, manifest_uri, raced, "reused")
+        try:
+            copy_path_to_uri(manifest_path, manifest_uri, immutable=True)
+        except DataLakeError as upload_error:
+            raced_manifest = _read_optional_manifest(manifest_uri)
+            if raced_manifest is None:
+                raise upload_error
+            raced, _ = raced_manifest
+            _assert_existing_publication(raced, manifest, expected)
+            _verify_artifact_uri(
+                target_uri,
+                raced.get("output") if isinstance(raced.get("output"), Mapping) else raced,
+            )
+            return _publication_result(task, local, target_uri, manifest_uri, raced, "reused")
+    published = _read_optional_manifest(manifest_uri)
+    if published is None:
+        raise DataLakeError("产物已上传但发布 manifest 不可读，发布未完成")
+    published_manifest, _ = published
+    _assert_existing_publication(published_manifest, manifest, expected)
+    _verify_artifact_uri(target_uri, published_manifest.get("output") if isinstance(published_manifest.get("output"), Mapping) else published_manifest)
+    return _publication_result(task, local, target_uri, manifest_uri, published_manifest, "published")

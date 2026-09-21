@@ -701,7 +701,7 @@ def test_start_data_lake_import_job_writes_import_manifest(tmp_path: Path):
     assert manifest["source_object_sha256"] == _file_sha256(source)
 
 
-def test_data_lake_import_accepts_source_path_relative_to_canonical_uri(tmp_path: Path):
+def test_data_lake_import_rejects_source_path_not_listed_in_manifest(tmp_path: Path):
     canonical_root = tmp_path / "canonical"
     source = canonical_root / "manual_seed_500" / "v1" / "raw.jsonl"
     source.parent.mkdir(parents=True)
@@ -761,11 +761,13 @@ def test_data_lake_import_accepts_source_path_relative_to_canonical_uri(tmp_path
     )
     task = load_task(created["path"])
 
-    with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
-        imported = pipeline.import_from_data_lake(tmp_path / "runs", task)
-
-    assert imported["import_id"] == "lake_import"
-    assert imported["data_lake"]["source_object_path"] == "inputs/manual_seed_500/v1/raw.jsonl"
+    try:
+        with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
+            pipeline.import_from_data_lake(tmp_path / "runs", task)
+    except Exception as exc:
+        assert "数据集 manifest 中没有匹配的可导入对象" in str(exc)
+    else:
+        raise AssertionError("source_object_path must be listed exactly in manifest.objects[].path")
 
 
 def test_data_lake_import_requires_manifest_relative_object_and_matching_manifest(tmp_path: Path):

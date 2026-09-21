@@ -69,7 +69,7 @@ data_lake:
 - `lake_registry_uri`：数据湖登记表。可省略，默认读取当前部署的 `task_registry_uri`。若只写到目录，系统会补 `data_lake.yaml`。
 - `source_dataset_id`：registry 中的数据集编号。
 - `source_manifest_uri`：源数据集 manifest。可省略；如果显式填写，必须和 registry 中的 manifest 完全一致。
-- `source_object_path`：安全相对路径。优先精确匹配 manifest `objects[].path`；若登记表的 dataset 写了 `canonical_uri`，也可填写相对该 `canonical_uri` 的路径。平台不接受任意 `storage_uri` 作为导入源。
+- `source_object_path`：必须是安全相对路径，并且必须精确匹配 manifest `objects[].path`。平台不接受通过 `canonical_uri` 推导路径，也不接受任意 `storage_uri` 作为导入源。
 - `default_import_id`：面板从数据湖生成本地导入时使用的默认导入编号。
 - `output_base_uri`：后续标注结果、训练集、预测结果回写 R2 的根路径。
 
@@ -108,7 +108,7 @@ labels/<domain>/<task_id>/predictions/...
 ```text
 source_dataset_id
   -> registry 找 manifest
-  -> manifest.objects[] 精确匹配 source_object_path，或按 dataset.canonical_uri 匹配相对路径
+  -> manifest.objects[] 精确匹配 source_object_path
   -> 得到 storage_uri / bytes / sha256 / rows
   -> 创建异步导入 job
   -> rclone copyto 到本地临时文件
@@ -184,6 +184,16 @@ LLS_RCLONE_TIMEOUT_SECONDS=120
 ```text
 LLS_ALLOW_LOCAL_DATA_LAKE_URIS=1
 ```
+
+## R2 产物发布契约
+
+`export_artifact` 发布 R2 产物时，调用方必须提供任务配置中的 R2 `source_manifest_uri`，且该 URI 必须属于允许的数据湖前缀。内联 `source_manifest` 只用于本地测试或开发排查，不能作为 R2 正式发布的血缘来源。发布 manifest 会同时记录：
+
+- source manifest URI 和 sha256；
+- 输出对象 URI、bytes、rows、sha256；
+- `version`、`idempotency_key` 和 `expected_version`。`expected_version`（如果提供）必须等于本次发布版本；首次发布允许目标不存在，已有目标时还必须匹配远端 manifest 版本。
+
+产物对象和对应的 `<artifact>.manifest.json` 都通过 `rclone --immutable` 写入，并在写入后回读校验。相同版本、相同幂等键和相同内容会返回幂等复用；同版本不同 hash、来源血缘不同、并发版本不匹配，或只存在对象/manifest 的残缺状态，都会失败，不自动覆盖或修复。新版本应使用新的目标对象路径，不能覆盖既有发布。
 
 ## 边界
 
