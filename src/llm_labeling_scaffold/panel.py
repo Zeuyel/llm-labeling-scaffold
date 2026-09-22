@@ -5164,11 +5164,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "bad task"}, status=400)
                 return
             try:
-                task_cfg, task_runs_root, _ = self._task_context(
-                    task,
-                    params,
-                    require_task_config=True,
-                )
+                task_cfg = pipeline.load_task_by_id(self.tasks_root, task)
+                task_runs_root = self.runs_root
                 self._json({"imports": pipeline.list_imports(task_runs_root, task, id_field=task_cfg.id_field)})
             except Exception as exc:
                 self._route_error(exc)
