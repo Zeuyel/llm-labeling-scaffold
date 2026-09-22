@@ -1541,6 +1541,33 @@ def _contract_capabilities(
                 "response_schema": {"type": "object", "required": ["task"]},
             },
             {
+                "method": "GET",
+                "path": "/api/task/summary",
+                "action": "task_summary",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": True},
+                },
+                "response_schema": {
+                    "type": "object",
+                    "required": ["task"],
+                    "properties": {
+                        "task": {
+                            "type": "object",
+                            "required": [
+                                "task_id",
+                                "workspace",
+                                "lifecycle_state",
+                                "status",
+                                "capabilities",
+                            ],
+                        },
+                    },
+                },
+            },
+            {
                 "method": "POST",
                 "path": "/api/tasks",
                 "action": "task_control_create",
@@ -2254,6 +2281,7 @@ def _mcp_route_allowed(method: str, path: str) -> bool:
             "/api/settings/public",
             "/api/tasks",
             "/api/task/control",
+            "/api/task/summary",
             "/api/task/imports",
             "/api/import/detail",
             "/api/task/data_lake",
@@ -2292,6 +2320,7 @@ def _database_authorized_route(method: str, path: str) -> bool:
         if path in {
             "/api/tasks",
             "/api/task/control",
+            "/api/task/summary",
             "/api/task/imports",
             "/api/import/detail",
             "/api/task/data_lake",
@@ -2455,7 +2484,7 @@ def _active_task_summary(workspace_slug: str, access, active: ActiveTaskRevision
         "roles": [role.value for role in access.roles],
     }
     if lifecycle_state != TaskLifecycleState.ACTIVE:
-        summary.update({"status": lifecycle_state.value, "active": False, "revision": 0})
+        summary.update({"status": lifecycle_state.value, "active": False})
         return summary
     summary["active"] = True
     draft_fingerprint = getattr(access.task, "draft_fingerprint", None)
@@ -4086,6 +4115,56 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._route_error(exc)
 
+    def _control_task_summary(self, params) -> None:
+        try:
+            task_id = str(params.get("task_id", [""])[0] or "").strip()
+            if not _safe_segment(task_id):
+                raise ValueError("task_id 必须是单段安全标识符")
+            service, actor_identity, _, _ = self._authorization_context()
+            workspace_slug = self._resolve_workspace(
+                service,
+                actor_identity,
+                self._workspace_selector(params),
+            )
+            service.require_task(actor_identity, workspace_slug, task_id, Permission.TASK_READ)
+
+            after_task_key = None
+            access = None
+            while access is None:
+                page = service.list_authorized_tasks(
+                    actor_identity,
+                    workspace_slug,
+                    limit=100,
+                    after_task_key=after_task_key,
+                    include_archived=True,
+                )
+                access = next(
+                    (item for item in page.items if item.task.task_key == task_id),
+                    None,
+                )
+                if access is not None or page.next_cursor is None:
+                    break
+                after_task_key = page.next_cursor
+            if access is None:
+                raise _PanelRouteError(
+                    HTTPStatus.NOT_FOUND,
+                    "resource_not_found",
+                    "任务不可见",
+                )
+
+            active = None
+            if access.task.lifecycle_state == TaskLifecycleState.ACTIVE:
+                active = self._load_active_revision(workspace_slug, task_id)
+            self._json(
+                {"task": _active_task_summary(workspace_slug, access, active)},
+                headers={
+                    "Cache-Control": "no-store, private",
+                    "Pragma": "no-cache",
+                },
+            )
+        except Exception as exc:
+            self._route_error(exc)
+
     def _control_draft_detail(self, params) -> None:
         try:
             task_id = str(params.get("task_id", [""])[0] or "").strip()
@@ -4982,6 +5061,11 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json({"error": "当前不是 scaffold 控制面任务来源模式"}, status=400)
                 return
             self._control_draft_detail(params)
+        elif path == "/api/task/summary":
+            if not _control_task_source_enabled():
+                self._json({"error": "当前不是 scaffold 控制面任务来源模式"}, status=400)
+                return
+            self._control_task_summary(params)
         elif path == "/api/task/profile":
             task = params.get("task_id", [""])[0]
             preset = params.get("preset", [""])[0].strip() or None
