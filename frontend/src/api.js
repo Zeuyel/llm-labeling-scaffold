@@ -174,10 +174,20 @@ export const dataLakeImportPayload = (taskId, payload = {}) => {
 export const taskPublishIdempotencyKey = (taskId, draftFingerprint) =>
   `task-publish:${keyPart(taskId, "task")}:${keyPart(draftFingerprint, "draft")}`;
 
-export const getTasks = () => req("/api/tasks");
+export const getTasks = (workspace = "", options = {}) => {
+  const query = q({
+    workspace,
+    include_archived: options.include_archived ?? options.includeArchived,
+    after: options.after ?? options.cursor,
+    limit: options.limit,
+  });
+  return req(query ? `/api/tasks?${query}` : "/api/tasks");
+};
 export const syncTasks = () => req("/api/tasks/sync", { method: "POST" });
 export const getTaskControl = (taskId, workspace = "") =>
   req(`/api/task/control?${q({ task_id: taskId, workspace })}`).then((data) => data.task || data);
+export const getTaskSummary = (taskId, workspace = "") =>
+  req(`/api/task/summary?${q({ task_id: taskId, workspace })}`);
 const unwrapSettings = (data) => data.settings || data.config || data || {};
 
 export const getSettings = () => req("/api/settings").then(unwrapSettings);
@@ -381,6 +391,27 @@ export const startAction = (taskPath, action, params) =>
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ task: taskPath, action, params }),
   }).then((data) => data.job || data);
+
+export const startWorkflow = (taskId, payload = {}) =>
+  req("/api/workflow/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_id: taskId, ...payload }),
+  }).then((data) => data.workflow || data);
+
+export const resumeWorkflow = (taskId, workflowId, payload = {}) =>
+  req("/api/workflow/resume", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ task_id: taskId, workflow_id: workflowId, ...payload }),
+  }).then((data) => data.workflow || data);
+
+export const listWorkflows = (taskId) => req(`/api/workflow?${q({ task_id: taskId })}`);
+
+export const getWorkflowStatus = (taskId, workflowId) =>
+  req(`/api/workflow/status?${q({ task_id: taskId, workflow_id: workflowId })}`).then(
+    (data) => data.workflow || data,
+  );
 
 export const importSuggestions = (taskId, annotationId, suggestionId, text, opts = {}) =>
   req(`/api/suggestions/import?${q({

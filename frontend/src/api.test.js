@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  getTaskSummary,
+  getTasks,
   getWorkflowStatus,
   listWorkflows,
   resumeWorkflow,
@@ -53,4 +55,27 @@ test("workflow API helpers use the panel contract", async () => {
     workflow_id: "wf-1",
     params: { retry: true },
   });
+});
+
+test("task list and summary helpers carry the workspace contract", async () => {
+  const requests = [];
+  globalThis.fetch = async (path, options = {}) => {
+    requests.push({ path, options });
+    return { ok: true, json: async () => ({ tasks: [], task: {} }) };
+  };
+
+  await getTasks("workspace-a", {
+    include_archived: true,
+    after: "cursor-1",
+    limit: 25,
+  });
+  await getTaskSummary("task/1", "workspace-a");
+
+  assert.deepEqual(
+    requests.map(({ path }) => path),
+    [
+      "/api/tasks?workspace=workspace-a&include_archived=true&after=cursor-1&limit=25",
+      "/api/task/summary?task_id=task%2F1&workspace=workspace-a",
+    ],
+  );
 });
