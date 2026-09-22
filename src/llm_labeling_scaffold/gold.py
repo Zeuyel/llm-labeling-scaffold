@@ -8,7 +8,8 @@ import shutil
 import tempfile
 
 from .config import TaskConfig
-from .io import iter_jsonl, read_jsonl, write_json, write_jsonl
+from .audit import validate_run_inputs
+from .io import iter_jsonl, read_json, read_jsonl, sha256_file, write_json, write_jsonl
 
 
 def _row_id(task: TaskConfig, row: dict, source: str) -> str:
@@ -42,6 +43,24 @@ def _validate_gold_rows(task: TaskConfig, rows: list[dict]) -> None:
             raise ValueError(f"gold 记录 {record_id} 缺少主标签: {primary}")
 
 
+def validate_gold_artifact(task: TaskConfig, version: str) -> dict:
+    out = task.runs_dir / "gold"
+    gold_path = out / f"gold_{version}.jsonl"
+    manifest_path = out / f"gold_{version}.manifest.json"
+    if not gold_path.is_file() or not manifest_path.is_file():
+        raise FileNotFoundError(f"gold 版本产物不完整: {version}")
+    manifest = read_json(manifest_path)
+    if manifest.get("task_id") != task.task_id or manifest.get("version") != version:
+        raise ValueError(f"gold manifest 标识不匹配: {version}")
+    if manifest.get("data_sha256") != sha256_file(gold_path):
+        raise ValueError(f"gold 内容哈希与质量证明不一致: {version}")
+    rows = read_jsonl(gold_path)
+    if manifest.get("rows") != len(rows):
+        raise ValueError(f"gold 行数与质量证明不一致: {version}")
+    _validate_gold_rows(task, rows)
+    return manifest
+
+
 def _source_rows_from_batches(task: TaskConfig, batch_paths) -> dict[str, dict]:
     source_rows: dict[str, dict] = {}
     for batch_path in batch_paths:
@@ -69,23 +88,14 @@ def _write_gold_files(
     data_card_path = out / f"gold_{version}.data_card.md"
     existing = [path for path in (gold_path, manifest_path, data_card_path) if path.exists()]
     if existing:
+        if gold_path.is_file() and manifest_path.is_file():
+            validate_gold_artifact(task, version)
         raise FileExistsError(
             "gold 版本产物已存在，拒绝覆盖: "
             + ", ".join(str(path) for path in existing)
         )
     primary = task.primary_label["name"]
     counts = Counter(str(row.get(primary)) for row in rows)
-    manifest = {
-        "task_id": task.task_id,
-        "version": version,
-        "path": str(gold_path),
-        "rows": len(rows),
-        "unique_ids": len({str(row[task.id_field]) for row in rows if task.id_field in row}),
-        "primary_label": primary,
-        "label_counts": dict(counts),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        **manifest_extra,
-    }
     data_card = (
         "# 训练集说明\n\n"
         f"- 任务：`{task.task_id}`\n"
@@ -103,6 +113,18 @@ def _write_gold_files(
     published: list[Path] = []
     try:
         write_jsonl(rows, staged_paths[gold_path])
+        manifest = {
+            "task_id": task.task_id,
+            "version": version,
+            "path": str(gold_path),
+            "rows": len(rows),
+            "unique_ids": len({str(row[task.id_field]) for row in rows if task.id_field in row}),
+            "primary_label": primary,
+            "label_counts": dict(counts),
+            "data_sha256": sha256_file(staged_paths[gold_path]),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            **manifest_extra,
+        }
         write_json(manifest, staged_paths[manifest_path])
         staged_paths[data_card_path].write_text(data_card, encoding="utf-8")
         for final_path, staged_path in staged_paths.items():
@@ -121,15 +143,28 @@ def _write_gold_files(
 
 def build_gold(task: TaskConfig, run_dir: str | Path, version: str, decisions: str | Path | None = None) -> Path:
     run = Path(run_dir)
+    input_evidence = validate_run_inputs(run)
+    if not input_evidence["valid"]:
+        raise ValueError("批次输入证据未通过，不能构建 gold")
+    merge_path = run / "merged" / "merge_summary.json"
+    if not merge_path.is_file():
+        raise ValueError("缺少 merge_summary.json，不能构建 gold")
+    merge_summary = read_json(merge_path)
+    merged_path = run / "merged" / "merged_clean.jsonl"
+    if merge_summary.get("is_usable") is not True:
+        raise ValueError("合并结果未通过质量与血缘检查，不能构建 gold")
+    if merge_summary.get("input_evidence") != input_evidence:
+        raise ValueError("合并输入证据与当前批次 manifest 不一致")
+    if not merged_path.is_file() or merge_summary.get("merged_sha256") != sha256_file(merged_path):
+        raise ValueError("合并结果内容与血缘证明不一致")
 
-    # Start from source records so gold rows keep text and metadata fields for local training.
     source_rows = _source_rows_from_batches(
         task,
         sorted((run / "input" / "batches").glob("batch_*.jsonl")),
     )
 
     rows: dict[str, dict] = {}
-    merged_rows = _unique_rows(task, iter_jsonl(run / "merged" / "merged_clean.jsonl"), "merged_clean")
+    merged_rows = _unique_rows(task, iter_jsonl(merged_path), "merged_clean")
     for rid, label_row in merged_rows.items():
         merged = dict(source_rows.get(rid, {}))
         merged.update(label_row)
@@ -155,6 +190,9 @@ def build_gold(task: TaskConfig, run_dir: str | Path, version: str, decisions: s
             "source": "run",
             "run_dir": str(run),
             "decisions": str(decisions) if decisions else None,
+            "decisions_sha256": sha256_file(decisions) if decisions else None,
+            "input_manifest_sha256": input_evidence["manifest_sha256"],
+            "merged_sha256": merge_summary["merged_sha256"],
         },
     )
 
@@ -187,5 +225,7 @@ def build_gold_from_decisions(
             "source": "decision_artifact",
             "sample_path": str(sample_path),
             "decisions": str(decisions_path),
+            "sample_sha256": sha256_file(sample_path),
+            "decisions_sha256": sha256_file(decisions_path),
         },
     )
