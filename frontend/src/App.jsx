@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo, useState, useCallback } from "react";
+import React, { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import * as api from "./api.js";
 import { RouterProvider, useRouter, matchRoute } from "./router.jsx";
 import Sidebar from "./components/Sidebar.jsx";
+import TaskLayout, { LegacyTaskArchiveRedirect } from "./components/TaskLayout.jsx";
 import TasksPage from "./pages/TasksPage.jsx";
 import TaskOverviewPage from "./pages/TaskOverviewPage.jsx";
 import TaskCanvasPage from "./pages/TaskCanvasPage.jsx";
@@ -12,7 +13,6 @@ import JobsPage from "./pages/JobsPage.jsx";
 import GoldPage from "./pages/GoldPage.jsx";
 import ModelsPage from "./pages/ModelsPage.jsx";
 import SettingsPage from "./pages/SettingsPage.jsx";
-import TaskArchivePage from "./pages/TaskArchivePage.jsx";
 import LoginPage from "./pages/LoginPage.jsx";
 import DataAssetsPage from "./pages/DataAssetsPage.jsx";
 import AllocationPlansPage from "./pages/AllocationPlansPage.jsx";
@@ -22,6 +22,7 @@ import MembersPage from "./pages/MembersPage.jsx";
 
 const ROUTES = [
   { pattern: "/", page: "tasks" },
+  { pattern: "/tasks/new", page: "task-create" },
   { pattern: "/settings", page: "settings" },
   { pattern: "/members", page: "members" },
   { pattern: "/annotators/:id", page: "annotators" },
@@ -29,6 +30,8 @@ const ROUTES = [
   { pattern: "/cohorts/:id", page: "cohorts" },
   { pattern: "/cohorts", page: "cohorts" },
   { pattern: "/data-assets", page: "data-assets" },
+  { pattern: "/task/:id/configuration", page: "configuration" },
+  { pattern: "/task/:id/archive", page: "archive-redirect" },
   { pattern: "/task/:id", page: "overview" },
   { pattern: "/task/:id/canvas", page: "canvas" },
   { pattern: "/task/:id/imports", page: "imports" },
@@ -39,8 +42,24 @@ const ROUTES = [
   { pattern: "/task/:id/jobs", page: "jobs" },
   { pattern: "/task/:id/gold", page: "gold" },
   { pattern: "/task/:id/models", page: "models" },
-  { pattern: "/task/:id/archive", page: "archive" },
 ];
+
+const TASK_SUMMARY_PAGES = new Set([
+  "overview",
+  "canvas",
+  "imports",
+  "samples",
+  "allocation-plans",
+  "annotations",
+  "jobs",
+  "gold",
+  "models",
+]);
+
+const TASK_LAYOUT_PAGES = new Set([...TASK_SUMMARY_PAGES, "configuration"]);
+const TASK_ROUTE_PAGES = new Set([...TASK_LAYOUT_PAGES, "archive-redirect"]);
+
+const TASKS_ENTRY_PAGES = new Set(["tasks", "task-create", "configuration"]);
 
 const DEFAULT_SETTINGS = {
   allow_data_lake_overrides: false,
@@ -54,12 +73,21 @@ const DEFAULT_SETTINGS = {
 function Shell({ session, onLogout }) {
   const { path } = useRouter();
   const [tasks, setTasks] = useState([]);
+  const [tasksNextCursor, setTasksNextCursor] = useState("");
+  const [tasksLoading, setTasksLoading] = useState(false);
+  const [tasksError, setTasksError] = useState("");
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsReady, setSettingsReady] = useState(false);
   const [settingsError, setSettingsError] = useState("");
   const [err, setErr] = useState("");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => localStorage.getItem("lls.sidebarCollapsed") === "1");
   const [managementWorkspace, setManagementWorkspace] = useState("");
+  const [taskSummary, setTaskSummary] = useState(null);
+  const [taskSummaryKey, setTaskSummaryKey] = useState("");
+  const [taskSummaryLoading, setTaskSummaryLoading] = useState(false);
+  const [taskSummaryError, setTaskSummaryError] = useState("");
+  const tasksRequestSeq = useRef(0);
+  const taskSummaryRequestSeq = useRef(0);
 
   const managementWorkspaces = useMemo(() => {
     const values = session?.authorization?.workspaces;
@@ -86,13 +114,55 @@ function Shell({ session, onLogout }) {
     && selectedManagementWorkspace.workspace_capabilities.includes("workspace:manage"),
   );
 
-  const loadTasks = useCallback(() =>
-    api.getTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
-  []);
-  const syncTasks = useCallback(() =>
-    api.syncTasks().then((d) => setTasks(d.tasks || [])).catch((e) => setErr(String(e))),
-  []);
-  useEffect(() => { loadTasks(); }, [loadTasks]);
+  const loadTasks = useCallback(async (options = {}) => {
+    const requestSeq = ++tasksRequestSeq.current;
+    const normalizedOptions = typeof options === "string" ? { workspace: options } : (options || {});
+    const workspace = String(normalizedOptions.workspace ?? managementWorkspace).trim();
+    const requestOptions = {
+      ...normalizedOptions,
+      workspace,
+      include_archived: normalizedOptions.include_archived ?? normalizedOptions.includeArchived ?? false,
+      limit: normalizedOptions.limit ?? 100,
+    };
+    setTasksLoading(true);
+    setTasksError("");
+    setTasks([]);
+    setTasksNextCursor("");
+    try {
+      if (!workspace) {
+        const error = new Error("必须选择 Scaffold 工作区");
+        error.code = "workspace_required";
+        throw error;
+      }
+      const data = await api.getTasks(workspace, requestOptions);
+      if (requestSeq !== tasksRequestSeq.current) return data;
+      setTasks(data.tasks || []);
+      setTasksNextCursor(data.next_cursor || "");
+      return data;
+    } catch (error) {
+      if (requestSeq === tasksRequestSeq.current) setTasksError(String(error));
+      throw error;
+    } finally {
+      if (requestSeq === tasksRequestSeq.current) setTasksLoading(false);
+    }
+  }, [managementWorkspace]);
+  const syncTasks = useCallback(async () => {
+    try {
+      const data = await api.syncTasks();
+      setTasks(data.tasks || []);
+      setTasksNextCursor(data.next_cursor || "");
+      setTasksError("");
+      return data;
+    } catch (error) {
+      const message = String(error);
+      setTasksError(message);
+      setErr(message);
+      throw error;
+    }
+  }, []);
+  useEffect(() => {
+    loadTasks().catch(() => {});
+  }, [loadTasks]);
   const handleSettingsLoadError = useCallback((error) => {
     const message = `设置读取失败：${String(error)}`;
     setSettings(DEFAULT_SETTINGS);
@@ -119,31 +189,95 @@ function Shell({ session, onLogout }) {
     const params = matchRoute(r.pattern, path);
     if (params) { matched = { page: r.page, params }; break; }
   }
-  const taskPages = new Set(["overview", "canvas", "imports", "samples", "allocation-plans", "annotations", "jobs", "gold", "models", "archive"]);
-  const activeTaskId = taskPages.has(matched.page) ? matched.params.id || null : null;
-  const taskOf = (id) => tasks.find((t) => t.task_id === id) || null;
+  const activeTaskId = TASK_ROUTE_PAGES.has(matched.page) ? matched.params.id || null : null;
+  const requiresTaskSummary = TASK_SUMMARY_PAGES.has(matched.page);
+  const currentTaskSummaryKey = `${managementWorkspace}\u0000${activeTaskId || ""}`;
+  const taskSummaryMatches = Boolean(activeTaskId) && taskSummaryKey === currentTaskSummaryKey;
+  const resolvedTaskSummary = taskSummaryMatches ? taskSummary : null;
+  const activeTask = resolvedTaskSummary;
+
+  const loadTaskSummary = useCallback(async () => {
+    const requestSeq = ++taskSummaryRequestSeq.current;
+    const taskId = String(activeTaskId || "").trim();
+    const workspace = managementWorkspace.trim();
+    const summaryKey = `${workspace}\u0000${taskId}`;
+    setTaskSummaryKey(summaryKey);
+    setTaskSummary(null);
+    setTaskSummaryError("");
+    if (!taskId || !requiresTaskSummary) {
+      setTaskSummaryLoading(false);
+      return null;
+    }
+    setTaskSummaryLoading(true);
+    try {
+      if (!workspace) {
+        const error = new Error("任务详情读取被阻塞：必须先选择 Scaffold 工作区。");
+        error.code = "workspace_required";
+        throw error;
+      }
+      if (typeof api.getTaskSummary !== "function") {
+        const error = new Error("任务详情接口尚未接入：需要 api.getTaskSummary(taskId, workspace)。");
+        error.code = "task_detail_helper_unavailable";
+        throw error;
+      }
+      const data = await api.getTaskSummary(taskId, workspace);
+      if (requestSeq !== taskSummaryRequestSeq.current) return data;
+      if (!data?.task || typeof data.task !== "object" || Array.isArray(data.task)) {
+        const error = new Error("任务详情响应格式无效：缺少 task summary。");
+        error.code = "task_summary_invalid_response";
+        throw error;
+      }
+      const summary = data.task;
+      setTaskSummary(summary);
+      return summary;
+    } catch (error) {
+      if (requestSeq === taskSummaryRequestSeq.current) setTaskSummaryError(String(error));
+      throw error;
+    } finally {
+      if (requestSeq === taskSummaryRequestSeq.current) setTaskSummaryLoading(false);
+    }
+  }, [activeTaskId, managementWorkspace, requiresTaskSummary]);
+
+  useEffect(() => {
+    loadTaskSummary().catch(() => {});
+  }, [loadTaskSummary]);
 
   async function handleSettingsSaved(next) {
     setSettings({ ...DEFAULT_SETTINGS, ...(next || {}) });
     setSettingsError("");
     setSettingsReady(true);
-    await loadTasks();
+    await loadTasks().catch(() => {});
   }
 
   const common = { onError: setErr };
   const settingsAvailable = settingsReady && !settingsError;
-  let page = null;
-  if (matched.page === "tasks") page = (
+  const renderTasksPage = ({ createMode = false, detailTaskId = "" } = {}) => (
     <TasksPage
       tasks={tasks}
+      tasksLoading={tasksLoading}
+      tasksError={tasksError}
+      tasksNextCursor={tasksNextCursor}
+      createMode={createMode}
+      detailTaskId={detailTaskId}
+      workspace={managementWorkspace}
+      workspaces={managementWorkspaces}
+      onWorkspaceChange={setManagementWorkspace}
       onReload={loadTasks}
       onSync={syncTasks}
-      allowDataLakeOverrides={Boolean(settings.allow_data_lake_overrides)}
-      taskSource={settings.task_source || "local"}
-      taskRegistryUri={settings.task_registry_uri || ""}
+      settingsReady={settingsReady}
+      settingsError={settingsError}
+      allowDataLakeOverrides={settingsAvailable && Boolean(settings.allow_data_lake_overrides)}
+      taskSource={settingsAvailable ? (settings.task_source || "") : ""}
+      taskRegistryUri={settingsAvailable ? (settings.task_registry_uri || "") : ""}
       {...common}
     />
   );
+
+  let page = null;
+  if (TASKS_ENTRY_PAGES.has(matched.page)) page = renderTasksPage({
+    createMode: matched.page === "task-create",
+    detailTaskId: matched.page === "configuration" ? activeTaskId : "",
+  });
   else if (matched.page === "settings") page = (
     <SettingsPage
       settings={settings}
@@ -182,11 +316,11 @@ function Shell({ session, onLogout }) {
     />
   );
   else if (matched.page === "data-assets") page = <DataAssetsPage {...common} />;
-  else if (matched.page === "overview") page = <TaskOverviewPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "canvas") page = <TaskCanvasPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "overview") page = <TaskOverviewPage task={activeTask} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "canvas") page = <TaskCanvasPage task={activeTask} taskId={activeTaskId} {...common} />;
   else if (matched.page === "imports") page = (
     <ImportsPage
-      task={taskOf(activeTaskId)}
+      task={activeTask}
       taskId={activeTaskId}
       taskSource={settingsAvailable ? (settings.task_source || "") : ""}
       allowManualImports={settingsAvailable && Boolean(settings.allow_manual_imports || settings.manual_imports_enabled)}
@@ -195,13 +329,13 @@ function Shell({ session, onLogout }) {
       {...common}
     />
   );
-  else if (matched.page === "samples") page = <SamplesPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "allocation-plans") page = <AllocationPlansPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "annotations") page = <RunsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "jobs") page = <JobsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "gold") page = <GoldPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "models") page = <ModelsPage task={taskOf(activeTaskId)} taskId={activeTaskId} {...common} />;
-  else if (matched.page === "archive") page = <TaskArchivePage taskId={activeTaskId} onReloadTasks={loadTasks} {...common} />;
+  else if (matched.page === "samples") page = <SamplesPage task={activeTask} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "allocation-plans") page = <AllocationPlansPage task={activeTask} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "annotations") page = <RunsPage task={activeTask} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "jobs") page = <JobsPage task={activeTask} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "gold") page = <GoldPage task={activeTask} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "models") page = <ModelsPage task={activeTask} taskId={activeTaskId} {...common} />;
+  else if (matched.page === "archive-redirect") page = <LegacyTaskArchiveRedirect taskId={activeTaskId} />;
 
   function toggleSidebar() {
     setSidebarCollapsed((value) => {
@@ -211,12 +345,30 @@ function Shell({ session, onLogout }) {
     });
   }
 
+  if (activeTaskId && TASK_LAYOUT_PAGES.has(matched.page)) {
+    page = (
+      <TaskLayout
+        taskId={activeTaskId}
+        taskSummary={resolvedTaskSummary}
+        taskSummaryRequired={requiresTaskSummary}
+        activePage={matched.page}
+        taskSummaryLoading={requiresTaskSummary && (taskSummaryLoading || !taskSummaryMatches)}
+        taskSummaryError={taskSummaryError}
+        onRetryTaskSummary={() => loadTaskSummary().catch(() => {})}
+      >
+        {page}
+      </TaskLayout>
+    );
+  }
+
+  const globalPage = matched.page === "task-create" || TASK_ROUTE_PAGES.has(matched.page)
+    ? "tasks"
+    : matched.page;
+
   return (
     <div className={sidebarCollapsed ? "app-shell is-sidebar-collapsed" : "app-shell"}>
       <Sidebar
-        tasks={tasks}
-        activeTaskId={activeTaskId}
-        activePage={matched.page}
+        activePage={globalPage}
         collapsed={sidebarCollapsed}
         onToggle={toggleSidebar}
         user={session?.user}

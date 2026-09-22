@@ -14,8 +14,14 @@ export function RouterProvider({ children }) {
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
-  const navigate = useCallback((to) => {
-    window.location.hash = to.startsWith("#") ? to : `#${to}`;
+  const navigate = useCallback((to, { replace = false } = {}) => {
+    const hash = to.startsWith("#") ? to : `#${to}`;
+    if (replace) {
+      window.history.replaceState(null, "", hash);
+      setPath(currentPath());
+      return;
+    }
+    window.location.hash = hash;
   }, []);
   return <RouterCtx.Provider value={{ path, navigate }}>{children}</RouterCtx.Provider>;
 }
@@ -37,13 +43,14 @@ export function matchRoute(pattern, path) {
   return params;
 }
 
-export function Link({ to, className, children, title }) {
+export function Link({ to, className, children, title, ...props }) {
   const { navigate } = useRouter();
   return (
     <a
       href={`#${to}`}
       className={className}
       title={title}
+      {...props}
       onClick={(e) => {
         e.preventDefault();
         navigate(to);

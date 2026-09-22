@@ -9,8 +9,8 @@ test("人员管理入口和详情路由独立存在", () => {
   const sidebar = source("components/Sidebar.jsx");
   assert.match(app, /pattern: "\/annotators"/);
   assert.match(app, /pattern: "\/cohorts"/);
-  assert.match(sidebar, />标注人员</);
-  assert.match(sidebar, />人员组</);
+  assert.match(sidebar, /label: "标注人员"/);
+  assert.match(sidebar, /label: "人员组"/);
 });
 
 test("人员管理页面不调用 Argilla 或通用 action", () => {
