@@ -15,8 +15,11 @@ import pytest
 from llm_labeling_scaffold import panel
 from llm_labeling_scaffold import pipeline
 from llm_labeling_scaffold import gold as gold_module
+from llm_labeling_scaffold.audit import audit_run
+from llm_labeling_scaffold.batching import batch_records
 from llm_labeling_scaffold.gold import build_gold_from_decisions
-from llm_labeling_scaffold.io import read_json, read_jsonl, write_jsonl
+from llm_labeling_scaffold.io import read_json, read_jsonl, sha256_file, write_json, write_jsonl
+from llm_labeling_scaffold.merge import merge_run
 
 
 def _decode_basic(header: str) -> tuple[str, str]:
@@ -479,19 +482,42 @@ def test_build_gold_from_decisions_rejects_missing_primary_label_without_outputs
     assert not (gold_dir / "gold_strict_missing_primary_v001.data_card.md").exists()
 
 
+def _prepare_gold_run(task, run_dir, rows, *, batch_size=1, overlap_rate=0.0):
+    sample_path = run_dir / "sample.jsonl"
+    write_jsonl(rows, sample_path)
+    batches = batch_records(
+        sample_path,
+        run_dir / "input",
+        batch_size,
+        overlap_rate=overlap_rate,
+        min_annotators_per_overlap_item=2,
+        id_field=task.id_field,
+    )
+    for batch in batches:
+        write_json(
+            {
+                "results": [
+                    {task.id_field: row[task.id_field], "class_label": "non_target", "is_target": 0}
+                    for row in read_jsonl(batch)
+                ]
+            },
+            run_dir / "llm" / f"{batch.stem}.json",
+        )
+    assert audit_run(task, run_dir)["is_usable"]
+    assert merge_run(task, run_dir)["is_usable"]
+
+
 def test_build_gold_allows_identical_cross_batch_overlap(panel_workspace):
     task = panel_workspace["task"]
     run_dir = panel_workspace["run_dir"]
-    write_jsonl(
+    _prepare_gold_run(
+        task,
+        run_dir,
         [
             {"record_id": "r001", "title": "General notice"},
             {"record_id": "r002", "title": "Service upgrade"},
         ],
-        run_dir / "input" / "batches" / "batch_00001.jsonl",
-    )
-    write_jsonl(
-        [{"record_id": "r001", "title": "General notice"}],
-        run_dir / "input" / "batches" / "batch_00002.jsonl",
+        overlap_rate=0.5,
     )
 
     gold_path = gold_module.build_gold(task, run_dir, "strict_overlap_v001")
@@ -502,29 +528,55 @@ def test_build_gold_allows_identical_cross_batch_overlap(panel_workspace):
 def test_build_gold_rejects_conflicting_cross_batch_duplicate(panel_workspace):
     task = panel_workspace["task"]
     run_dir = panel_workspace["run_dir"]
-    write_jsonl(
-        [{"record_id": "r001", "title": "General notice"}],
-        run_dir / "input" / "batches" / "batch_00001.jsonl",
+    _prepare_gold_run(
+        task,
+        run_dir,
+        [
+            {"record_id": "r001", "title": "General notice"},
+            {"record_id": "r002", "title": "Service upgrade"},
+        ],
+        overlap_rate=0.5,
     )
-    write_jsonl(
-        [{"record_id": "r001", "title": "Conflicting source"}],
-        run_dir / "input" / "batches" / "batch_00002.jsonl",
-    )
+    manifest_path = run_dir / "input" / "manifest.json"
+    manifest = read_json(manifest_path)
+    overlapping_batch = next(entry for entry in manifest["batches"] if entry["overlap_rows"])
+    batch_path = run_dir / "input" / "batches" / overlapping_batch["batch"]
+    batch_rows = read_jsonl(batch_path)
+    overlapping_id = overlapping_batch["overlap_item_ids"][0]
+    next(row for row in batch_rows if row[task.id_field] == overlapping_id)["title"] = "Conflicting source"
+    write_jsonl(batch_rows, batch_path)
+    overlapping_batch["sha256"] = sha256_file(batch_path)
+    write_json(manifest, manifest_path)
+    assert audit_run(task, run_dir)["is_usable"]
+    assert merge_run(task, run_dir)["is_usable"]
 
-    with pytest.raises(ValueError, match="跨批重复 ID 内容不一致"):
+    with pytest.raises(ValueError, match="输入批次跨批重复 ID 内容不一致"):
         gold_module.build_gold(task, run_dir, "strict_overlap_conflict_v001")
 
 
 def test_build_gold_rejects_duplicate_merged_id(panel_workspace):
     task = panel_workspace["task"]
     run_dir = panel_workspace["run_dir"]
+    _prepare_gold_run(
+        task,
+        run_dir,
+        [
+            {"record_id": "r001", "title": "General notice"},
+            {"record_id": "r002", "title": "Service upgrade"},
+        ],
+    )
+    merged_path = run_dir / "merged" / "merged_clean.jsonl"
     write_jsonl(
         [
             {"record_id": "r001", "class_label": "non_target"},
             {"record_id": "r001", "class_label": "service_upgrade"},
         ],
-        run_dir / "merged" / "merged_clean.jsonl",
+        merged_path,
     )
+    merge_summary_path = run_dir / "merged" / "merge_summary.json"
+    merge_summary = read_json(merge_summary_path)
+    merge_summary["merged_sha256"] = sha256_file(merged_path)
+    write_json(merge_summary, merge_summary_path)
 
     with pytest.raises(ValueError, match="merged_clean 存在重复 ID"):
         gold_module.build_gold(task, run_dir, "strict_merged_duplicate_v001")
