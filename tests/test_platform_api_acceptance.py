@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import shutil
 import uuid
 from pathlib import Path
 
@@ -27,18 +26,11 @@ from tests.test_panel_control import (
 )
 
 
-REPORT_ROOT = Path("/data/lls-platform-20260922/reports/api-acceptance")
-
-
 @pytest.fixture
-def acceptance_root(request: pytest.FixtureRequest) -> Path:
-    root = REPORT_ROOT / "http-tests" / request.node.name
-    shutil.rmtree(root, ignore_errors=True)
+def acceptance_root(tmp_path: Path) -> Path:
+    root = tmp_path / "http-tests"
     root.mkdir(parents=True)
-    try:
-        yield root
-    finally:
-        shutil.rmtree(root, ignore_errors=True)
+    return root
 
 
 def _session_factory(control_database):
