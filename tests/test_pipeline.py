@@ -159,6 +159,79 @@ def test_create_task_writes_custom_task_with_auxiliary_labels(tmp_path: Path):
     assert created.annotation_guidelines == "请阅读专利标题、摘要和权利要求节选后完成标注。"
 
 
+def test_task_spec_roundtrip_preserves_label_meaning_and_constraints(tmp_path: Path):
+    constraints = [
+        {"if": "review_status == '需要复核'", "then": "decision == '待定'"},
+    ]
+    spec = {
+        "task_id": "chinese_label_roundtrip",
+        "id_field": "record_id",
+        "text_fields": ["title"],
+        "metadata_fields": ["source"],
+        "primary_label_name": "decision",
+        "primary_label_type": "categorical",
+        "primary_label_values": ["accept", "reject"],
+        "primary_label_title": "最终判定",
+        "primary_label_description": "请选择最终判定结果。",
+        "primary_label_required": True,
+        "primary_label_value_labels": {
+            "accept": {"label": "接受", "description": "符合要求"},
+            "reject": {"label": "拒绝", "description": "不符合要求"},
+        },
+        "auxiliary_labels": [
+            {
+                "name": "review_status",
+                "type": "categorical",
+                "values": ["无需复核", "需要复核"],
+                "description": "记录是否需要进一步复核。",
+                "value_labels": {"无需复核": "无需复核", "需要复核": {"label": "需要复核", "description": "存在疑点"}},
+                "required": False,
+            },
+            {"name": "confidence", "type": "number", "min": 0, "max": 1},
+        ],
+        "constraints": constraints,
+        "runs_dir": "/outside/should-not-be-accepted",
+        "provider": "unauthorized-provider",
+    }
+
+    rendered = pipeline.build_task_raw_from_spec(spec)
+    assert rendered["runs_dir"] == "runs"
+    assert "provider" not in rendered
+    assert "input_path" not in rendered
+    assert rendered["labels"]["primary"]["description"] == spec["primary_label_description"]
+    assert rendered["labels"]["primary"]["value_labels"] == spec["primary_label_value_labels"]
+    assert rendered["labels"]["primary"]["required"] is True
+    assert rendered["labels"]["auxiliary"] == spec["auxiliary_labels"]
+    assert rendered["labels"]["auxiliary"][1]["min"] == 0.0
+    assert rendered["labels"]["auxiliary"][1]["max"] == 1.0
+    assert rendered["constraints"] == constraints
+
+    created = pipeline.create_task(tmp_path / "tasks", spec)
+    loaded = load_task(created["path"])
+    assert loaded.raw == rendered
+
+
+@pytest.mark.parametrize(
+    ("spec_update", "message"),
+    [
+        ({"auxiliary_labels": [None]}, r"auxiliary_labels\[0\] 必须是对象"),
+        ({"auxiliary_labels": [{"type": "string"}]}, "缺少标签字段名"),
+        ({"constraints": [{"if": "decision == 'accept'"}]}, r"constraints\[0\]\.then"),
+        ({"primary_label_value_labels": {"accept": {"description": "只有说明"}, "reject": "拒绝"}}, "缺少显示文本"),
+    ],
+)
+def test_task_spec_rejects_unsupported_structures(spec_update: dict, message: str):
+    spec = {
+        "task_id": "invalid_task_spec",
+        "text_fields": ["title"],
+        "primary_label_values": ["accept", "reject"],
+        **spec_update,
+    }
+
+    with pytest.raises(ValueError, match=message):
+        pipeline.build_task_raw_from_spec(spec)
+
+
 def test_list_tasks_reads_multiple_roots_and_deduplicates(tmp_path: Path):
     root_a = tmp_path / "examples"
     root_b = tmp_path / "tasks"

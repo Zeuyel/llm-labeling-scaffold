@@ -1477,6 +1477,23 @@ def _coerce_label_value(label_type: str, value: str):
 
 
 def _normalize_label(raw: dict[str, Any], *, primary: bool = False) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise ValueError("标签定义必须是对象")
+    supported_fields = {
+        "name",
+        "primary_label_name",
+        "type",
+        "title",
+        "description",
+        "required",
+        "values",
+        "value_labels",
+        "min",
+        "max",
+    }
+    unsupported_fields = sorted(str(key) for key in set(raw) - supported_fields)
+    if unsupported_fields:
+        raise ValueError(f"标签包含不支持字段: {', '.join(unsupported_fields)}")
     name = str(raw.get("name") or raw.get("primary_label_name") or "").strip()
     if not name:
         raise ValueError("标签字段名不能为空")
@@ -1490,6 +1507,12 @@ def _normalize_label(raw: dict[str, Any], *, primary: bool = False) -> dict[str,
     title = str(raw.get("title") or "").strip()
     if title:
         label["title"] = title
+    description = raw.get("description")
+    if description not in (None, ""):
+        if not isinstance(description, str):
+            raise ValueError(f"标签说明必须是字符串: {name}")
+        if description.strip():
+            label["description"] = description
     if "required" in raw:
         label["required"] = bool(raw.get("required"))
 
@@ -1498,15 +1521,71 @@ def _normalize_label(raw: dict[str, Any], *, primary: bool = False) -> dict[str,
         label["values"] = [_coerce_label_value(label_type, value) for value in values]
     if label_type == "categorical" and len(label.get("values", [])) < 2:
         raise ValueError(f"分类标签至少需要两个取值: {name}")
+    if "value_labels" in raw:
+        value_labels = raw["value_labels"]
+        if not isinstance(value_labels, dict):
+            raise ValueError(f"标签 value_labels 必须是对象: {name}")
+        normalized_value_labels: dict[Any, Any] = {}
+        for value, display in value_labels.items():
+            if isinstance(display, dict):
+                supported_display_fields = {"label", "title", "name", "description"}
+                unsupported_display_fields = sorted(
+                    str(key) for key in set(display) - supported_display_fields
+                )
+                if unsupported_display_fields:
+                    raise ValueError(
+                        f"标签 value_labels[{value!r}] 包含不支持字段: "
+                        f"{', '.join(unsupported_display_fields)}"
+                    )
+                if not any(display.get(key) not in (None, "") for key in ("label", "title", "name")):
+                    raise ValueError(f"标签 value_labels[{value!r}] 缺少显示文本: {name}")
+                if display.get("description") not in (None, "") and not isinstance(
+                    display.get("description"), str
+                ):
+                    raise ValueError(f"标签 value_labels[{value!r}] 的说明必须是字符串: {name}")
+                normalized_value_labels[value] = dict(display)
+            elif isinstance(display, (bool, int, float, str)):
+                normalized_value_labels[value] = display
+            else:
+                raise ValueError(f"标签 value_labels[{value!r}] 结构不受支持: {name}")
+        label["value_labels"] = normalized_value_labels
     if label_type in {"integer", "number"}:
         if raw.get("min") not in (None, ""):
             label["min"] = _coerce_label_value(label_type, str(raw["min"]))
         if raw.get("max") not in (None, ""):
             label["max"] = _coerce_label_value(label_type, str(raw["max"]))
+    elif raw.get("min") not in (None, "") or raw.get("max") not in (None, ""):
+        raise ValueError(f"标签类型不支持 min/max: {name}")
     return label
 
 
+def _normalize_constraints(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError("constraints 必须是列表")
+    normalized: list[dict[str, str]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"constraints[{index}] 必须是对象")
+        unsupported_fields = sorted(str(key) for key in set(item) - {"if", "then"})
+        if unsupported_fields:
+            raise ValueError(
+                f"constraints[{index}] 包含不支持字段: {', '.join(unsupported_fields)}"
+            )
+        normalized_item: dict[str, str] = {}
+        for side in ("if", "then"):
+            expression = item.get(side)
+            if not isinstance(expression, str) or not expression.strip():
+                raise ValueError(f"constraints[{index}].{side} 必须是非空字符串")
+            if "==" not in expression:
+                raise ValueError(f"constraints[{index}].{side} 仅支持现有 == 表达式")
+            normalized_item[side] = expression
+        normalized.append(normalized_item)
+    return normalized
+
+
 def build_task_raw_from_spec(spec: dict[str, Any], *, revision: int | None = None) -> dict[str, Any]:
+    if not isinstance(spec, dict):
+        raise ValueError("任务规格必须是对象")
     task_id = str(spec.get("task_id", "")).strip()
     if not task_id or ".." in task_id or "/" in task_id or "\\" in task_id:
         raise ValueError("任务编号只能使用单段目录名")
@@ -1521,12 +1600,21 @@ def build_task_raw_from_spec(spec: dict[str, Any], *, revision: int | None = Non
         "values": spec.get("primary_label_values", []),
         "title": spec.get("primary_label_title", ""),
     }
+    for field in ("description", "value_labels", "required", "min", "max"):
+        spec_key = f"primary_label_{field}"
+        if spec_key in spec:
+            primary_raw[field] = spec[spec_key]
     primary_label = _normalize_label(primary_raw, primary=True)
-    auxiliary_labels = [
-        _normalize_label(item)
-        for item in spec.get("auxiliary_labels", [])
-        if isinstance(item, dict) and str(item.get("name", "")).strip()
-    ]
+    auxiliary_spec = spec.get("auxiliary_labels", [])
+    if not isinstance(auxiliary_spec, list):
+        raise ValueError("auxiliary_labels 必须是列表")
+    auxiliary_labels = []
+    for index, item in enumerate(auxiliary_spec):
+        if not isinstance(item, dict):
+            raise ValueError(f"auxiliary_labels[{index}] 必须是对象")
+        if not str(item.get("name", "")).strip():
+            raise ValueError(f"auxiliary_labels[{index}] 缺少标签字段名")
+        auxiliary_labels.append(_normalize_label(item))
     if not text_fields:
         raise ValueError("至少需要一个文本字段")
 
@@ -1554,6 +1642,8 @@ def build_task_raw_from_spec(spec: dict[str, Any], *, revision: int | None = Non
         cleaned = {str(key): value for key, value in data_lake.items() if value not in (None, "")}
         if cleaned:
             raw["data_lake"] = cleaned
+    if "constraints" in spec:
+        raw["constraints"] = _normalize_constraints(spec["constraints"])
     if revision is not None:
         raw["revision"] = int(revision)
     return raw

@@ -143,6 +143,56 @@ def test_publish_keeps_live_prompts_versioned(tmp_path: Path):
     assert second_prompt.read_text(encoding="utf-8") == "Second prompt\n"
 
 
+def test_publish_roundtrip_preserves_label_meaning_after_one_field_update(tmp_path: Path):
+    runs_root = tmp_path / "runs"
+    tasks_root = tmp_path / "tasks"
+    spec = {
+        **_draft_spec("label_semantics_control_task"),
+        "primary_label_title": "最终判定",
+        "primary_label_description": "请选择最终判定结果。",
+        "primary_label_value_labels": {
+            "accept": {"label": "接受", "description": "符合要求"},
+            "reject": {"label": "拒绝", "description": "不符合要求"},
+        },
+        "auxiliary_labels": [
+            {
+                "name": "review_status",
+                "type": "categorical",
+                "values": ["无需复核", "需要复核"],
+                "description": "记录是否需要进一步复核。",
+                "value_labels": {
+                    "无需复核": "无需复核",
+                    "需要复核": {"label": "需要复核", "description": "存在疑点"},
+                },
+                "required": False,
+            },
+        ],
+        "constraints": [
+            {"if": "review_status == '需要复核'", "then": "decision == 'reject'"},
+        ],
+    }
+    task_control.create_draft(runs_root, tasks_root, spec)
+
+    first = _publish(runs_root, tasks_root, spec["task_id"], "publish-labels-001")
+    first_snapshot = Path(first["published"]["snapshot_path"])
+    first_raw = load_task(first_snapshot).raw
+
+    updated_spec = {**spec, "annotation_guidelines": "请结合证据完成复核。"}
+    task_control.update_draft(
+        runs_root,
+        spec["task_id"],
+        updated_spec,
+        expected_draft_fingerprint=_fingerprint(runs_root, spec["task_id"]),
+    )
+    second = _publish(runs_root, tasks_root, spec["task_id"], "publish-labels-002")
+    second_raw = load_task(Path(second["published"]["snapshot_path"])).raw
+
+    assert first_raw["labels"] == second_raw["labels"]
+    assert first_raw["constraints"] == second_raw["constraints"] == spec["constraints"]
+    assert "annotation" not in first_raw
+    assert second_raw["annotation"]["guidelines"] == updated_spec["annotation_guidelines"]
+
+
 def test_publish_idempotency_reuses_the_same_revision(tmp_path: Path):
     runs_root = tmp_path / "runs"
     tasks_root = tmp_path / "tasks"
