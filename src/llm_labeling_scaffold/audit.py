@@ -60,6 +60,11 @@ def validate_run_inputs(run_dir: str | Path) -> dict[str, Any]:
     if not isinstance(entries, list):
         errors.append("批次 manifest 缺少 batches 列表")
         entries = []
+    batch_count = manifest.get("batch_count")
+    if isinstance(batch_count, bool) or not isinstance(batch_count, int) or batch_count < 0:
+        errors.append("批次 manifest 缺少有效 batch_count")
+    elif batch_count != len(entries):
+        errors.append("批次 manifest 的 batch_count 与 batches 条目数不一致")
     expected: dict[str, dict[str, Any]] = {}
     for entry in entries:
         if not isinstance(entry, dict):
@@ -80,6 +85,9 @@ def validate_run_inputs(run_dir: str | Path) -> dict[str, Any]:
 
     sample = manifest.get("sample")
     sample_sha256 = manifest.get("sample_sha256")
+    sample_rows = manifest.get("sample_rows")
+    if isinstance(sample_rows, bool) or not isinstance(sample_rows, int) or sample_rows < 0:
+        errors.append("批次 manifest 缺少有效 sample_rows")
     if not isinstance(sample, str) or not sample:
         errors.append("批次 manifest 缺少样本路径")
     elif not isinstance(sample_sha256, str) or len(sample_sha256) != 64:
@@ -88,8 +96,15 @@ def validate_run_inputs(run_dir: str | Path) -> dict[str, Any]:
         sample_path = Path(sample)
         if not sample_path.is_file():
             errors.append(f"样本文件不存在: {sample}")
-        elif sha256_file(sample_path) != sample_sha256:
-            errors.append("样本文件哈希与批次 manifest 不一致")
+        else:
+            if sha256_file(sample_path) != sample_sha256:
+                errors.append("样本文件哈希与批次 manifest 不一致")
+            try:
+                actual_sample_rows = len(read_jsonl(sample_path))
+                if sample_rows != actual_sample_rows:
+                    errors.append("样本行数与批次 manifest 不一致")
+            except Exception as exc:
+                errors.append(f"无法读取样本文件 {sample}: {exc}")
 
     batch_dir = input_dir / "batches"
     actual = {path.name for path in batch_dir.glob("batch_*.jsonl")} if batch_dir.is_dir() else set()
@@ -129,6 +144,7 @@ def validate_run_inputs(run_dir: str | Path) -> dict[str, Any]:
         "manifest_sha256": sha256_file(manifest_path),
         "sample": sample,
         "sample_sha256": sample_sha256,
+        "sample_rows": sample_rows,
         "batches": evidence,
         "errors": errors,
     }

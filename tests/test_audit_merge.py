@@ -38,6 +38,24 @@ def test_audit_blocks_missing_or_tampered_batch(toy_task, mode: str):
     assert not summary["is_usable"]
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("batch_count", 99), ("sample_rows", 99)],
+)
+def test_audit_blocks_tampered_manifest_counts(toy_task, field: str, value: int):
+    sample = sample_records(toy_task, rows=4, sample_id=f"manifest_{field}", strategy="head")
+    run = annotate(toy_task, sample, f"manifest_{field}", "local_stub", 2)
+    manifest_path = run / "input" / "manifest.json"
+    manifest = read_json(manifest_path)
+    manifest[field] = value
+    write_json(manifest, manifest_path)
+
+    summary = audit_run(toy_task, run)
+
+    assert not summary["input_evidence"]["valid"]
+    assert not summary["is_usable"]
+
+
 def test_merge_blocks_cross_batch_id_content_conflict(toy_task, tmp_path: Path):
     sample = tmp_path / "sample.jsonl"
     write_jsonl(

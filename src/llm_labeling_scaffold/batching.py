@@ -153,6 +153,7 @@ def batch_records(
         "schema_version": 3,
         "sample": str(sample),
         "sample_sha256": sha256_file(sample),
+        "sample_rows": len(rows),
         "batch_size": batch_size,
         "batch_count": len(paths),
         "plan_id": resolved_plan_id,
