@@ -10,11 +10,17 @@ import threading
 import urllib.error
 import urllib.request
 
+import pytest
+
 from llm_labeling_scaffold import panel
 from llm_labeling_scaffold import pipeline
 from llm_labeling_scaffold.auth import build_panel_authenticator
+from llm_labeling_scaffold import gold as gold_module
+from llm_labeling_scaffold.audit import audit_run
+from llm_labeling_scaffold.batching import batch_records
 from llm_labeling_scaffold.gold import build_gold_from_decisions
-from llm_labeling_scaffold.io import read_json, read_jsonl, write_json, write_jsonl
+from llm_labeling_scaffold.io import read_json, read_jsonl, sha256_file, write_json, write_jsonl
+from llm_labeling_scaffold.merge import merge_run
 
 
 def _decode_basic(header: str) -> tuple[str, str]:
@@ -308,6 +314,196 @@ def test_task_graph_api_returns_nodes_and_edges(panel_workspace):
     assert any(edge["source"] == "sample:sample_a" and edge["target"] == "decision:argilla_round_1" for edge in body["edges"])
 
 
+def test_workflow_start_api_passes_validated_inputs(panel_workspace, monkeypatch):
+    calls = {}
+
+    class FakeWorkflow:
+        @staticmethod
+        def start_workflow(runs_root, task, *, profile_id, workflow_id, params):
+            calls.update({
+                "runs_root": runs_root,
+                "task_id": task.task_id,
+                "profile_id": profile_id,
+                "workflow_id": workflow_id,
+                "params": params,
+            })
+            return {"workflow_id": workflow_id, "status": "running"}
+
+    monkeypatch.setattr(panel, "_workflow_api", lambda: FakeWorkflow)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={
+                "task_id": "toy_multiclass_v1",
+                "profile": "manual_labeling_cv_v1",
+                "workflow_id": "workflow_001",
+                "params": {"batch_size": 10},
+            },
+        )
+
+    assert status == 200
+    assert body == {"ok": True, "workflow": {"workflow_id": "workflow_001", "status": "running"}}
+    assert calls == {
+        "runs_root": panel_workspace["runs_root"],
+        "task_id": "toy_multiclass_v1",
+        "profile_id": "manual_labeling_cv_v1",
+        "workflow_id": "workflow_001",
+        "params": {"batch_size": 10},
+    }
+
+
+def test_workflow_list_and_status_api(panel_workspace, monkeypatch):
+    calls = []
+
+    class FakeWorkflow:
+        @staticmethod
+        def list_workflows(runs_root, task_id):
+            calls.append(("list", runs_root, task_id))
+            return [{"workflow_id": "workflow_001", "status": "running"}]
+
+        @staticmethod
+        def get_workflow_status(runs_root, task_id, workflow_id):
+            calls.append(("status", runs_root, task_id, workflow_id))
+            return {"workflow_id": workflow_id, "status": "running"}
+
+    monkeypatch.setattr(panel, "_workflow_api", lambda: FakeWorkflow)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        list_status, list_body = _request(base_url, "/api/workflow?task_id=toy_multiclass_v1")
+        status_status, status_body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=workflow_001",
+        )
+
+    assert list_status == 200
+    assert list_body == {"workflows": [{"workflow_id": "workflow_001", "status": "running"}]}
+    assert status_status == 200
+    assert status_body == {"workflow": {"workflow_id": "workflow_001", "status": "running"}}
+    assert calls == [
+        ("list", panel_workspace["runs_root"], "toy_multiclass_v1"),
+        ("status", panel_workspace["runs_root"], "toy_multiclass_v1", "workflow_001"),
+    ]
+
+
+def test_workflow_status_api_returns_404_for_unknown_workflow(panel_workspace):
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=missing_workflow",
+        )
+
+    assert status == 404
+    assert body == {"error": "workflow not found: missing_workflow"}
+
+
+def test_workflow_api_preserves_r2_task_registry_constraint(panel_workspace, monkeypatch):
+    class SyncedTasks:
+        tasks = {}
+
+    called = False
+
+    def unavailable():
+        nonlocal called
+        called = True
+        raise AssertionError("workflow engine must not run for an unregistered R2 task")
+
+    monkeypatch.setenv("LLS_TASK_SOURCE", "r2")
+    monkeypatch.setattr(panel._Handler, "_sync_tasks_if_needed", lambda _self: SyncedTasks())
+    monkeypatch.setattr(panel, "_workflow_api", unavailable)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=workflow_001",
+        )
+
+    assert status == 400
+    assert "未在 R2 数据湖登记表中登记为启用状态" in body["error"]
+    assert called is False
+
+
+def test_workflow_api_does_not_sync_r2_registry_in_local_mode(panel_workspace, monkeypatch):
+    apply_calls = []
+
+    class FakeWorkflow:
+        @staticmethod
+        def get_workflow_status(_runs_root, _task_id, workflow_id):
+            return {"workflow_id": workflow_id, "status": "running"}
+
+    monkeypatch.setenv("LLS_TASK_SOURCE", "local")
+    monkeypatch.setattr(
+        panel,
+        "_apply_runtime_settings",
+        lambda *args, **kwargs: apply_calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(panel, "_workflow_api", lambda: FakeWorkflow)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        status, body = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=workflow_001",
+        )
+
+    assert status == 200
+    assert body == {"workflow": {"workflow_id": "workflow_001", "status": "running"}}
+    assert apply_calls == []
+
+
+def test_workflow_api_rejects_invalid_inputs(panel_workspace, monkeypatch):
+    called = False
+
+    def unavailable():
+        nonlocal called
+        called = True
+        raise AssertionError("workflow engine should not be called for invalid input")
+
+    monkeypatch.setattr(panel, "_workflow_api", unavailable)
+    with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
+        missing_task_status, _ = _request(base_url, "/api/workflow/start", method="POST", body={})
+        bad_task_status, _ = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={"task_id": "../outside"},
+        )
+        dot_task_status, _ = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={"task_id": "."},
+        )
+        missing_workflow_status, _ = _request(
+            base_url,
+            "/api/workflow/resume",
+            method="POST",
+            body={"task_id": "toy_multiclass_v1"},
+        )
+        bad_params_status, _ = _request(
+            base_url,
+            "/api/workflow/start",
+            method="POST",
+            body={"task_id": "toy_multiclass_v1", "params": []},
+        )
+        bad_workflow_status, _ = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=../outside",
+        )
+        dot_workflow_status, _ = _request(
+            base_url,
+            "/api/workflow/status?task_id=toy_multiclass_v1&workflow_id=.",
+        )
+
+    assert [
+        missing_task_status,
+        bad_task_status,
+        dot_task_status,
+        missing_workflow_status,
+        bad_params_status,
+        bad_workflow_status,
+        dot_workflow_status,
+    ] == [400, 400, 400, 400, 400, 400, 400]
+    assert called is False
+
+
 def test_task_archive_plan_api_returns_active_assets(panel_workspace):
     with _panel_server(panel_workspace["runs_root"], Path("examples")) as base_url:
         status, body = _request(base_url, "/api/task/archive_plan?task_id=toy_multiclass_v1")
@@ -371,3 +567,256 @@ def test_build_gold_from_sample_and_decisions(panel_workspace):
     assert manifest["source"] == "decision_artifact"
     assert manifest["rows"] == 2
     assert manifest["sample_path"] == str(panel_workspace["sample_path"])
+
+
+def test_build_gold_from_decisions_rejects_unknown_id_without_outputs(panel_workspace):
+    task = panel_workspace["task"]
+    decisions_path = panel_workspace["decisions_path"]
+    write_jsonl(
+        [{"record_id": "unknown", "human_label": {"class_label": "non_target"}}],
+        decisions_path,
+    )
+
+    with pytest.raises(ValueError, match="未知 ID"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            decisions_path,
+            "strict_unknown_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not any(
+        path.exists()
+        for path in (
+            gold_dir / "gold_strict_unknown_v001.jsonl",
+            gold_dir / "gold_strict_unknown_v001.manifest.json",
+            gold_dir / "gold_strict_unknown_v001.data_card.md",
+        )
+    )
+
+
+def test_build_gold_from_decisions_rejects_duplicate_id_without_outputs(panel_workspace):
+    task = panel_workspace["task"]
+    decisions_path = panel_workspace["decisions_path"]
+    write_jsonl(
+        [
+            {"record_id": "r001", "human_label": {"class_label": "non_target"}},
+            {"record_id": "r001", "human_label": {"class_label": "non_target"}},
+        ],
+        decisions_path,
+    )
+
+    with pytest.raises(ValueError, match="重复 ID"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            decisions_path,
+            "strict_duplicate_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not (gold_dir / "gold_strict_duplicate_v001.jsonl").exists()
+    assert not (gold_dir / "gold_strict_duplicate_v001.manifest.json").exists()
+    assert not (gold_dir / "gold_strict_duplicate_v001.data_card.md").exists()
+
+
+def test_build_gold_from_decisions_rejects_missing_primary_label_without_outputs(panel_workspace):
+    task = panel_workspace["task"]
+    decisions_path = panel_workspace["decisions_path"]
+    write_jsonl(
+        [{"record_id": "r001", "human_label": {"is_target": 0}}],
+        decisions_path,
+    )
+
+    with pytest.raises(ValueError, match="缺少主标签"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            decisions_path,
+            "strict_missing_primary_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not (gold_dir / "gold_strict_missing_primary_v001.jsonl").exists()
+    assert not (gold_dir / "gold_strict_missing_primary_v001.manifest.json").exists()
+    assert not (gold_dir / "gold_strict_missing_primary_v001.data_card.md").exists()
+
+
+def _prepare_gold_run(task, run_dir, rows, *, batch_size=1, overlap_rate=0.0):
+    sample_path = run_dir / "sample.jsonl"
+    write_jsonl(rows, sample_path)
+    batches = batch_records(
+        sample_path,
+        run_dir / "input",
+        batch_size,
+        overlap_rate=overlap_rate,
+        min_annotators_per_overlap_item=2,
+        id_field=task.id_field,
+    )
+    for batch in batches:
+        write_json(
+            {
+                "results": [
+                    {task.id_field: row[task.id_field], "class_label": "non_target", "is_target": 0}
+                    for row in read_jsonl(batch)
+                ]
+            },
+            run_dir / "llm" / f"{batch.stem}.json",
+        )
+    assert audit_run(task, run_dir)["is_usable"]
+    assert merge_run(task, run_dir)["is_usable"]
+
+
+def test_build_gold_allows_identical_cross_batch_overlap(panel_workspace):
+    task = panel_workspace["task"]
+    run_dir = panel_workspace["run_dir"]
+    _prepare_gold_run(
+        task,
+        run_dir,
+        [
+            {"record_id": "r001", "title": "General notice"},
+            {"record_id": "r002", "title": "Service upgrade"},
+        ],
+        overlap_rate=0.5,
+    )
+
+    gold_path = gold_module.build_gold(task, run_dir, "strict_overlap_v001")
+
+    assert len(read_jsonl(gold_path)) == 2
+
+
+def test_build_gold_rejects_conflicting_cross_batch_duplicate(panel_workspace):
+    task = panel_workspace["task"]
+    run_dir = panel_workspace["run_dir"]
+    _prepare_gold_run(
+        task,
+        run_dir,
+        [
+            {"record_id": "r001", "title": "General notice"},
+            {"record_id": "r002", "title": "Service upgrade"},
+        ],
+        overlap_rate=0.5,
+    )
+    manifest_path = run_dir / "input" / "manifest.json"
+    manifest = read_json(manifest_path)
+    overlapping_batch = next(entry for entry in manifest["batches"] if entry["overlap_rows"])
+    batch_path = run_dir / "input" / "batches" / overlapping_batch["batch"]
+    batch_rows = read_jsonl(batch_path)
+    overlapping_id = overlapping_batch["overlap_item_ids"][0]
+    next(row for row in batch_rows if row[task.id_field] == overlapping_id)["title"] = "Conflicting source"
+    write_jsonl(batch_rows, batch_path)
+    overlapping_batch["sha256"] = sha256_file(batch_path)
+    write_json(manifest, manifest_path)
+    assert audit_run(task, run_dir)["is_usable"]
+    assert merge_run(task, run_dir)["is_usable"]
+
+    with pytest.raises(ValueError, match="输入批次跨批重复 ID 内容不一致"):
+        gold_module.build_gold(task, run_dir, "strict_overlap_conflict_v001")
+
+
+def test_build_gold_rejects_duplicate_merged_id(panel_workspace):
+    task = panel_workspace["task"]
+    run_dir = panel_workspace["run_dir"]
+    _prepare_gold_run(
+        task,
+        run_dir,
+        [
+            {"record_id": "r001", "title": "General notice"},
+            {"record_id": "r002", "title": "Service upgrade"},
+        ],
+    )
+    merged_path = run_dir / "merged" / "merged_clean.jsonl"
+    write_jsonl(
+        [
+            {"record_id": "r001", "class_label": "non_target"},
+            {"record_id": "r001", "class_label": "service_upgrade"},
+        ],
+        merged_path,
+    )
+    merge_summary_path = run_dir / "merged" / "merge_summary.json"
+    merge_summary = read_json(merge_summary_path)
+    merge_summary["merged_sha256"] = sha256_file(merged_path)
+    write_json(merge_summary, merge_summary_path)
+
+    with pytest.raises(ValueError, match="merged_clean 存在重复 ID"):
+        gold_module.build_gold(task, run_dir, "strict_merged_duplicate_v001")
+
+
+@pytest.mark.parametrize(
+    "existing_name",
+    [
+        "gold_strict_existing_v001.jsonl",
+        "gold_strict_existing_v001.manifest.json",
+        "gold_strict_existing_v001.data_card.md",
+    ],
+)
+def test_build_gold_from_decisions_rejects_any_existing_output(panel_workspace, existing_name):
+    task = panel_workspace["task"]
+    gold_dir = task.runs_dir / "gold"
+    existing_path = gold_dir / existing_name
+    existing_path.write_text("existing\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="拒绝覆盖"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            panel_workspace["decisions_path"],
+            "strict_existing_v001",
+        )
+
+    assert existing_path.read_text(encoding="utf-8") == "existing\n"
+    output_paths = {
+        gold_dir / "gold_strict_existing_v001.jsonl",
+        gold_dir / "gold_strict_existing_v001.manifest.json",
+        gold_dir / "gold_strict_existing_v001.data_card.md",
+    }
+    assert {path for path in output_paths if path.exists()} == {existing_path}
+
+
+def test_build_gold_from_decisions_does_not_publish_partial_outputs(panel_workspace, monkeypatch):
+    task = panel_workspace["task"]
+
+    def fail_manifest_write(*args, **kwargs):
+        raise OSError("manifest storage unavailable")
+
+    monkeypatch.setattr(gold_module, "write_json", fail_manifest_write)
+
+    with pytest.raises(OSError, match="manifest storage unavailable"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            panel_workspace["decisions_path"],
+            "strict_atomic_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not any(gold_dir.glob("gold_strict_atomic_v001.*"))
+    assert not any(gold_dir.glob(".gold_strict_atomic_v001_*"))
+
+
+def test_build_gold_cleans_published_files_when_publish_fails(panel_workspace, monkeypatch):
+    task = panel_workspace["task"]
+    real_link = gold_module.os.link
+    calls = 0
+
+    def fail_on_second_link(source, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("gold publication unavailable")
+        return real_link(source, target)
+
+    monkeypatch.setattr(gold_module.os, "link", fail_on_second_link)
+
+    with pytest.raises(OSError, match="gold publication unavailable"):
+        build_gold_from_decisions(
+            task,
+            panel_workspace["sample_path"],
+            panel_workspace["decisions_path"],
+            "strict_publish_failure_v001",
+        )
+
+    gold_dir = task.runs_dir / "gold"
+    assert not any(gold_dir.glob("gold_strict_publish_failure_v001.*"))
+    assert not any(gold_dir.glob(".gold_strict_publish_failure_v001_*"))

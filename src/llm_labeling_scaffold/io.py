@@ -11,12 +11,16 @@ import uuid
 _JSONL_PAIR_SCHEMA_VERSION = 1
 
 
-def _file_sha256(path: Path) -> str:
+def sha256_file(path: str | Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as fh:
+    with Path(path).open("rb") as fh:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return sha256_file(path)
 
 
 def _jsonl_pair_commit_path(primary_path: Path) -> Path:

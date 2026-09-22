@@ -241,6 +241,33 @@ def _allocation_uuid(value: str, field: str) -> uuid.UUID:
         raise AllocationPreviewDTOError("invalid_uuid", f"{field} 必须是合法 UUID", field=field) from exc
 
 
+def _workflow_api():
+    try:
+        from . import workflow
+    except ImportError as exc:
+        raise RuntimeError("workflow API is not available") from exc
+    return workflow
+
+
+def _workflow_identifier(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a single path segment")
+    value = value.strip()
+    if value == "." or not _safe_segment(value):
+        raise ValueError(f"{field} must be a single path segment")
+    return value
+
+
+def _workflow_profile_id(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    profile_id = _workflow_identifier(value, "profile")
+    from .profiles import profile_definition
+
+    profile_definition(profile_id)
+    return profile_id
+
+
 def _truthy_env(name: str) -> bool:
     return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -1970,6 +1997,75 @@ def _contract_capabilities(
                     "required": ["ok", "job"],
                 },
             },
+            {
+                "method": "POST",
+                "path": "/api/workflow/start",
+                "action": "workflow_start",
+                "side_effects": True,
+                "requires_task_source": "control",
+                "required_permission": Permission.TASK_EDIT.value,
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id"],
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "profile": {"type": "string"},
+                        "workflow_id": {"type": "string"},
+                        "params": {"type": "object"},
+                        "workspace": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "response_schema": {"type": "object", "required": ["ok", "workflow"]},
+            },
+            {
+                "method": "POST",
+                "path": "/api/workflow/resume",
+                "action": "workflow_resume",
+                "side_effects": True,
+                "requires_task_source": "control",
+                "required_permission": Permission.TASK_EDIT.value,
+                "request_schema": {
+                    "type": "object",
+                    "required": ["task_id", "workflow_id"],
+                    "properties": {
+                        "task_id": {"type": "string"},
+                        "profile": {"type": "string"},
+                        "workflow_id": {"type": "string"},
+                        "params": {"type": "object"},
+                        "workspace": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                "response_schema": {"type": "object", "required": ["ok", "workflow"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/workflow",
+                "action": "workflow_list",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.TASK_READ.value,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["workspace", "workflows"]},
+            },
+            {
+                "method": "GET",
+                "path": "/api/workflow/status",
+                "action": "workflow_status",
+                "side_effects": False,
+                "requires_task_source": "control",
+                "required_permission": Permission.TASK_READ.value,
+                "query_params": {
+                    "task_id": {"type": "string", "required": True},
+                    "workflow_id": {"type": "string", "required": True},
+                    "workspace": {"type": "string", "required": True},
+                },
+                "response_schema": {"type": "object", "required": ["workspace", "workflow"]},
+            },
         ],
     }
     if auth_mode == "cloudflare_access":
@@ -2201,6 +2297,8 @@ def _database_authorized_route(method: str, path: str) -> bool:
             "/api/task/data_lake",
             "/api/jobs",
             "/api/data_lake/catalog",
+            "/api/workflow",
+            "/api/workflow/status",
         }:
             return True
         if _allocation_route_allowed(method, path):
@@ -2209,6 +2307,7 @@ def _database_authorized_route(method: str, path: str) -> bool:
     if method == "POST":
         return (
             path in {"/api/tasks", "/api/import/data_lake", "/api/allocation/preview"}
+            or path in {"/api/workflow/start", "/api/workflow/resume"}
             or _allocation_route_allowed(method, path)
             or _contract_task_path(path, suffix="publish") is not None
             or _contract_task_path(path, suffix="check") is not None
@@ -4434,6 +4533,9 @@ class _Handler(BaseHTTPRequestHandler):
             if active.task_config is None:
                 raise ActiveTaskLoaderUnavailable(f"任务尚未完成物化: {task_id}")
             return active.task_config
+        synced = self._sync_tasks_if_needed()
+        if synced is not None and task_id not in synced.tasks:
+            raise ValueError(f"任务未在 R2 数据湖登记表中登记为启用状态: {task_id}")
         return pipeline.load_task_by_id(self.tasks_root, task_id)
 
     def _resolve_action_task_path(
@@ -4491,6 +4593,140 @@ class _Handler(BaseHTTPRequestHandler):
             })
         except Exception as exc:
             self._json({"error": str(exc)}, status=400)
+
+    def _workflow_task(self, task_id: str):
+        task = self._load_task_by_id(task_id)
+        self._resolve_action_task_path(str(task.path))
+        return task
+
+    def _workflow_authorized_task(
+        self,
+        task_id: str,
+        params,
+        *,
+        body: dict[str, Any] | None = None,
+        permission: Permission = Permission.TASK_READ,
+    ) -> tuple[Any, Path, str | None]:
+        if _control_task_source_enabled():
+            workspace_slug, active, workspace_runs_root = self._authorized_active_task(
+                task_id,
+                params,
+                body=body,
+                permission=permission,
+            )
+            return active.task_config, workspace_runs_root, workspace_slug
+        return self._workflow_task(task_id), self.runs_root, None
+
+    def _workflow_payload(self, body: Any, *, require_workflow_id: bool) -> tuple[str, str | None, str | None, dict]:
+        if not isinstance(body, dict):
+            raise ValueError("workflow payload must be a JSON object")
+        task_id = _workflow_identifier(body.get("task_id"), "task_id")
+        profile_id = _workflow_profile_id(body.get("profile"))
+        workflow_value = body.get("workflow_id")
+        if workflow_value in (None, "") and not require_workflow_id:
+            workflow_id = None
+        else:
+            workflow_id = _workflow_identifier(workflow_value, "workflow_id")
+        params = body.get("params", {})
+        if not isinstance(params, dict):
+            raise ValueError("params must be a JSON object")
+        return task_id, profile_id, workflow_id, params
+
+    def _workflow_start(self) -> None:
+        body = self._read_body()
+        try:
+            task_id, profile_id, workflow_id, params = self._workflow_payload(body, require_workflow_id=False)
+            if _control_task_source_enabled():
+                self._authorized_active_task(
+                    task_id,
+                    {},
+                    body=body,
+                    permission=Permission.TASK_EDIT,
+                )
+                raise _PanelRouteError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "workflow_mutation_unavailable",
+                    "control 模式 workflow start 尚未接入受验证的参数与路径 contract",
+                )
+            task = self._workflow_task(task_id)
+            result = _workflow_api().start_workflow(
+                self.runs_root,
+                task,
+                profile_id=profile_id,
+                workflow_id=workflow_id,
+                params=params,
+            )
+            self._json({"ok": True, "workflow": result})
+        except Exception as exc:
+            if isinstance(exc, ValueError):
+                self._json({"error": str(exc)}, status=400)
+            else:
+                self._route_error(exc)
+
+    def _workflow_resume(self) -> None:
+        body = self._read_body()
+        try:
+            task_id, profile_id, workflow_id, params = self._workflow_payload(body, require_workflow_id=True)
+            if _control_task_source_enabled():
+                self._authorized_active_task(
+                    task_id,
+                    {},
+                    body=body,
+                    permission=Permission.TASK_EDIT,
+                )
+                raise _PanelRouteError(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "workflow_mutation_unavailable",
+                    "control 模式 workflow resume 尚未接入受验证的参数与路径 contract",
+                )
+            task = self._workflow_task(task_id)
+            result = _workflow_api().resume_workflow(
+                self.runs_root,
+                task,
+                workflow_id=workflow_id,
+                profile_id=profile_id,
+                params=params,
+            )
+            self._json({"ok": True, "workflow": result})
+        except Exception as exc:
+            if isinstance(exc, ValueError):
+                self._json({"error": str(exc)}, status=400)
+            else:
+                self._route_error(exc)
+
+    def _workflow_list(self, params) -> None:
+        try:
+            task_id = _workflow_identifier(params.get("task_id", [""])[0], "task_id")
+            _, workspace_runs_root, workspace_slug = self._workflow_authorized_task(task_id, params)
+            result = _workflow_api().list_workflows(workspace_runs_root, task_id)
+            payload = {"workflows": result}
+            if workspace_slug is not None:
+                payload["workspace"] = workspace_slug
+            self._json(payload)
+        except Exception as exc:
+            if isinstance(exc, ValueError):
+                self._json({"error": str(exc)}, status=400)
+            else:
+                self._route_error(exc)
+
+    def _workflow_status(self, params) -> None:
+        try:
+            task_id = _workflow_identifier(params.get("task_id", [""])[0], "task_id")
+            workflow_id = _workflow_identifier(params.get("workflow_id", [""])[0], "workflow_id")
+            _, workspace_runs_root, workspace_slug = self._workflow_authorized_task(task_id, params)
+            result = _workflow_api().get_workflow_status(workspace_runs_root, task_id, workflow_id)
+            if result is None:
+                self._json({"error": f"workflow not found: {workflow_id}"}, status=404)
+                return
+            payload = {"workflow": result}
+            if workspace_slug is not None:
+                payload["workspace"] = workspace_slug
+            self._json(payload)
+        except Exception as exc:
+            if isinstance(exc, ValueError):
+                self._json({"error": str(exc)}, status=400)
+            else:
+                self._route_error(exc)
 
     def _task_detail(self, task_id: str) -> None:
         if not _safe_segment(task_id):
@@ -4701,6 +4937,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self._task_detail(contract_task_id)
         elif path.startswith("/api/tasks/"):
             self._json({"error": "not found"}, status=404)
+        elif path == "/api/workflow":
+            self._workflow_list(params)
+        elif path == "/api/workflow/status":
+            self._workflow_status(params)
         elif path == "/api/runs":
             if _control_task_source_enabled():
                 self._json({"error": "control 模式必须使用带 task_id 的任务范围接口"}, status=400)
@@ -5118,6 +5358,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._sync_tasks_from_registry()
         elif path.startswith("/api/tasks/"):
             self._json({"error": "not found"}, status=404)
+        elif path == "/api/workflow/start":
+            self._workflow_start()
+        elif path == "/api/workflow/resume":
+            self._workflow_resume()
         elif path == "/api/adjudicate":
             run_dir = self._resolve_run(params)
             if not run_dir:

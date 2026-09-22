@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 from pathlib import Path
+from time import monotonic, sleep
 
 from .annotation import annotate
 from .audit import audit_run
@@ -93,6 +95,152 @@ def _task_runs_root(args) -> Path:
     if _control_task_source_enabled():
         return root / str(args.workspace)
     return root
+
+
+def _workflow_module():
+    try:
+        return importlib.import_module("llm_labeling_scaffold.workflow")
+    except ImportError as exc:
+        raise SystemExit("workflow 核心模块不可用，请先完成后端部署") from exc
+
+
+def _workflow_task(args):
+    if not args.task and not args.task_id:
+        raise SystemExit("workflow start/resume 需要 --task 或 --task-id")
+    return _load_task_reference(args.task, args.task_id, args.tasks_root, args.runs_root, args.workspace)
+
+
+def _workflow_task_id(args) -> str | None:
+    if args.task_id:
+        return args.task_id
+    if args.task:
+        return _workflow_task(args).task_id
+    return None
+
+
+def _workflow_id(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    direct = value.get("workflow_id")
+    if direct:
+        return str(direct)
+    for key in ("workflow", "manifest"):
+        nested = _workflow_id(value.get(key))
+        if nested:
+            return nested
+    direct = value.get("id")
+    return str(direct) if direct else None
+
+
+def _workflow_status_value(value: object) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    if status:
+        return str(status)
+    for key in ("workflow", "manifest"):
+        nested = _workflow_status_value(value.get(key))
+        if nested:
+            return nested
+    return None
+
+
+def _workflow_result(value: object) -> dict:
+    if isinstance(value, dict):
+        return value
+    raise SystemExit("workflow 核心接口返回了无法识别的结果")
+
+
+def _wait_for_workflow(args, task_id: str, workflow_id: str) -> dict:
+    workflow = _workflow_module()
+    deadline = monotonic() + args.timeout if args.timeout > 0 else None
+    while True:
+        result = _workflow_result(
+            workflow.get_workflow_status(
+                Path(args.runs_root),
+                task_id,
+                workflow_id,
+            ),
+        )
+        status = _workflow_status_value(result)
+        if status in {"succeeded", "failed", "waiting_for_human"}:
+            return result
+        if deadline is not None and monotonic() >= deadline:
+            raise SystemExit("等待 workflow 超时")
+        sleep(args.poll_interval)
+
+
+def _run_workflow_command(args) -> None:
+    workflow = _workflow_module()
+    runs_root = Path(args.runs_root)
+
+    if args.workflow_cmd == "start":
+        task = _workflow_task(args)
+        result = workflow.start_workflow(
+            runs_root,
+            task,
+            profile_id=args.profile,
+            workflow_id=args.workflow_id,
+            params=_parse_params(args.param),
+        )
+        result = _workflow_result(result)
+        if args.wait:
+            workflow_id = _workflow_id(result)
+            if not workflow_id:
+                raise SystemExit("workflow 启动结果缺少 workflow_id，无法等待")
+            result = _wait_for_workflow(args, task.task_id, workflow_id)
+        _print_json(result)
+        return
+
+    if args.workflow_cmd == "resume":
+        task = _workflow_task(args)
+        result = workflow.resume_workflow(
+            runs_root,
+            task,
+            args.workflow_id,
+            params=_parse_params(args.param),
+            profile_id=args.profile,
+        )
+        result = _workflow_result(result)
+        if args.wait:
+            result = _wait_for_workflow(args, task.task_id, args.workflow_id)
+        _print_json(result)
+        return
+
+    task_id = _workflow_task_id(args)
+    if args.workflow_cmd == "list":
+        result = workflow.list_workflows(runs_root, task_id=task_id)
+        if isinstance(result, dict):
+            _print_json(result)
+        else:
+            _print_json({"workflows": result})
+        return
+
+    if args.workflow_cmd == "status":
+        if not task_id:
+            raise SystemExit("workflow status 需要 --task 或 --task-id")
+        _print_json(
+            _workflow_result(
+                workflow.get_workflow_status(runs_root, task_id, args.workflow_id),
+            ),
+        )
+        return
+
+    raise SystemExit(f"未知 workflow 操作: {args.workflow_cmd}")
+
+
+def _add_workflow_reference_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--task")
+    parser.add_argument("--task-id")
+    parser.add_argument("--workspace")
+    parser.add_argument("--tasks-root", default="tasks")
+    parser.add_argument("--runs-root", default="runs")
+
+
+def _add_workflow_wait_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--wait", action="store_true", help="等待当前 workflow 阶段完成或进入人工等待")
+    parser.add_argument("--poll-interval", type=float, default=1.0)
+    parser.add_argument("--timeout", type=float, default=0.0)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -210,6 +358,30 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--import-id", default="patent_boundary_manual_seed_500_2026_06_27")
     smoke.add_argument("--timeout", type=float, default=10.0)
     smoke.add_argument("--format", choices=["json", "markdown"], default="json")
+
+    workflow_cmd = sub.add_parser("workflow")
+    workflow_sub = workflow_cmd.add_subparsers(dest="workflow_cmd", required=True)
+
+    workflow_start = workflow_sub.add_parser("start")
+    _add_workflow_reference_args(workflow_start)
+    workflow_start.add_argument("--profile")
+    workflow_start.add_argument("--workflow-id")
+    workflow_start.add_argument("--param", action="append", default=[])
+    _add_workflow_wait_args(workflow_start)
+
+    workflow_resume = workflow_sub.add_parser("resume")
+    _add_workflow_reference_args(workflow_resume)
+    workflow_resume.add_argument("--workflow-id", required=True)
+    workflow_resume.add_argument("--profile")
+    workflow_resume.add_argument("--param", action="append", default=[])
+    _add_workflow_wait_args(workflow_resume)
+
+    workflow_status = workflow_sub.add_parser("status")
+    _add_workflow_reference_args(workflow_status)
+    workflow_status.add_argument("--workflow-id", required=True)
+
+    workflow_list = workflow_sub.add_parser("list")
+    _add_workflow_reference_args(workflow_list)
 
     panel = sub.add_parser("panel")
     panel.add_argument("--runs-root", default="runs")
@@ -367,6 +539,9 @@ def main(argv: list[str] | None = None) -> None:
         print(render_summary(summary, args.format))
         if not summary.get("ok"):
             raise SystemExit(1)
+
+    elif args.cmd == "workflow":
+        _run_workflow_command(args)
 
     elif args.cmd == "panel":
         from .panel import serve_panel

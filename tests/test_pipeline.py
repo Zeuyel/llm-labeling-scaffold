@@ -823,7 +823,7 @@ def test_start_data_lake_import_reuses_idempotency_key(tmp_path: Path):
         raise AssertionError("same idempotency key with different request should fail")
 
 
-def test_data_lake_import_accepts_source_path_relative_to_canonical_uri(tmp_path: Path):
+def test_data_lake_import_rejects_source_path_not_listed_in_manifest(tmp_path: Path):
     canonical_root = tmp_path / "canonical"
     source = canonical_root / "manual_seed_500" / "v1" / "raw.jsonl"
     source.parent.mkdir(parents=True)
@@ -883,11 +883,13 @@ def test_data_lake_import_accepts_source_path_relative_to_canonical_uri(tmp_path
     )
     task = load_task(created["path"])
 
-    with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
-        imported = pipeline.import_from_data_lake(tmp_path / "runs", task)
-
-    assert imported["import_id"] == "lake_import"
-    assert imported["data_lake"]["source_object_path"] == "inputs/manual_seed_500/v1/raw.jsonl"
+    try:
+        with patch.dict("os.environ", {"LLS_ALLOW_LOCAL_DATA_LAKE_URIS": "1"}):
+            pipeline.import_from_data_lake(tmp_path / "runs", task)
+    except Exception as exc:
+        assert "数据集 manifest 中没有匹配的可导入对象" in str(exc)
+    else:
+        raise AssertionError("source_object_path must be listed exactly in manifest.objects[].path")
 
 
 def test_data_lake_import_requires_manifest_relative_object_and_matching_manifest(tmp_path: Path):
@@ -2405,6 +2407,72 @@ def test_prelabel_provider_payload_must_be_dict(tmp_path: Path, monkeypatch):
 
     with pytest.raises(ValueError, match="必须返回 dict payload"):
         suggestions_module._provider_results(task, [{"record_id": "r1", "title": "A"}], "bad_provider")
+
+
+def test_prelabel_suggest_writes_local_suggestions_for_annotation_job(tmp_path: Path):
+    created = pipeline.create_task(
+        tmp_path / "tasks",
+        {
+            "task_id": "suggest_task",
+            "id_field": "record_id",
+            "text_fields": ["title"],
+            "primary_label_name": "label",
+            "primary_label_values": ["yes", "no"],
+        },
+    )
+    task = pipeline.with_runs_root(load_task(created["path"]), tmp_path / "runs")
+    annotation_dir = tmp_path / "runs" / task.task_id / "annotation_jobs" / "argilla_round_1"
+    dispatch_path = annotation_dir / "dispatch.jsonl"
+    write_jsonl(
+        [
+            {
+                "record_id": "r1",
+                "title": "remote service platform",
+                "__lls_batch_id": "batch_00001.jsonl",
+                "__lls_argilla_record_id": "r1__batch_00001.jsonl",
+                "__lls_batch_plan_id": "plan_1",
+            }
+        ],
+        dispatch_path,
+    )
+    write_json(
+        {
+            "annotation_id": "argilla_round_1",
+            "argilla_dataset": "argilla_dataset_1",
+            "dispatch_path": str(dispatch_path),
+            "dispatch_mode": "batch_plan",
+            "batch_plan_id": "plan_1",
+            "batch_ids": ["batch_00001.jsonl"],
+        },
+        annotation_dir / "manifest.json",
+    )
+
+    job = pipeline.start_action(
+        tmp_path / "runs",
+        created["path"],
+        "prelabel_suggest",
+        {
+            "annotation_id": "argilla_round_1",
+            "suggestion_id": "local_stub_v001",
+            "provider": "local_stub",
+            "prompt_version": "v001",
+        },
+    )
+    current = _wait_for_job(tmp_path / "runs", task.task_id, job["id"])
+
+    assert current["status"] == "succeeded"
+    out_dir = tmp_path / "runs" / task.task_id / "suggestions" / "argilla_round_1" / "local_stub_v001"
+    manifest = read_json(out_dir / "manifest.json")
+    rows = read_jsonl(out_dir / "suggestions.jsonl")
+    assert manifest["annotation_id"] == "argilla_round_1"
+    assert manifest["argilla_dataset"] == "argilla_dataset_1"
+    assert manifest["batch_plan_id"] == "plan_1"
+    assert manifest["records"] == 1
+    assert rows[0]["argilla_record_id"] == "r1__batch_00001.jsonl"
+    assert rows[0]["batch_id"] == "batch_00001.jsonl"
+    assert rows[0]["batch_plan_id"] == "plan_1"
+    assert rows[0]["agent"] == "local_stub:v001"
+    assert rows[0]["suggestions"]["label"] in {"yes", "no"}
 
 
 def test_argilla_push_sample_dispatch_still_uses_sample_file_without_batch_plan(tmp_path: Path):

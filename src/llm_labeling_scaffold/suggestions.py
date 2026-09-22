@@ -71,6 +71,8 @@ def json_dumps(value: Any) -> str:
 
 
 def _provider_results(task: TaskConfig, rows: list[dict], provider_name: str) -> list[dict]:
+    if provider_name == "codex_exec":
+        raise ValueError("codex_exec provider 尚未实现；当前先支持本地 suggestions 产物和 Argilla Suggestions 写入边界")
     provider = get_provider(provider_name)
     payload = provider.annotate_batch(rows, task)
     if not isinstance(payload, dict):

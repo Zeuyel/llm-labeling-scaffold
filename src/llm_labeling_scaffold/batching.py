@@ -1,18 +1,10 @@
 from __future__ import annotations
 
 import math
-import hashlib
 from pathlib import Path
 from typing import Any
 
-from .io import read_jsonl, write_json, write_jsonl
-
-
-def _hash_rows(rows: list[dict]) -> str:
-    h = hashlib.sha256()
-    for row in rows:
-        h.update(repr(sorted(row.items())).encode("utf-8"))
-    return h.hexdigest()
+from .io import read_jsonl, sha256_file, write_json, write_jsonl
 
 
 def _rate(value: float | int | str | None, *, name: str) -> float:
@@ -149,7 +141,7 @@ def batch_records(
                 "overlap_rows": len(overlap_entries),
                 "regular_item_ids": [entry["id"] for entry in regular_entries],
                 "overlap_item_ids": [entry["id"] for entry in overlap_entries],
-                "sha256": _hash_rows(chunk),
+                "sha256": sha256_file(path),
             }
         )
 
@@ -158,8 +150,10 @@ def batch_records(
         resolved_strategy_id = "quality_control_overlap_v1" if overlap_rate_value > 0 else "regular_sequential_v1"
     resolved_plan_id = str(plan_id or "").strip() or _default_plan_id(out, batch_size, overlap_rate_value)
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "sample": str(sample),
+        "sample_sha256": sha256_file(sample),
+        "sample_rows": len(rows),
         "batch_size": batch_size,
         "batch_count": len(paths),
         "plan_id": resolved_plan_id,
